@@ -37,6 +37,8 @@ Ordered for the phase-1 critical path (see ../docs/TASKS.md). Each task should l
 ## 4. Phase 2
 
 - [ ] Open5GS/UERANSIM driver: `mode: s-nssai` slice provisioning (H2)
+- [ ] URSP-style `slice_policy`: per-node traffic-class → slice routing over concurrent PDU
+      sessions (UE-side slicing; mirrors Snapdragon Auto URSP behavior)
 - [ ] SONiC-VS twin: render slice intent to SONiC config, boot VS qcow2, verify config parity
 - [ ] TrafficService: synthetic generator (pps/bandwidth/payload per profile)
 - [ ] TS SDK (connect-es) generation + tonic-web enablement; minimal web dashboard repo/dir
@@ -48,3 +50,6 @@ Ordered for the phase-1 critical path (see ../docs/TASKS.md). Each task should l
 - [ ] Qt/QML operator HMI (Qt GRPC ≥6.8): live slice metrics view
 - [ ] `vxedged --controller`: federation of site daemons over WireGuard+mTLS
 - [ ] `traffic_profiles.source: carla` integration hook
+- [ ] `type: can` links: SocketCAN/vcan provisioning, QEMU CAN controller attach, cannelloni
+      CAN-over-Ethernet tunnels
+- [ ] TSN gateway variant: taprio/cbs qdisc rendering + gPTP time sync (linuxptp)
