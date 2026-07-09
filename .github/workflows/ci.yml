@@ -32,6 +32,15 @@ jobs:
       - uses: bufbuild/buf-action@v1
         with:
           lint: true
-          # Breaking-change check activates once a baseline tag exists.
-          breaking: false
+          # vxAPI is the contract: PRs must not break it. Compared against main.
+          breaking: ${{ github.event_name == 'pull_request' }}
+          breaking_against: "https://github.com/${{ github.repository }}.git#branch=main"
           push: false
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check

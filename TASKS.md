@@ -17,6 +17,8 @@ Ordered for the phase-1 critical path (see ../docs/TASKS.md). Each task should l
       of mutating calls *(done: tonic server on UDS with Gateway/Job stubs, graceful shutdown)*
 - [ ] `vxedge-cli`: auto-spawn ephemeral daemon; `--json` for all verbs *(done: full clap tree
       matching canonical commands, `--endpoint`, live `status` RPC with human + JSON output)*
+- [ ] `vxedge manifest validate` subcommand (schema + semantic checks over vxedge-core;
+      powers manifest-validation CI in vxperiments)
 
 ## 2. vxgateway backend (phase 1 — the research-critical piece)
 
@@ -30,7 +32,8 @@ netns tests. WireGuard/VXLAN/FRR may trail within the phase — not needed for e
 - [ ] FRR config rendering (BGP optional path)
 - [ ] `GatewayService.Apply/Up/Down/Status` wired to reconciler; idempotency test: double-up,
       double-down, up-after-partial-failure
-- [ ] netns-based integration test suite (CI-runnable)
+- [ ] netns-based integration test suite — CI-runnable on standard `ubuntu-latest` runners
+      (sudo + nested KVM available); design for that from the start
 
 ## 3. Zone & compute backends (phase 1 minimal, phase 2 full)
 
@@ -51,6 +54,7 @@ netns tests. WireGuard/VXLAN/FRR may trail within the phase — not needed for e
 - [ ] mTLS + OIDC auth path; viewer/operator/admin roles
 - [ ] Harness `impairments` rendering: tc netem per link (rate cap, latency/jitter, loss —
       100/1000BASE-T1 emulation); manifest struct extension
+- [ ] Release binaries for vxedge/vxedged via cargo-dist (digest-recorded, §13)
 
 ## 5. Phase 3
 
