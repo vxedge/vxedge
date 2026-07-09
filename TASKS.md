@@ -53,3 +53,5 @@ Ordered for the phase-1 critical path (see ../docs/TASKS.md). Each task should l
 - [ ] `type: can` links: SocketCAN/vcan provisioning, QEMU CAN controller attach, cannelloni
       CAN-over-Ethernet tunnels
 - [ ] TSN gateway variant: taprio/cbs qdisc rendering + gPTP time sync (linuxptp)
+- [ ] V2X groundwork: N vehicle manifests per experiment (V2V paths through vxgateway) +
+      `type: rsu` node support in zone/gateway provisioning (V2I)
