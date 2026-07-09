@@ -1,9 +1,9 @@
 //! vxedge — thin vxAPI client. Every subcommand is a 1:1 wrapper over a vxAPI
 //! RPC; no orchestration logic lives here (hard rule, AGENTS.md).
 //!
-//! Scaffold status: the full canonical command tree parses; `status` performs
-//! a real RPC against vxedged. Remaining verbs print a scaffold notice until
-//! their daemon-side services land.
+//! Wired today: `status`, `up`, `down` (job submission + live progress
+//! streaming). Remaining verbs print a scaffold notice until their
+//! daemon-side services land.
 
 use clap::{Parser, Subcommand};
 use hyper_util::rt::TokioIo;
@@ -11,8 +11,13 @@ use tokio::net::UnixStream;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 
-use vxedge_api::v1::GatewayStatusRequest;
 use vxedge_api::v1::gateway_service_client::GatewayServiceClient;
+use vxedge_api::v1::job_service_client::JobServiceClient;
+use vxedge_api::v1::manifest_ref::Source;
+use vxedge_api::v1::{
+    GatewayDownRequest, GatewayStatusRequest, GatewayUpRequest, Job, JobState, ManifestRef,
+    WatchJobRequest,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -41,9 +46,16 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Bring the edge gateway (vxgateway) up.
-    Up,
+    Up {
+        /// Experiment manifest declaring the slices (path readable by the daemon).
+        #[arg(long)]
+        manifest: Option<String>,
+    },
     /// Tear the edge gateway down.
-    Down,
+    Down {
+        #[arg(long)]
+        manifest: Option<String>,
+    },
     /// Show gateway status.
     Status,
     /// Zone lifecycle (vxzones).
@@ -206,7 +218,7 @@ enum TrafficCmd {
 async fn connect(endpoint: &str) -> Result<Channel, Box<dyn std::error::Error>> {
     let Some(path) = endpoint.strip_prefix("unix://") else {
         return Err(format!(
-            "unsupported endpoint `{endpoint}` — only unix:// is supported in this scaffold"
+            "unsupported endpoint `{endpoint}` — only unix:// is supported for now"
         )
         .into());
     };
@@ -219,6 +231,72 @@ async fn connect(endpoint: &str) -> Result<Channel, Box<dyn std::error::Error>> 
         }))
         .await?;
     Ok(channel)
+}
+
+fn manifest_ref(path: &Option<String>) -> Option<ManifestRef> {
+    // The manifest path travels to the daemon, which reads it. Absolutize so
+    // the daemon resolves it regardless of its own working directory.
+    path.as_ref().map(|p| {
+        let abs = std::path::Path::new(p)
+            .canonicalize()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| p.clone());
+        ManifestRef {
+            source: Some(Source::Path(abs)),
+            sha256: String::new(),
+        }
+    })
+}
+
+fn state_name(state: i32) -> &'static str {
+    match JobState::try_from(state) {
+        Ok(JobState::Pending) => "pending",
+        Ok(JobState::Running) => "running",
+        Ok(JobState::Succeeded) => "succeeded",
+        Ok(JobState::Failed) => "failed",
+        Ok(JobState::Cancelled) => "cancelled",
+        _ => "unknown",
+    }
+}
+
+/// Stream a job's progress to the terminal; exit non-zero on failure.
+async fn watch_job(
+    channel: Channel,
+    job: Job,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut jobs = JobServiceClient::new(channel);
+    let mut stream = jobs
+        .watch(WatchJobRequest { id: job.id.clone() })
+        .await?
+        .into_inner();
+    let mut last: Option<Job> = None;
+    while let Some(snapshot) = stream.message().await? {
+        if json {
+            println!("{}", serde_json::to_string(&JsonJob::from(&snapshot))?);
+        } else if !snapshot.message.is_empty() || snapshot.progress_percent > 0 {
+            println!(
+                "[{:>3}%] {} {}",
+                snapshot.progress_percent, snapshot.kind, snapshot.message
+            );
+        }
+        last = Some(snapshot);
+    }
+    match last {
+        Some(job) if job.state == JobState::Succeeded as i32 => {
+            if !json {
+                println!("{}: succeeded", job.kind);
+            }
+            Ok(())
+        }
+        Some(job) => {
+            if !json {
+                eprintln!("{}: {} — {}", job.kind, state_name(job.state), job.error);
+            }
+            std::process::exit(1);
+        }
+        None => Err("job stream ended without a terminal state".into()),
+    }
 }
 
 fn scaffold_notice(what: &str) {
@@ -252,8 +330,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("gateway: no status reported");
             }
         }
-        Command::Up => scaffold_notice("up"),
-        Command::Down => scaffold_notice("down"),
+        Command::Up { manifest } => {
+            let channel = connect(&cli.endpoint).await?;
+            let mut gw = GatewayServiceClient::new(channel.clone());
+            let job = gw
+                .up(GatewayUpRequest {
+                    manifest: manifest_ref(manifest),
+                })
+                .await?
+                .into_inner();
+            watch_job(channel, job, cli.json).await?;
+        }
+        Command::Down { manifest } => {
+            let channel = connect(&cli.endpoint).await?;
+            let mut gw = GatewayServiceClient::new(channel.clone());
+            let job = gw
+                .down(GatewayDownRequest {
+                    manifest: manifest_ref(manifest),
+                })
+                .await?
+                .into_inner();
+            watch_job(channel, job, cli.json).await?;
+        }
         Command::Zone { .. } => scaffold_notice("zone"),
         Command::Compute { .. } => scaffold_notice("compute"),
         Command::Ota { .. } => scaffold_notice("ota"),
@@ -279,6 +377,29 @@ impl From<&vxedge_api::v1::GatewayStatus> for JsonStatus {
             vxid: s.vxid,
             state: s.state,
             detail: s.detail,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct JsonJob {
+    id: String,
+    kind: String,
+    state: String,
+    progress_percent: u32,
+    message: String,
+    error: String,
+}
+
+impl From<&Job> for JsonJob {
+    fn from(j: &Job) -> Self {
+        Self {
+            id: j.id.clone(),
+            kind: j.kind.clone(),
+            state: state_name(j.state).to_string(),
+            progress_percent: j.progress_percent,
+            message: j.message.clone(),
+            error: j.error.clone(),
         }
     }
 }

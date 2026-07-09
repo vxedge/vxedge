@@ -13,10 +13,12 @@ Ordered for the phase-1 critical path (see ../docs/TASKS.md). Each task should l
       realtime/carla/gpu) + serde_yaml parsing + semantic validation (slice refs, vxid
       uniqueness, slice-mode consistency, service refs) — vehicle manifest (§6.2) still TODO
 - [ ] `vxedge-core`: vehicle-manifest structs (§6.2) + validation
-- [ ] `vxedged`: job engine (async tasks + progress channel), event bus, structured audit log
-      of mutating calls *(done: tonic server on UDS with Gateway/Job stubs, graceful shutdown)*
-- [ ] `vxedge-cli`: auto-spawn ephemeral daemon; `--json` for all verbs *(done: full clap tree
-      matching canonical commands, `--endpoint`, live `status` RPC with human + JSON output)*
+- [x] `vxedged`: job engine (async tasks + watch-channel progress), event bus
+      (EventService.Subscribe live), structured JSONL audit log of mutating calls; Gateway
+      Apply/Up/Down submit real jobs (validate + plan; Up/Down fail honestly at the
+      provisioning step until §2 lands)
+- [ ] `vxedge-cli`: auto-spawn ephemeral daemon *(done: full clap tree, `--endpoint`, live
+      `status`, and `up`/`down` submitting jobs with streamed progress + JSON output)*
 - [ ] `vxedge manifest validate` subcommand (schema + semantic checks over vxedge-core;
       powers manifest-validation CI in vxperiments)
 

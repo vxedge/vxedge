@@ -33,6 +33,7 @@ cargo test --workspace
 ./target/debug/vxedge --endpoint unix:///tmp/vxedge.sock status
 ```
 
-Scaffold status: the vxAPI v1 contract, manifest model/validation, daemon transport, and CLI
-command tree are in place; the gateway/zone backends and job engine are the next work items
-(`TASKS.md` §2–3).
+Status: the vxAPI v1 contract, manifest model/validation, job engine (async jobs with
+streamed progress), event bus, audit log, and CLI (`status`, `up`, `down` with `--manifest`)
+are live; `up`/`down` validate + plan, then fail honestly at provisioning until the vxgateway
+backend lands — the next work item (`TASKS.md` §2).

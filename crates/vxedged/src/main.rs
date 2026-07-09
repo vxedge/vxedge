@@ -1,16 +1,21 @@
 //! vxedged — the vxedge control-plane daemon.
 //!
-//! Serves vxAPI (gRPC) on a Unix domain socket by default. Scaffold status:
-//! GatewayService.Status responds with a placeholder; every other RPC returns
-//! UNIMPLEMENTED until the job engine and backends land (TASKS.md §1–2).
+//! Serves vxAPI (gRPC) on a Unix domain socket. Live: job engine, event bus,
+//! audit log, Gateway/Job/Event services (gateway Up/Down validate manifests
+//! and fail honestly at provisioning until the backend lands — TASKS.md §2).
 
+mod audit;
+mod events;
+mod jobs;
 mod services;
 
 use clap::Parser;
+use std::sync::Arc;
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::Server;
 use tracing::info;
 
+use vxedge_api::v1::event_service_server::EventServiceServer;
 use vxedge_api::v1::gateway_service_server::GatewayServiceServer;
 use vxedge_api::v1::job_service_server::JobServiceServer;
 
@@ -20,6 +25,10 @@ struct Args {
     /// Listen address: unix:///path/to.sock (TCP+mTLS arrives with the auth work).
     #[arg(long, default_value = "unix:///run/vxedge.sock", env = "VXEDGE_LISTEN")]
     listen: String,
+
+    /// Runtime directory (ephemeral state: audit log, future staging dirs).
+    #[arg(long, default_value = "/run/vxedge", env = "VXEDGE_RUNTIME_DIR")]
+    runtime_dir: std::path::PathBuf,
 
     /// Federate site daemons instead of provisioning locally (phase 3).
     #[arg(long)]
@@ -41,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let Some(path) = args.listen.strip_prefix("unix://") else {
         return Err(format!(
-            "unsupported listen address `{}` — only unix:// sockets are supported in this scaffold",
+            "unsupported listen address `{}` — only unix:// sockets are supported for now",
             args.listen
         )
         .into());
@@ -54,13 +63,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = std::path::Path::new(path).parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let _ = std::fs::create_dir_all(&args.runtime_dir);
+
+    let bus = events::EventBus::new();
+    let engine = jobs::JobEngine::new(bus.clone());
+    let audit = Arc::new(audit::Audit::new(&args.runtime_dir));
 
     let listener = tokio::net::UnixListener::bind(path)?;
-    info!(socket = %path, "vxedged listening (vxAPI, package vxedge.v1)");
+    info!(socket = %path, runtime_dir = %args.runtime_dir.display(),
+        "vxedged listening (vxAPI, package vxedge.v1)");
 
     Server::builder()
-        .add_service(GatewayServiceServer::new(services::GatewayStub))
-        .add_service(JobServiceServer::new(services::JobStub))
+        .add_service(GatewayServiceServer::new(services::GatewaySvc {
+            engine: engine.clone(),
+            audit,
+        }))
+        .add_service(JobServiceServer::new(services::JobSvc { engine }))
+        .add_service(EventServiceServer::new(services::EventSvc { bus }))
         .serve_with_incoming_shutdown(UnixListenerStream::new(listener), async {
             let _ = tokio::signal::ctrl_c().await;
             info!("shutdown signal received");
