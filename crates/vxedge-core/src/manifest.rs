@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 #[derive(Debug, thiserror::Error)]
 pub enum ManifestError {
     #[error("manifest parse error: {0}")]
-    Parse(#[from] serde_yaml::Error),
+    Parse(#[from] serde_yaml_ng::Error),
     #[error("manifest validation failed:\n{}", .0.iter().map(|e| format!("  - {e}")).collect::<Vec<_>>().join("\n"))]
     Invalid(Vec<ValidationError>),
 }
@@ -140,7 +140,7 @@ pub struct ServiceDef {
     pub service_type: ServiceType,
     pub image: Image,
     #[serde(default)]
-    pub config: Option<serde_yaml::Value>,
+    pub config: Option<serde_yaml_ng::Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -307,7 +307,7 @@ pub struct Link {
     #[serde(rename = "type")]
     pub link_type: LinkType,
     #[serde(default)]
-    pub properties: Vec<serde_yaml::Value>,
+    pub properties: Vec<serde_yaml_ng::Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -398,7 +398,7 @@ pub struct Results {
 impl ExperimentManifest {
     /// Parse YAML and run semantic validation.
     pub fn from_yaml(yaml: &str) -> Result<Self, ManifestError> {
-        let manifest: Self = serde_yaml::from_str(yaml)?;
+        let manifest: Self = serde_yaml_ng::from_str(yaml)?;
         let errors = manifest.validate();
         if errors.is_empty() {
             Ok(manifest)
@@ -453,13 +453,13 @@ impl ExperimentManifest {
         for zone in &self.zones {
             for node in &zone.nodes {
                 for iface in &node.network {
-                    if let Some(slice) = &iface.slice {
-                        if !slice_ids.contains(slice.as_str()) {
-                            errors.push(ValidationError::UnknownSlice {
-                                node: node.id.clone(),
-                                slice: slice.clone(),
-                            });
-                        }
+                    if let Some(slice) = &iface.slice
+                        && !slice_ids.contains(slice.as_str())
+                    {
+                        errors.push(ValidationError::UnknownSlice {
+                            node: node.id.clone(),
+                            slice: slice.clone(),
+                        });
                     }
                 }
                 for rule in &node.slice_policy {

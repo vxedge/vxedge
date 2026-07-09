@@ -36,8 +36,10 @@ nftables via `nftables` crate or `nft -j`, clap (CLI), tokio, tracing.
 
 ## Build/test
 
-Requires Rust stable + `protoc` (system package; Rust proto codegen runs in
-`crates/vxedge-api/build.rs`, so `cargo build` is self-sufficient given protoc).
+Requires Rust 1.96+ (pinned in `rust-toolchain.toml`) + `protoc` (any recent; Rust proto
+codegen runs in `crates/vxedge-api/build.rs` via tonic-prost-build, so `cargo build` is
+self-sufficient given protoc). Stack: tonic 0.14 (+ tonic-prost), prost 0.14, edition 2024,
+serde_yaml_ng (serde_yaml is deprecated upstream — do not reintroduce it).
 
 - `cargo build --workspace` / `cargo test --workspace`
 - `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check`

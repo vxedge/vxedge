@@ -19,7 +19,8 @@ Contributor guidance: [`AGENTS.md`](AGENTS.md). Work items: [`TASKS.md`](TASKS.m
 
 ## Build & run
 
-Requires Rust (stable) and `protoc`.
+Requires Rust 1.96+ (pinned via `rust-toolchain.toml`) and `protoc`. New to the project?
+Start with [GETTING-STARTED](https://github.com/vxedge/docs/blob/main/GETTING-STARTED.md).
 
 ```bash
 cargo build --workspace

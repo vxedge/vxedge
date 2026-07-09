@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     "crates/vxedge-api",
     "crates/vxedge-core",
@@ -9,7 +9,8 @@ members = [
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+rust-version = "1.96"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/vxedge/vxedge"
 
@@ -17,17 +18,18 @@ repository = "https://github.com/vxedge/vxedge"
 vxedge-api = { path = "crates/vxedge-api" }
 vxedge-core = { path = "crates/vxedge-core" }
 
-tonic = "0.12"
-tonic-build = "0.12"
-prost = "0.13"
+tonic = "0.14"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+prost = "0.14"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
 tokio-stream = { version = "0.1", features = ["net"] }
-tower = "0.4"
+tower = "0.5"
 hyper-util = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
+serde_yaml_ng = "0.10"
 serde_json = "1"
-thiserror = "1"
+thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

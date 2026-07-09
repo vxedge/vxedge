@@ -3,6 +3,7 @@ name = "vxedged"
 description = "vxedge control-plane daemon: serves vxAPI (gRPC) over UDS/TCP"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

@@ -11,8 +11,8 @@ use tokio::net::UnixStream;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 
-use vxedge_api::v1::gateway_service_client::GatewayServiceClient;
 use vxedge_api::v1::GatewayStatusRequest;
+use vxedge_api::v1::gateway_service_client::GatewayServiceClient;
 
 #[derive(Parser, Debug)]
 #[command(
