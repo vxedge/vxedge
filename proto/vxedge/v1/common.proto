@@ -1,0 +1,51 @@
+syntax = "proto3";
+
+package vxedge.v1;
+
+// A manifest is THE input to every mutating RPC. The API carries manifests
+// (or references to them) and never introduces a second source of truth.
+message ManifestRef {
+  oneof source {
+    // Path to a manifest file readable by the daemon.
+    string path = 1;
+    // Full manifest document inlined as YAML.
+    string inline_yaml = 2;
+  }
+  // Optional expected SHA-256 of the manifest content; the daemon rejects
+  // the call if the checksum does not match (reproducibility guard).
+  string sha256 = 3;
+}
+
+// Identifies a zone, compute node, service, or other manifest-declared resource.
+message VxidRef {
+  string vxid = 1;
+}
+
+enum ResourceKind {
+  RESOURCE_KIND_UNSPECIFIED = 0;
+  RESOURCE_KIND_GATEWAY = 1;
+  RESOURCE_KIND_ZONE = 2;
+  RESOURCE_KIND_COMPUTE = 3;
+  RESOURCE_KIND_SERVICE = 4;
+  RESOURCE_KIND_VEHICLE = 5;
+  RESOURCE_KIND_EXPERIMENT = 6;
+  RESOURCE_KIND_TRAFFIC = 7;
+}
+
+enum ResourceState {
+  RESOURCE_STATE_UNSPECIFIED = 0;
+  RESOURCE_STATE_DOWN = 1;
+  RESOURCE_STATE_STAGING = 2;
+  RESOURCE_STATE_UP = 3;
+  RESOURCE_STATE_DEGRADED = 4;
+  RESOURCE_STATE_ERROR = 5;
+}
+
+// Observed status of a single resource, as reported by the reconciler.
+message ResourceStatus {
+  string vxid = 1;
+  ResourceKind kind = 2;
+  ResourceState state = 3;
+  string detail = 4;
+  int64 since_unix_ms = 5;
+}

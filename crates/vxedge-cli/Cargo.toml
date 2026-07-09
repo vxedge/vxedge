@@ -1,0 +1,21 @@
+[package]
+name = "vxedge-cli"
+description = "vxedge CLI — thin vxAPI client (the `vxedge` binary)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "vxedge"
+path = "src/main.rs"
+
+[dependencies]
+vxedge-api = { workspace = true }
+tonic = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+hyper-util = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

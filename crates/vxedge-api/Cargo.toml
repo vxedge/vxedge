@@ -1,0 +1,14 @@
+[package]
+name = "vxedge-api"
+description = "Generated Rust bindings for vxAPI (vxedge.v1) — do not hand-edit generated code"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tonic = { workspace = true }
+prost = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }

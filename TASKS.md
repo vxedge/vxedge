@@ -4,16 +4,19 @@ Ordered for the phase-1 critical path (see ../docs/TASKS.md). Each task should l
 
 ## 1. Scaffolding & contract (phase 1)
 
-- [ ] Cargo workspace: `vxedge-core`, `vxedged`, `vxedge-cli` crates; CI (build/clippy/fmt/test)
-- [ ] `proto/vxedge/v1/`: Gateway/Zone/Compute/Svc/Vehicle/Experiment/Traffic services +
+- [x] Cargo workspace: `vxedge-api` + `vxedge-core` + `vxedged` + `vxedge-cli` crates; CI
+      (build/clippy/fmt/test + buf lint)
+- [x] `proto/vxedge/v1/`: Gateway/Zone/Compute/Svc/Vehicle/Experiment/Traffic services +
       JobService (Get/Watch) + EventService (Subscribe) + TelemetryService (StreamMetrics,
-      Collect); buf config + codegen in CI
-- [ ] `vxedge-core`: manifest structs (experiment §6.1, vehicle §6.2) + serde_yaml parsing +
-      semantic validation (slice refs, vxid uniqueness, role enum, backend enum)
-- [ ] `vxedged` skeleton: tonic server on UDS, job engine (async tasks + progress channel),
-      event bus, structured audit log of mutating calls
-- [ ] `vxedge-cli`: clap tree matching the canonical commands; `--endpoint`; auto-spawn
-      ephemeral daemon; human + `--json` output
+      Collect); buf config; Rust codegen via vxedge-api build.rs
+- [x] `vxedge-core`: experiment-manifest structs (§6.1 incl. slices/slice_policy/backend/
+      realtime/carla/gpu) + serde_yaml parsing + semantic validation (slice refs, vxid
+      uniqueness, slice-mode consistency, service refs) — vehicle manifest (§6.2) still TODO
+- [ ] `vxedge-core`: vehicle-manifest structs (§6.2) + validation
+- [ ] `vxedged`: job engine (async tasks + progress channel), event bus, structured audit log
+      of mutating calls *(done: tonic server on UDS with Gateway/Job stubs, graceful shutdown)*
+- [ ] `vxedge-cli`: auto-spawn ephemeral daemon; `--json` for all verbs *(done: full clap tree
+      matching canonical commands, `--endpoint`, live `status` RPC with human + JSON output)*
 
 ## 2. vxgateway backend (phase 1 — the research-critical piece)
 

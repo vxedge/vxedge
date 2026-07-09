@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package vxedge.v1;
+
+// Every mutating RPC in vxAPI returns a Job. Progress is observed via
+// JobService.Watch (server streaming).
+
+enum JobState {
+  JOB_STATE_UNSPECIFIED = 0;
+  JOB_STATE_PENDING = 1;
+  JOB_STATE_RUNNING = 2;
+  JOB_STATE_SUCCEEDED = 3;
+  JOB_STATE_FAILED = 4;
+  JOB_STATE_CANCELLED = 5;
+}
+
+message Job {
+  string id = 1;
+  // e.g. "gateway.up", "zone.down", "telemetry.collect"
+  string kind = 2;
+  JobState state = 3;
+  uint32 progress_percent = 4;
+  string message = 5;
+  string error = 6;
+  int64 created_unix_ms = 7;
+  int64 updated_unix_ms = 8;
+}
+
+message GetJobRequest {
+  string id = 1;
+}
+
+message WatchJobRequest {
+  string id = 1;
+}
+
+service JobService {
+  rpc Get(GetJobRequest) returns (Job);
+  // Streams Job updates until the job reaches a terminal state.
+  rpc Watch(WatchJobRequest) returns (stream Job);
+}

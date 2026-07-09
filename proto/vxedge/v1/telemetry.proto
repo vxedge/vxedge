@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package vxedge.v1;
+
+import "vxedge/v1/common.proto";
+import "vxedge/v1/jobs.proto";
+
+message Metric {
+  string name = 1;
+  map<string, string> labels = 2;
+  double value = 3;
+  int64 ts_unix_ms = 4;
+}
+
+message StreamMetricsRequest {
+  // Restrict to metrics belonging to this experiment (empty = all).
+  ManifestRef experiment = 1;
+  // Optional label selector, e.g. {"slice": "adas"}.
+  map<string, string> selector = 2;
+}
+
+message CollectRequest {
+  ManifestRef manifest = 1;
+  // Archive output path, e.g. "results/exp-001.zip".
+  string out_path = 2;
+}
+
+service TelemetryService {
+  // Live metrics for dashboards / HMI.
+  rpc StreamMetrics(StreamMetricsRequest) returns (stream Metric);
+  // Bundle Prometheus data, PCAPs, logs + metadata into the results archive.
+  rpc Collect(CollectRequest) returns (Job);
+}

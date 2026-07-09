@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package vxedge.v1;
+
+import "vxedge/v1/common.proto";
+
+// State transitions and audit events emitted by the daemon.
+message Event {
+  string id = 1;
+  int64 ts_unix_ms = 2;
+  // e.g. "state-transition", "audit", "reconcile"
+  string kind = 3;
+  ResourceKind resource_kind = 4;
+  string resource_vxid = 5;
+  string detail = 6;
+}
+
+message SubscribeRequest {
+  // Empty = all kinds.
+  repeated string kinds = 1;
+}
+
+service EventService {
+  rpc Subscribe(SubscribeRequest) returns (stream Event);
+}

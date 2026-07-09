@@ -1,0 +1,15 @@
+version: v2
+modules:
+  - path: proto
+lint:
+  use:
+    - STANDARD
+  except:
+    # Lifecycle verbs (Up/Down/Status) intentionally share Job / status
+    # response messages across services; per-RPC wrapper messages would add
+    # noise without value.
+    - RPC_REQUEST_RESPONSE_UNIQUE
+    - RPC_RESPONSE_STANDARD_NAME
+breaking:
+  use:
+    - FILE

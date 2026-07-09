@@ -1,0 +1,228 @@
+syntax = "proto3";
+
+package vxedge.v1;
+
+import "vxedge/v1/common.proto";
+import "vxedge/v1/jobs.proto";
+
+// ---------------------------------------------------------------------------
+// Gateway (vxgateway — the virtual edge gateway)
+// ---------------------------------------------------------------------------
+
+message GatewayApplyRequest {
+  ManifestRef manifest = 1;
+}
+
+message GatewayUpRequest {
+  ManifestRef manifest = 1;
+}
+
+message GatewayDownRequest {
+  ManifestRef manifest = 1;
+}
+
+message GatewayStatusRequest {}
+
+message GatewayStatus {
+  ResourceStatus status = 1;
+  // Per-slice observed state (VLAN, queue tree, counters summary).
+  repeated SliceStatus slices = 2;
+}
+
+message SliceStatus {
+  string slice_id = 1;
+  ResourceState state = 2;
+  string detail = 3;
+}
+
+service GatewayService {
+  // Validate + stage without starting (plan/diff semantics).
+  rpc Apply(GatewayApplyRequest) returns (Job);
+  rpc Up(GatewayUpRequest) returns (Job);
+  rpc Down(GatewayDownRequest) returns (Job);
+  rpc Status(GatewayStatusRequest) returns (GatewayStatus);
+}
+
+// ---------------------------------------------------------------------------
+// Zones & Compute (mirrored surface)
+// ---------------------------------------------------------------------------
+
+message ZoneApplyRequest {
+  ManifestRef manifest = 1;
+}
+
+message ZoneUpRequest {
+  VxidRef ref = 1;
+}
+
+message ZoneDownRequest {
+  VxidRef ref = 1;
+}
+
+message ZoneListRequest {}
+
+message ZoneListResponse {
+  repeated ResourceStatus zones = 1;
+}
+
+message ZoneRemoveRequest {
+  VxidRef ref = 1;
+}
+
+// Client-streaming image push: first message carries metadata, the rest data.
+message ImagePushRequest {
+  oneof payload {
+    ImageMeta meta = 1;
+    bytes chunk = 2;
+  }
+}
+
+message ImageMeta {
+  string vxid = 1;
+  string filename = 2;
+  // Optional registry URL; empty = daemon-local store.
+  string registry = 3;
+  uint64 total_bytes = 4;
+}
+
+message ImagePushResponse {
+  // SHA-256 digest under which the image was stored (reproducibility rule).
+  string sha256 = 1;
+  string stored_url = 2;
+}
+
+service ZoneService {
+  rpc Apply(ZoneApplyRequest) returns (Job);
+  rpc Up(ZoneUpRequest) returns (Job);
+  rpc Down(ZoneDownRequest) returns (Job);
+  rpc List(ZoneListRequest) returns (ZoneListResponse);
+  rpc Remove(ZoneRemoveRequest) returns (Job);
+  rpc PushImage(stream ImagePushRequest) returns (ImagePushResponse);
+}
+
+message ComputeApplyRequest {
+  ManifestRef manifest = 1;
+}
+
+message ComputeUpRequest {
+  VxidRef ref = 1;
+}
+
+message ComputeDownRequest {
+  VxidRef ref = 1;
+}
+
+message ComputeListRequest {}
+
+message ComputeListResponse {
+  repeated ResourceStatus nodes = 1;
+}
+
+message ComputeRemoveRequest {
+  VxidRef ref = 1;
+}
+
+service ComputeService {
+  rpc Apply(ComputeApplyRequest) returns (Job);
+  rpc Up(ComputeUpRequest) returns (Job);
+  rpc Down(ComputeDownRequest) returns (Job);
+  rpc List(ComputeListRequest) returns (ComputeListResponse);
+  rpc Remove(ComputeRemoveRequest) returns (Job);
+  rpc PushImage(stream ImagePushRequest) returns (ImagePushResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Services (ota, telemetry) — deployed per experiment manifest
+// ---------------------------------------------------------------------------
+
+message SvcUpRequest {
+  // "ota" | "telemetry" (§8: only these two types for now).
+  string service_type = 1;
+  ManifestRef experiment = 2;
+}
+
+message SvcDownRequest {
+  string service_type = 1;
+  ManifestRef experiment = 2;
+}
+
+message SvcStatusRequest {
+  string service_type = 1;
+  ManifestRef experiment = 2;
+}
+
+service SvcService {
+  rpc Up(SvcUpRequest) returns (Job);
+  rpc Down(SvcDownRequest) returns (Job);
+  rpc Status(SvcStatusRequest) returns (ResourceStatus);
+}
+
+// ---------------------------------------------------------------------------
+// Vehicle (ordered composition: gateway -> zones -> compute -> signal plane -> services)
+// ---------------------------------------------------------------------------
+
+message VehicleUpRequest {
+  ManifestRef manifest = 1;
+}
+
+message VehicleDownRequest {
+  ManifestRef manifest = 1;
+}
+
+message VehicleStatusRequest {
+  ManifestRef manifest = 1;
+}
+
+message VehicleStatus {
+  ResourceStatus status = 1;
+  repeated ResourceStatus components = 2;
+}
+
+service VehicleService {
+  rpc Up(VehicleUpRequest) returns (Job);
+  rpc Down(VehicleDownRequest) returns (Job);
+  rpc Status(VehicleStatusRequest) returns (VehicleStatus);
+}
+
+// ---------------------------------------------------------------------------
+// Experiment & Traffic
+// ---------------------------------------------------------------------------
+
+message ExperimentUpRequest {
+  ManifestRef manifest = 1;
+}
+
+message ExperimentDownRequest {
+  ManifestRef manifest = 1;
+}
+
+message ExperimentStatusRequest {
+  ManifestRef manifest = 1;
+}
+
+message ExperimentStatus {
+  ResourceStatus status = 1;
+  repeated ResourceStatus components = 2;
+}
+
+service ExperimentService {
+  rpc Up(ExperimentUpRequest) returns (Job);
+  rpc Down(ExperimentDownRequest) returns (Job);
+  rpc Status(ExperimentStatusRequest) returns (ExperimentStatus);
+}
+
+message TrafficUpRequest {
+  ManifestRef manifest = 1;
+  // Restrict to specific profiles (empty = all in manifest).
+  repeated string profiles = 2;
+}
+
+message TrafficDownRequest {
+  ManifestRef manifest = 1;
+  repeated string profiles = 2;
+}
+
+service TrafficService {
+  rpc Up(TrafficUpRequest) returns (Job);
+  rpc Down(TrafficDownRequest) returns (Job);
+}

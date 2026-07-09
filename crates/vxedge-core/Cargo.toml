@@ -1,0 +1,12 @@
+[package]
+name = "vxedge-core"
+description = "vxedge domain library: manifest model, validation, reconciler, backends"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
