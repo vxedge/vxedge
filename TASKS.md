@@ -20,6 +20,9 @@ Ordered for the phase-1 critical path (see ../docs/TASKS.md). Each task should l
 
 ## 2. vxgateway backend (phase 1 — the research-critical piece)
 
+H1 minimum (exp-001, single host): bridge/OVS + VLANs, tc HTB, nftables, reconciler,
+netns tests. WireGuard/VXLAN/FRR may trail within the phase — not needed for exp-001.
+
 - [ ] netns/bridge-OVS provisioning via rtnetlink/OVSDB: trunk + per-slice VLANs from
       `network.slices`
 - [ ] tc HTB queue trees per slice (min_rate/max_rate/priority) — H1 mechanism
