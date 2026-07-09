@@ -49,6 +49,8 @@ netns tests. WireGuard/VXLAN/FRR may trail within the phase — not needed for e
 - [ ] TrafficService: synthetic generator (pps/bandwidth/payload per profile)
 - [ ] TS SDK (connect-es) generation + tonic-web enablement; minimal web dashboard repo/dir
 - [ ] mTLS + OIDC auth path; viewer/operator/admin roles
+- [ ] Harness `impairments` rendering: tc netem per link (rate cap, latency/jitter, loss —
+      100/1000BASE-T1 emulation); manifest struct extension
 
 ## 5. Phase 3
 
@@ -61,3 +63,6 @@ netns tests. WireGuard/VXLAN/FRR may trail within the phase — not needed for e
 - [ ] TSN gateway variant: taprio/cbs qdisc rendering + gPTP time sync (linuxptp)
 - [ ] V2X groundwork: N vehicle manifests per experiment (V2V paths through vxgateway) +
       `type: rsu` node support in zone/gateway provisioning (V2I)
+- [ ] Manifest structs: `io:`, `sensors:`, `actuators:` node blocks (§6.1)
+- [ ] QEMU `io.devices` attach (virtio-gpio/i2c/spi/can) in the libvirt backend
+- [ ] `backend: renode` — Renode zone backend for MCU-class virtual ECUs (register-level I/O)
