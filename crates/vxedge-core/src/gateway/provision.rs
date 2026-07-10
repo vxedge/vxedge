@@ -48,24 +48,35 @@ pub fn apply_links(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
     Ok(())
 }
 
+/// True when our HTB root qdisc (handle 1:) is already installed on `dev`.
+fn htb_root_present(sh: &Shell, dev: &str) -> Result<bool, NetOpsError> {
+    let out = sh.run("tc", &["qdisc", "show", "dev", dev])?;
+    Ok(out.lines().any(|l| l.starts_with("qdisc htb 1:")))
+}
+
 /// Phase 2 of apply: per-slice VLANs on the trunk + the HTB queue tree.
 pub fn apply_slices(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
     let root_rate = format!("{}mbit", plan.root_rate_mbps);
-    sh.run(
-        "tc",
-        &[
-            "qdisc",
-            "replace",
-            "dev",
-            &plan.uplink,
-            "root",
-            "handle",
-            "1:",
-            "htb",
-            "default",
-            DEFAULT_CLASS,
-        ],
-    )?;
+    // HTB root qdiscs don't support in-place change (`replace` fails on an
+    // existing one), so create only when absent; classes/filters below use
+    // replace semantics and converge on every apply.
+    if !htb_root_present(sh, &plan.uplink)? {
+        sh.run(
+            "tc",
+            &[
+                "qdisc",
+                "add",
+                "dev",
+                &plan.uplink,
+                "root",
+                "handle",
+                "1:",
+                "htb",
+                "default",
+                DEFAULT_CLASS,
+            ],
+        )?;
+    }
     sh.run(
         "tc",
         &[
