@@ -21,6 +21,8 @@ Ordered for the phase-1 critical path (see ../docs/TASKS.md). Each task should l
       `status`, and `up`/`down` submitting jobs with streamed progress + JSON output)*
 - [ ] `vxedge manifest validate` subcommand (schema + semantic checks over vxedge-core;
       powers manifest-validation CI in vxperiments)
+- [ ] `vxedge doctor`: host preflight per docs/TESTBED-SETUP.md tiers (binaries, versions,
+      CAP_NET_ADMIN, KVM/groups, GPU) with actionable fix hints
 
 ## 2. vxgateway backend (phase 1 — the research-critical piece)
 
@@ -64,6 +66,8 @@ exp-001 measurements).
 - [ ] mTLS + OIDC auth path; viewer/operator/admin roles
 - [ ] Harness `impairments` rendering: tc netem per link (rate cap, latency/jitter, loss —
       100/1000BASE-T1 emulation); manifest struct extension
+- [ ] OVS data-plane variant: same GatewayPlan rendered via ovs-vsctl/OVSDB (kernel bridge
+      remains the default backend)
 - [ ] Release binaries for vxedge/vxedged via cargo-dist (digest-recorded, §13)
 
 ## 5. Phase 3
