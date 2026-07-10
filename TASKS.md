@@ -74,6 +74,10 @@ exp-001 measurements).
 
 - [ ] VehicleService: ordered composition (gateway→zones→compute→signal plane→services)
 - [ ] Qt/QML operator HMI (Qt GRPC ≥6.8): live slice metrics view
+- [ ] vxedge-tray: Rust SNI (StatusNotifierItem) system tray — thin vxAPI client showing
+      gateway/experiment state with quick up/down; no orchestration logic (hard rule)
+- [ ] vxedged systemd unit (+ socket activation where possible); packaging notes for the
+      CAP_NET_ADMIN grant (AmbientCapabilities vs setcap)
 - [ ] `vxedged --controller`: federation of site daemons over WireGuard+mTLS
 - [ ] `traffic_profiles.source: carla` integration hook
 - [ ] `type: can` links: SocketCAN/vcan provisioning, QEMU CAN controller attach, cannelloni
