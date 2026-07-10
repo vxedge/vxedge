@@ -49,3 +49,9 @@ serde_yaml_ng (serde_yaml is deprecated upstream — do not reintroduce it).
   behind a feature/ignored marker so plain `cargo test` works unprivileged.
 - Smoke test: `vxedged --listen unix:///tmp/vxedge.sock` then
   `vxedge --endpoint unix:///tmp/vxedge.sock status`.
+
+## Project skills
+
+AI/contributor skills in `.claude/skills/`: **rust-patterns** (house Rust rules, per the
+Microsoft Rust Patterns book) and **testbed-quality** (the OEM-adoption bar). Apply both to
+every change.
