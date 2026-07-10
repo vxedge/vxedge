@@ -240,17 +240,16 @@ pub fn observe(sh: &Shell, plan: &GatewayPlan) -> Result<GatewayObservation, Net
     let bridge_present = sh.link_exists(&plan.bridge);
     let uplink_present = sh.link_exists(&plan.uplink);
 
-    // HTB classes on the uplink: [{"handle":"1:10",...}, ...]
+    // HTB classes on the uplink. Parsed from text output — `tc -j class show`
+    // emits non-JSON on several shipped iproute2 versions (bit us in CI).
+    // Lines look like: "class htb 1:10 parent 1:1 prio 1 rate 100Mbit ...".
     let class_handles: Vec<String> = if uplink_present {
-        let v = sh.json("tc", &["-j", "class", "show", "dev", &plan.uplink])?;
-        v.as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|c| c.get("handle").and_then(|h| h.as_str()))
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default()
+        sh.run("tc", &["class", "show", "dev", &plan.uplink])?
+            .lines()
+            .filter(|l| l.starts_with("class "))
+            .filter_map(|l| l.split_whitespace().nth(2))
+            .map(str::to_string)
+            .collect()
     } else {
         Vec::new()
     };
