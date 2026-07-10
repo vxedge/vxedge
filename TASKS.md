@@ -24,18 +24,26 @@ Ordered for the phase-1 critical path (see ../docs/TASKS.md). Each task should l
 
 ## 2. vxgateway backend (phase 1 — the research-critical piece)
 
-H1 minimum (exp-001, single host): bridge/OVS + VLANs, tc HTB, nftables, reconciler,
-netns tests. WireGuard/VXLAN/FRR may trail within the phase — not needed for exp-001.
+H1 minimum (exp-001, single host): bridge + VLANs, tc HTB, plan/observe/verify, netns tests
+— **done 2026-07-10**. nftables/WireGuard/VXLAN/FRR trail within the phase (not needed for
+exp-001 measurements).
 
-- [ ] netns/bridge-OVS provisioning via rtnetlink/OVSDB: trunk + per-slice VLANs from
-      `network.slices`
-- [ ] tc HTB queue trees per slice (min_rate/max_rate/priority) — H1 mechanism
+- [x] Linux-bridge provisioning (kernel VLAN filtering; OVS deferred): trunk uplink +
+      per-slice VLANs + access-port endpoints from `network.slices`/zones, via
+      `gateway::{plan,netops,provision}` — iproute2 argv exec with `-json` observation
+- [x] tc HTB queue tree per slice (min_rate/max_rate/priority floors, flower vlan_id
+      filters → classes) — H1 mechanism
+- [x] `GatewayService.Apply/Up/Down/Status` wired: Apply = plan-only; Up = provision +
+      observe + verify (fails if observed ≠ planned); Status = live observation per slice;
+      clear CAP_NET_ADMIN error when unprivileged
+- [x] netns integration test (CI job `netns-integration`, sudo on ubuntu-latest):
+      apply → observe → double-apply idempotency → teardown → double-teardown
 - [ ] nftables per-slice firewall; WireGuard link setup; VXLAN inter-host links
 - [ ] FRR config rendering (BGP optional path)
-- [ ] `GatewayService.Apply/Up/Down/Status` wired to reconciler; idempotency test: double-up,
-      double-down, up-after-partial-failure
-- [ ] netns-based integration test suite — CI-runnable on standard `ubuntu-latest` runners
-      (sudo + nested KVM available); design for that from the start
+- [ ] Port NetOps from iproute2 argv exec to pure rtnetlink/netlink (recorded deviation
+      from AGENTS.md; plan/observe layers are unaffected)
+- [ ] Reconciler: converge partial state (up-after-partial-failure repairs deltas rather
+      than failing verify)
 
 ## 3. Zone & compute backends (phase 1 minimal, phase 2 full)
 

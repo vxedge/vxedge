@@ -44,3 +44,14 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
+
+  # Privileged gateway integration tests: provisions bridge/VLAN/HTB inside a
+  # network namespace. Hosted runners allow sudo; -E keeps rustup's HOME.
+  netns-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Gateway netns tests
+        run: sudo -E env "PATH=$PATH" cargo test -p vxedge-core --test gateway_netns -- --ignored --nocapture

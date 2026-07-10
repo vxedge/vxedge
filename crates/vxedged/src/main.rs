@@ -68,6 +68,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bus = events::EventBus::new();
     let engine = jobs::JobEngine::new(bus.clone());
     let audit = Arc::new(audit::Audit::new(&args.runtime_dir));
+    // Optional netns confinement of all gateway objects (used by tests/dev).
+    let shell = vxedge_core::gateway::Shell {
+        netns: std::env::var("VXEDGE_NETNS").ok().filter(|s| !s.is_empty()),
+    };
 
     let listener = tokio::net::UnixListener::bind(path)?;
     info!(socket = %path, runtime_dir = %args.runtime_dir.display(),
@@ -77,6 +81,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .add_service(GatewayServiceServer::new(services::GatewaySvc {
             engine: engine.clone(),
             audit,
+            shell,
+            state: Arc::new(tokio::sync::Mutex::new(None)),
         }))
         .add_service(JobServiceServer::new(services::JobSvc { engine }))
         .add_service(EventServiceServer::new(services::EventSvc { bus }))
