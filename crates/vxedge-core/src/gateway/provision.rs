@@ -141,7 +141,10 @@ pub fn apply_slices(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
             ],
         )?;
         // Map the slice's VLAN onto its class (egress on the trunk).
-        sh.run(
+        // Flower `replace` without an explicit handle EEXISTs on an identical
+        // filter — which is already the converged state, so tolerate it.
+        // (Changing a vlan→class mapping in place is reconciler follow-up.)
+        sh.run_tolerate_exists(
             "tc",
             &[
                 "filter",
