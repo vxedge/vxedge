@@ -35,13 +35,31 @@ pub struct Shell {
 
 impl Shell {
     pub fn run(&self, program: &str, args: &[&str]) -> Result<String, NetOpsError> {
-        let mut cmd = match &self.netns {
-            Some(ns) => {
+        self.run_inner(program, args, true)
+    }
+
+    /// Run in the host context, ignoring the netns wrapper. Required for
+    /// `ip netns add/del/exec/list`: named-netns registry entries are
+    /// per-mount-namespace, and creating one from inside `ip netns exec`
+    /// leaves a bind mount that does not propagate (caught in CI: the
+    /// subsequent veth move fails with EINVAL on an empty registry file).
+    pub fn run_host(&self, program: &str, args: &[&str]) -> Result<String, NetOpsError> {
+        self.run_inner(program, args, false)
+    }
+
+    fn run_inner(
+        &self,
+        program: &str,
+        args: &[&str],
+        wrapped: bool,
+    ) -> Result<String, NetOpsError> {
+        let mut cmd = match (&self.netns, wrapped) {
+            (Some(ns), true) => {
                 let mut c = Command::new("ip");
                 c.args(["netns", "exec", ns, program]);
                 c
             }
-            None => Command::new(program),
+            _ => Command::new(program),
         };
         cmd.args(args);
         let cmdline = format!("{program} {}", args.join(" "));
@@ -62,7 +80,20 @@ impl Shell {
 
     /// Run, treating "already exists" as success (idempotent creates).
     pub fn run_tolerate_exists(&self, program: &str, args: &[&str]) -> Result<(), NetOpsError> {
-        match self.run(program, args) {
+        Self::tolerate_exists(self.run(program, args))
+    }
+
+    /// Host-context variant of [`Self::run_tolerate_exists`].
+    pub fn run_host_tolerate_exists(
+        &self,
+        program: &str,
+        args: &[&str],
+    ) -> Result<(), NetOpsError> {
+        Self::tolerate_exists(self.run_host(program, args))
+    }
+
+    fn tolerate_exists(res: Result<String, NetOpsError>) -> Result<(), NetOpsError> {
+        match res {
             Ok(_) => Ok(()),
             Err(NetOpsError::Command { stderr, .. }) if stderr.contains("File exists") => Ok(()),
             Err(e) => Err(e),
@@ -71,12 +102,26 @@ impl Shell {
 
     /// Run, treating "does not exist" as success (idempotent deletes).
     pub fn run_tolerate_missing(&self, program: &str, args: &[&str]) -> Result<(), NetOpsError> {
-        match self.run(program, args) {
+        Self::tolerate_missing(self.run(program, args))
+    }
+
+    /// Host-context variant of [`Self::run_tolerate_missing`].
+    pub fn run_host_tolerate_missing(
+        &self,
+        program: &str,
+        args: &[&str],
+    ) -> Result<(), NetOpsError> {
+        Self::tolerate_missing(self.run_host(program, args))
+    }
+
+    fn tolerate_missing(res: Result<String, NetOpsError>) -> Result<(), NetOpsError> {
+        match res {
             Ok(_) => Ok(()),
             Err(NetOpsError::Command { stderr, .. })
                 if stderr.contains("Cannot find device")
                     || stderr.contains("does not exist")
-                    || stderr.contains("No such device") =>
+                    || stderr.contains("No such device")
+                    || stderr.contains("No such file") =>
             {
                 Ok(())
             }

@@ -99,7 +99,7 @@ fn gateway_and_container_zone_cycle_in_netns() {
 
     // The node's eth0 carries the manifest IP inside its namespace.
     let addr = sh
-        .run(
+        .run_host(
             "ip",
             &[
                 "netns",

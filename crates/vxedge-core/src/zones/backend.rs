@@ -70,29 +70,31 @@ fn bundle_paths(np: &NodePlan) -> Result<(String, String), ZoneBackendError> {
 
 fn container_up(sh: &Shell, np: &NodePlan) -> Result<(), ZoneBackendError> {
     let ns = np.runtime_name();
-    sh.run_tolerate_exists("ip", &["netns", "add", &ns])?;
+    // Netns registry ops run in the HOST context (see Shell::run_host);
+    // only the veth move runs where the interface currently lives.
+    sh.run_host_tolerate_exists("ip", &["netns", "add", &ns])?;
     if sh.link_exists(&np.peer) {
         sh.run("ip", &["link", "set", &np.peer, "netns", &ns])?;
-        sh.run(
+        sh.run_host(
             "ip",
             &[
                 "netns", "exec", &ns, "ip", "link", "set", &np.peer, "name", "eth0",
             ],
         )?;
     }
-    sh.run(
+    sh.run_host(
         "ip",
         &["netns", "exec", &ns, "ip", "link", "set", "lo", "up"],
     )?;
     if let Some(cidr) = &np.ip_cidr {
-        sh.run_tolerate_exists(
+        sh.run_host_tolerate_exists(
             "ip",
             &[
                 "netns", "exec", &ns, "ip", "addr", "add", cidr, "dev", "eth0",
             ],
         )?;
     }
-    sh.run(
+    sh.run_host(
         "ip",
         &["netns", "exec", &ns, "ip", "link", "set", "eth0", "up"],
     )?;
@@ -102,18 +104,18 @@ fn container_up(sh: &Shell, np: &NodePlan) -> Result<(), ZoneBackendError> {
 fn container_down(sh: &Shell, np: &NodePlan) -> Result<(), ZoneBackendError> {
     // Destroys the moved veth peer (and thus the bridge-side pair);
     // `vxedge up` re-creates endpoints idempotently.
-    sh.run_tolerate_missing("ip", &["netns", "del", &np.runtime_name()])?;
+    sh.run_host_tolerate_missing("ip", &["netns", "del", &np.runtime_name()])?;
     Ok(())
 }
 
 fn container_status(sh: &Shell, np: &NodePlan) -> NodeState {
     let ns = np.runtime_name();
-    let listed = sh.run("ip", &["netns", "list"]).unwrap_or_default();
+    let listed = sh.run_host("ip", &["netns", "list"]).unwrap_or_default();
     if listed
         .lines()
         .any(|l| l.split_whitespace().next() == Some(ns.as_str()))
         && sh
-            .run(
+            .run_host(
                 "ip",
                 &[
                     "netns", "exec", &ns, "ip", "-j", "link", "show", "dev", "eth0",
