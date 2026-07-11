@@ -1,5 +1,6 @@
-//! Privileged integration test: provisions a full gateway inside a dedicated
-//! network namespace, asserts observation, proves idempotency, tears down.
+//! Privileged integration tests: gateway provisioning + container zone
+//! backend inside a dedicated network namespace. Idempotency proven by
+//! double-apply/double-teardown.
 //!
 //! Ignored by default (needs CAP_NET_ADMIN / root). Run with:
 //!   sudo -E env "PATH=$PATH" cargo test -p vxedge-core --test gateway_netns -- --ignored
@@ -9,6 +10,8 @@
 
 use vxedge_core::ExperimentManifest;
 use vxedge_core::gateway::{GatewayPlan, Shell, apply, observe, teardown};
+use vxedge_core::zones::backend::NodeState;
+use vxedge_core::zones::{node_down, node_status, node_up, plan_nodes};
 
 const MANIFEST: &str = r#"
 experiment: { id: exp-netns, name: netns integration }
@@ -23,12 +26,14 @@ zones:
     nodes:
       - id: node-ecu-01
         type: ecu
-        image: { url: x, kind: rtimage }
+        image: { url: /nonexistent/bundle, kind: rtimage }
+        backend: qemu-microvm
         network: [{ iface: eth0, vlan: 101, slice: adas }]
       - id: node-info-01
         type: infotainment
-        image: { url: x, kind: vm }
-        network: [{ iface: eth0, vlan: 103, slice: infotainment }]
+        image: { url: x, kind: container }
+        backend: container
+        network: [{ iface: eth0, vlan: 103, slice: infotainment, ip: 10.103.0.2/24 }]
 "#;
 
 /// Deletes the test netns even if assertions panic.
@@ -44,7 +49,7 @@ impl Drop for NetnsGuard {
 
 #[test]
 #[ignore = "needs CAP_NET_ADMIN; run under sudo (see module docs)"]
-fn gateway_provisions_idempotently_in_netns() {
+fn gateway_and_container_zone_cycle_in_netns() {
     let ns = format!("vxtest{}", std::process::id());
     let created = std::process::Command::new("ip")
         .args(["netns", "add", &ns])
@@ -61,27 +66,72 @@ fn gateway_provisions_idempotently_in_netns() {
     let manifest = ExperimentManifest::from_yaml(MANIFEST).unwrap();
     let plan = GatewayPlan::from_manifest(&manifest).unwrap();
 
-    // Apply, then verify every planned object is observed.
+    // --- gateway: apply, observe, idempotency -------------------------------
     apply(&sh, &plan).unwrap();
     let obs = observe(&sh, &plan).unwrap();
-    assert!(obs.bridge_present, "bridge missing after apply");
-    assert!(obs.uplink_present, "uplink missing after apply");
-    assert_eq!(obs.endpoints_present, 2, "endpoints missing after apply");
-    for s in &obs.slices {
-        assert!(s.class_present, "slice {} missing HTB class", s.id);
-        assert!(s.trunk_vlan_present, "slice {} missing trunk VLAN", s.id);
-    }
-    assert!(obs.fully_up());
+    assert!(obs.fully_up(), "gateway not fully up: {obs:?}");
+    // Mixed endpoint kinds: microvm node => tap (peer == name), container => veth.
+    assert_eq!(
+        plan.endpoints[0].peer, plan.endpoints[0].name,
+        "tap endpoint"
+    );
+    assert_ne!(
+        plan.endpoints[1].peer, plan.endpoints[1].name,
+        "veth endpoint"
+    );
 
-    // Idempotency: applying again must succeed and change nothing observable.
-    apply(&sh, &plan).unwrap();
+    apply(&sh, &plan).unwrap(); // double-apply is a no-op
     assert!(observe(&sh, &plan).unwrap().fully_up());
 
-    // Teardown removes everything; a second teardown is a no-op.
+    // --- container zone backend ---------------------------------------------
+    let runtime = std::env::temp_dir().join(format!("vxzones-test-{}", std::process::id()));
+    std::fs::create_dir_all(&runtime).unwrap();
+    let nodes = plan_nodes(&manifest, &plan, std::path::Path::new("/")).unwrap();
+    let container = nodes
+        .iter()
+        .find(|n| n.node_id == "node-info-01")
+        .expect("container node planned");
+
+    node_up(&sh, container, &runtime).unwrap();
+    assert_eq!(node_status(&sh, container, &runtime), NodeState::Up);
+    node_up(&sh, container, &runtime).unwrap(); // idempotent
+    assert_eq!(node_status(&sh, container, &runtime), NodeState::Up);
+
+    // The node's eth0 carries the manifest IP inside its namespace.
+    let addr = sh
+        .run(
+            "ip",
+            &[
+                "netns",
+                "exec",
+                &container.runtime_name(),
+                "ip",
+                "-j",
+                "addr",
+                "show",
+                "dev",
+                "eth0",
+            ],
+        )
+        .unwrap();
+    assert!(addr.contains("10.103.0.2"), "node ip missing: {addr}");
+
+    node_down(&sh, container, &runtime).unwrap();
+    assert_eq!(node_status(&sh, container, &runtime), NodeState::Down);
+    node_down(&sh, container, &runtime).unwrap(); // idempotent
+
+    // Container down destroyed its veth pair; a re-apply restores endpoints.
+    apply(&sh, &plan).unwrap();
+    assert!(
+        observe(&sh, &plan).unwrap().fully_up(),
+        "re-apply after zone down"
+    );
+
+    // --- teardown -------------------------------------------------------------
     teardown(&sh, &plan).unwrap();
     let gone = observe(&sh, &plan).unwrap();
-    assert!(!gone.bridge_present, "bridge survived teardown");
-    assert!(!gone.uplink_present, "uplink survived teardown");
-    assert_eq!(gone.endpoints_present, 0, "endpoints survived teardown");
+    assert!(!gone.bridge_present && !gone.uplink_present);
+    assert_eq!(gone.endpoints_present, 0);
     teardown(&sh, &plan).unwrap();
+    let _ = std::fs::remove_dir_all(&runtime);
 }

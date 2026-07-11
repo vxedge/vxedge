@@ -169,15 +169,22 @@ pub fn apply_slices(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
 }
 
 /// Phase 3 of apply: zone endpoints as access ports (pvid untagged).
+/// Veth for container nodes (peer moves into the node's netns at `zone up`);
+/// tap for VM nodes (libvirt/qemu opens it directly).
 pub fn apply_endpoints(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
     for ep in &plan.endpoints {
         if !sh.link_exists(&ep.name) {
-            sh.run(
-                "ip",
-                &[
-                    "link", "add", &ep.name, "type", "veth", "peer", "name", &ep.peer,
-                ],
-            )?;
+            match ep.kind {
+                super::plan::EndpointKind::Veth => sh.run(
+                    "ip",
+                    &[
+                        "link", "add", &ep.name, "type", "veth", "peer", "name", &ep.peer,
+                    ],
+                )?,
+                super::plan::EndpointKind::Tap => {
+                    sh.run("ip", &["tuntap", "add", "dev", &ep.name, "mode", "tap"])?
+                }
+            };
         }
         sh.run("ip", &["link", "set", &ep.name, "master", &plan.bridge])?;
         let vid = ep.vlan.to_string();
@@ -191,7 +198,9 @@ pub fn apply_endpoints(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError
         )?;
         sh.run_tolerate_missing("bridge", &["vlan", "del", "dev", &ep.name, "vid", "1"])?;
         sh.run("ip", &["link", "set", &ep.name, "up"])?;
-        sh.run("ip", &["link", "set", &ep.peer, "up"])?;
+        if ep.kind == super::plan::EndpointKind::Veth {
+            sh.run("ip", &["link", "set", &ep.peer, "up"])?;
+        }
     }
     Ok(())
 }

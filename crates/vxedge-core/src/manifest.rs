@@ -288,6 +288,10 @@ pub struct NodeIface {
     /// Binds the interface to a slice from `network.slices`.
     #[serde(default)]
     pub slice: Option<String>,
+    /// Optional node address in CIDR form (e.g. `10.101.0.2/24`), configured
+    /// by the zone backend at `zone up`.
+    #[serde(default)]
+    pub ip: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

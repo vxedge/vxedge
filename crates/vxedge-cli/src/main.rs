@@ -14,9 +14,10 @@ use tower::service_fn;
 use vxedge_api::v1::gateway_service_client::GatewayServiceClient;
 use vxedge_api::v1::job_service_client::JobServiceClient;
 use vxedge_api::v1::manifest_ref::Source;
+use vxedge_api::v1::zone_service_client::ZoneServiceClient;
 use vxedge_api::v1::{
     GatewayDownRequest, GatewayStatusRequest, GatewayUpRequest, Job, JobState, ManifestRef,
-    WatchJobRequest,
+    VxidRef, WatchJobRequest, ZoneDownRequest, ZoneListRequest, ZoneUpRequest,
 };
 
 #[derive(Parser, Debug)]
@@ -352,7 +353,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .into_inner();
             watch_job(channel, job, cli.json).await?;
         }
-        Command::Zone { .. } => scaffold_notice("zone"),
+        Command::Zone { cmd } => match cmd {
+            ZoneCmd::Up { vxid } => {
+                let channel = connect(&cli.endpoint).await?;
+                let mut zc = ZoneServiceClient::new(channel.clone());
+                let job = zc
+                    .up(ZoneUpRequest {
+                        r#ref: Some(VxidRef { vxid: vxid.clone() }),
+                    })
+                    .await?
+                    .into_inner();
+                watch_job(channel, job, cli.json).await?;
+            }
+            ZoneCmd::Down { vxid } => {
+                let channel = connect(&cli.endpoint).await?;
+                let mut zc = ZoneServiceClient::new(channel.clone());
+                let job = zc
+                    .down(ZoneDownRequest {
+                        r#ref: Some(VxidRef { vxid: vxid.clone() }),
+                    })
+                    .await?
+                    .into_inner();
+                watch_job(channel, job, cli.json).await?;
+            }
+            ZoneCmd::List => {
+                let channel = connect(&cli.endpoint).await?;
+                let mut zc = ZoneServiceClient::new(channel);
+                let resp = zc.list(ZoneListRequest {}).await?.into_inner();
+                if cli.json {
+                    let rows: Vec<serde_json::Value> = resp
+                        .zones
+                        .iter()
+                        .map(|s| {
+                            serde_json::json!({
+                                "vxid": s.vxid, "state": s.state, "detail": s.detail
+                            })
+                        })
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&rows)?);
+                } else {
+                    for s in &resp.zones {
+                        println!("node {}: state={} {}", s.vxid, s.state, s.detail);
+                    }
+                }
+            }
+            other => scaffold_notice(&format!("zone {other:?}")),
+        },
         Command::Compute { .. } => scaffold_notice("compute"),
         Command::Ota { .. } => scaffold_notice("ota"),
         Command::Telemetry { .. } => scaffold_notice("telemetry"),

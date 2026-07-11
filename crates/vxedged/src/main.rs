@@ -18,6 +18,7 @@ use tracing::info;
 use vxedge_api::v1::event_service_server::EventServiceServer;
 use vxedge_api::v1::gateway_service_server::GatewayServiceServer;
 use vxedge_api::v1::job_service_server::JobServiceServer;
+use vxedge_api::v1::zone_service_server::ZoneServiceServer;
 
 #[derive(Parser, Debug)]
 #[command(name = "vxedged", about = "vxedge control-plane daemon (vxAPI)")]
@@ -77,12 +78,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!(socket = %path, runtime_dir = %args.runtime_dir.display(),
         "vxedged listening (vxAPI, package vxedge.v1)");
 
+    let state: services::SharedState =
+        Arc::new(tokio::sync::Mutex::new(services::EdgeState::default()));
+
     Server::builder()
         .add_service(GatewayServiceServer::new(services::GatewaySvc {
             engine: engine.clone(),
+            audit: audit.clone(),
+            shell: shell.clone(),
+            state: state.clone(),
+        }))
+        .add_service(ZoneServiceServer::new(services::ZoneSvc {
+            engine: engine.clone(),
             audit,
             shell,
-            state: Arc::new(tokio::sync::Mutex::new(None)),
+            state,
+            runtime_dir: args.runtime_dir.clone(),
         }))
         .add_service(JobServiceServer::new(services::JobSvc { engine }))
         .add_service(EventServiceServer::new(services::EventSvc { bus }))

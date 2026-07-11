@@ -1,8 +1,9 @@
-//! vxAPI service implementations. GatewayService is live end-to-end:
-//! Apply plans, Up provisions the Linux bridge/VLAN/HTB gateway via
-//! vxedge-core::gateway, Down removes it, Status reports observed state.
+//! vxAPI service implementations. GatewayService and ZoneService are live
+//! end-to-end: gateway Up provisions bridge/VLAN/HTB, zone Up runs nodes
+//! under their packaging backend (container / qemu-microvm / libvirt).
 
 use sha2::Digest;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
@@ -12,31 +13,51 @@ use vxedge_api::v1::event_service_server::EventService;
 use vxedge_api::v1::gateway_service_server::GatewayService;
 use vxedge_api::v1::job_service_server::JobService;
 use vxedge_api::v1::manifest_ref::Source;
+use vxedge_api::v1::zone_service_server::ZoneService;
 use vxedge_api::v1::{
     Event, GatewayApplyRequest, GatewayDownRequest, GatewayStatus, GatewayStatusRequest,
-    GatewayUpRequest, GetJobRequest, Job, ManifestRef, ResourceKind, ResourceState, ResourceStatus,
-    SliceStatus, SubscribeRequest, WatchJobRequest,
+    GatewayUpRequest, GetJobRequest, ImagePushRequest, ImagePushResponse, Job, ManifestRef,
+    ResourceKind, ResourceState, ResourceStatus, SliceStatus, SubscribeRequest, WatchJobRequest,
+    ZoneApplyRequest, ZoneDownRequest, ZoneListRequest, ZoneListResponse, ZoneRemoveRequest,
+    ZoneUpRequest,
 };
 use vxedge_core::ExperimentManifest;
 use vxedge_core::gateway::{self, GatewayPlan, Shell};
+use vxedge_core::zones::{self, NodePlan};
 
 use crate::audit::Audit;
 use crate::events::EventBus;
 use crate::jobs::{JobEngine, is_terminal, now_ms};
 
-/// Resolve a ManifestRef to its YAML content + SHA-256, enforcing the
+/// Daemon-wide view of the active experiment: set by a successful
+/// `gateway up`, consumed by zone verbs, cleared by `gateway down`.
+#[derive(Default)]
+pub struct EdgeState {
+    pub gateway: Option<GatewayPlan>,
+    pub manifest_yaml: Option<String>,
+    pub manifest_dir: Option<PathBuf>,
+}
+
+pub type SharedState = Arc<tokio::sync::Mutex<EdgeState>>;
+
+/// Resolve a ManifestRef to (yaml, sha256, source dir), enforcing the
 /// checksum guard when the caller supplied one.
-async fn resolve_manifest(mref: Option<&ManifestRef>) -> Result<(String, String), Status> {
+async fn resolve_manifest(
+    mref: Option<&ManifestRef>,
+) -> Result<(String, String, Option<PathBuf>), Status> {
     let mref = mref.ok_or_else(|| {
         Status::invalid_argument("a manifest is required (pass --manifest <path> on the CLI)")
     })?;
-    let yaml = match &mref.source {
-        Some(Source::Path(path)) => tokio::fs::read_to_string(path).await.map_err(|e| {
-            Status::invalid_argument(format!(
-                "cannot read manifest `{path}` on the daemon host: {e}"
-            ))
-        })?,
-        Some(Source::InlineYaml(yaml)) => yaml.clone(),
+    let (yaml, dir) = match &mref.source {
+        Some(Source::Path(path)) => {
+            let yaml = tokio::fs::read_to_string(path).await.map_err(|e| {
+                Status::invalid_argument(format!(
+                    "cannot read manifest `{path}` on the daemon host: {e}"
+                ))
+            })?;
+            (yaml, PathBuf::from(path).parent().map(PathBuf::from))
+        }
+        Some(Source::InlineYaml(yaml)) => (yaml.clone(), None),
         None => {
             return Err(Status::invalid_argument(
                 "manifest has no source (path or inline_yaml)",
@@ -50,7 +71,7 @@ async fn resolve_manifest(mref: Option<&ManifestRef>) -> Result<(String, String)
             mref.sha256
         )));
     }
-    Ok((yaml, sha256))
+    Ok((yaml, sha256, dir))
 }
 
 mod hex {
@@ -86,9 +107,9 @@ pub struct GatewaySvc {
     pub engine: JobEngine,
     pub audit: Arc<Audit>,
     pub shell: Shell,
-    /// Last successfully applied plan (cleared on down). The observed side of
-    /// Status; lost on daemon restart, in which case Status degrades honestly.
-    pub state: Arc<tokio::sync::Mutex<Option<GatewayPlan>>>,
+    /// Active experiment (plan + manifest). Set on up, cleared on down; lost
+    /// on daemon restart, in which case Status degrades honestly.
+    pub state: SharedState,
 }
 
 impl GatewaySvc {
@@ -99,7 +120,7 @@ impl GatewaySvc {
         mref: Option<&ManifestRef>,
         verb: Verb,
     ) -> Result<Response<Job>, Status> {
-        let (yaml, sha256) = resolve_manifest(mref).await?;
+        let (yaml, sha256, manifest_dir) = resolve_manifest(mref).await?;
         self.audit
             .record(rpc, serde_json::json!({ "manifest_sha256": sha256 }));
         let shell = self.shell.clone();
@@ -153,7 +174,10 @@ impl GatewaySvc {
                             ));
                         }
                         let summary = plan.summary();
-                        *state.lock().await = Some(plan);
+                        let mut st = state.lock().await;
+                        st.gateway = Some(plan);
+                        st.manifest_yaml = Some(yaml.clone());
+                        st.manifest_dir = manifest_dir.clone();
                         Ok(format!("vxgateway up — {summary}"))
                     }
                     Verb::Down => {
@@ -162,7 +186,7 @@ impl GatewaySvc {
                         let pl = plan.clone();
                         blocking(move || gateway::teardown(&sh, &pl).map_err(|e| e.to_string()))
                             .await?;
-                        *state.lock().await = None;
+                        *state.lock().await = EdgeState::default();
                         Ok("vxgateway down — all gateway objects removed".to_string())
                     }
                 }
@@ -208,7 +232,7 @@ impl GatewayService for GatewaySvc {
         &self,
         _: Request<GatewayStatusRequest>,
     ) -> Result<Response<GatewayStatus>, Status> {
-        let plan = self.state.lock().await.clone();
+        let plan = self.state.lock().await.gateway.clone();
         let (state, detail, slices) = match plan {
             Some(plan) => {
                 let shell = self.shell.clone();
@@ -366,5 +390,206 @@ impl EventService for EventSvc {
             }
         });
         Ok(Response::new(Box::pin(stream)))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ZoneService
+// ---------------------------------------------------------------------------
+
+pub struct ZoneSvc {
+    pub engine: JobEngine,
+    pub audit: Arc<Audit>,
+    pub shell: Shell,
+    pub state: SharedState,
+    pub runtime_dir: PathBuf,
+}
+
+impl ZoneSvc {
+    /// Node plans for the active experiment, optionally filtered to one zone.
+    async fn plans_for(&self, zone_vxid: Option<&str>) -> Result<Vec<NodePlan>, Status> {
+        let st = self.state.lock().await;
+        let (yaml, gateway) = match (&st.manifest_yaml, &st.gateway) {
+            (Some(y), Some(g)) => (y.clone(), g.clone()),
+            _ => {
+                return Err(Status::failed_precondition(
+                    "no active experiment — run `vxedge up --manifest <exp.yaml>` first",
+                ));
+            }
+        };
+        let dir = st
+            .manifest_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("."));
+        drop(st);
+        let manifest = ExperimentManifest::from_yaml(&yaml)
+            .map_err(|e| Status::internal(format!("stored manifest no longer parses: {e}")))?;
+        let plans = zones::plan_nodes(&manifest, &gateway, &dir)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let filtered: Vec<NodePlan> = match zone_vxid {
+            Some(z) => plans.into_iter().filter(|p| p.zone_id == z).collect(),
+            None => plans,
+        };
+        if filtered.is_empty() {
+            return Err(Status::not_found(format!(
+                "no nodes for zone `{}` in the active experiment",
+                zone_vxid.unwrap_or("<all>")
+            )));
+        }
+        Ok(filtered)
+    }
+
+    async fn lifecycle(
+        &self,
+        rpc: &'static str,
+        kind: &'static str,
+        vxid: String,
+        up: bool,
+    ) -> Result<Response<Job>, Status> {
+        let plans = self.plans_for(Some(&vxid)).await?;
+        self.audit.record(
+            rpc,
+            serde_json::json!({ "zone": vxid, "nodes": plans.len() }),
+        );
+        let shell = self.shell.clone();
+        let runtime_dir = self.runtime_dir.clone();
+        let job = self
+            .engine
+            .submit(kind, move |p| async move {
+                let total = plans.len();
+                for (i, np) in plans.iter().enumerate() {
+                    let pct = 10 + (i as u32 * 80) / total as u32;
+                    p.update(
+                        pct,
+                        &format!(
+                            "{} node {}/{}: {} ({:?})",
+                            if up { "starting" } else { "stopping" },
+                            i + 1,
+                            total,
+                            np.node_id,
+                            np.backend
+                        ),
+                    );
+                    let sh = shell.clone();
+                    let rd = runtime_dir.clone();
+                    let node = np.clone();
+                    blocking(move || {
+                        if up {
+                            zones::node_up(&sh, &node, &rd).map_err(|e| e.to_string())
+                        } else {
+                            zones::node_down(&sh, &node, &rd).map_err(|e| e.to_string())
+                        }
+                    })
+                    .await?;
+                }
+                // Verify observed state matches the verb before claiming success.
+                let sh = shell.clone();
+                let rd = runtime_dir.clone();
+                let verify = plans.clone();
+                let wrong: Vec<String> = blocking(move || {
+                    Ok(verify
+                        .iter()
+                        .filter(|np| {
+                            let s = zones::node_status(&sh, np, &rd);
+                            up != (s == vxedge_core::zones::backend::NodeState::Up)
+                        })
+                        .map(|np| np.node_id.clone())
+                        .collect())
+                })
+                .await?;
+                if !wrong.is_empty() {
+                    return Err(format!(
+                        "verification failed — nodes not {}: {}",
+                        if up { "up" } else { "down" },
+                        wrong.join(", ")
+                    ));
+                }
+                Ok(format!(
+                    "zone `{vxid}` {}: {total} node(s)",
+                    if up { "up" } else { "down" }
+                ))
+            })
+            .await;
+        Ok(Response::new(job))
+    }
+}
+
+#[tonic::async_trait]
+impl ZoneService for ZoneSvc {
+    async fn apply(&self, _: Request<ZoneApplyRequest>) -> Result<Response<Job>, Status> {
+        Err(Status::unimplemented(
+            "ZoneService.Apply: zone manifests register via the experiment manifest for now",
+        ))
+    }
+
+    async fn up(&self, req: Request<ZoneUpRequest>) -> Result<Response<Job>, Status> {
+        let vxid = req
+            .into_inner()
+            .r#ref
+            .map(|r| r.vxid)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| Status::invalid_argument("--vxid <zone id> is required"))?;
+        self.lifecycle("ZoneService.Up", "zone.up", vxid, true)
+            .await
+    }
+
+    async fn down(&self, req: Request<ZoneDownRequest>) -> Result<Response<Job>, Status> {
+        let vxid = req
+            .into_inner()
+            .r#ref
+            .map(|r| r.vxid)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| Status::invalid_argument("--vxid <zone id> is required"))?;
+        self.lifecycle("ZoneService.Down", "zone.down", vxid, false)
+            .await
+    }
+
+    async fn list(
+        &self,
+        _: Request<ZoneListRequest>,
+    ) -> Result<Response<ZoneListResponse>, Status> {
+        let plans = self.plans_for(None).await?;
+        let shell = self.shell.clone();
+        let rd = self.runtime_dir.clone();
+        let statuses = tokio::task::spawn_blocking(move || {
+            plans
+                .iter()
+                .map(|np| {
+                    let s = zones::node_status(&shell, np, &rd);
+                    ResourceStatus {
+                        vxid: np.node_id.clone(),
+                        kind: ResourceKind::Zone as i32,
+                        state: if s == vxedge_core::zones::backend::NodeState::Up {
+                            ResourceState::Up as i32
+                        } else {
+                            ResourceState::Down as i32
+                        },
+                        detail: format!(
+                            "zone={} backend={:?} port={} vlan={}",
+                            np.zone_id, np.backend, np.endpoint, np.vlan
+                        ),
+                        since_unix_ms: now_ms(),
+                    }
+                })
+                .collect()
+        })
+        .await
+        .map_err(|e| Status::internal(format!("status task panicked: {e}")))?;
+        Ok(Response::new(ZoneListResponse { zones: statuses }))
+    }
+
+    async fn remove(&self, _: Request<ZoneRemoveRequest>) -> Result<Response<Job>, Status> {
+        Err(Status::unimplemented(
+            "ZoneService.Remove: zones are defined by the experiment manifest for now",
+        ))
+    }
+
+    async fn push_image(
+        &self,
+        _: Request<tonic::Streaming<ImagePushRequest>>,
+    ) -> Result<Response<ImagePushResponse>, Status> {
+        Err(Status::unimplemented(
+            "ZoneService.PushImage: image store lands with the registry work",
+        ))
     }
 }

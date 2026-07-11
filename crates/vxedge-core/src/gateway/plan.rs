@@ -3,7 +3,7 @@
 //! run anywhere. Interface names are deterministic per manifest ordering,
 //! which is what lets the reconciler match observed state on re-runs.
 
-use crate::manifest::{ExperimentManifest, SliceMode};
+use crate::manifest::{Backend, ExperimentManifest, ImageKind, Node, SliceMode};
 
 /// Linux IFNAMSIZ is 16 incl. NUL; our generated names stay well below it.
 const MAX_SLICES: usize = 200;
@@ -33,12 +33,32 @@ pub struct SlicePlan {
     pub class_minor: u16,
 }
 
+/// How a node attaches to its bridge access port. Resolved from the node's
+/// `backend:` (explicit) or its image kind: containers get a veth pair whose
+/// peer moves into the node's namespace; VMs (libvirt / qemu-microvm) get a
+/// tap the hypervisor opens directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointKind {
+    Veth,
+    Tap,
+}
+
+/// Resolve the effective zone backend for a node (§9: libvirt is the default
+/// for vm/rtimage image kinds; containers default to the container backend).
+pub fn resolved_backend(node: &Node) -> Backend {
+    node.backend.unwrap_or(match node.image.kind {
+        ImageKind::Container => Backend::Container,
+        ImageKind::Vm | ImageKind::Rtimage => Backend::Libvirt,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EndpointPlan {
-    /// Host-side veth attached to the bridge (access port).
+    /// Bridge access port (veth host side, or the tap itself).
     pub name: String,
-    /// Peer end, where the node/probe attaches.
+    /// Veth peer where the node attaches (== `name` for taps).
     pub peer: String,
+    pub kind: EndpointKind,
     /// vxid of the node this endpoint serves.
     pub node: String,
     pub vlan: u16,
@@ -95,12 +115,21 @@ impl GatewayPlan {
         let mut endpoints = Vec::new();
         for zone in &manifest.zones {
             for node in &zone.nodes {
+                let kind = match resolved_backend(node) {
+                    Backend::Container => EndpointKind::Veth,
+                    Backend::Libvirt | Backend::QemuMicrovm => EndpointKind::Tap,
+                };
                 for iface in &node.network {
                     if let Some(vlan) = iface.vlan {
                         let idx = endpoints.len();
+                        let name = format!("vz{idx}");
                         endpoints.push(EndpointPlan {
-                            name: format!("vz{idx}"),
-                            peer: format!("vzp{idx}"),
+                            peer: match kind {
+                                EndpointKind::Veth => format!("vzp{idx}"),
+                                EndpointKind::Tap => name.clone(),
+                            },
+                            name,
+                            kind,
                             node: node.id.clone(),
                             vlan,
                             slice: iface.slice.clone(),
@@ -191,8 +220,10 @@ zones:
         assert_eq!(plan.slices[1].min_rate_mbps, 1);
         assert_eq!(plan.endpoints.len(), 2);
         assert_eq!(plan.endpoints[0].name, "vz0");
-        assert_eq!(plan.endpoints[0].peer, "vzp0");
         assert_eq!(plan.endpoints[0].node, "node-ecu-01");
+        // No explicit backend: rtimage/vm image kinds default to libvirt => tap.
+        assert_eq!(plan.endpoints[0].kind, EndpointKind::Tap);
+        assert_eq!(plan.endpoints[0].peer, "vz0");
         // Determinism: same manifest, same plan.
         assert_eq!(plan, GatewayPlan::from_manifest(&manifest(BASE)).unwrap());
     }
