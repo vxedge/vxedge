@@ -49,11 +49,16 @@ exp-001 measurements).
 
 ## 3. Zone & compute backends (phase 1 minimal, phase 2 full)
 
-- [ ] libvirt backend: manifest → domain XML (vNIC→OVS tag, cputune from `realtime:`,
-      hugepages, storage pool with SHA256-digest images); define/start/destroy/undefine
-- [ ] `backend: qemu-microvm`: raw QEMU via QMP, `microvm` machine type (H3 arm)
-- [ ] container backend for `kind: container` nodes/compute
-- [ ] `ZoneService`/`ComputeService` full verbs incl. client-streaming `PushImage`
+- [x] Zone backends (2026-07-11): container (netns + veth→eth0 + manifest IP),
+      qemu-microvm (raw QEMU direct kernel boot, pidfile, taskset pinning), libvirt
+      (virsh qemu:///system, precreated tap managed=no, vcpupin) — idempotent, observed
+      status; endpoint kinds veth|tap in the gateway plan; per-iface `ip:` in the schema
+- [x] `ZoneService.Up/Down/List` live (jobs with per-node progress + post-verify);
+      CLI `zone up/down/list`; container cycle covered by the netns CI test
+- [ ] libvirt: storage pools with SHA256-digest disk images + hugepages (beyond direct
+      kernel boot); QMP instead of pidfile for microvm control
+- [ ] container backend: OCI runtime integration (payload currently exec'd by the runner)
+- [ ] `ComputeService` verbs; client-streaming `PushImage` (image store)
 
 ## 4. Phase 2
 
