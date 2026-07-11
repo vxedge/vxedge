@@ -95,7 +95,13 @@ impl Shell {
     fn tolerate_exists(res: Result<String, NetOpsError>) -> Result<(), NetOpsError> {
         match res {
             Ok(_) => Ok(()),
-            Err(NetOpsError::Command { stderr, .. }) if stderr.contains("File exists") => Ok(()),
+            // iproute2 spells EEXIST differently per subsystem: links say
+            // "File exists", addresses say "Address already assigned".
+            Err(NetOpsError::Command { stderr, .. })
+                if stderr.contains("File exists") || stderr.contains("already assigned") =>
+            {
+                Ok(())
+            }
             Err(e) => Err(e),
         }
     }
