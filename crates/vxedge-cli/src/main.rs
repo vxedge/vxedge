@@ -1,9 +1,9 @@
 //! vxedge — thin vxAPI client. Every subcommand is a 1:1 wrapper over a vxAPI
 //! RPC; no orchestration logic lives here (hard rule, AGENTS.md).
 //!
-//! Wired today: `status`, `up`, `down` (job submission + live progress
-//! streaming). Remaining verbs print a scaffold notice until their
-//! daemon-side services land.
+//! Wired today: `status`, `up`, `down`, `zone up|down|list`, `ota up|down`
+//! (job submission + live progress streaming). Remaining verbs print a
+//! scaffold notice until their daemon-side services land.
 
 use clap::{Parser, Subcommand};
 use hyper_util::rt::TokioIo;
@@ -14,10 +14,12 @@ use tower::service_fn;
 use vxedge_api::v1::gateway_service_client::GatewayServiceClient;
 use vxedge_api::v1::job_service_client::JobServiceClient;
 use vxedge_api::v1::manifest_ref::Source;
+use vxedge_api::v1::svc_service_client::SvcServiceClient;
 use vxedge_api::v1::zone_service_client::ZoneServiceClient;
 use vxedge_api::v1::{
     GatewayDownRequest, GatewayStatusRequest, GatewayUpRequest, Job, JobState, ManifestRef,
-    VxidRef, WatchJobRequest, ZoneDownRequest, ZoneListRequest, ZoneUpRequest,
+    SvcDownRequest, SvcUpRequest, VxidRef, WatchJobRequest, ZoneDownRequest, ZoneListRequest,
+    ZoneUpRequest,
 };
 
 #[derive(Parser, Debug)]
@@ -400,7 +402,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             other => scaffold_notice(&format!("zone {other:?}")),
         },
         Command::Compute { .. } => scaffold_notice("compute"),
-        Command::Ota { .. } => scaffold_notice("ota"),
+        Command::Ota { cmd } => match cmd {
+            SvcCmd::Up { experiment } => {
+                let channel = connect(&cli.endpoint).await?;
+                let mut svc = SvcServiceClient::new(channel.clone());
+                let job = svc
+                    .up(SvcUpRequest {
+                        service_type: "ota".to_string(),
+                        experiment: manifest_ref(&Some(experiment.clone())),
+                    })
+                    .await?
+                    .into_inner();
+                watch_job(channel, job, cli.json).await?;
+            }
+            SvcCmd::Down { experiment } => {
+                let channel = connect(&cli.endpoint).await?;
+                let mut svc = SvcServiceClient::new(channel.clone());
+                let job = svc
+                    .down(SvcDownRequest {
+                        service_type: "ota".to_string(),
+                        experiment: manifest_ref(&Some(experiment.clone())),
+                    })
+                    .await?
+                    .into_inner();
+                watch_job(channel, job, cli.json).await?;
+            }
+        },
         Command::Telemetry { .. } => scaffold_notice("telemetry"),
         Command::Vehicle { .. } => scaffold_notice("vehicle"),
         Command::Experiment { .. } => scaffold_notice("experiment"),

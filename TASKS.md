@@ -60,6 +60,27 @@ exp-001 measurements).
 - [ ] container backend: OCI runtime integration (payload currently exec'd by the runner)
 - [ ] `ComputeService` verbs; client-streaming `PushImage` (image store)
 
+## 3b. Service lifecycle (ota, telemetry — §8)
+
+- [x] `SvcService.Up/Down/Status` live (2026-07-12): generic `vxedge-core::services`
+      process backend spawns the service binary as a host-local child, pidfile-tracked
+      like the qemu-microvm zone backend; `ota` is implemented (spawns `vxota serve` per
+      the manifest's `services.<key>.config.{artifacts,listen}`), `telemetry` returns a
+      clear "unsupported by this backend yet" error (it's driven directly via the
+      `vxtelemetry` CLI by experiment runners today, not through vxedged). CLI `ota
+      up/down` wired end-to-end; smoke-tested live (spawn, reach over HTTP, idempotent
+      re-up, teardown, zero zombies).
+  - Found and fixed a real bug during that smoke test: the spawned child was never
+    `wait()`-ed, so after `kill` it became a zombie — `/proc/<pid>` and `kill -0` kept
+    reporting it as alive forever, both to `svc_down`'s own liveness check and to anyone
+    else polling status. Fixed with a dedicated reaper thread per spawn.
+- [ ] `vxcompute` scheduling: v1 co-locates every service with vxedged on the host — real
+      placement onto a compute node is blocked on the `vxcompute` backend not existing yet
+- [ ] WireGuard `ota`/telemetry slice transport (§7) — v1's `config.listen` must be an
+      address zone nodes can already reach (typically the gateway's own bridge address)
+      since there's no encrypted overlay yet
+- [ ] `telemetry` service type in the generic process backend (today: CLI-driven only)
+
 ## 4. Phase 2
 
 - [ ] Open5GS/UERANSIM driver: `mode: s-nssai` slice provisioning (H2)

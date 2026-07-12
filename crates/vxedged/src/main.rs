@@ -18,6 +18,7 @@ use tracing::info;
 use vxedge_api::v1::event_service_server::EventServiceServer;
 use vxedge_api::v1::gateway_service_server::GatewayServiceServer;
 use vxedge_api::v1::job_service_server::JobServiceServer;
+use vxedge_api::v1::svc_service_server::SvcServiceServer;
 use vxedge_api::v1::zone_service_server::ZoneServiceServer;
 
 #[derive(Parser, Debug)]
@@ -34,6 +35,12 @@ struct Args {
     /// Federate site daemons instead of provisioning locally (phase 3).
     #[arg(long)]
     controller: bool,
+
+    /// Path to the `vxota` binary the generic service backend spawns for
+    /// `ota` services (v1: host-local process, co-located with vxedged —
+    /// see ARCHITECTURE.md §8). Default assumes it's on PATH.
+    #[arg(long, default_value = "vxota", env = "VXEDGE_VXOTA_BIN")]
+    vxota_bin: String,
 }
 
 #[tokio::main]
@@ -90,10 +97,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }))
         .add_service(ZoneServiceServer::new(services::ZoneSvc {
             engine: engine.clone(),
-            audit,
+            audit: audit.clone(),
             shell,
             state,
             runtime_dir: args.runtime_dir.clone(),
+        }))
+        .add_service(SvcServiceServer::new(services::SvcSvc {
+            engine: engine.clone(),
+            audit,
+            runtime_dir: args.runtime_dir.clone(),
+            vxota_bin: args.vxota_bin.clone(),
         }))
         .add_service(JobServiceServer::new(services::JobSvc { engine }))
         .add_service(EventServiceServer::new(services::EventSvc { bus }))

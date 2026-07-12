@@ -13,13 +13,14 @@ use vxedge_api::v1::event_service_server::EventService;
 use vxedge_api::v1::gateway_service_server::GatewayService;
 use vxedge_api::v1::job_service_server::JobService;
 use vxedge_api::v1::manifest_ref::Source;
+use vxedge_api::v1::svc_service_server::SvcService;
 use vxedge_api::v1::zone_service_server::ZoneService;
 use vxedge_api::v1::{
     Event, GatewayApplyRequest, GatewayDownRequest, GatewayStatus, GatewayStatusRequest,
     GatewayUpRequest, GetJobRequest, ImagePushRequest, ImagePushResponse, Job, ManifestRef,
-    ResourceKind, ResourceState, ResourceStatus, SliceStatus, SubscribeRequest, WatchJobRequest,
-    ZoneApplyRequest, ZoneDownRequest, ZoneListRequest, ZoneListResponse, ZoneRemoveRequest,
-    ZoneUpRequest,
+    ResourceKind, ResourceState, ResourceStatus, SliceStatus, SubscribeRequest, SvcDownRequest,
+    SvcStatusRequest, SvcUpRequest, WatchJobRequest, ZoneApplyRequest, ZoneDownRequest,
+    ZoneListRequest, ZoneListResponse, ZoneRemoveRequest, ZoneUpRequest,
 };
 use vxedge_core::ExperimentManifest;
 use vxedge_core::gateway::{self, GatewayPlan, Shell};
@@ -591,5 +592,148 @@ impl ZoneService for ZoneSvc {
         Err(Status::unimplemented(
             "ZoneService.PushImage: image store lands with the registry work",
         ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SvcService (ota, telemetry — §8)
+// ---------------------------------------------------------------------------
+
+fn service_type_str(t: vxedge_core::manifest::ServiceType) -> &'static str {
+    match t {
+        vxedge_core::manifest::ServiceType::Ota => "ota",
+        vxedge_core::manifest::ServiceType::Telemetry => "telemetry",
+    }
+}
+
+pub struct SvcSvc {
+    pub engine: JobEngine,
+    pub audit: Arc<Audit>,
+    pub runtime_dir: PathBuf,
+    /// Path to the `vxota` binary the process backend spawns (v1 co-locates
+    /// the service with vxedged — see ARCHITECTURE.md §8).
+    pub vxota_bin: String,
+}
+
+impl SvcSvc {
+    async fn service_def(
+        &self,
+        service_type: &str,
+        experiment: Option<&ManifestRef>,
+    ) -> Result<(vxedge_core::manifest::ServiceDef, String), Status> {
+        if service_type.is_empty() {
+            return Err(Status::invalid_argument(
+                "service_type is required (\"ota\" or \"telemetry\")",
+            ));
+        }
+        let (yaml, sha256, _dir) = resolve_manifest(experiment).await?;
+        let manifest = ExperimentManifest::from_yaml(&yaml)
+            .map_err(|e| Status::invalid_argument(format!("manifest invalid: {e}")))?;
+        let def = manifest
+            .services
+            .values()
+            .find(|s| service_type_str(s.service_type) == service_type)
+            .cloned()
+            .ok_or_else(|| {
+                Status::not_found(format!(
+                    "no `{service_type}` service declared under `services` in this manifest"
+                ))
+            })?;
+        Ok((def, sha256))
+    }
+}
+
+#[tonic::async_trait]
+impl SvcService for SvcSvc {
+    async fn up(&self, req: Request<SvcUpRequest>) -> Result<Response<Job>, Status> {
+        let req = req.into_inner();
+        let (def, sha256) = self
+            .service_def(&req.service_type, req.experiment.as_ref())
+            .await?;
+        self.audit.record(
+            "SvcService.Up",
+            serde_json::json!({ "service_type": req.service_type, "manifest_sha256": sha256 }),
+        );
+        let vxota_bin = self.vxota_bin.clone();
+        let runtime_dir = self.runtime_dir.clone();
+        let service_type = req.service_type.clone();
+        let job = self
+            .engine
+            .submit("svc.up", move |p| async move {
+                p.update(30, &format!("starting {service_type} service"));
+                let msg = blocking(move || {
+                    vxedge_core::services::svc_up(&def, &vxota_bin, &runtime_dir)
+                        .map_err(|e| e.to_string())
+                })
+                .await?;
+                p.update(100, &msg);
+                Ok(msg)
+            })
+            .await;
+        Ok(Response::new(job))
+    }
+
+    async fn down(&self, req: Request<SvcDownRequest>) -> Result<Response<Job>, Status> {
+        let req = req.into_inner();
+        if req.service_type.is_empty() {
+            return Err(Status::invalid_argument(
+                "service_type is required (\"ota\" or \"telemetry\")",
+            ));
+        }
+        self.audit.record(
+            "SvcService.Down",
+            serde_json::json!({ "service_type": req.service_type }),
+        );
+        let runtime_dir = self.runtime_dir.clone();
+        let service_type = req.service_type.clone();
+        let job = self
+            .engine
+            .submit("svc.down", move |p| async move {
+                p.update(50, &format!("stopping {service_type} service"));
+                let msg = blocking(move || {
+                    vxedge_core::services::svc_down(&service_type, &runtime_dir)
+                        .map_err(|e| e.to_string())
+                })
+                .await?;
+                p.update(100, &msg);
+                Ok(msg)
+            })
+            .await;
+        Ok(Response::new(job))
+    }
+
+    async fn status(
+        &self,
+        req: Request<SvcStatusRequest>,
+    ) -> Result<Response<ResourceStatus>, Status> {
+        let service_type = req.into_inner().service_type;
+        if service_type.is_empty() {
+            return Err(Status::invalid_argument(
+                "service_type is required (\"ota\" or \"telemetry\")",
+            ));
+        }
+        let runtime_dir = self.runtime_dir.clone();
+        let st_for_task = service_type.clone();
+        let state = tokio::task::spawn_blocking(move || {
+            vxedge_core::services::svc_status(&runtime_dir, &st_for_task)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("status task panicked: {e}")))?;
+        let (state, detail) = match state {
+            vxedge_core::services::SvcState::Up => {
+                (ResourceState::Up, format!("{service_type} service running"))
+            }
+            vxedge_core::services::SvcState::Down => (
+                ResourceState::Down,
+                format!("{service_type} service not running"),
+            ),
+        };
+        Ok(Response::new(ResourceStatus {
+            vxid: format!("svc-{service_type}"),
+            kind: ResourceKind::Service as i32,
+            state: state as i32,
+            detail,
+            since_unix_ms: now_ms(),
+        }))
     }
 }

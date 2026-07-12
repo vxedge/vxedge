@@ -18,10 +18,22 @@ All notable changes to this repo are documented here. Format follows
   Apply/Up/Down/Status wired with observe+verify, netns integration test in CI (2026-07-10).
 - Zone backends: `container` (netns), `qemu-microvm` (raw QEMU), `libvirt` (virsh) — all
   behind the same `ZoneService`/`vxedge zone up|down|list` interface (2026-07-11).
+- `SvcService.Up/Down/Status` live for `ota` (2026-07-12): generic process backend spawns
+  `vxota serve` per the manifest's `services.<key>.config` (`artifacts`, `listen`),
+  pidfile-tracked like the qemu-microvm zone backend; CLI `ota up|down` wired end-to-end.
+  `telemetry` returns a clear unsupported error for now (still CLI-driven directly).
 - CI: build/test/clippy/fmt, `buf` lint + PR breaking-change check on the proto, Dependabot,
   `cargo-deny`, privileged netns integration job.
 
+### Fixed
+- A service spawned by `SvcService.Up` became a zombie after `SvcService.Down`'s `kill` —
+  nothing ever called `wait()` on it, so `/proc/<pid>` and `kill -0` kept reporting it as
+  alive indefinitely even though it had already exited. Found by an end-to-end smoke test
+  (spawn, reach over HTTP, teardown, check for zombies), not by the unit tests. Fixed with
+  a dedicated reaper thread per spawn (2026-07-12).
+
 ### Known gaps (tracked in `TASKS.md`, not yet in this changelog's scope)
 - nftables, WireGuard/VXLAN/FRR, pure-rtnetlink NetOps port, converging reconciler,
-  vehicle-manifest structs, `vxedge manifest validate`, `vxedge doctor`, service
-  orchestration wiring for `ota up`/`telemetry up` against real service processes.
+  vehicle-manifest structs, `vxedge manifest validate`, `vxedge doctor`, `vxcompute`
+  service scheduling (v1 co-locates services with vxedged on the host), `telemetry` in the
+  generic service backend.

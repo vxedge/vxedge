@@ -7,6 +7,7 @@
 
 pub mod gateway;
 pub mod manifest;
+pub mod services;
 pub mod zones;
 
 pub use manifest::{ExperimentManifest, ValidationError};
