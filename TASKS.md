@@ -19,10 +19,14 @@ Ordered for the phase-1 critical path (see ../docs/TASKS.md). Each task should l
       provisioning step until §2 lands)
 - [ ] `vxedge-cli`: auto-spawn ephemeral daemon *(done: full clap tree, `--endpoint`, live
       `status`, and `up`/`down` submitting jobs with streamed progress + JSON output)*
-- [ ] `vxedge manifest validate` subcommand (schema + semantic checks over vxedge-core;
-      powers manifest-validation CI in vxperiments)
-- [ ] `vxedge doctor`: host preflight per docs/TESTBED-SETUP.md tiers (binaries, versions,
-      CAP_NET_ADMIN, KVM/groups, GPU) with actionable fix hints
+- [x] `vxedge manifest validate` subcommand (2026-07-13): local-only (no daemon connection
+      — same read-only check `vxedge up` runs before provisioning, exposed standalone),
+      wraps `vxedge-core::ExperimentManifest::from_yaml` directly; `--json` for CI.
+      Ready to power manifest-validation CI in vxperiments.
+- [x] `vxedge doctor` (2026-07-13): host preflight per docs/TESTBED-SETUP.md tiers 0-3
+      (kernel/Rust/protoc/buf/iproute2; CAP_NET_ADMIN/nftables/PREEMPT_RT; KVM/QEMU/
+      libvirt/OVS/WireGuard/GPU/container-runtime; phase-3 stub), `--tier N` to scope
+      what's required vs. informational, actionable fix hints, `--json` for CI
 
 ## 2. vxgateway backend (phase 1 — the research-critical piece)
 

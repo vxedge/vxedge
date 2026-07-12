@@ -2,14 +2,18 @@
 //! RPC; no orchestration logic lives here (hard rule, AGENTS.md).
 //!
 //! Wired today: `status`, `up`, `down`, `zone up|down|list`, `ota up|down`
-//! (job submission + live progress streaming). Remaining verbs print a
-//! scaffold notice until their daemon-side services land.
+//! (job submission + live progress streaming); `manifest validate` and
+//! `doctor` are local-only (no daemon connection — see their own doc
+//! comments for why that's not a hard-rule violation). Remaining verbs
+//! print a scaffold notice until their daemon-side services land.
 
 use clap::{Parser, Subcommand};
 use hyper_util::rt::TokioIo;
 use tokio::net::UnixStream;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
+
+mod doctor;
 
 use vxedge_api::v1::gateway_service_client::GatewayServiceClient;
 use vxedge_api::v1::job_service_client::JobServiceClient;
@@ -95,6 +99,32 @@ enum Command {
     Traffic {
         #[command(subcommand)]
         cmd: TrafficCmd,
+    },
+    /// Manifest schema + semantic checks (local — no daemon connection needed;
+    /// this is the same read-only check `vxedge up` runs before provisioning,
+    /// exposed standalone for CI and quick iteration).
+    Manifest {
+        #[command(subcommand)]
+        cmd: ManifestCmd,
+    },
+    /// Host preflight per docs/TESTBED-SETUP.md tiers (local — no daemon
+    /// connection needed, since its job is to check whether the environment
+    /// can even run one).
+    Doctor {
+        /// Check up to this tier (0=control-plane dev, 1=H1 experiments,
+        /// 2=real workloads/5G/CARLA, 3=full vehicle+HMI). Default: 1, the
+        /// tier phase 1 experiments need.
+        #[arg(long, default_value_t = 1)]
+        tier: u8,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ManifestCmd {
+    /// Parse + validate an experiment manifest (schema + semantic checks).
+    Validate {
+        #[arg(long)]
+        manifest: String,
     },
 }
 
@@ -432,6 +462,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Vehicle { .. } => scaffold_notice("vehicle"),
         Command::Experiment { .. } => scaffold_notice("experiment"),
         Command::Traffic { .. } => scaffold_notice("traffic"),
+        Command::Manifest { cmd } => match cmd {
+            ManifestCmd::Validate { manifest } => {
+                let yaml = std::fs::read_to_string(manifest)
+                    .map_err(|e| format!("cannot read manifest `{manifest}`: {e}"))?;
+                match vxedge_core::ExperimentManifest::from_yaml(&yaml) {
+                    Ok(m) => {
+                        if cli.json {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "manifest": manifest, "valid": true,
+                                    "experiment_id": m.experiment.id,
+                                    "zones": m.zones.len(), "compute": m.compute.len(),
+                                    "services": m.services.len(),
+                                })
+                            );
+                        } else {
+                            println!(
+                                "OK: {manifest} — experiment `{}`, {} zone(s), {} compute node(s), {} service(s)",
+                                m.experiment.id,
+                                m.zones.len(),
+                                m.compute.len(),
+                                m.services.len()
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        if cli.json {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "manifest": manifest, "valid": false, "error": e.to_string(),
+                                })
+                            );
+                        } else {
+                            eprintln!("INVALID: {manifest}\n{e}");
+                        }
+                        std::process::exit(1);
+                    }
+                }
+            }
+        },
+        Command::Doctor { tier } => doctor::run(*tier, cli.json)?,
     }
     Ok(())
 }

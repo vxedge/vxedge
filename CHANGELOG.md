@@ -24,6 +24,13 @@ All notable changes to this repo are documented here. Format follows
   `telemetry` returns a clear unsupported error for now (still CLI-driven directly).
 - CI: build/test/clippy/fmt, `buf` lint + PR breaking-change check on the proto, Dependabot,
   `cargo-deny`, privileged netns integration job.
+- `vxedge manifest validate --manifest <path>` (2026-07-13): local-only (no daemon
+  connection needed — the same read-only check `vxedge up` runs before provisioning,
+  exposed standalone), `--json` for CI use.
+- `vxedge doctor --tier N` (2026-07-13): host preflight against docs/TESTBED-SETUP.md
+  tiers 0-3 (kernel/Rust/protoc/buf/iproute2; CAP_NET_ADMIN/nftables/PREEMPT_RT;
+  KVM/QEMU/libvirt/OVS/WireGuard/GPU/container-runtime), actionable fix hints per failed
+  check, `--json` for CI.
 
 ### Fixed
 - A service spawned by `SvcService.Up` became a zombie after `SvcService.Down`'s `kill` —
@@ -34,6 +41,5 @@ All notable changes to this repo are documented here. Format follows
 
 ### Known gaps (tracked in `TASKS.md`, not yet in this changelog's scope)
 - nftables, WireGuard/VXLAN/FRR, pure-rtnetlink NetOps port, converging reconciler,
-  vehicle-manifest structs, `vxedge manifest validate`, `vxedge doctor`, `vxcompute`
-  service scheduling (v1 co-locates services with vxedged on the host), `telemetry` in the
-  generic service backend.
+  vehicle-manifest structs, `vxcompute` service scheduling (v1 co-locates services with
+  vxedged on the host), `telemetry` in the generic service backend.
