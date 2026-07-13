@@ -53,5 +53,6 @@ serde_yaml_ng (serde_yaml is deprecated upstream — do not reintroduce it).
 ## Project skills
 
 AI/contributor skills in `.claude/skills/`: **rust-patterns** (house Rust rules, per the
-Microsoft Rust Patterns book) and **testbed-quality** (the OEM-adoption bar). Apply both to
-every change.
+Microsoft Rust Patterns book), **testbed-quality** (the OEM-adoption bar), and
+**gateway-verification** (netns/UDS/doctor verification loop + idempotency rule for
+gateway/zone backend changes). Apply all three to every change.
