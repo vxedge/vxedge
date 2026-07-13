@@ -248,6 +248,30 @@ fn tier2() -> Vec<Check> {
         Some("apt install wireguard-tools"),
     ));
 
+    c.push(check(
+        2,
+        "Open5GS (5G core, for `mode: s-nssai` slices / H2)",
+        false,
+        present("open5gs-amfd", &["--version"]),
+        cmd_version("open5gs-amfd", &["--version"])
+            .unwrap_or_else(|| "not found — needed only for s-nssai slice experiments".to_string()),
+        Some("add-apt-repository ppa:open5gs/latest && apt install open5gs"),
+    ));
+
+    let ueransim = present("nr-gnb", &["--version"]) && present("nr-ue", &["--version"]);
+    c.push(check(
+        2,
+        "UERANSIM (gNB/UE simulator, for `mode: s-nssai` slices / H2)",
+        false,
+        ueransim,
+        if ueransim {
+            cmd_version("nr-gnb", &["--version"]).unwrap_or_else(|| "present".to_string())
+        } else {
+            "nr-gnb/nr-ue not found — needed only for s-nssai slice experiments".to_string()
+        },
+        Some("build from source: github.com/aligungr/UERANSIM (cmake), install nr-gnb + nr-ue into PATH"),
+    ));
+
     let gpu = present("nvidia-smi", &["--query-gpu=name", "--format=csv,noheader"]);
     c.push(check(
         2,
@@ -274,15 +298,6 @@ fn tier2() -> Vec<Check> {
             "neither docker nor podman found".to_string()
         },
         Some("needed for digest-pinned service/compute images"),
-    ));
-
-    c.push(check(
-        2,
-        "Open5GS + UERANSIM (H2, S-NSSAI slicing)",
-        false,
-        false,
-        "not yet packaged by this project — phase-2 driver work, not a host-setup gap".to_string(),
-        None,
     ));
 
     c

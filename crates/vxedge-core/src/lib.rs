@@ -5,6 +5,7 @@
 //! reconciler and provisioning backends (libvirt, rtnetlink/OVSDB, containers,
 //! Open5GS, traffic) as they land.
 
+pub mod fiveg;
 pub mod gateway;
 pub mod manifest;
 pub mod services;

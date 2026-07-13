@@ -88,7 +88,17 @@ exp-001 measurements).
 
 ## 4. Phase 2
 
-- [ ] Open5GS/UERANSIM driver: `mode: s-nssai` slice provisioning (H2)
+- [ ] Open5GS/UERANSIM driver: `mode: s-nssai` slice provisioning (H2). *In progress —
+      first increment landed 2026-07-14 (`vxedge-core/src/fiveg/`): `FiveGPlan` (pure-data,
+      mirrors GatewayPlan — per-slice SMF/UPF sessions, deterministic loopback addressing,
+      validated sst/sd/slice-id, typed errors) + deterministic config rendering for
+      Open5GS 2.7.x (amf/nssf + per-slice smf/upf) and UERANSIM 3.2.x (gnb + per-slice ue),
+      10 unit tests (YAML-parse, per-slice bindings, determinism, error paths); doctor
+      tier-2 now reports open5gs-amfd + nr-gnb/nr-ue presence. Remaining: process
+      lifecycle (spawn core+gNB/UEs via the pidfile process backend, health, teardown),
+      subscriber provisioning (UDM/UDR DB), uesimtun↔gateway bridging, wiring into
+      GatewayService for s-nssai slices, and **validation of rendered configs against
+      live binaries** (none installed on the dev host — gates any H2 claim)*
 - [ ] URSP-style `slice_policy`: per-node traffic-class → slice routing over concurrent PDU
       sessions (UE-side slicing; mirrors Snapdragon Auto URSP behavior)
 - [ ] SONiC-VS twin: render slice intent to SONiC config, boot VS qcow2, verify config parity
