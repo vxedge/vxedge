@@ -365,6 +365,12 @@ pub struct Telemetry {
 pub struct PrometheusCfg {
     #[serde(default)]
     pub scrape_targets: Vec<String>,
+    /// Targets that are legitimately absent under some experiment arms (a
+    /// burst driver's exporter that only exists while that arm is active,
+    /// say) — vxtelemetry doesn't count a failed scrape here against its
+    /// completeness metric. See ARCHITECTURE.md §6.
+    #[serde(default)]
+    pub optional_scrape_targets: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

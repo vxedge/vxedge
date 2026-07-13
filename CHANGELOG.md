@@ -31,6 +31,10 @@ All notable changes to this repo are documented here. Format follows
   tiers 0-3 (kernel/Rust/protoc/buf/iproute2; CAP_NET_ADMIN/nftables/PREEMPT_RT;
   KVM/QEMU/libvirt/OVS/WireGuard/GPU/container-runtime), actionable fix hints per failed
   check, `--json` for CI.
+- `telemetry.prometheus.optional_scrape_targets` (2026-07-13) in the manifest schema —
+  marks a scrape target as legitimately absent under some experiment arms; consumed by
+  `vxtelemetry` (see its own CHANGELOG), added here for schema consistency (`vxedge-core`
+  is the single source of truth for the manifest shape).
 
 ### Fixed
 - A service spawned by `SvcService.Up` became a zombie after `SvcService.Down`'s `kill` —

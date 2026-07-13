@@ -10,8 +10,9 @@ Ordered for the phase-1 critical path (see ../docs/TASKS.md). Each task should l
       JobService (Get/Watch) + EventService (Subscribe) + TelemetryService (StreamMetrics,
       Collect); buf config; Rust codegen via vxedge-api build.rs
 - [x] `vxedge-core`: experiment-manifest structs (§6.1 incl. slices/slice_policy/backend/
-      realtime/carla/gpu) + serde_yaml parsing + semantic validation (slice refs, vxid
-      uniqueness, slice-mode consistency, service refs) — vehicle manifest (§6.2) still TODO
+      realtime/carla/gpu/`telemetry.prometheus.optional_scrape_targets`) + serde_yaml
+      parsing + semantic validation (slice refs, vxid uniqueness, slice-mode consistency,
+      service refs) — vehicle manifest (§6.2) still TODO
 - [ ] `vxedge-core`: vehicle-manifest structs (§6.2) + validation
 - [x] `vxedged`: job engine (async tasks + watch-channel progress), event bus
       (EventService.Subscribe live), structured JSONL audit log of mutating calls; Gateway
