@@ -283,7 +283,7 @@ fn tier2() -> Vec<Check> {
         } else {
             "not found — needed only for s-nssai slice experiments".to_string()
         },
-        Some("add-apt-repository ppa:open5gs/latest && apt install open5gs"),
+        Some("preferred: vx5g-core container image (containers/fiveg/) — host install only for non-container runs"),
     ));
 
     // UERANSIM's nr-gnb/nr-ue expect a config and error without one; PATH
