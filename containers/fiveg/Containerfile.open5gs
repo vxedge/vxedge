@@ -1,0 +1,30 @@
+# vx5g-core — Open5GS network functions, containerized (hybrid split: the 5G
+# stack runs in a pod; the measured kernel data plane stays on the host).
+# One image, every NF binary; the pod runs one container per NF with a
+# vxedge-rendered config bind-mounted (crates/vxedge-core/src/fiveg/).
+#
+# Build:  podman build -t vx5g-core -f Containerfile.open5gs .
+# Run:    entrypoint is the NF daemon name, e.g.
+#         podman run --rm vx5g-core open5gs-amfd -c /etc/vx5g/amf.yaml
+#
+# Version comes from the same Open5GS PPA the project validated against
+# (2.8.0); the built image digest becomes the reproducibility pin (§13) —
+# record it in the manifest/results metadata when the lifecycle stage lands.
+
+FROM docker.io/library/ubuntu:24.04
+
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      software-properties-common ca-certificates \
+ && add-apt-repository -y ppa:open5gs/latest \
+ && apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      open5gs iproute2 \
+ && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Log to stdout by default (containers); rendered configs may override with -l.
+RUN mkdir -p /etc/vx5g /var/log/open5gs
+
+# No default command: the pod runner names the NF explicitly.
+ENTRYPOINT []
+CMD ["bash", "-c", "ls /usr/bin/open5gs-* && echo 'vx5g-core: pass an NF daemon + -c <config>'"]

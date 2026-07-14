@@ -99,11 +99,18 @@ exp-001 measurements).
       2.8.0 (2026-07-14)**: 4 schema fixes found and applied (t3512 required; nssf nsi
       s_nssai is a mapping; smf dnn nests inside s_nssai; per-slice tun devices) — AMF/
       NSSF parse clean, SMFs start, UPFs stop only at unprivileged tun creation.
-      Remaining: UERANSIM config validation (blocked: nr-gnb/nr-ue need libsctp-dev to
-      build), process lifecycle (spawn core+gNB/UEs via the pidfile process backend,
-      health, teardown; per-slice tun setup), subscriber provisioning (UDM/UDR needs
-      MongoDB — not installed, apt "Recommends" only), uesimtun↔gateway bridging, wiring
-      into GatewayService for s-nssai slices*
+      **Containerized 5G stack landed 2026-07-14** (hybrid policy, ARCHITECTURE §15):
+      `containers/fiveg/` — vx5g-core (Open5GS 2.8, PPA-in-container) + vx5g-ran
+      (UERANSIM v3.2.7, pinned source build) images built rootless under podman, plus
+      `pod-up.sh` (shared-netns pod: the FiveGPlan loopback addressing works unchanged)
+      as the lifecycle stage's reference. **Full rendered-config validation complete**:
+      every Open5GS NF reaches `initialize...done` and stays running in-container (UPF
+      creates its per-slice vxtun under NET_ADMIN+/dev/net/tun), nr-gnb parses → NGAP
+      SCTP connect attempt, nr-ue parses → NAS PLMN search. Remaining: process lifecycle
+      (pod supervision from vxedged), AUSF/UDM/UDR + subscriber provisioning
+      (open5gs-dbctl vs rendered ue keys; mongo runs in the pod, not on the host),
+      uesimtun↔gateway bridging, GatewayService wiring for s-nssai slices, image-digest
+      recording into results metadata*
 - [ ] URSP-style `slice_policy`: per-node traffic-class → slice routing over concurrent PDU
       sessions (UE-side slicing; mirrors Snapdragon Auto URSP behavior)
 - [ ] SONiC-VS twin: render slice intent to SONiC config, boot VS qcow2, verify config parity

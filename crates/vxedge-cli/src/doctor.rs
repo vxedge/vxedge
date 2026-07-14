@@ -299,7 +299,7 @@ fn tier2() -> Vec<Check> {
         } else {
             "nr-gnb/nr-ue not found — needed only for s-nssai slice experiments".to_string()
         },
-        Some("build from source: github.com/aligungr/UERANSIM (cmake), install nr-gnb + nr-ue into PATH"),
+        Some("preferred: vx5g-ran container image (containers/fiveg/) — host binaries only needed for non-container runs"),
     ));
 
     let gpu = present("nvidia-smi", &["--query-gpu=name", "--format=csv,noheader"]);

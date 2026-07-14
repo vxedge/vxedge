@@ -1,0 +1,31 @@
+# vx5g-ran — UERANSIM gNB/UE simulator, containerized (pairs with vx5g-core).
+# Built from the pinned upstream tag so nr-gnb/nr-ue versions ride the image
+# digest into results metadata (§13) instead of "whatever /usr/local had".
+#
+# Build:  podman build -t vx5g-ran -f Containerfile.ueransim .
+# Run:    podman run --rm vx5g-ran nr-gnb -c /etc/vx5g/gnb.yaml
+#         nr-ue needs NET_ADMIN + /dev/net/tun (creates uesimtunN);
+#         SCTP comes from the HOST kernel: `modprobe sctp` once per boot.
+
+FROM docker.io/library/ubuntu:24.04 AS build
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      make g++ cmake git ca-certificates libsctp-dev lksctp-tools \
+ && rm -rf /var/lib/apt/lists/*
+ARG UERANSIM_TAG=v3.2.7
+RUN git clone --depth 1 --branch ${UERANSIM_TAG} \
+      https://github.com/aligungr/UERANSIM /src/UERANSIM
+RUN cd /src/UERANSIM && make -j"$(nproc)"
+
+FROM docker.io/library/ubuntu:24.04
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      libsctp1 lksctp-tools iproute2 iputils-ping \
+ && apt-get clean && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/UERANSIM/build/nr-gnb /usr/local/bin/nr-gnb
+COPY --from=build /src/UERANSIM/build/nr-ue /usr/local/bin/nr-ue
+COPY --from=build /src/UERANSIM/build/nr-cli /usr/local/bin/nr-cli
+RUN mkdir -p /etc/vx5g
+
+ENTRYPOINT []
+CMD ["bash", "-c", "nr-gnb --version; nr-ue --version"]

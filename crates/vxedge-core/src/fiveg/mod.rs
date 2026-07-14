@@ -7,14 +7,15 @@
 //! teardown) lands next and reuses the pidfile-tracked process backend
 //! `SvcService` already uses.
 //!
-//! Config schema targets **Open5GS 2.8.x** and **UERANSIM 3.2.x**.
-//! Validation state (2026-07-14): every rendered Open5GS config was run
-//! against live 2.8.0 daemons — AMF/NSSF parse fully (fail only on ports
-//! held by concurrently running instances), SMFs parse *and start*, UPFs
-//! parse and stop only at unprivileged tun creation (the lifecycle stage's
-//! job). UERANSIM configs remain schema-unvalidated until nr-gnb/nr-ue are
-//! built on the host (`vxedge doctor --tier 2`); that gap gates any H2
-//! measurement claim.
+//! Config schema targets **Open5GS 2.8.x** and **UERANSIM 3.2.x** — every
+//! rendered config is validated (2026-07-14) against the containerized stack
+//! (`containers/fiveg/`: vx5g-core / vx5g-ran images, hybrid policy in
+//! ARCHITECTURE §15): all Open5GS NFs reach `initialize...done` and stay
+//! running (UPF creates its per-slice vxtun device under NET_ADMIN +
+//! /dev/net/tun), nr-gnb parses and reaches the NGAP SCTP connect, nr-ue
+//! parses and runs its NAS state machine. Remaining before H2 numbers:
+//! process lifecycle (pod supervision), AUSF/UDM/UDR + subscriber
+//! provisioning (open5gs-dbctl), uesimtun↔gateway bridging.
 
 pub mod plan;
 pub mod render;
