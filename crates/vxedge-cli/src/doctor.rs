@@ -43,6 +43,26 @@ fn present(program: &str, args: &[&str]) -> bool {
     cmd_version(program, args).is_some()
 }
 
+/// Presence by PATH lookup only — for programs that must never be executed
+/// to probe them (the Open5GS daemons treat any invocation as "start up",
+/// so `--version` under sudo would leave a running daemon behind).
+fn on_path(program: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths).any(|dir| {
+                let p = dir.join(program);
+                p.is_file()
+                    && std::fs::metadata(&p)
+                        .map(|m| {
+                            use std::os::unix::fs::PermissionsExt;
+                            m.permissions().mode() & 0o111 != 0
+                        })
+                        .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
 fn check(
     tier: u8,
     name: &'static str,
@@ -248,24 +268,34 @@ fn tier2() -> Vec<Check> {
         Some("apt install wireguard-tools"),
     ));
 
+    // PATH-presence only: executing an Open5GS daemon starts it (no --version
+    // support), which under sudo would leave a stray daemon running.
+    let open5gs = on_path("open5gs-amfd");
     c.push(check(
         2,
         "Open5GS (5G core, for `mode: s-nssai` slices / H2)",
         false,
-        present("open5gs-amfd", &["--version"]),
-        cmd_version("open5gs-amfd", &["--version"])
-            .unwrap_or_else(|| "not found — needed only for s-nssai slice experiments".to_string()),
+        open5gs,
+        if open5gs {
+            cmd_version("dpkg-query", &["-W", "-f=${Version}", "open5gs-amf"])
+                .map(|v| format!("present ({v})"))
+                .unwrap_or_else(|| "present".to_string())
+        } else {
+            "not found — needed only for s-nssai slice experiments".to_string()
+        },
         Some("add-apt-repository ppa:open5gs/latest && apt install open5gs"),
     ));
 
-    let ueransim = present("nr-gnb", &["--version"]) && present("nr-ue", &["--version"]);
+    // UERANSIM's nr-gnb/nr-ue expect a config and error without one; PATH
+    // presence avoids relying on that behavior.
+    let ueransim = on_path("nr-gnb") && on_path("nr-ue");
     c.push(check(
         2,
         "UERANSIM (gNB/UE simulator, for `mode: s-nssai` slices / H2)",
         false,
         ueransim,
         if ueransim {
-            cmd_version("nr-gnb", &["--version"]).unwrap_or_else(|| "present".to_string())
+            "present".to_string()
         } else {
             "nr-gnb/nr-ue not found — needed only for s-nssai slice experiments".to_string()
         },

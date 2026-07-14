@@ -7,11 +7,14 @@
 //! teardown) lands next and reuses the pidfile-tracked process backend
 //! `SvcService` already uses.
 //!
-//! Config schema targets **Open5GS 2.7.x** and **UERANSIM 3.2.x**. Rendered
-//! configs are unit-tested for structure and determinism but have not yet
-//! been validated against live binaries (not installed on the dev host —
-//! `vxedge doctor --tier 2` reports them); that validation is a tracked
-//! TASKS.md item and gates any H2 measurement claim.
+//! Config schema targets **Open5GS 2.8.x** and **UERANSIM 3.2.x**.
+//! Validation state (2026-07-14): every rendered Open5GS config was run
+//! against live 2.8.0 daemons — AMF/NSSF parse fully (fail only on ports
+//! held by concurrently running instances), SMFs parse *and start*, UPFs
+//! parse and stop only at unprivileged tun creation (the lifecycle stage's
+//! job). UERANSIM configs remain schema-unvalidated until nr-gnb/nr-ue are
+//! built on the host (`vxedge doctor --tier 2`); that gap gates any H2
+//! measurement claim.
 
 pub mod plan;
 pub mod render;

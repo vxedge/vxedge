@@ -60,6 +60,9 @@ pub struct SliceSession {
     pub upf_pfcp_addr: String,
     /// UPF GTP-U address (`127.0.2.<110+i>`).
     pub upf_gtpu_addr: String,
+    /// UPF tun device (`vxtun<i>`): one per slice — the default `ogstun`
+    /// can only serve one UPF instance (found live: EBUSY on the second).
+    pub tun_dev: String,
     /// UE SUPI (`imsi-99970000000000<1+i>`), registered against the lab PLMN.
     pub supi: String,
 }
@@ -149,6 +152,7 @@ impl FiveGPlan {
                 smf_addr: format!("127.0.1.{}", 10 + i),
                 upf_pfcp_addr: format!("127.0.2.{}", 10 + i),
                 upf_gtpu_addr: format!("127.0.2.{}", 110 + i),
+                tun_dev: format!("vxtun{i}"),
                 // 15-digit IMSI: MCC(3) + MNC(2) + 10-digit MSIN.
                 supi: format!("imsi-{}{}{:010}", PLMN_MCC, PLMN_MNC, 1 + i),
             });

@@ -1,7 +1,8 @@
 //! Deterministic config rendering from a [`FiveGPlan`].
 //!
-//! Targets Open5GS 2.7.x (`amf.yaml`/`nssf.yaml`/per-slice `smf`/`upf`) and
-//! UERANSIM 3.2.x (`gnb.yaml`, per-slice `ue.yaml`). Every interpolated value
+//! Targets Open5GS 2.8.x (`amf.yaml`/`nssf.yaml`/per-slice `smf`/`upf` —
+//! validated against live 2.8.0 daemons, 2026-07-14) and UERANSIM 3.2.x
+//! (`gnb.yaml`, per-slice `ue.yaml` — pending local build). Every interpolated value
 //! is validated by the plan (ids restricted to `[a-zA-Z0-9_-]`, sd to hex,
 //! addresses generated), so plain string templates are injection-safe here.
 //! Each rendered file must parse as YAML — unit-tested below — and the full
@@ -59,6 +60,9 @@ amf:
   network_name:
     full: vxedge
   amf_name: vxedge-amf
+  time:
+    t3512:
+      value: 540
 "#,
         amf = plan.amf_addr,
         nrf = plan.nrf_addr,
@@ -69,14 +73,20 @@ amf:
 }
 
 fn render_nssf(plan: &FiveGPlan) -> String {
+    // Each nsi entry's s_nssai is a MAPPING, not a list (live 2.8.0 asserts
+    // on the list form: `ogs_yaml_iter_key: node->type == YAML_SCALAR_NODE`).
     let nsi_list = plan
         .sessions
         .iter()
         .map(|s| {
-            let snssai = snssai_yaml("          ", s.sst, s.sd.as_deref());
+            let sd = match s.sd.as_deref() {
+                Some(sd) => format!("\n          sd: \"{sd}\""),
+                None => String::new(),
+            };
             format!(
-                "      - uri: http://{nrf}:7777\n        s_nssai:\n{snssai}",
+                "      - uri: http://{nrf}:7777\n        s_nssai:\n          sst: {sst}{sd}",
                 nrf = plan.nrf_addr,
+                sst = s.sst,
             )
         })
         .collect::<Vec<_>>()
@@ -100,14 +110,19 @@ nssf:
 }
 
 fn render_smf(plan: &FiveGPlan, s: &SliceSession) -> String {
-    let snssai = snssai_yaml("        ", s.sst, s.sd.as_deref());
+    // `dnn` nests INSIDE each s_nssai entry (live 2.8.0: sibling `dnn` is an
+    // unknown key and the slice then has "No DNN").
+    let sd_line = match s.sd.as_deref() {
+        Some(sd) => format!("\n        sd: \"{sd}\""),
+        None => String::new(),
+    };
     format!(
         r#"# rendered by vxedge (FiveGPlan) — slice `{id}` — do not hand-edit
 smf:
   info:
     - s_nssai:
-{snssai}
-      dnn: [{dnn}]
+      - sst: {sst}{sd_line}
+        dnn: [{dnn}]
   sbi:
     server:
       - address: {smf}
@@ -135,6 +150,7 @@ smf:
   dns: [1.1.1.1]
 "#,
         id = s.slice_id,
+        sst = s.sst,
         dnn = s.dnn,
         smf = s.smf_addr,
         nrf = plan.nrf_addr,
@@ -158,6 +174,7 @@ upf:
     - subnet: {subnet}
       gateway: {gw}
       dnn: {dnn}
+      dev: {tun}
 "#,
         id = s.slice_id,
         pfcp = s.upf_pfcp_addr,
@@ -165,6 +182,7 @@ upf:
         subnet = s.ue_subnet,
         gw = s.ue_gateway,
         dnn = s.dnn,
+        tun = s.tun_dev,
     )
 }
 

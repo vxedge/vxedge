@@ -94,11 +94,16 @@ exp-001 measurements).
       validated sst/sd/slice-id, typed errors) + deterministic config rendering for
       Open5GS 2.7.x (amf/nssf + per-slice smf/upf) and UERANSIM 3.2.x (gnb + per-slice ue),
       10 unit tests (YAML-parse, per-slice bindings, determinism, error paths); doctor
-      tier-2 now reports open5gs-amfd + nr-gnb/nr-ue presence. Remaining: process
-      lifecycle (spawn core+gNB/UEs via the pidfile process backend, health, teardown),
-      subscriber provisioning (UDM/UDR DB), uesimtun↔gateway bridging, wiring into
-      GatewayService for s-nssai slices, and **validation of rendered configs against
-      live binaries** (none installed on the dev host — gates any H2 claim)*
+      tier-2 now reports open5gs-amfd + nr-gnb/nr-ue presence (PATH-based — executing an
+      Open5GS daemon starts it, found live). **Open5GS configs validated against live
+      2.8.0 (2026-07-14)**: 4 schema fixes found and applied (t3512 required; nssf nsi
+      s_nssai is a mapping; smf dnn nests inside s_nssai; per-slice tun devices) — AMF/
+      NSSF parse clean, SMFs start, UPFs stop only at unprivileged tun creation.
+      Remaining: UERANSIM config validation (blocked: nr-gnb/nr-ue need libsctp-dev to
+      build), process lifecycle (spawn core+gNB/UEs via the pidfile process backend,
+      health, teardown; per-slice tun setup), subscriber provisioning (UDM/UDR needs
+      MongoDB — not installed, apt "Recommends" only), uesimtun↔gateway bridging, wiring
+      into GatewayService for s-nssai slices*
 - [ ] URSP-style `slice_policy`: per-node traffic-class → slice routing over concurrent PDU
       sessions (UE-side slicing; mirrors Snapdragon Auto URSP behavior)
 - [ ] SONiC-VS twin: render slice intent to SONiC config, boot VS qcow2, verify config parity
