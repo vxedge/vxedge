@@ -186,6 +186,44 @@ upf:
     )
 }
 
+/// Simple SBI-only NFs (NRF has no client section; the rest are NRF-direct
+/// clients; UDR/PCF additionally bind the pod's MongoDB).
+fn render_nrf(plan: &FiveGPlan) -> String {
+    format!(
+        r#"# rendered by vxedge (FiveGPlan) — do not hand-edit
+nrf:
+  serving:
+    - plmn_id: {{ mcc: {mcc}, mnc: {mnc} }}
+  sbi:
+    server:
+      - address: {nrf}
+        port: 7777
+"#,
+        mcc = plan.mcc,
+        mnc = plan.mnc,
+        nrf = plan.nrf_addr,
+    )
+}
+
+fn render_simple_nf(name: &str, addr: &str, nrf: &str, db_uri: Option<&str>) -> String {
+    let db = match db_uri {
+        Some(uri) => format!("\n\ndb_uri: {uri}"),
+        None => String::new(),
+    };
+    format!(
+        r#"# rendered by vxedge (FiveGPlan) — do not hand-edit{db}
+{name}:
+  sbi:
+    server:
+      - address: {addr}
+        port: 7777
+    client:
+      nrf:
+        - uri: http://{nrf}:7777
+"#,
+    )
+}
+
 fn render_gnb(plan: &FiveGPlan) -> String {
     let slice_list = plan
         .sessions
@@ -284,12 +322,36 @@ integrityMaxRate:
 pub fn render_all(plan: &FiveGPlan) -> Vec<ConfigFile> {
     let mut files = vec![
         ConfigFile {
+            name: "open5gs/nrf.yaml".into(),
+            contents: render_nrf(plan),
+        },
+        ConfigFile {
             name: "open5gs/amf.yaml".into(),
             contents: render_amf(plan),
         },
         ConfigFile {
             name: "open5gs/nssf.yaml".into(),
             contents: render_nssf(plan),
+        },
+        ConfigFile {
+            name: "open5gs/ausf.yaml".into(),
+            contents: render_simple_nf("ausf", &plan.ausf_addr, &plan.nrf_addr, None),
+        },
+        ConfigFile {
+            name: "open5gs/udm.yaml".into(),
+            contents: render_simple_nf("udm", &plan.udm_addr, &plan.nrf_addr, None),
+        },
+        ConfigFile {
+            name: "open5gs/udr.yaml".into(),
+            contents: render_simple_nf("udr", &plan.udr_addr, &plan.nrf_addr, Some(&plan.db_uri)),
+        },
+        ConfigFile {
+            name: "open5gs/pcf.yaml".into(),
+            contents: render_simple_nf("pcf", &plan.pcf_addr, &plan.nrf_addr, Some(&plan.db_uri)),
+        },
+        ConfigFile {
+            name: "open5gs/bsf.yaml".into(),
+            contents: render_simple_nf("bsf", &plan.bsf_addr, &plan.nrf_addr, None),
         },
         ConfigFile {
             name: "ueransim/gnb.yaml".into(),
@@ -333,8 +395,8 @@ network:
     #[test]
     fn renders_complete_set_and_every_file_is_valid_yaml() {
         let files = render_all(&plan());
-        // amf + nssf + gnb + 2 x (smf, upf, ue)
-        assert_eq!(files.len(), 9);
+        // 8 core NFs (nrf/amf/nssf/ausf/udm/udr/pcf/bsf) + gnb + 2 x (smf, upf, ue)
+        assert_eq!(files.len(), 15);
         for f in &files {
             let parsed: Result<serde_yaml_ng::Value, _> = serde_yaml_ng::from_str(&f.contents);
             assert!(parsed.is_ok(), "{} is not valid YAML: {:?}", f.name, parsed);

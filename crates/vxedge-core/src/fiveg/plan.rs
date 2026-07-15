@@ -78,6 +78,15 @@ pub struct FiveGPlan {
     pub nrf_addr: String,
     /// NSSF SBI address.
     pub nssf_addr: String,
+    /// AUSF / UDM / UDR / PCF / BSF SBI addresses (registration + session
+    /// policy path; upstream loopback convention).
+    pub ausf_addr: String,
+    pub udm_addr: String,
+    pub udr_addr: String,
+    pub pcf_addr: String,
+    pub bsf_addr: String,
+    /// Subscriber/policy database (MongoDB inside the vx5g pod).
+    pub db_uri: String,
     /// UERANSIM gNB link/NGAP/GTP address.
     pub gnb_addr: String,
     pub sessions: Vec<SliceSession>,
@@ -165,6 +174,12 @@ impl FiveGPlan {
             amf_addr: "127.0.0.5".to_string(),
             nrf_addr: "127.0.0.10".to_string(),
             nssf_addr: "127.0.0.14".to_string(),
+            ausf_addr: "127.0.0.11".to_string(),
+            udm_addr: "127.0.0.12".to_string(),
+            udr_addr: "127.0.0.20".to_string(),
+            pcf_addr: "127.0.0.13".to_string(),
+            bsf_addr: "127.0.0.15".to_string(),
+            db_uri: "mongodb://127.0.0.1/open5gs".to_string(),
             gnb_addr: "127.0.0.100".to_string(),
             sessions,
         })

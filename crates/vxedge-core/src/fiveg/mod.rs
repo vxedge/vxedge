@@ -7,15 +7,17 @@
 //! teardown) lands next and reuses the pidfile-tracked process backend
 //! `SvcService` already uses.
 //!
-//! Config schema targets **Open5GS 2.8.x** and **UERANSIM 3.2.x** — every
-//! rendered config is validated (2026-07-14) against the containerized stack
-//! (`containers/fiveg/`: vx5g-core / vx5g-ran images, hybrid policy in
-//! ARCHITECTURE §15): all Open5GS NFs reach `initialize...done` and stay
-//! running (UPF creates its per-slice vxtun device under NET_ADMIN +
-//! /dev/net/tun), nr-gnb parses and reaches the NGAP SCTP connect, nr-ue
-//! parses and runs its NAS state machine. Remaining before H2 numbers:
-//! process lifecycle (pod supervision), AUSF/UDM/UDR + subscriber
-//! provisioning (open5gs-dbctl), uesimtun↔gateway bridging.
+//! Config schema targets **Open5GS 2.8.x** and **UERANSIM 3.2.x**. The
+//! rendered config set has been proven **end to end** (2026-07-14) against
+//! the containerized stack (`containers/fiveg/`, hybrid policy §15): the
+//! full core (NRF/AUSF/UDM/UDR/PCF/BSF/NSSF/AMF + per-slice SMF/UPF) comes
+//! up on rendered configs, the gNB completes **NG Setup**, and **both UEs
+//! register and establish PDU sessions on their own S-NSSAI**, each getting
+//! its slice's subnet (adas → 10.46.0.2 on uesimtun0, infotainment →
+//! 10.47.0.2 on uesimtun1). Remaining before H2 numbers: vxedged pod
+//! lifecycle (supervision/health/teardown), explicit subscriber documents
+//! (dbctl's slice helper needs an SD), and uesimtun↔vxgateway bridging so
+//! measured traffic rides the PDU sessions.
 
 pub mod plan;
 pub mod render;
