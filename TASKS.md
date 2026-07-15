@@ -88,29 +88,34 @@ exp-001 measurements).
 
 ## 4. Phase 2
 
-- [ ] Open5GS/UERANSIM driver: `mode: s-nssai` slice provisioning (H2). *In progress —
-      first increment landed 2026-07-14 (`vxedge-core/src/fiveg/`): `FiveGPlan` (pure-data,
-      mirrors GatewayPlan — per-slice SMF/UPF sessions, deterministic loopback addressing,
-      validated sst/sd/slice-id, typed errors) + deterministic config rendering for
-      Open5GS 2.7.x (amf/nssf + per-slice smf/upf) and UERANSIM 3.2.x (gnb + per-slice ue),
-      10 unit tests (YAML-parse, per-slice bindings, determinism, error paths); doctor
-      tier-2 now reports open5gs-amfd + nr-gnb/nr-ue presence (PATH-based — executing an
-      Open5GS daemon starts it, found live). **Open5GS configs validated against live
-      2.8.0 (2026-07-14)**: 4 schema fixes found and applied (t3512 required; nssf nsi
-      s_nssai is a mapping; smf dnn nests inside s_nssai; per-slice tun devices) — AMF/
-      NSSF parse clean, SMFs start, UPFs stop only at unprivileged tun creation.
-      **Containerized 5G stack landed 2026-07-14** (hybrid policy, ARCHITECTURE §15):
-      `containers/fiveg/` — vx5g-core (Open5GS 2.8, PPA-in-container) + vx5g-ran
-      (UERANSIM v3.2.7, pinned source build) images built rootless under podman, plus
-      `pod-up.sh` (shared-netns pod: the FiveGPlan loopback addressing works unchanged)
-      as the lifecycle stage's reference. **Full rendered-config validation complete**:
-      every Open5GS NF reaches `initialize...done` and stays running in-container (UPF
-      creates its per-slice vxtun under NET_ADMIN+/dev/net/tun), nr-gnb parses → NGAP
-      SCTP connect attempt, nr-ue parses → NAS PLMN search. Remaining: process lifecycle
-      (pod supervision from vxedged), AUSF/UDM/UDR + subscriber provisioning
-      (open5gs-dbctl vs rendered ue keys; mongo runs in the pod, not on the host),
-      uesimtun↔gateway bridging, GatewayService wiring for s-nssai slices, image-digest
-      recording into results metadata*
+- [ ] Open5GS/UERANSIM driver: `mode: s-nssai` slice provisioning (H2). *In progress,
+      major milestone reached 2026-07-14 — **end-to-end slice-differentiated PDU
+      sessions proven live**:
+      - `vxedge-core/src/fiveg/`: `FiveGPlan` (pure-data, mirrors GatewayPlan) compiles
+        `mode: s-nssai` slices into the full 8-NF Open5GS core (NRF/AMF/AUSF/UDM/UDR/
+        PCF/BSF/NSSF + per-slice SMF/UPF) plus UERANSIM gNB/UE configs — deterministic
+        loopback addressing, validated sst/sd/slice-id, typed errors, 15 rendered files,
+        10 unit tests. All config-schema fixes (t3512, nssf s_nssai mapping, smf dnn
+        nesting, per-slice tun devices) found and fixed against live Open5GS 2.8.0.
+      - **Containerized** (hybrid policy, ARCHITECTURE §15): `containers/fiveg/` —
+        vx5g-core (Open5GS 2.8 + mongosh + open5gs-dbctl pinned to v2.8.0) and vx5g-ran
+        (UERANSIM v3.2.7) images, rootless podman, digest-pinned; `pod-up.sh` brings up
+        the full core in dependency order and inserts subscribers by parsing rendered
+        `ue-*.yaml` files directly (rendered config stays the single source of truth).
+      - **Live E2E proof**: gNB completes NG Setup against the rendered AMF; both test
+        UEs complete Initial Registration and PDU Session Establishment **each on its
+        own S-NSSAI**, landing on their slice's subnet (adas → 10.46.0.2/uesimtun0,
+        infotainment → 10.47.0.2/uesimtun1). This is the first confirmation the
+        rendered stack forms real, slice-differentiated sessions, not just "daemons
+        start clean".
+      - Known gap, tracked: dbctl's slice helper needs an SD — a slice declared without
+        one currently falls back to the default subscribed slice (`pod-up.sh` comment).
+      Remaining before H2 numbers: vxedged pod lifecycle (Rust-native supervision/
+      health/teardown, replacing the shell `pod-up.sh` reference), explicit subscriber
+      documents (drop the dbctl SD limitation), **uesimtun↔vxgateway bridging** — this
+      is the last-mile item: measured traffic must ride the PDU session tunnels instead
+      of the loopback addresses used for this validation — GatewayService wiring for
+      s-nssai slices, image-digest recording into results metadata.*
 - [ ] URSP-style `slice_policy`: per-node traffic-class → slice routing over concurrent PDU
       sessions (UE-side slicing; mirrors Snapdragon Auto URSP behavior)
 - [ ] SONiC-VS twin: render slice intent to SONiC config, boot VS qcow2, verify config parity
