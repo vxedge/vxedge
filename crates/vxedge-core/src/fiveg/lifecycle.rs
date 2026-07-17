@@ -22,13 +22,14 @@
 //! separate runner).
 //!
 //! Scope note: this module is the *mechanism* — bring a `FiveGPlan` up as
-//! running pods, observe them, tear them down. It is not yet wired to any
-//! vxAPI RPC or manifest lifecycle verb; that wiring (GatewayService
-//! recognizing `mode: s-nssai` slices) is tracked separately
-//! (`vxedge/TASKS.md` §4) since it is a proto/RPC design decision, not a
-//! mechanism one. Bridging the CN pod's transit interface into vxgateway's
-//! own bridge (so measured traffic rides these PDU sessions) is the next
-//! increment, built on top of this one.
+//! running pods, observe them, tear them down, and (via [`bridge_up`]/
+//! [`bridge_down`]) attach the CN pod to an external bridge. It is not yet
+//! wired to any vxAPI RPC or manifest lifecycle verb; that wiring
+//! (GatewayService recognizing `mode: s-nssai` slices, and deciding
+//! whether/how the bridge attachment joins `vxgateway`'s real, VLAN-aware
+//! `vxbr0`) is tracked separately (`vxedge/TASKS.md` §4) since it is a
+//! proto/RPC design decision, not a mechanism one — [`bridge_up`]
+//! deliberately does not touch `vxbr0` or any VLAN membership itself.
 //!
 //! Two-layer split for testability (rust-patterns: pure logic vs. I/O):
 //! [`core_run_specs`] (here) and [`super::subscriber::subscriber_insert_commands`]
@@ -166,7 +167,7 @@ fn nsenter_ip(pid: u32, args: &[&str]) -> Result<String, FiveGLifecycleError> {
 /// PID of a pod's infra container — the anchor for its network namespace.
 /// Requires the pod to have been started (`pod start`/`pod create` alone
 /// leaves the infra container's PID at 0 — found live, 2026-07-17).
-fn pod_pid(pod_name: &str) -> Result<u32, FiveGLifecycleError> {
+pub fn pod_pid(pod_name: &str) -> Result<u32, FiveGLifecycleError> {
     let infra_id = podman(&[
         "pod".to_string(),
         "inspect".to_string(),
@@ -351,6 +352,68 @@ fn setup_upf_tun(cn_pid: u32, session: &SliceSession) -> Result<(), FiveGLifecyc
     nsenter_ip(cn_pid, &["addr", "add", &addr, "dev", &session.tun_dev])?;
     nsenter_ip(cn_pid, &["link", "set", &session.tun_dev, "up"])?;
     Ok(())
+}
+
+/// Address for the CN pod's side of [`bridge_up`]'s attachment — distinct
+/// from the CN↔RAN transit subnet, since this is a different link (CN pod
+/// ↔ bridge, not CN pod ↔ RAN pod).
+pub const BRIDGE_ATTACH_SUBNET: &str = "10.98.0.0/24";
+pub const BRIDGE_ATTACH_CN_ADDR: &str = "10.98.0.1";
+
+fn bridge_veth_names(pod_name: &str) -> (String, String) {
+    let base: String = pod_name.chars().take(10).collect();
+    (format!("{base}-br0"), format!("{base}-brp0"))
+}
+
+/// Attach the CN pod's netns to a bridge as a plain access port (no VLAN
+/// tagging — a deliberately minimal mechanism spike, 2026-07-17, proving
+/// that the fiveg CN pod's UE-subnet routing is reachable from *outside*
+/// its own netns at all, through the exact same veth-into-bridge primitive
+/// `gateway::provision::apply_endpoints` already uses for zone nodes).
+///
+/// **Not `vxgateway`'s real bridge, and not wired into `fiveg_up`.** Uses
+/// whatever bridge name is passed in — pass a throwaway test bridge, not
+/// `vxbr0`, unless you have deliberately decided to attach to the real
+/// one (`vxbr0` is `vlan_filtering 1`; a port needs an explicit `bridge
+/// vlan add ... pvid untagged` to pass any traffic on such a bridge, which
+/// this function does not do — that VLAN-membership decision belongs to
+/// the real GatewayService integration, tracked separately,
+/// `vxedge/TASKS.md` §4, not decided as a side effect here).
+pub fn bridge_up(
+    cfg: &FiveGLifecycleConfig,
+    bridge: &str,
+    cn_pid: u32,
+) -> Result<(), FiveGLifecycleError> {
+    let (host_side, pod_side) = bridge_veth_names(&cfg.pod_name);
+    host_ip(&[
+        "link", "add", &host_side, "type", "veth", "peer", "name", &pod_side,
+    ])?;
+    host_ip(&["link", "set", &pod_side, "netns", &cn_pid.to_string()])?;
+
+    host_ip(&["link", "set", &host_side, "master", bridge])?;
+    host_ip(&["link", "set", &host_side, "up"])?;
+
+    let cn_addr = format!("{BRIDGE_ATTACH_CN_ADDR}/24");
+    nsenter_ip(cn_pid, &["addr", "add", &cn_addr, "dev", &pod_side])?;
+    nsenter_ip(cn_pid, &["link", "set", &pod_side, "up"])?;
+    Ok(())
+}
+
+/// Remove the bridge attachment. Idempotent: deleting the host-side veth
+/// also destroys its pod-side peer, wherever it currently lives; a missing
+/// interface is tolerated (`ip link del` failing with "Cannot find device"
+/// means it's already gone, not an error worth surfacing).
+pub fn bridge_down(cfg: &FiveGLifecycleConfig) -> Result<(), FiveGLifecycleError> {
+    let (host_side, _) = bridge_veth_names(&cfg.pod_name);
+    match host_ip(&["link", "del", &host_side]) {
+        Ok(_) => Ok(()),
+        Err(FiveGLifecycleError::Command { stderr, .. })
+            if stderr.contains("Cannot find device") || stderr.contains("does not exist") =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Bring the 5G core up as a running pod. Idempotent: an already-existing
@@ -757,5 +820,31 @@ network:
         let (cn, ran) = transit_veth_names("a-very-long-custom-pod-name");
         assert!(cn.len() <= 15, "{cn} exceeds IFNAMSIZ");
         assert!(ran.len() <= 15, "{ran} exceeds IFNAMSIZ");
+    }
+
+    #[test]
+    fn bridge_veth_names_fit_ifnamsiz_and_differ_from_transit_names() {
+        let (host, pod) = bridge_veth_names("vx5g");
+        assert_eq!(host, "vx5g-br0");
+        assert_eq!(pod, "vx5g-brp0");
+        assert!(host.len() <= 15 && pod.len() <= 15);
+
+        // Distinct namespaces of names: bridge attach vs CN<->RAN transit
+        // link must never collide even for the same pod_name.
+        let (cn, ran) = transit_veth_names("vx5g");
+        assert_ne!(host, cn);
+        assert_ne!(host, ran);
+        assert_ne!(pod, cn);
+        assert_ne!(pod, ran);
+
+        let (host, pod) = bridge_veth_names("a-very-long-custom-pod-name");
+        assert!(host.len() <= 15, "{host} exceeds IFNAMSIZ");
+        assert!(pod.len() <= 15, "{pod} exceeds IFNAMSIZ");
+    }
+
+    #[test]
+    fn bridge_attach_addressing_is_distinct_from_transit_subnet() {
+        assert_ne!(BRIDGE_ATTACH_SUBNET, super::super::plan::TRANSIT_SUBNET);
+        assert_eq!(BRIDGE_ATTACH_CN_ADDR, "10.98.0.1");
     }
 }

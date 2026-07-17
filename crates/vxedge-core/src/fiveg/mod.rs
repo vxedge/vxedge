@@ -35,7 +35,8 @@ pub mod render;
 pub mod subscriber;
 
 pub use lifecycle::{
-    FiveGLifecycleConfig, FiveGLifecycleError, FiveGStatus, fiveg_down, fiveg_status, fiveg_up,
+    FiveGLifecycleConfig, FiveGLifecycleError, FiveGStatus, bridge_down, bridge_up, fiveg_down,
+    fiveg_status, fiveg_up, pod_pid,
 };
 pub use plan::{FiveGPlan, FiveGPlanError, SliceSession};
 pub use render::{ConfigFile, render_all};

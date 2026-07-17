@@ -10,12 +10,8 @@ const MAX_SLICES: usize = 200;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PlanError {
-    #[error(
-        "no `network.slices` with mode `vlan` — nothing to provision (S-NSSAI slices are phase 2)"
-    )]
-    NoVlanSlices,
-    #[error("slice `{0}` uses mode `s-nssai`, which is not provisionable yet (phase 2)")]
-    SnssaiNotSupported(String),
+    #[error("no `network.slices` at all — nothing to provision")]
+    NoSlices,
     #[error("too many slices: {0} (max {MAX_SLICES})")]
     TooManySlices(usize),
 }
@@ -78,6 +74,16 @@ pub struct GatewayPlan {
     pub root_rate_mbps: u64,
     pub slices: Vec<SlicePlan>,
     pub endpoints: Vec<EndpointPlan>,
+    /// Ids of `mode: s-nssai` slices present in the manifest — tracked, not
+    /// yet provisioned by this reconciler. Real S-NSSAI slice lifecycle is
+    /// `vxedge_core::fiveg`'s job (its own CN/RAN pods); a manifest mixing
+    /// vlan and s-nssai slices no longer fails outright here (previously
+    /// `PlanError::SnssaiNotSupported`, removed 2026-07-17) — apply/
+    /// teardown/observe below are still vlan-slice-only and untouched, so
+    /// this is additive: existing vlan-only plans are unaffected byte for
+    /// byte. Bridging an s-nssai slice's fiveg pod into `bridge` as an
+    /// access port is `fiveg`'s job, tracked in `vxedge/TASKS.md` §4.
+    pub snssai_slice_ids: Vec<String>,
 }
 
 impl GatewayPlan {
@@ -85,9 +91,6 @@ impl GatewayPlan {
         let network = manifest.network.as_ref();
         let manifest_slices = network.map(|n| n.slices.as_slice()).unwrap_or(&[]);
 
-        if let Some(s) = manifest_slices.iter().find(|s| s.mode == SliceMode::Snssai) {
-            return Err(PlanError::SnssaiNotSupported(s.id.clone()));
-        }
         if manifest_slices.len() > MAX_SLICES {
             return Err(PlanError::TooManySlices(manifest_slices.len()));
         }
@@ -108,8 +111,15 @@ impl GatewayPlan {
                 }
             })
             .collect();
-        if slices.is_empty() {
-            return Err(PlanError::NoVlanSlices);
+
+        let snssai_slice_ids: Vec<String> = manifest_slices
+            .iter()
+            .filter(|s| s.mode == SliceMode::Snssai)
+            .map(|s| s.id.clone())
+            .collect();
+
+        if slices.is_empty() && snssai_slice_ids.is_empty() {
+            return Err(PlanError::NoSlices);
         }
 
         let mut endpoints = Vec::new();
@@ -152,6 +162,7 @@ impl GatewayPlan {
             root_rate_mbps,
             slices,
             endpoints,
+            snssai_slice_ids,
         })
     }
 
@@ -168,8 +179,16 @@ impl GatewayPlan {
             })
             .collect::<Vec<_>>()
             .join(", ");
+        let snssai = if self.snssai_slice_ids.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; s-nssai slices (fiveg-managed, not provisioned here): [{}]",
+                self.snssai_slice_ids.join(", ")
+            )
+        };
         format!(
-            "bridge {} + uplink {} @ {} mbit; slices: [{slices}]; {} endpoint(s)",
+            "bridge {} + uplink {} @ {} mbit; slices: [{slices}]{snssai}; {} endpoint(s)",
             self.bridge,
             self.uplink,
             self.root_rate_mbps,
@@ -229,25 +248,51 @@ zones:
     }
 
     #[test]
-    fn rejects_snssai_slices_for_now() {
-        let yaml = BASE.replace(
-            "{ id: adas, mode: vlan, vlan: 101,",
-            "{ id: adas, mode: s-nssai, s_nssai: { sst: 1 },",
-        );
-        // Manifest itself is valid; the *plan* rejects it as phase 2.
-        let m = manifest(&yaml);
-        assert!(matches!(
-            GatewayPlan::from_manifest(&m),
-            Err(PlanError::SnssaiNotSupported(id)) if id == "adas"
-        ));
+    fn vlan_only_manifest_has_no_snssai_ids_tracked() {
+        // Regression guard: adding s-nssai tracking must not change the
+        // vlan-only plan at all (zero risk to the frozen H1/H3/H4 numbers).
+        let plan = GatewayPlan::from_manifest(&manifest(BASE)).unwrap();
+        assert!(plan.snssai_slice_ids.is_empty());
     }
 
     #[test]
-    fn rejects_manifest_without_slices() {
+    fn mixed_manifest_tracks_snssai_ids_without_provisioning_them() {
+        // 2026-07-17: a manifest mixing vlan and s-nssai slices used to be
+        // rejected outright (PlanError::SnssaiNotSupported); it's now
+        // accepted, with vlan slices provisioned exactly as before and
+        // s-nssai slices merely tracked (fiveg owns their real lifecycle).
+        let m = manifest(&BASE.replacen(
+            "    - { id: adas, mode: vlan, vlan: 101, qos: { min_rate_mbps: 100, max_rate_mbps: 200, priority: 1 } }",
+            "    - { id: adas, mode: vlan, vlan: 101, qos: { min_rate_mbps: 100, max_rate_mbps: 200, priority: 1 } }\n    - { id: adas5g, mode: s-nssai, s_nssai: { sst: 1, sd: '000001' } }",
+            1,
+        ));
+        let plan = GatewayPlan::from_manifest(&m).expect("mixed manifest now succeeds");
+        // vlan slices provisioned exactly as the vlan-only case (BASE).
+        assert_eq!(plan.slices.len(), 2);
+        assert_eq!(plan.slices[0].id, "adas");
+        // s-nssai slice tracked, not turned into a SlicePlan/HTB class.
+        assert_eq!(plan.snssai_slice_ids, vec!["adas5g".to_string()]);
+    }
+
+    #[test]
+    fn snssai_only_manifest_succeeds_with_no_vlan_slices() {
+        let m = manifest(
+            "experiment: { id: e, name: n }\nnetwork:\n  slices:\n    - { id: adas5g, mode: s-nssai, s_nssai: { sst: 1, sd: '000001' } }\n",
+        );
+        let plan = GatewayPlan::from_manifest(&m).expect("s-nssai-only manifest now succeeds");
+        assert!(plan.slices.is_empty());
+        assert_eq!(plan.snssai_slice_ids, vec!["adas5g".to_string()]);
+        // Bridge/uplink are still planned — an s-nssai-only experiment still
+        // needs the bridge for fiveg's transit veth to attach to.
+        assert_eq!(plan.bridge, "vxbr0");
+    }
+
+    #[test]
+    fn rejects_manifest_without_any_slices() {
         let m = manifest("experiment: { id: e, name: n }\n");
         assert!(matches!(
             GatewayPlan::from_manifest(&m),
-            Err(PlanError::NoVlanSlices)
+            Err(PlanError::NoSlices)
         ));
     }
 }
