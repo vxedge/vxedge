@@ -1,11 +1,11 @@
 //! vxedge — thin vxAPI client. Every subcommand is a 1:1 wrapper over a vxAPI
 //! RPC; no orchestration logic lives here (hard rule, AGENTS.md).
 //!
-//! Wired today: `status`, `up`, `down`, `zone up|down|list`, `ota up|down`
-//! (job submission + live progress streaming); `manifest validate` and
-//! `doctor` are local-only (no daemon connection — see their own doc
-//! comments for why that's not a hard-rule violation). Remaining verbs
-//! print a scaffold notice until their daemon-side services land.
+//! Wired today: `status`, `up`, `down`, `zone up|down|list`, `ota up|down`,
+//! `traffic up|down` (job submission + live progress streaming); `manifest
+//! validate` and `doctor` are local-only (no daemon connection — see their
+//! own doc comments for why that's not a hard-rule violation). Remaining
+//! verbs print a scaffold notice until their daemon-side services land.
 
 use clap::{Parser, Subcommand};
 use hyper_util::rt::TokioIo;
@@ -19,11 +19,12 @@ use vxedge_api::v1::gateway_service_client::GatewayServiceClient;
 use vxedge_api::v1::job_service_client::JobServiceClient;
 use vxedge_api::v1::manifest_ref::Source;
 use vxedge_api::v1::svc_service_client::SvcServiceClient;
+use vxedge_api::v1::traffic_service_client::TrafficServiceClient;
 use vxedge_api::v1::zone_service_client::ZoneServiceClient;
 use vxedge_api::v1::{
     GatewayDownRequest, GatewayStatusRequest, GatewayUpRequest, Job, JobState, ManifestRef,
-    SvcDownRequest, SvcUpRequest, VxidRef, WatchJobRequest, ZoneDownRequest, ZoneListRequest,
-    ZoneUpRequest,
+    SvcDownRequest, SvcUpRequest, TrafficDownRequest, TrafficUpRequest, VxidRef, WatchJobRequest,
+    ZoneDownRequest, ZoneListRequest, ZoneUpRequest,
 };
 
 #[derive(Parser, Debug)]
@@ -241,10 +242,16 @@ enum TrafficCmd {
     Up {
         #[arg(long)]
         manifest: String,
+        /// Restrict to specific `traffic_profiles` ids (repeatable; default:
+        /// every profile in the manifest).
+        #[arg(long = "profile")]
+        profiles: Vec<String>,
     },
     Down {
         #[arg(long)]
         manifest: String,
+        #[arg(long = "profile")]
+        profiles: Vec<String>,
     },
 }
 
@@ -467,7 +474,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Telemetry { .. } => scaffold_notice("telemetry"),
         Command::Vehicle { .. } => scaffold_notice("vehicle"),
         Command::Experiment { .. } => scaffold_notice("experiment"),
-        Command::Traffic { .. } => scaffold_notice("traffic"),
+        Command::Traffic { cmd } => match cmd {
+            TrafficCmd::Up { manifest, profiles } => {
+                let channel = connect(&cli.endpoint).await?;
+                let mut traffic = TrafficServiceClient::new(channel.clone());
+                let job = traffic
+                    .up(TrafficUpRequest {
+                        manifest: manifest_ref(&Some(manifest.clone())),
+                        profiles: profiles.clone(),
+                    })
+                    .await?
+                    .into_inner();
+                watch_job(channel, job, cli.json).await?;
+            }
+            TrafficCmd::Down { manifest, profiles } => {
+                let channel = connect(&cli.endpoint).await?;
+                let mut traffic = TrafficServiceClient::new(channel.clone());
+                let job = traffic
+                    .down(TrafficDownRequest {
+                        manifest: manifest_ref(&Some(manifest.clone())),
+                        profiles: profiles.clone(),
+                    })
+                    .await?
+                    .into_inner();
+                watch_job(channel, job, cli.json).await?;
+            }
+        },
         Command::Manifest { cmd } => match cmd {
             ManifestCmd::Validate { manifest } => {
                 let yaml = std::fs::read_to_string(manifest)

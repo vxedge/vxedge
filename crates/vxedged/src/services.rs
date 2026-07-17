@@ -14,17 +14,20 @@ use vxedge_api::v1::gateway_service_server::GatewayService;
 use vxedge_api::v1::job_service_server::JobService;
 use vxedge_api::v1::manifest_ref::Source;
 use vxedge_api::v1::svc_service_server::SvcService;
+use vxedge_api::v1::traffic_service_server::TrafficService;
 use vxedge_api::v1::zone_service_server::ZoneService;
 use vxedge_api::v1::{
     Event, GatewayApplyRequest, GatewayDownRequest, GatewayStatus, GatewayStatusRequest,
     GatewayUpRequest, GetJobRequest, ImagePushRequest, ImagePushResponse, Job, ManifestRef,
     ResourceKind, ResourceState, ResourceStatus, SliceStatus, SubscribeRequest, SvcDownRequest,
-    SvcStatusRequest, SvcUpRequest, WatchJobRequest, ZoneApplyRequest, ZoneDownRequest,
-    ZoneListRequest, ZoneListResponse, ZoneRemoveRequest, ZoneUpRequest,
+    SvcStatusRequest, SvcUpRequest, TrafficDownRequest, TrafficUpRequest, WatchJobRequest,
+    ZoneApplyRequest, ZoneDownRequest, ZoneListRequest, ZoneListResponse, ZoneRemoveRequest,
+    ZoneUpRequest,
 };
 use vxedge_core::ExperimentManifest;
 use vxedge_core::fiveg::{self, FiveGLifecycleConfig, FiveGPlan};
 use vxedge_core::gateway::{self, GatewayPlan, Shell};
+use vxedge_core::traffic::{self, TrafficPlan};
 use vxedge_core::zones::{self, NodePlan};
 
 use crate::audit::Audit;
@@ -850,5 +853,157 @@ impl SvcService for SvcSvc {
             detail,
             since_unix_ms: now_ms(),
         }))
+    }
+}
+
+/// Port every `vxprobe`/`vxtraffic` endpoint this service provisions binds
+/// to — matches `run-exp-001.sh`'s own hardcoded convention (`9800`) rather
+/// than inventing a new one; `TrafficProfile` has no `port` field in the
+/// manifest schema to read one from.
+const TRAFFIC_PORT: u16 = 9800;
+
+pub struct TrafficSvc {
+    pub engine: JobEngine,
+    pub audit: Arc<Audit>,
+    pub shell: Shell,
+    pub runtime_dir: PathBuf,
+    pub vxprobe_bin: String,
+    pub vxtraffic_bin: String,
+}
+
+impl TrafficSvc {
+    /// Resolve a manifest into everything `TrafficPlan::from_manifest`
+    /// needs. Builds a fresh `GatewayPlan`/`FiveGPlan` from the manifest
+    /// alone rather than reading `GatewaySvc`'s shared `EdgeState` — both
+    /// are pure, deterministic functions of the manifest, so this only
+    /// requires `vxedge up` to have *already run* against the same
+    /// manifest (the interfaces `TrafficPlan` resolves against must exist
+    /// on the host/in podman), not that this service reach into another
+    /// service's in-memory state.
+    async fn resolve_plans(
+        &self,
+        mref: Option<&ManifestRef>,
+    ) -> Result<(TrafficPlan, Option<FiveGPlan>, String), Status> {
+        let (yaml, sha256, _dir) = resolve_manifest(mref).await?;
+        let manifest = ExperimentManifest::from_yaml(&yaml)
+            .map_err(|e| Status::invalid_argument(format!("manifest invalid: {e}")))?;
+        let gateway_plan = GatewayPlan::from_manifest(&manifest)
+            .map_err(|e| Status::invalid_argument(format!("gateway plan: {e}")))?;
+        let five_g_plan = match FiveGPlan::from_manifest(&manifest) {
+            Ok(p) => Some(p),
+            Err(fiveg::FiveGPlanError::NoSnssaiSlices) => None,
+            Err(e) => return Err(Status::invalid_argument(format!("fiveg plan: {e}"))),
+        };
+        let traffic_plan = TrafficPlan::from_manifest(&manifest, &gateway_plan)
+            .map_err(|e| Status::invalid_argument(format!("traffic plan: {e}")))?;
+        Ok((traffic_plan, five_g_plan, sha256))
+    }
+}
+
+fn select_profiles(
+    plan: TrafficPlan,
+    requested: &[String],
+) -> Result<Vec<vxedge_core::traffic::ResolvedProfile>, Status> {
+    let selected: Vec<_> = plan
+        .profiles
+        .into_iter()
+        .filter(|p| requested.is_empty() || requested.contains(&p.id))
+        .collect();
+    if selected.is_empty() {
+        return Err(Status::not_found(
+            "no matching traffic_profiles in this manifest (check `profiles` filter and \
+             `network.slices`/`traffic_profiles` in the manifest itself)",
+        ));
+    }
+    Ok(selected)
+}
+
+#[tonic::async_trait]
+impl TrafficService for TrafficSvc {
+    async fn up(&self, req: Request<TrafficUpRequest>) -> Result<Response<Job>, Status> {
+        let req = req.into_inner();
+        let (traffic_plan, five_g_plan, sha256) = self.resolve_plans(req.manifest.as_ref()).await?;
+        self.audit.record(
+            "TrafficService.Up",
+            serde_json::json!({ "manifest_sha256": sha256, "profiles": req.profiles }),
+        );
+        let selected = select_profiles(traffic_plan, &req.profiles)?;
+
+        let shell = self.shell.clone();
+        let runtime_dir = self.runtime_dir.clone();
+        let vxprobe_bin = self.vxprobe_bin.clone();
+        let vxtraffic_bin = self.vxtraffic_bin.clone();
+        let job = self
+            .engine
+            .submit("traffic.up", move |p| async move {
+                let total = selected.len().max(1);
+                let mut messages = Vec::with_capacity(selected.len());
+                for (i, profile) in selected.into_iter().enumerate() {
+                    p.update(
+                        ((i * 100) / total) as u32,
+                        &format!("starting traffic profile `{}`", profile.id),
+                    );
+                    let sh = shell.clone();
+                    let fiveg_cfg = FiveGLifecycleConfig::default();
+                    let five_g_plan = five_g_plan.clone();
+                    let runtime_dir = runtime_dir.clone();
+                    let vxprobe_bin = vxprobe_bin.clone();
+                    let vxtraffic_bin = vxtraffic_bin.clone();
+                    let msg = blocking(move || {
+                        traffic::profile_up(
+                            &sh,
+                            &fiveg_cfg,
+                            five_g_plan.as_ref(),
+                            &runtime_dir,
+                            &vxprobe_bin,
+                            &vxtraffic_bin,
+                            &profile,
+                            TRAFFIC_PORT,
+                        )
+                        .map_err(|e| e.to_string())
+                    })
+                    .await?;
+                    messages.push(msg);
+                }
+                p.update(100, "all traffic profiles up");
+                Ok(messages.join("; "))
+            })
+            .await;
+        Ok(Response::new(job))
+    }
+
+    async fn down(&self, req: Request<TrafficDownRequest>) -> Result<Response<Job>, Status> {
+        let req = req.into_inner();
+        let (traffic_plan, _five_g_plan, sha256) =
+            self.resolve_plans(req.manifest.as_ref()).await?;
+        self.audit.record(
+            "TrafficService.Down",
+            serde_json::json!({ "manifest_sha256": sha256, "profiles": req.profiles }),
+        );
+        let selected = select_profiles(traffic_plan, &req.profiles)?;
+
+        let runtime_dir = self.runtime_dir.clone();
+        let job = self
+            .engine
+            .submit("traffic.down", move |p| async move {
+                let total = selected.len().max(1);
+                let mut messages = Vec::with_capacity(selected.len());
+                for (i, profile) in selected.into_iter().enumerate() {
+                    p.update(
+                        ((i * 100) / total) as u32,
+                        &format!("stopping traffic profile `{}`", profile.id),
+                    );
+                    let runtime_dir = runtime_dir.clone();
+                    let msg = blocking(move || {
+                        Ok::<_, String>(traffic::profile_down(&runtime_dir, &profile.id))
+                    })
+                    .await?;
+                    messages.push(msg);
+                }
+                p.update(100, "all traffic profiles down");
+                Ok(messages.join("; "))
+            })
+            .await;
+        Ok(Response::new(job))
     }
 }

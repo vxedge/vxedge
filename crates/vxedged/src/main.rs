@@ -19,6 +19,7 @@ use vxedge_api::v1::event_service_server::EventServiceServer;
 use vxedge_api::v1::gateway_service_server::GatewayServiceServer;
 use vxedge_api::v1::job_service_server::JobServiceServer;
 use vxedge_api::v1::svc_service_server::SvcServiceServer;
+use vxedge_api::v1::traffic_service_server::TrafficServiceServer;
 use vxedge_api::v1::zone_service_server::ZoneServiceServer;
 
 #[derive(Parser, Debug)]
@@ -41,6 +42,18 @@ struct Args {
     /// see ARCHITECTURE.md §8). Default assumes it's on PATH.
     #[arg(long, default_value = "vxota", env = "VXEDGE_VXOTA_BIN")]
     vxota_bin: String,
+
+    /// Path to the `vxprobe` binary `TrafficService` spawns for round-trip
+    /// probe profiles (`traffic_profiles.<id>.pps`). Default assumes it's
+    /// on PATH.
+    #[arg(long, default_value = "vxprobe", env = "VXEDGE_VXPROBE_BIN")]
+    vxprobe_bin: String,
+
+    /// Path to the `vxtraffic` binary `TrafficService` spawns for
+    /// one-directional load profiles (`traffic_profiles.<id>.bandwidth_mbps`).
+    /// Default assumes it's on PATH.
+    #[arg(long, default_value = "vxtraffic", env = "VXEDGE_VXTRAFFIC_BIN")]
+    vxtraffic_bin: String,
 }
 
 #[tokio::main]
@@ -107,15 +120,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .add_service(ZoneServiceServer::new(services::ZoneSvc {
             engine: engine.clone(),
             audit: audit.clone(),
-            shell,
+            shell: shell.clone(),
             state,
             runtime_dir: args.runtime_dir.clone(),
         }))
         .add_service(SvcServiceServer::new(services::SvcSvc {
             engine: engine.clone(),
-            audit,
+            audit: audit.clone(),
             runtime_dir: args.runtime_dir.clone(),
             vxota_bin: args.vxota_bin.clone(),
+        }))
+        .add_service(TrafficServiceServer::new(services::TrafficSvc {
+            engine: engine.clone(),
+            audit,
+            shell,
+            runtime_dir: args.runtime_dir.clone(),
+            vxprobe_bin: args.vxprobe_bin.clone(),
+            vxtraffic_bin: args.vxtraffic_bin.clone(),
         }))
         .add_service(JobServiceServer::new(services::JobSvc { engine }))
         .add_service(EventServiceServer::new(services::EventSvc { bus }))
