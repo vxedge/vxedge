@@ -108,8 +108,9 @@ exp-001 measurements).
         infotainment → 10.47.0.2/uesimtun1). This is the first confirmation the
         rendered stack forms real, slice-differentiated sessions, not just "daemons
         start clean".
-      - Known gap, tracked: dbctl's slice helper needs an SD — a slice declared without
-        one currently falls back to the default subscribed slice (`pod-up.sh` comment).
+      - Known gap at the time, tracked: dbctl's slice helper needs an SD — a slice
+        declared without one fell back to the default subscribed slice (`pod-up.sh`
+        comment). **Closed 2026-07-17**, see below.
       - **Rust-native pod lifecycle delivered 2026-07-17**
         (`vxedge-core::fiveg::lifecycle`): ports `pod-up.sh`'s proven sequence into a
         tested module — `core_run_specs`/`subscriber_commands` are pure data (8 unit
@@ -123,12 +124,31 @@ exp-001 measurements).
         result as the shell version (same subnets, same NG Setup, same PDU session
         establishment). **This module is the mechanism only** — not yet wired to any
         vxAPI RPC or manifest verb.
-      Remaining before H2 numbers: explicit subscriber documents (drop the dbctl SD
-      limitation), **uesimtun↔vxgateway bridging** — the last-mile item: measured
-      traffic must ride the PDU session tunnels instead of the loopback addresses used
-      for this validation — **GatewayService wiring for s-nssai slices** (the proto/RPC
-      design decision that turns the lifecycle module into something `vxedge up` can
-      call), image-digest recording into results metadata.*
+      - **Explicit subscriber documents delivered 2026-07-17**
+        (`vxedge-core::fiveg::subscriber`): drops `dbctl` entirely — writes the
+        MongoDB `subscribers` document directly (`mongosh --eval`), sourced straight
+        from `FiveGPlan`, always with the slice's true sst and its sd only when
+        declared. Confirmed the SD gap was a real bug, not just a CLI inconvenience:
+        `dbctl`'s SD-less fallback hardcoded `sst: 1` regardless of the manifest.
+        **Live-caught a second, worse bug during verification**: the first cut wrote
+        `session` as a bare object instead of the array Open5GS's schema requires — a
+        find/replace placeholder ate its own brackets. UDR accepted the malformed
+        insert silently but failed converting it back to JSON on query, breaking PDU
+        session establishment for **every** subscriber (not just SD-less ones) with
+        `DNN_NOT_SUPPORTED_OR_NOT_SUBSCRIBED`. Root-caused by isolating a single-slice
+        pod and diffing against a known-good `dbctl`-inserted document field by field;
+        fixed by building the nesting directly instead of string-replace; a named
+        regression test now guards the exact shape. **Re-verified live three times
+        after the fix**: single-slice PDU session established; two-slice pod (one SD,
+        one without) — both PDU sessions established, both UEs on their correct
+        distinct subnets, matching every prior proof; MongoDB document inspected
+        directly to confirm correct sst/absent-not-blank-sd/array shape.
+      Remaining before H2 numbers: **uesimtun↔vxgateway bridging** — the last-mile
+      item: measured traffic must ride the PDU session tunnels instead of the
+      loopback addresses used for this validation — **GatewayService wiring for
+      s-nssai slices** (the proto/RPC design decision that turns the lifecycle module
+      into something `vxedge up` can call), image-digest recording into results
+      metadata.*
 - [ ] URSP-style `slice_policy`: per-node traffic-class → slice routing over concurrent PDU
       sessions (UE-side slicing; mirrors Snapdragon Auto URSP behavior)
 - [ ] SONiC-VS twin: render slice intent to SONiC config, boot VS qcow2, verify config parity
