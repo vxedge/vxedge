@@ -274,6 +274,55 @@ exp-001 measurements).
       Remaining: image-digest recording into results metadata (not H2-
       blocking — a reproducibility/provenance nicety for the eventual
       results archive).*
+- [ ] **H2 campaign (exp-010), in progress since 2026-07-17.** Started once
+      the mechanism (above) closed the last blocker. Staged plan: model H2
+      in SysML v2 first (M3, `vxmodels`) → hand-derive `exp-010.yaml` →
+      real `TrafficService`/`ExperimentService` RPC surface (no bash-runner
+      hardcoding, matching H1's own gap) → run the campaign → compare
+      against exp-001's frozen numbers. Progress so far:
+      - **Model authored, model-first, gate 1 real** —
+        `vxmodels/models/experiments/exp-010-h2-real-slicing.sysml`:
+        `Exp010RealSlicingComparison`, reusing exp-001's own
+        `CampaignFrame`/`InterferenceSource` unchanged plus a new
+        `SliceMode` (vlan/snssai) variant dimension, so the vlan arm is
+        directly comparable to exp-001's frozen archive. Parses/type-checks
+        clean against the pinned SysIDE toolchain (digest-verified before
+        use), no regression to the existing models. Honest gap recorded in
+        the model itself: `vxmodel` (M2) doesn't exist yet, so
+        `exp-010.yaml` needs hand-derivation, not automated rendering, until
+        it lands — gate 2 of the double gate runs partially (real `vxedge
+        manifest validate --json`, no render step) for now.
+      - **The probe data path, delivered and live-verified same day**: H1's
+        methodology runs `vxprobe reflect` *on* the device under test, not
+        pinged from outside — so H2 needs a reflector running inside each
+        UE's own pod, reachable through its actual PDU session. `vxprobe`
+        (`vxagents`) is now baked into the `vx5g-ran` image (staged via a
+        small script, `containers/fiveg/build-vx5g-ran.sh` — `vxagents` is
+        a separate repo, unreachable from this build context directly,
+        the standard cross-repo-binary staging pattern) and a new
+        `fiveg::lifecycle::ue_probe_up` starts it, joined to the UE's pod.
+        **Live-caught a real bug, not a mechanism gap**: the first cut bound
+        the reflector to `0.0.0.0`. `vxprobe send` from the host reported
+        100% loss for both slices — but `uesimtun0`'s own RX packet counter
+        proved every probe genuinely arrived (RX +20 for 20 sent); the
+        failure was entirely on the *reply* side (TX +1). Root-caused, not
+        patched around: an unbound-source socket's reply route resolves
+        before the UE's own per-source policy rule
+        (`from <addr> lookup rt_uesimtun<i>`) can pin it to the tunnel, so
+        replies leaked out via UERANSIM's own unrelated `tap0` default
+        route instead. Fixed by waiting for the PDU-session address to
+        exist (`wait_for_ue_pdu_addr`, a bounded poll — not a fixed sleep,
+        since binding before registration completes would just fail
+        outright) and binding the reflector explicitly to it. **Live-
+        verified after the fix**: real `vxprobe send`/`reflect` round-trips
+        (not ping) through the actual bridge + PDU session, both slices
+        simultaneously: adas 300/300 received, 0% loss, p50 428 µs / p99
+        583 µs; infotainment 300/300 received, 0% loss, p50 488 µs / p99
+        685 µs. All 48 unit tests plus clippy/fmt stayed clean throughout.
+      Remaining: hand-derive `exp-010.yaml`, build the real `TrafficService`/
+      `ExperimentService` RPC surface (the engineering-quality bar set for
+      this campaign — no ad-hoc shell runner like H1's), then actually run
+      the campaign and compare against exp-001.
 - [ ] **Image-digest recording into results metadata.** Sized 2026-07-17,
       not started: not a small add — there is no results-metadata-writing
       code in `vxedge-core` yet to hook a `podman inspect --format
