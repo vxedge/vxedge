@@ -43,9 +43,9 @@ pub mod render;
 pub mod subscriber;
 
 pub use lifecycle::{
-    FIVEG_UPLINK_VLAN, FiveGLifecycleConfig, FiveGLifecycleError, FiveGStatus, bridge_down,
-    bridge_host_veth, bridge_up, fiveg_down, fiveg_status, fiveg_up, pod_exists, pod_pid, ue_down,
-    ue_pod_name, ue_probe_up, ue_up,
+    BRIDGE_ATTACH_CN_ADDR, FIVEG_UPLINK_VLAN, FiveGLifecycleConfig, FiveGLifecycleError,
+    FiveGStatus, bridge_down, bridge_host_veth, bridge_up, fiveg_down, fiveg_status, fiveg_up,
+    pod_exists, pod_pid, ue_down, ue_pod_name, ue_probe_up, ue_up, wait_for_ue_pdu_addr,
 };
 pub use plan::{FiveGPlan, FiveGPlanError, SliceSession};
 pub use render::{ConfigFile, render_all};

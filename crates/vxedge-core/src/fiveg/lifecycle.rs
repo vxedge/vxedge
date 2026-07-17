@@ -507,8 +507,10 @@ const UE_PDU_ADDR_TIMEOUT: Duration = Duration::from_secs(15);
 /// dependency-phase settling elsewhere in this module, a fixed sleep here
 /// risks either failing outright on a slow first run or silently binding
 /// too early). A bounded poll is the correct tool for a real readiness
-/// condition, not a magic number.
-fn wait_for_ue_pdu_addr(ue_pid: u32) -> Result<String, FiveGLifecycleError> {
+/// condition, not a magic number. `pub` so `traffic::lifecycle` can reuse
+/// this exact discovery for its own s-nssai targets rather than
+/// reimplementing it a second way.
+pub fn wait_for_ue_pdu_addr(ue_pid: u32) -> Result<String, FiveGLifecycleError> {
     let deadline = std::time::Instant::now() + UE_PDU_ADDR_TIMEOUT;
     loop {
         if let Ok(out) = nsenter_ip(ue_pid, &["-4", "-o", "addr", "show", "uesimtun0"]) {

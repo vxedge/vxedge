@@ -5,6 +5,8 @@
 //! for what `vxperiments/scripts/run-exp-001.sh` currently hand-assembles
 //! with raw `ip addr`/`ip link add ... type vlan` and hardcoded addresses.
 
+pub mod lifecycle;
 pub mod plan;
 
+pub use lifecycle::{TrafficLifecycleError, profile_down, profile_up};
 pub use plan::{ProfileEndpoint, ResolvedProfile, TrafficPlan, TrafficPlanError};
