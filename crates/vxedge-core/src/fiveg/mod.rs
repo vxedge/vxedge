@@ -16,8 +16,10 @@
 //! 10.47.0.2 on uesimtun1).
 //!
 //! [`lifecycle`] (2026-07-17) ports that proven `pod-up.sh` sequence into a
-//! tested Rust module — pod up/down/status, idempotent. It is the
-//! *mechanism* only: not yet wired to any vxAPI RPC or manifest verb.
+//! tested Rust module — pod up/down/status, idempotent — and is now wired
+//! into `GatewayService` (`vxedged`): `vxedge up/down/status` provision the
+//! CN/RAN pods and attach the CN pod to the real `vxbr0` whenever a
+//! manifest declares `mode: s-nssai` slices.
 //!
 //! [`subscriber`] (2026-07-17) replaces `dbctl`-shelling with direct
 //! `subscribers` document writes — sourced straight from the plan, never
@@ -25,9 +27,15 @@
 //! source: its SD-less fallback (`add_ue_with_apn`) hardcoded `sst: 1`,
 //! silently mis-registering any slice without an SD under the wrong SST.
 //!
-//! Remaining before H2 numbers: GatewayService wiring so `mode: s-nssai`
-//! slices provision through the normal `vxedge up` lifecycle, and
-//! uesimtun↔vxgateway bridging so measured traffic rides the PDU sessions.
+//! [`lifecycle::ue_up`]/[`lifecycle::ue_down`] (2026-07-17) give each UE its
+//! own pod/netns, joined to gNB via a bridge internal to the RAN pod —
+//! fixes a real bug found live during the bridging proof: UERANSIM
+//! hardcodes routing table `1000` for its per-UE default route, so UEs
+//! sharing one netns collide on it. Still started separately per test run,
+//! not by `fiveg_up` (the vxprobe/vxtraffic pattern).
+//!
+//! Remaining before H2 numbers: URSP-style `slice_policy`, image-digest
+//! recording into results metadata.
 
 pub mod lifecycle;
 pub mod plan;
@@ -36,7 +44,8 @@ pub mod subscriber;
 
 pub use lifecycle::{
     FIVEG_UPLINK_VLAN, FiveGLifecycleConfig, FiveGLifecycleError, FiveGStatus, bridge_down,
-    bridge_host_veth, bridge_up, fiveg_down, fiveg_status, fiveg_up, pod_pid,
+    bridge_host_veth, bridge_up, fiveg_down, fiveg_status, fiveg_up, pod_exists, pod_pid, ue_down,
+    ue_pod_name, ue_up,
 };
 pub use plan::{FiveGPlan, FiveGPlanError, SliceSession};
 pub use render::{ConfigFile, render_all};

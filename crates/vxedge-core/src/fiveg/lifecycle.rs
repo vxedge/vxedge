@@ -5,21 +5,29 @@
 //! container groups — `containers/fiveg/pod-up.sh` is the shell reference
 //! this module replaces with a tested, typed Rust path).
 //!
-//! **Two pods, not one** (found necessary live, 2026-07-17): the RAN (gNB +
-//! UEs) cannot share a network namespace with the CN (AMF + per-slice
-//! SMF/UPF) — co-located, the UE's own `uesimtun<i>` and the UPF's
-//! `vxtun<i>` install *identical* connected routes for the same UE subnet,
-//! an ambiguity that never occurs in a real deployment (the UE is a
-//! physically separate device). `fiveg_up` creates a CN pod and a RAN pod,
-//! joins them with a veth pair on the transit subnet
-//! ([`super::plan::TRANSIT_SUBNET`] — the N2/N3 equivalent), starts the gNB
-//! in the RAN pod, and explicitly configures each UPF's tun device (Open5GS
-//! creates the raw device but — standard bare-metal practice — leaves IP
-//! configuration to the deployer; found live: it comes up `DOWN`, unrouted,
-//! with nothing configuring it otherwise). Individual UEs are started
-//! separately per test run against the RAN pod (the vxprobe/vxtraffic
-//! pattern: infrastructure is provisioned here, traffic is driven by a
-//! separate runner).
+//! **Two pods plus one pod per UE** (found necessary live, 2026-07-17, in
+//! two rounds). Round one: the RAN (gNB) cannot share a network namespace
+//! with the CN (AMF + per-slice SMF/UPF) — co-located, the UE's own
+//! `uesimtun<i>` and the UPF's `vxtun<i>` install *identical* connected
+//! routes for the same UE subnet, an ambiguity that never occurs in a real
+//! deployment (the UE is a physically separate device). `fiveg_up` creates
+//! a CN pod and a RAN pod, joins them with a veth pair on the transit
+//! subnet ([`super::plan::TRANSIT_SUBNET`] — the N2/N3 equivalent), starts
+//! the gNB in the RAN pod, and explicitly configures each UPF's tun device
+//! (Open5GS creates the raw device but — standard bare-metal practice —
+//! leaves IP configuration to the deployer; found live: it comes up
+//! `DOWN`, unrouted, with nothing configuring it otherwise). Round two,
+//! found live during the bridging proof: multiple UEs sharing the RAN
+//! pod's netns also collide — UERANSIM hardcodes routing table `1000` for
+//! its per-UE default route rather than deriving it from the interface, so
+//! a second UE's route insert fails against the first's. Fixed the same
+//! way as round one: each UE gets its **own** pod ([`ue_up`]/[`ue_down`]),
+//! joined to gNB via a small bridge entirely internal to the RAN pod's own
+//! netns ([`ran_bridge_name`]) rather than a shared netns. Individual UEs
+//! are still started separately per test run, not by `fiveg_up` itself
+//! (the vxprobe/vxtraffic pattern: infrastructure is provisioned here,
+//! traffic is driven by a separate runner) — `fiveg_up` only brings up the
+//! CN pod and the (now UE-less) RAN pod running gNB alone.
 //!
 //! Scope note: this module is the *mechanism* — bring a `FiveGPlan` up as
 //! running pods, observe them, tear them down, and (via [`bridge_up`]/
@@ -96,6 +104,30 @@ impl Default for FiveGLifecycleConfig {
 fn transit_veth_names(pod_name: &str) -> (String, String) {
     let base: String = pod_name.chars().take(10).collect();
     (format!("{base}-cn0"), format!("{base}-ran0"))
+}
+
+/// Bridge inside the RAN pod's own netns that unifies its two kinds of
+/// members: the transit veth's RAN-side peer (reaching the CN pod) and one
+/// veth per UE pod (reaching each UE). `RAN_TRANSIT_ADDR` lives on this
+/// bridge rather than directly on the transit veth, so it stays reachable
+/// from both. Entirely internal to fiveg — never touches the host or
+/// `vxgateway`'s own bridge.
+fn ran_bridge_name(ran_pod_name: &str) -> String {
+    let base: String = ran_pod_name.chars().take(10).collect();
+    format!("{base}-br")
+}
+
+/// Per-UE veth pair names, session-index-keyed (not slice-id-keyed — slice
+/// ids are unbounded-length manifest strings, unsafe to fit in IFNAMSIZ).
+fn ue_veth_names(ran_pod_name: &str, index: usize) -> (String, String) {
+    let base: String = ran_pod_name.chars().take(6).collect();
+    (format!("{base}-ue{index}a"), format!("{base}-ue{index}b"))
+}
+
+/// Per-UE pod name — unlike interface names, pod names aren't IFNAMSIZ-
+/// constrained, so this uses the slice id directly (readable, debuggable).
+pub fn ue_pod_name(ran_pod_name: &str, slice_id: &str) -> String {
+    format!("{ran_pod_name}-ue-{slice_id}")
 }
 
 /// Settle time between dependency phases. A fixed sleep, not a health poll —
@@ -322,12 +354,24 @@ fn run_detached(pod: &str, cfg_dir: &Path, spec: &RunSpec) -> Result<(), FiveGLi
 /// mechanism side of the N2/N3 equivalent. Both ends are created on the
 /// host, then each is moved into its target pod's netns and addressed
 /// (`nsenter`, since podman pods aren't in `ip netns`'s named registry).
+///
+/// The RAN-side end lands on [`ran_bridge_name`], not directly on the RAN
+/// pod's own stack: with each UE now in its own pod/netns (found necessary
+/// live, 2026-07-17 — UERANSIM hardcodes routing table `1000` per UE, so
+/// UEs sharing one netns collide), gNB needs one address reachable from
+/// *both* the CN pod (across this transit veth) and every UE pod (each
+/// across its own veth, added later by [`ue_up`]) — a small internal
+/// bridge, entirely inside the RAN pod's netns, is what makes one address
+/// (`RAN_TRANSIT_ADDR`) reachable from an arbitrary number of separate
+/// peers, the same veth-into-bridge primitive used everywhere else in this
+/// codebase (`gateway::provision::apply_endpoints`, [`bridge_up`]).
 fn setup_transit_link(
     cfg: &FiveGLifecycleConfig,
     cn_pid: u32,
     ran_pid: u32,
 ) -> Result<(), FiveGLifecycleError> {
     let (cn_side, ran_side) = transit_veth_names(&cfg.pod_name);
+    let bridge = ran_bridge_name(&cfg.ran_pod_name);
     host_ip(&[
         "link", "add", &cn_side, "type", "veth", "peer", "name", &ran_side,
     ])?;
@@ -338,9 +382,13 @@ fn setup_transit_link(
     nsenter_ip(cn_pid, &["addr", "add", &cn_addr, "dev", &cn_side])?;
     nsenter_ip(cn_pid, &["link", "set", &cn_side, "up"])?;
 
-    let ran_addr = format!("{RAN_TRANSIT_ADDR}/24");
-    nsenter_ip(ran_pid, &["addr", "add", &ran_addr, "dev", &ran_side])?;
+    nsenter_ip(ran_pid, &["link", "add", &bridge, "type", "bridge"])?;
+    nsenter_ip(ran_pid, &["link", "set", &bridge, "up"])?;
+    nsenter_ip(ran_pid, &["link", "set", &ran_side, "master", &bridge])?;
     nsenter_ip(ran_pid, &["link", "set", &ran_side, "up"])?;
+
+    let ran_addr = format!("{RAN_TRANSIT_ADDR}/24");
+    nsenter_ip(ran_pid, &["addr", "add", &ran_addr, "dev", &bridge])?;
     Ok(())
 }
 
@@ -356,6 +404,95 @@ fn setup_upf_tun(cn_pid: u32, session: &SliceSession) -> Result<(), FiveGLifecyc
     nsenter_ip(cn_pid, &["addr", "add", &addr, "dev", &session.tun_dev])?;
     nsenter_ip(cn_pid, &["link", "set", &session.tun_dev, "up"])?;
     Ok(())
+}
+
+/// Bring one UE up in its **own** pod, joined to the RAN pod's gNB-access
+/// bridge ([`ran_bridge_name`]) by a dedicated veth. This is the actual fix
+/// for the routing-table collision found live 2026-07-17 (the bridging
+/// live-proof): UERANSIM hardcodes routing table `1000` for its per-UE
+/// default route rather than deriving it from the interface, so two UEs
+/// sharing one netns collide the moment the second one registers — a real
+/// deployment never hits this (UERANSIM's own intended model is one UE per
+/// netns). Giving each UE a fully private pod/netns is the same fix
+/// already proven for the CN/RAN split one layer up, applied one layer
+/// down. Idempotent: an already-existing UE pod is left untouched.
+///
+/// The transit link ([`setup_transit_link`], called by [`fiveg_up`]) must
+/// already exist — `ran_pid` is the RAN pod's own PID ([`pod_pid`]) and
+/// `index` is this session's position in `plan.sessions` (used only for
+/// IFNAMSIZ-safe veth naming, [`ue_veth_names`] — pod names use the slice
+/// id directly, unconstrained).
+pub fn ue_up(
+    cfg: &FiveGLifecycleConfig,
+    cfg_dir: &Path,
+    ran_pid: u32,
+    index: usize,
+    session: &SliceSession,
+) -> Result<String, FiveGLifecycleError> {
+    let pod = ue_pod_name(&cfg.ran_pod_name, &session.slice_id);
+    if pod_exists(&pod)? {
+        return Ok(format!("UE pod `{pod}` already up (idempotent)"));
+    }
+    podman(&["pod".into(), "create".into(), "--name".into(), pod.clone()])?;
+    podman(&["pod".into(), "start".into(), pod.clone()])?;
+    let ue_pid = pod_pid(&pod)?;
+
+    let (ran_side, ue_side) = ue_veth_names(&cfg.ran_pod_name, index);
+    let bridge = ran_bridge_name(&cfg.ran_pod_name);
+    host_ip(&[
+        "link", "add", &ran_side, "type", "veth", "peer", "name", &ue_side,
+    ])?;
+    host_ip(&["link", "set", &ran_side, "netns", &ran_pid.to_string()])?;
+    host_ip(&["link", "set", &ue_side, "netns", &ue_pid.to_string()])?;
+
+    nsenter_ip(ran_pid, &["link", "set", &ran_side, "master", &bridge])?;
+    nsenter_ip(ran_pid, &["link", "set", &ran_side, "up"])?;
+
+    let ue_addr = format!("{}/24", session.ue_ran_link_addr);
+    nsenter_ip(ue_pid, &["addr", "add", &ue_addr, "dev", &ue_side])?;
+    nsenter_ip(ue_pid, &["link", "set", &ue_side, "up"])?;
+
+    run_detached(
+        &pod,
+        cfg_dir,
+        &RunSpec {
+            name: "ue".to_string(),
+            image: cfg.ran_image.clone(),
+            extra_flags: vec![
+                "--cap-add=NET_ADMIN".to_string(),
+                "--device".to_string(),
+                "/dev/net/tun".to_string(),
+            ],
+            cmd: vec![
+                "nr-ue".to_string(),
+                "-c".to_string(),
+                format!("/etc/vx5g/ueransim/ue-{}.yaml", session.slice_id),
+            ],
+        },
+    )?;
+
+    Ok(format!(
+        "UE pod `{pod}` up, joined to gNB via {bridge} at {}",
+        session.ue_ran_link_addr
+    ))
+}
+
+/// Tear one UE's pod down. Idempotent (`podman pod rm --ignore`) — its
+/// veth is destroyed automatically with the pod's netns, same as
+/// [`fiveg_down`]'s transit link.
+pub fn ue_down(
+    cfg: &FiveGLifecycleConfig,
+    session: &SliceSession,
+) -> Result<String, FiveGLifecycleError> {
+    let pod = ue_pod_name(&cfg.ran_pod_name, &session.slice_id);
+    podman(&[
+        "pod".into(),
+        "rm".into(),
+        "-f".into(),
+        "--ignore".into(),
+        pod.clone(),
+    ])?;
+    Ok(format!("UE pod `{pod}` down"))
 }
 
 /// Address for the CN pod's side of [`bridge_up`]'s attachment — distinct
@@ -875,5 +1012,40 @@ network:
     fn bridge_attach_addressing_is_distinct_from_transit_subnet() {
         assert_ne!(BRIDGE_ATTACH_SUBNET, super::super::plan::TRANSIT_SUBNET);
         assert_eq!(BRIDGE_ATTACH_CN_ADDR, "10.98.0.1");
+    }
+
+    #[test]
+    fn ran_bridge_name_fits_ifnamsiz_and_is_derived_from_ran_pod_name() {
+        let br = ran_bridge_name("vx5g-ran");
+        assert_eq!(br, "vx5g-ran-br");
+        assert!(br.len() <= 15, "{br} exceeds IFNAMSIZ");
+
+        let br = ran_bridge_name("a-very-long-custom-ran-pod-name");
+        assert!(br.len() <= 15, "{br} exceeds IFNAMSIZ");
+    }
+
+    #[test]
+    fn ue_veth_names_fit_ifnamsiz_and_are_distinct_per_index() {
+        let (ran0, ue0) = ue_veth_names("vx5g-ran", 0);
+        let (ran1, ue1) = ue_veth_names("vx5g-ran", 1);
+        assert_ne!(ran0, ran1, "different UEs must get different veth names");
+        assert_ne!(ue0, ue1);
+        for name in [&ran0, &ue0, &ran1, &ue1] {
+            assert!(name.len() <= 15, "{name} exceeds IFNAMSIZ");
+        }
+
+        // Max slice index (MAX_SNSSAI_SLICES - 1 = 15) must still fit.
+        let (ran15, ue15) = ue_veth_names("a-very-long-custom-ran-pod-name", 15);
+        assert!(ran15.len() <= 15, "{ran15} exceeds IFNAMSIZ");
+        assert!(ue15.len() <= 15, "{ue15} exceeds IFNAMSIZ");
+    }
+
+    #[test]
+    fn ue_pod_name_is_stable_and_slice_id_keyed() {
+        assert_eq!(ue_pod_name("vx5g-ran", "adas"), "vx5g-ran-ue-adas");
+        assert_ne!(
+            ue_pod_name("vx5g-ran", "adas"),
+            ue_pod_name("vx5g-ran", "infotainment")
+        );
     }
 }

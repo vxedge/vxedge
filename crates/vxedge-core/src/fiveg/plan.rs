@@ -86,6 +86,19 @@ pub struct SliceSession {
     pub tun_dev: String,
     /// UE SUPI (`imsi-99970000000000<1+i>`), registered against the lab PLMN.
     pub supi: String,
+    /// This UE's own address (`10.99.0.<50+i>`) on the RAN pod's internal
+    /// gNB-access bridge — reachable from gNB (`ran_transit_addr`, the
+    /// bridge's own address) so `nr-ue`'s outbound socket to
+    /// `gnbSearchList` has a source address and a route. Unrelated to
+    /// `ue_subnet` (the UE's *own* PDU-session data IP, assigned only once
+    /// registration succeeds) — this is purely the transport the UE's
+    /// control-plane process itself runs over, before any PDU session
+    /// exists. Offset well clear of `upf_gtpu_addr`'s `10.99.0.<10+i>`
+    /// range (max index 15 → `.25`) even though they live on different
+    /// pods' interfaces and would never literally collide at the kernel
+    /// level — same subnet, so IP-level uniqueness still matters for
+    /// routing consistency across it.
+    pub ue_ran_link_addr: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,8 +125,15 @@ pub struct FiveGPlan {
     /// Subscriber/policy database (MongoDB inside the CN pod).
     pub db_uri: String,
     /// RAN pod's transit address — gNB's link/NGAP/GTP-U bind address
-    /// (`RAN_TRANSIT_ADDR`), and what the UE's simulated radio search
-    /// targets (gNB and UEs share the RAN pod's netns).
+    /// (`RAN_TRANSIT_ADDR`), and what every UE's `gnbSearchList` dials.
+    /// Lives on a bridge internal to the RAN pod's own netns
+    /// (`fiveg::lifecycle::ran_bridge_name`), not directly on any single
+    /// veth — each UE now runs in its own pod/netns
+    /// (`fiveg::lifecycle::ue_up`), reachable via its own veth into that
+    /// bridge, so this one address stays reachable from all of them plus
+    /// the CN pod, without any two UEs sharing a network namespace (found
+    /// live 2026-07-17: UERANSIM hardcodes routing table `1000` for its
+    /// per-UE default route, so co-located UEs collide on it).
     pub ran_transit_addr: String,
     pub sessions: Vec<SliceSession>,
 }
@@ -190,6 +210,7 @@ impl FiveGPlan {
                 tun_dev: format!("vxtun{i}"),
                 // 15-digit IMSI: MCC(3) + MNC(2) + 10-digit MSIN.
                 supi: format!("imsi-{}{}{:010}", PLMN_MCC, PLMN_MNC, 1 + i),
+                ue_ran_link_addr: format!("10.99.0.{}", 50 + i),
             });
         }
 
@@ -249,16 +270,39 @@ network:
         assert_eq!(adas.ue_subnet, "10.46.0.0/16");
         assert_eq!(adas.smf_addr, "127.0.1.10");
         assert_eq!(adas.upf_gtpu_addr, "10.99.0.10");
+        assert_eq!(adas.ue_ran_link_addr, "10.99.0.50");
         assert_eq!(adas.supi, "imsi-999700000000001");
         let info = &plan.sessions[1];
         assert_eq!(info.sd, None);
         assert_eq!(info.ue_subnet, "10.47.0.0/16");
         assert_eq!(info.upf_gtpu_addr, "10.99.0.11");
+        assert_eq!(info.ue_ran_link_addr, "10.99.0.51");
         assert_eq!(info.supi, "imsi-999700000000002");
         assert_eq!(plan.amf_ngap_addr, CN_TRANSIT_ADDR);
         assert_eq!(plan.ran_transit_addr, RAN_TRANSIT_ADDR);
         // Same manifest, same plan — the reproducibility contract.
         assert_eq!(plan, FiveGPlan::from_manifest(&m).expect("plans again"));
+    }
+
+    #[test]
+    fn ue_ran_link_addr_never_collides_with_upf_gtpu_addr_even_at_max_slices() {
+        let slices: String = (0..MAX_SNSSAI_SLICES)
+            .map(|i| {
+                format!(
+                    "    - {{ id: s{i}, mode: s-nssai, s_nssai: {{ sst: 1, sd: '{i:06x}' }} }}\n"
+                )
+            })
+            .collect();
+        let m = manifest(&slices);
+        let plan = FiveGPlan::from_manifest(&m).expect("plans at the max slice count");
+        let gtpu: std::collections::HashSet<_> =
+            plan.sessions.iter().map(|s| &s.upf_gtpu_addr).collect();
+        let link: std::collections::HashSet<_> =
+            plan.sessions.iter().map(|s| &s.ue_ran_link_addr).collect();
+        assert!(
+            gtpu.is_disjoint(&link),
+            "upf_gtpu_addr and ue_ran_link_addr ranges must never overlap on the shared transit subnet"
+        );
     }
 
     #[test]

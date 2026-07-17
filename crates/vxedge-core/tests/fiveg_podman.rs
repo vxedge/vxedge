@@ -20,7 +20,10 @@
 //!     cargo test -p vxedge-core --test fiveg_podman -- --ignored --nocapture
 
 use vxedge_core::ExperimentManifest;
-use vxedge_core::fiveg::{FiveGLifecycleConfig, FiveGPlan, fiveg_down, fiveg_status, fiveg_up};
+use vxedge_core::fiveg::{
+    FiveGLifecycleConfig, FiveGPlan, SliceSession, fiveg_down, fiveg_status, fiveg_up, pod_exists,
+    pod_pid, ue_down, ue_pod_name, ue_up,
+};
 
 const MANIFEST: &str = r#"
 experiment: { id: fiveg-podman-test, name: fiveg lifecycle integration }
@@ -30,11 +33,18 @@ network:
     - { id: infotainment, mode: s-nssai, s_nssai: { sst: 2, sd: '000002' } }
 "#;
 
-/// Removes both test pods even if an assertion panics mid-test.
-struct PodGuard(FiveGLifecycleConfig);
+/// Removes both test pods, plus any UE pods brought up, even if an
+/// assertion panics mid-test.
+struct PodGuard {
+    cfg: FiveGLifecycleConfig,
+    ue_sessions: Vec<SliceSession>,
+}
 impl Drop for PodGuard {
     fn drop(&mut self) {
-        let _ = fiveg_down(&self.0);
+        for session in &self.ue_sessions {
+            let _ = ue_down(&self.cfg, session);
+        }
+        let _ = fiveg_down(&self.cfg);
     }
 }
 
@@ -50,7 +60,10 @@ fn fiveg_up_brings_cn_and_ran_pods_up_idempotently_then_tears_down() {
         core_image: "vx5g-core".to_string(),
         ran_image: "vx5g-ran".to_string(),
     };
-    let _guard = PodGuard(cfg.clone());
+    let mut guard = PodGuard {
+        cfg: cfg.clone(),
+        ue_sessions: vec![],
+    };
 
     let up_msg = fiveg_up(&plan, runtime_dir.path(), &cfg).expect("fiveg_up");
     assert!(up_msg.contains("6 dependency phases"));
@@ -61,7 +74,7 @@ fn fiveg_up_brings_cn_and_ran_pods_up_idempotently_then_tears_down() {
     assert!(status.ran_up, "RAN pod should be up");
     // CN: 8 core NFs + mongo + 2 slices x (smf, upf) = 13 containers.
     assert_eq!(status.containers.len(), 13, "{:?}", status.containers);
-    // RAN: gNB only (UEs are started separately per test run).
+    // RAN: gNB only (UEs now run in their own pods, not this one).
     assert_eq!(
         status.ran_containers.len(),
         1,
@@ -78,6 +91,40 @@ fn fiveg_up_brings_cn_and_ran_pods_up_idempotently_then_tears_down() {
     // Idempotent up: second call is a no-op, doesn't error or duplicate.
     let second = fiveg_up(&plan, runtime_dir.path(), &cfg).expect("fiveg_up idempotent");
     assert!(second.contains("already up"));
+
+    // Bring both UEs up, each in its own pod — the actual fix under test:
+    // UERANSIM's per-UE routing-table-1000 collision only happens when UEs
+    // share a netns, so proving each UE lands in its own pod (and that
+    // fiveg_up's pre-existing RAN pod stays gNB-only) is the acceptance
+    // bar here, not just "some container started".
+    let ran_pid = pod_pid(&cfg.ran_pod_name).expect("ran pod pid");
+    let cfg_dir = runtime_dir.path().join("fiveg-config");
+    for (i, session) in plan.sessions.iter().enumerate() {
+        let msg = ue_up(&cfg, &cfg_dir, ran_pid, i, session).expect("ue_up");
+        assert!(msg.contains("up"));
+        guard.ue_sessions.push(session.clone());
+        let pod = ue_pod_name(&cfg.ran_pod_name, &session.slice_id);
+        assert!(
+            pod_exists(&pod).expect("pod_exists"),
+            "UE pod `{pod}` should exist after ue_up"
+        );
+    }
+    // Idempotent ue_up: second call per UE is a no-op.
+    for (i, session) in plan.sessions.iter().enumerate() {
+        let msg = ue_up(&cfg, &cfg_dir, ran_pid, i, session).expect("ue_up idempotent");
+        assert!(msg.contains("already up"));
+    }
+
+    for session in &plan.sessions {
+        let msg = ue_down(&cfg, session).expect("ue_down");
+        assert!(msg.contains("down"));
+        let pod = ue_pod_name(&cfg.ran_pod_name, &session.slice_id);
+        assert!(
+            !pod_exists(&pod).expect("pod_exists after ue_down"),
+            "UE pod `{pod}` should be gone after ue_down"
+        );
+    }
+    guard.ue_sessions.clear();
 
     let down_msg = fiveg_down(&cfg).expect("fiveg_down");
     assert!(down_msg.contains("down"));
