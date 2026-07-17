@@ -213,7 +213,26 @@ pub fn apply_endpoints(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError
 /// [`apply_endpoints`] uses for zone nodes, but on
 /// `fiveg::lifecycle::FIVEG_UPLINK_VLAN` — the S-NSSAI slices attaching via
 /// this port carry no manifest `vlan:` of their own).
-pub fn apply_fiveg_uplink(sh: &Shell, host_veth: &str) -> Result<(), NetOpsError> {
+///
+/// Also gives the **host's own** network stack an address in
+/// `fiveg::lifecycle::BRIDGE_ATTACH_SUBNET` — found necessary live
+/// 2026-07-17: a host-generated `vxprobe send` targeting a UE's
+/// PDU-session address got 100% loss even with the CN pod's port
+/// correctly VLAN-tagged, because nothing gave the *host itself* an
+/// address reachable through that VLAN. A `vlan_filtering 1` bridge's own
+/// internal ("self") path needs its own explicit VLAN membership, same as
+/// any other port — `bridge vlan add dev <bridge> vid <n> self` — plus a
+/// `<bridge>.<vid>` subinterface to actually address it, the s-nssai
+/// equivalent of the vlan path's `<uplink_peer>.<vlan>` convention
+/// (`traffic::lifecycle::ensure_endpoint`'s `VlanUplinkFarSide` case).
+///
+/// Returns the created host-side interface name, for [`apply_fiveg_ue_routes`]
+/// to route each UE subnet through — an address in `BRIDGE_ATTACH_SUBNET`
+/// alone isn't enough for the host to reach a UE's PDU-session subnet, an
+/// *entirely different* subnet reachable only via the CN pod's own routing;
+/// found live the same day, one call deeper than this bug (see that
+/// function's own doc comment).
+pub fn apply_fiveg_uplink(sh: &Shell, host_veth: &str) -> Result<String, NetOpsError> {
     let vid = crate::fiveg::FIVEG_UPLINK_VLAN.to_string();
     sh.run_tolerate_exists(
         "bridge",
@@ -222,7 +241,100 @@ pub fn apply_fiveg_uplink(sh: &Shell, host_veth: &str) -> Result<(), NetOpsError
         ],
     )?;
     sh.run_tolerate_missing("bridge", &["vlan", "del", "dev", host_veth, "vid", "1"])?;
+
+    let bridge = host_veth_master(sh, host_veth)?;
+    sh.run_tolerate_exists(
+        "bridge",
+        &["vlan", "add", "dev", &bridge, "vid", &vid, "self"],
+    )?;
+    let host_iface = format!("{bridge}.{vid}");
+    if !sh.link_exists(&host_iface) {
+        sh.run(
+            "ip",
+            &[
+                "link",
+                "add",
+                "link",
+                &bridge,
+                "name",
+                &host_iface,
+                "type",
+                "vlan",
+                "id",
+                &vid,
+            ],
+        )?;
+    }
+    let host_addr = format!("{}/24", crate::fiveg::BRIDGE_ATTACH_HOST_ADDR);
+    sh.run_tolerate_exists("ip", &["addr", "add", &host_addr, "dev", &host_iface])?;
+    sh.run("ip", &["link", "set", &host_iface, "up"])?;
+    Ok(host_iface)
+}
+
+/// Route each s-nssai slice's UE subnet (`FiveGPlan::sessions[].ue_subnet`,
+/// e.g. `10.46.0.0/16`) through the CN pod
+/// (`fiveg::lifecycle::BRIDGE_ATTACH_CN_ADDR`), via the host-side VLAN
+/// subinterface [`apply_fiveg_uplink`] created and returned.
+///
+/// Found live 2026-07-17, immediately after fixing `apply_fiveg_uplink`'s
+/// own host-reachability gap: giving the host a *local* address in
+/// `BRIDGE_ATTACH_SUBNET` (`10.98.0.0/24`) still wasn't enough on its
+/// own — a UE's PDU-session subnet is a *completely different* subnet,
+/// reachable only through the CN pod's own internal routing
+/// (`ip_forward` between its bridge-attach interface and each UPF's tun
+/// device, already enabled by `bridge_up`). Without an explicit route,
+/// the host's kernel has no way to know that subnet exists at all, let
+/// alone that `BRIDGE_ATTACH_CN_ADDR` is the way to it — exactly the
+/// `sudo ip route add <ue_subnet> via 10.98.0.1 dev <bridge>` step every
+/// earlier manual verification script added by hand and this now
+/// replaces with real, tested code.
+pub fn apply_fiveg_ue_routes(
+    sh: &Shell,
+    host_iface: &str,
+    ue_subnets: &[String],
+) -> Result<(), NetOpsError> {
+    for subnet in ue_subnets {
+        sh.run_tolerate_exists(
+            "ip",
+            &[
+                "route",
+                "add",
+                subnet,
+                "via",
+                crate::fiveg::BRIDGE_ATTACH_CN_ADDR,
+                "dev",
+                host_iface,
+            ],
+        )?;
+    }
     Ok(())
+}
+
+/// Look up which bridge `host_veth` is currently enslaved to, so this stays
+/// correct regardless of the caller's own bridge name (`GatewayPlan.bridge`
+/// is always `vxbr0` today, but this function shouldn't assume it) —
+/// avoids threading a second parameter through every call site just to
+/// duplicate what `ip -json link show` already reports.
+fn host_veth_master(sh: &Shell, host_veth: &str) -> Result<String, NetOpsError> {
+    let out = sh.json("ip", &["-json", "link", "show", host_veth])?;
+    out.as_array()
+        .and_then(|a| a.first())
+        .and_then(|l| l.get("master"))
+        .and_then(|m| m.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| NetOpsError::Parse {
+            cmdline: format!("ip -json link show {host_veth}"),
+            detail: "no `master` field — is this veth actually attached to a bridge?".to_string(),
+        })
+}
+
+/// Remove the host-side VLAN subinterface [`apply_fiveg_uplink`] created
+/// (`<bridge>.<FIVEG_UPLINK_VLAN>`). Idempotent — a missing interface is
+/// not an error. Doesn't need `host_veth`: the interface name is fully
+/// determined by `bridge` + the fixed uplink VLAN id.
+pub fn teardown_fiveg_uplink(sh: &Shell, bridge: &str) -> Result<(), NetOpsError> {
+    let vid = crate::fiveg::FIVEG_UPLINK_VLAN;
+    sh.run_tolerate_missing("ip", &["link", "del", &format!("{bridge}.{vid}")])
 }
 
 /// Full apply, in dependency order.

@@ -14,6 +14,11 @@ pub enum PlanError {
     NoSlices,
     #[error("too many slices: {0} (max {MAX_SLICES})")]
     TooManySlices(usize),
+    #[error(
+        "slice `{0}` declares `vlan: {1}`, which is reserved for the 5G core's own uplink \
+         attachment (`fiveg::FIVEG_UPLINK_VLAN`) — pick a different VLAN id"
+    )]
+    VlanCollidesWithFiveGUplink(String, u16),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,16 +106,20 @@ impl GatewayPlan {
             .enumerate()
             .map(|(i, s)| {
                 let qos = s.qos.as_ref();
-                SlicePlan {
+                let vlan = s.vlan.expect("validated: vlan slice has vlan id");
+                if vlan == crate::fiveg::FIVEG_UPLINK_VLAN {
+                    return Err(PlanError::VlanCollidesWithFiveGUplink(s.id.clone(), vlan));
+                }
+                Ok(SlicePlan {
                     id: s.id.clone(),
-                    vlan: s.vlan.expect("validated: vlan slice has vlan id"),
+                    vlan,
                     min_rate_mbps: qos.and_then(|q| q.min_rate_mbps).unwrap_or(0).max(1),
                     max_rate_mbps: qos.and_then(|q| q.max_rate_mbps).unwrap_or(0).max(1),
                     priority: qos.and_then(|q| q.priority).unwrap_or(4),
                     class_minor: 0x10 + i as u16,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<_, PlanError>>()?;
 
         let snssai_slice_ids: Vec<String> = manifest_slices
             .iter()
@@ -245,6 +254,21 @@ zones:
         assert_eq!(plan.endpoints[0].peer, "vz0");
         // Determinism: same manifest, same plan.
         assert_eq!(plan, GatewayPlan::from_manifest(&manifest(BASE)).unwrap());
+    }
+
+    #[test]
+    fn rejects_vlan_colliding_with_the_reserved_fiveg_uplink_vlan() {
+        let yaml = r#"
+experiment: { id: exp-t, name: t }
+network:
+  slices:
+    - { id: adas, mode: vlan, vlan: 4000 }
+"#;
+        let err = GatewayPlan::from_manifest(&manifest(yaml)).unwrap_err();
+        assert!(matches!(
+            err,
+            PlanError::VlanCollidesWithFiveGUplink(id, 4000) if id == "adas"
+        ));
     }
 
     #[test]

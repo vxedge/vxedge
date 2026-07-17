@@ -219,6 +219,8 @@ impl GatewaySvc {
                             p.update(97, "attaching 5G core to vxbr0");
                             let sh = shell.clone();
                             let bridge = plan.bridge.clone();
+                            let ue_subnets: Vec<String> =
+                                fp.sessions.iter().map(|s| s.ue_subnet.clone()).collect();
                             blocking(move || {
                                 let cfg = FiveGLifecycleConfig::default();
                                 let cn_pid =
@@ -226,8 +228,15 @@ impl GatewaySvc {
                                 fiveg::bridge_up(&cfg, &bridge, cn_pid)
                                     .map_err(|e| e.to_string())?;
                                 let host_veth = fiveg::bridge_host_veth(&cfg.pod_name);
-                                gateway::provision::apply_fiveg_uplink(&sh, &host_veth)
-                                    .map_err(|e| e.to_string())
+                                let host_iface =
+                                    gateway::provision::apply_fiveg_uplink(&sh, &host_veth)
+                                        .map_err(|e| e.to_string())?;
+                                gateway::provision::apply_fiveg_ue_routes(
+                                    &sh,
+                                    &host_iface,
+                                    &ue_subnets,
+                                )
+                                .map_err(|e| e.to_string())
                             })
                             .await?;
 
@@ -275,9 +284,13 @@ impl GatewaySvc {
                             .await?;
 
                             p.update(50, "removing 5G core + uplink attachment");
+                            let sh = shell.clone();
+                            let bridge = plan.bridge.clone();
                             blocking(move || {
                                 let cfg = FiveGLifecycleConfig::default();
                                 fiveg::bridge_down(&cfg).map_err(|e| e.to_string())?;
+                                gateway::provision::teardown_fiveg_uplink(&sh, &bridge)
+                                    .map_err(|e| e.to_string())?;
                                 fiveg::fiveg_down(&cfg)
                                     .map(|_| ())
                                     .map_err(|e| e.to_string())

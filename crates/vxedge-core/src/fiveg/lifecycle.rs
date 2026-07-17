@@ -601,6 +601,16 @@ pub fn ue_probe_up(
 /// ↔ bridge, not CN pod ↔ RAN pod).
 pub const BRIDGE_ATTACH_SUBNET: &str = "10.98.0.0/24";
 pub const BRIDGE_ATTACH_CN_ADDR: &str = "10.98.0.1";
+/// The *host's own* address on this subnet — found necessary live
+/// 2026-07-17 wiring `TrafficService`: a host-generated `vxprobe send`
+/// targeting a UE's PDU-session address got 100% loss even though the CN
+/// pod's own port had correct VLAN membership (`apply_fiveg_uplink`),
+/// because *nothing* gave the host's own network stack a route into
+/// `BRIDGE_ATTACH_SUBNET` at all — `gateway::provision::apply_fiveg_uplink`
+/// now also creates a `<bridge>.<FIVEG_UPLINK_VLAN>` subinterface addressed
+/// here, the s-nssai equivalent of the vlan path's `<uplink_peer>.<vlan>`
+/// convention.
+pub const BRIDGE_ATTACH_HOST_ADDR: &str = "10.98.0.2";
 
 fn bridge_veth_names(pod_name: &str) -> (String, String) {
     let base: String = pod_name.chars().take(10).collect();
