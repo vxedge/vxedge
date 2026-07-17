@@ -16,20 +16,27 @@
 //! 10.47.0.2 on uesimtun1).
 //!
 //! [`lifecycle`] (2026-07-17) ports that proven `pod-up.sh` sequence into a
-//! tested Rust module — pod up/down/status, idempotent, subscriber
-//! provisioning sourced straight from the plan (not re-parsed YAML). It is
-//! the *mechanism* only: not yet wired to any vxAPI RPC or manifest verb.
+//! tested Rust module — pod up/down/status, idempotent. It is the
+//! *mechanism* only: not yet wired to any vxAPI RPC or manifest verb.
+//!
+//! [`subscriber`] (2026-07-17) replaces `dbctl`-shelling with direct
+//! `subscribers` document writes — sourced straight from the plan, never
+//! re-parsed YAML — fixing a real bug found by reading `dbctl`'s own
+//! source: its SD-less fallback (`add_ue_with_apn`) hardcoded `sst: 1`,
+//! silently mis-registering any slice without an SD under the wrong SST.
+//!
 //! Remaining before H2 numbers: GatewayService wiring so `mode: s-nssai`
-//! slices provision through the normal `vxedge up` lifecycle, explicit
-//! subscriber documents (dbctl's slice helper needs an SD), and
+//! slices provision through the normal `vxedge up` lifecycle, and
 //! uesimtun↔vxgateway bridging so measured traffic rides the PDU sessions.
 
 pub mod lifecycle;
 pub mod plan;
 pub mod render;
+pub mod subscriber;
 
 pub use lifecycle::{
     FiveGLifecycleConfig, FiveGLifecycleError, FiveGStatus, fiveg_down, fiveg_status, fiveg_up,
 };
 pub use plan::{FiveGPlan, FiveGPlanError, SliceSession};
 pub use render::{ConfigFile, render_all};
+pub use subscriber::{subscriber_insert_commands, subscriber_insert_script};

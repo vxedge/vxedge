@@ -12,17 +12,18 @@
 //! it is a proto/RPC design decision, not a mechanism one.
 //!
 //! Two-layer split for testability (rust-patterns: pure logic vs. I/O):
-//! [`core_run_specs`] and [`subscriber_commands`] are pure — they describe
-//! *what* to run, unit-tested without touching podman. [`fiveg_up`] and
-//! friends are the thin, untested-except-by-the-ignored-integration-test
-//! layer that actually execs `podman`.
+//! [`core_run_specs`] (here) and [`super::subscriber::subscriber_insert_commands`]
+//! are pure — they describe *what* to run, unit-tested without touching
+//! podman. [`fiveg_up`] and friends are the thin, untested-except-by-the-
+//! ignored-integration-test layer that actually execs `podman`.
 
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
 use super::plan::FiveGPlan;
-use super::render::{TEST_UE_KEY, TEST_UE_OPC, write_all};
+use super::render::write_all;
+use super::subscriber::subscriber_insert_commands;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FiveGLifecycleError {
@@ -170,43 +171,6 @@ pub fn core_run_specs(plan: &FiveGPlan, core_image: &str) -> Vec<Vec<RunSpec>> {
     ]
 }
 
-/// One `open5gs-dbctl` invocation per rendered UE, sourced directly from
-/// `FiveGPlan` — no round-trip through the rendered YAML (the plan already
-/// has supi/dnn/sst/sd; re-parsing text the plan itself produced would be a
-/// second source of truth for no benefit). Pure — testable without podman.
-///
-/// Known gap (tracked, `vxedge/TASKS.md` §4): `add_ue_with_slice` requires
-/// an SD; a session without one falls back to `add_ue_with_apn`, which
-/// registers the UE on Open5GS's *default* subscribed slice rather than the
-/// session's actual SST. Not a blocker for H2 (manifests always carry an SD
-/// for real S-NSSAI slices), but the eventual fix is writing the subscriber
-/// document directly instead of depending on dbctl's CLI surface.
-pub fn subscriber_commands(plan: &FiveGPlan) -> Vec<Vec<String>> {
-    plan.sessions
-        .iter()
-        .map(|s| match &s.sd {
-            Some(sd) => vec![
-                "open5gs-dbctl".to_string(),
-                "add_ue_with_slice".to_string(),
-                s.supi.trim_start_matches("imsi-").to_string(),
-                TEST_UE_KEY.to_string(),
-                TEST_UE_OPC.to_string(),
-                s.dnn.clone(),
-                s.sst.to_string(),
-                sd.clone(),
-            ],
-            None => vec![
-                "open5gs-dbctl".to_string(),
-                "add_ue_with_apn".to_string(),
-                s.supi.trim_start_matches("imsi-").to_string(),
-                TEST_UE_KEY.to_string(),
-                TEST_UE_OPC.to_string(),
-                s.dnn.clone(),
-            ],
-        })
-        .collect()
-}
-
 fn run_detached(pod: &str, cfg_dir: &Path, spec: &RunSpec) -> Result<(), FiveGLifecycleError> {
     let mut args: Vec<String> = vec![
         "run".into(),
@@ -258,7 +222,7 @@ pub fn fiveg_up(
         std::thread::sleep(PHASE_SETTLE);
     }
 
-    for cmd in subscriber_commands(plan) {
+    for cmd in subscriber_insert_commands(plan) {
         let mut args: Vec<String> = vec![
             "run".into(),
             "--rm".into(),
@@ -429,40 +393,10 @@ network:
         );
     }
 
-    #[test]
-    fn subscriber_with_sd_uses_add_ue_with_slice() {
-        let cmds = subscriber_commands(&plan_two_slices());
-        assert_eq!(cmds.len(), 2);
-        assert_eq!(
-            cmds[0],
-            vec![
-                "open5gs-dbctl",
-                "add_ue_with_slice",
-                "999700000000001",
-                TEST_UE_KEY,
-                TEST_UE_OPC,
-                "adas",
-                "1",
-                "000001",
-            ]
-        );
-    }
-
-    #[test]
-    fn subscriber_without_sd_falls_back_to_add_ue_with_apn() {
-        let cmds = subscriber_commands(&plan_two_slices());
-        assert_eq!(
-            cmds[1],
-            vec![
-                "open5gs-dbctl",
-                "add_ue_with_apn",
-                "999700000000002",
-                TEST_UE_KEY,
-                TEST_UE_OPC,
-                "infotainment",
-            ]
-        );
-    }
+    // Subscriber-command tests moved to subscriber.rs (2026-07-17): the
+    // dbctl-based codepath they tested is gone, replaced by direct MongoDB
+    // document writes that fix a real bug (dbctl's SD-less fallback
+    // hardcoded sst=1, ignoring the slice's actual SST).
 
     #[test]
     fn default_config_matches_the_containers_fiveg_images() {
