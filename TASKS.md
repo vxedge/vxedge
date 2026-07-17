@@ -274,8 +274,31 @@ exp-001 measurements).
       Remaining: image-digest recording into results metadata (not H2-
       blocking — a reproducibility/provenance nicety for the eventual
       results archive).*
-- [ ] URSP-style `slice_policy`: per-node traffic-class → slice routing over concurrent PDU
-      sessions (UE-side slicing; mirrors Snapdragon Auto URSP behavior)
+- [ ] **Image-digest recording into results metadata.** Sized 2026-07-17,
+      not started: not a small add — there is no results-metadata-writing
+      code in `vxedge-core` yet to hook a `podman inspect --format
+      '{{.RepoDigests}}'`-style lookup into. `vxedge telemetry collect`
+      (ARCHITECTURE.md §16, the natural home for this) isn't implemented
+      here; the actual results-artifact pipeline may live in `vxtelemetry`
+      or `vxperiments` instead. First task before writing any digest-lookup
+      code is finding/reading whichever of those repos actually owns
+      results-archive writing today. Not H2-blocking.
+- [ ] **URSP-style `slice_policy`.** Sized 2026-07-17, not started: not a
+      small add — the manifest schema (ARCHITECTURE.md §6.1) is `match:
+      <traffic class|dscp|app id> → slice: <slice-id>` **per zone node**,
+      meaning a single real compute node needs *multiple concurrent PDU
+      sessions* (one per slice) with traffic-class-based policy routing
+      selecting between them. But `FiveGPlan`'s current model is 1 UE = 1
+      `SliceSession` = 1 slice — no UE has more than one PDU session.
+      Supporting URSP means: (1) reworking `FiveGPlan`/`SliceSession` to let
+      one UE carry several concurrent sessions across different S-NSSAIs,
+      (2) rendering multiple `sessions:` entries into a single `ue-*.yaml`
+      (UERANSIM supports this; not yet exercised here), (3) real DSCP/`tc`
+      policy routing on the node side selecting which `uesimtun<i>` a given
+      traffic class rides. This is a real feature needing its own design
+      pass, not a follow-up patch — per-node traffic-class → slice routing
+      over concurrent PDU sessions (UE-side slicing; mirrors Snapdragon Auto
+      URSP behavior). Not H2-blocking.
 - [ ] SONiC-VS twin: render slice intent to SONiC config, boot VS qcow2, verify config parity
 - [ ] TrafficService: synthetic generator (pps/bandwidth/payload per profile)
 - [ ] TS SDK (connect-es) generation + tonic-web enablement; minimal web dashboard repo/dir
