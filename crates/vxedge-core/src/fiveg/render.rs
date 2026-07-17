@@ -8,13 +8,38 @@
 //! Each rendered file must parse as YAML — unit-tested below — and the full
 //! set is byte-stable for a given plan (reproducibility rule, §13).
 
+use std::path::Path;
+
 use super::plan::{FiveGPlan, SliceSession};
+
+/// Fixed Milenage test key/OPc used for every rendered UE subscriber
+/// (documented as test-only in `render_ue`). Shared with `lifecycle`'s
+/// `open5gs-dbctl` calls so the two never drift apart — one constant pair,
+/// not two copies that happen to match today.
+pub const TEST_UE_KEY: &str = "465B5CE8B199B49FAA5F0A2EE238A6BC";
+pub const TEST_UE_OPC: &str = "E8ED289DEBA952E4283B54E88E6183CA";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigFile {
     /// File name relative to the runtime config dir (e.g. `open5gs/amf.yaml`).
     pub name: String,
     pub contents: String,
+}
+
+/// Render and write the full config set under `dir` (created if absent),
+/// mirroring each [`ConfigFile::name`]'s relative path. Shared by the
+/// `render_fiveg` dev example and the `lifecycle` module — one write path.
+pub fn write_all(plan: &FiveGPlan, dir: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
+    let mut written = Vec::new();
+    for f in render_all(plan) {
+        let path = dir.join(&f.name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, &f.contents)?;
+        written.push(path);
+    }
+    Ok(written)
 }
 
 fn snssai_yaml(indent: &str, sst: u8, sd: Option<&str>) -> String {
@@ -268,8 +293,8 @@ supi: '{supi}'
 mcc: '{mcc}'
 mnc: '{mnc}'
 protectionScheme: 0
-key: '465B5CE8B199B49FAA5F0A2EE238A6BC'
-op: 'E8ED289DEBA952E4283B54E88E6183CA'
+key: '{key}'
+op: '{opc}'
 opType: 'OPC'
 amf: '8000'
 imei: '356938035643803'
@@ -311,6 +336,8 @@ integrityMaxRate:
         supi = s.supi,
         mcc = plan.mcc,
         mnc = plan.mnc,
+        key = TEST_UE_KEY,
+        opc = TEST_UE_OPC,
         gnb = plan.gnb_addr,
         dnn = s.dnn,
         nssai = nssai_entry,

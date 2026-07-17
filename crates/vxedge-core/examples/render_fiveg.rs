@@ -7,7 +7,8 @@
 
 use std::{env, fs, path::Path, process::ExitCode};
 use vxedge_core::ExperimentManifest;
-use vxedge_core::fiveg::{FiveGPlan, render_all};
+use vxedge_core::fiveg::FiveGPlan;
+use vxedge_core::fiveg::render::write_all;
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
@@ -31,12 +32,7 @@ fn run(manifest_path: &str, outdir: &str) -> Result<(), Box<dyn std::error::Erro
     let yaml = fs::read_to_string(manifest_path)?;
     let manifest = ExperimentManifest::from_yaml(&yaml)?;
     let plan = FiveGPlan::from_manifest(&manifest)?;
-    for f in render_all(&plan) {
-        let path = Path::new(outdir).join(&f.name);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&path, &f.contents)?;
+    for path in write_all(&plan, Path::new(outdir))? {
         println!("wrote {}", path.display());
     }
     Ok(())
