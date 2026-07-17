@@ -319,10 +319,62 @@ exp-001 measurements).
         simultaneously: adas 300/300 received, 0% loss, p50 428 µs / p99
         583 µs; infotainment 300/300 received, 0% loss, p50 488 µs / p99
         685 µs. All 48 unit tests plus clippy/fmt stayed clean throughout.
-      Remaining: hand-derive `exp-010.yaml`, build the real `TrafficService`/
-      `ExperimentService` RPC surface (the engineering-quality bar set for
-      this campaign — no ad-hoc shell runner like H1's), then actually run
-      the campaign and compare against exp-001.
+      - **`TrafficService` delivered and live-verified end to end, same
+        week**: new `vxedge-core::traffic` module (`TrafficPlan` — pure,
+        resolves `traffic_profiles.source/target` for both slice modes
+        against the *already-computed* `GatewayPlan.endpoints`, never
+        re-deriving peer-interface naming independently, per
+        `zone-backend-contract`'s join invariant; `traffic::lifecycle` —
+        real `vxprobe`/`vxtraffic` host processes, pidfile-tracked exactly
+        like `services.rs`'s own process backend, reusing
+        `fiveg::ue_probe_up`/`wait_for_ue_pdu_addr` outright for s-nssai
+        targets rather than reimplementing UE handling a second way).
+        `TrafficSvc` wired into `vxedged` (`vxapi-protobuf-design`
+        conventions: `Job`-returning `Up`/`Down`, dotted `"traffic.up"`
+        kind — the proto already had the right shape, no changes needed)
+        and the CLI (`vxedge traffic up/down --profile <id>`), replacing
+        the scaffold. `GatewayService.Up` also now brings up every s-nssai
+        session's **UE pod** (a real gap found before any live test:
+        nothing called `fiveg::ue_up` anywhere, so `ue_probe_up` would
+        have failed immediately with no pod to run inside); `Down` tears
+        every UE pod down first. **Three more real bugs live-caught and
+        fixed getting this to actually pass through the real production
+        `vxbr0`** (not a throwaway test bridge): (1) two real node
+        references on the same VLAN would have silently collided on the
+        identical `10.<vlan>.0.2` address — caught by the module's own
+        test suite before touching any I/O, now rejected explicitly
+        (`BothEndpointsRealOnSameVlan`); (2) a misconfigured s-nssai probe
+        profile resolved its target's real transport address *before*
+        checking whether a session even existed for it, so it failed on a
+        live podman call instead of a cheap validation error — reordered so
+        `ensure_reflector` validates first; (3) `apply_fiveg_uplink` gave
+        the CN pod's port correct VLAN membership, but nothing gave the
+        **host itself** a reachable address or route into that VLAN at all
+        — fixed with a `<bridge>.<FIVEG_UPLINK_VLAN>` host subinterface
+        (`self` VLAN membership on the bridge device, the standard
+        Linux-bridge pattern) plus one route per UE subnet
+        (`apply_fiveg_ue_routes`), replacing what every earlier manual
+        verification script added by hand with real, tested code. Also
+        closed a portability gap found while auditing for hardcoded
+        values: nothing stopped a manifest from declaring `vlan: 4000`,
+        silently colliding with the reserved uplink VLAN — now rejected
+        (`VlanCollidesWithFiveGUplink`). **Live-verified end to end**: a
+        real manifest with two vlan slices + one s-nssai slice, all three
+        `traffic_profiles` running *simultaneously* through the actual
+        production path — `adas-probe` (vlan) 2000/2000 received, 0% loss,
+        p50 44 µs; `infotainment-load` (vlan) 99.98 mbit achieved against a
+        100 mbit target; `h2-probe` (s-nssai, **UE as the reflector**,
+        through the real `vxbr0`) 2000/2000 received, 0% loss, p50 347 µs
+        — then clean teardown, host confirmed empty. 63 unit tests total,
+        zero regressions, clippy/fmt clean throughout. This exact scenario
+        is now a permanent, `#[ignore]`-gated integration test any joiner
+        can run (`crates/vxedge-core/tests/traffic_podman.rs`, mirroring
+        `fiveg_podman.rs`'s own pattern) — the manual verification scripts
+        that found these bugs lived only in an ephemeral job scratch dir
+        and would otherwise have left no reproducible trace in the repo.
+      Remaining: hand-derive `exp-010.yaml`, actually run the campaign
+      (repetitions × load levels × 2 arms) and compare against exp-001's
+      frozen numbers — the mechanism itself has no known gaps left.
 - [ ] **Image-digest recording into results metadata.** Sized 2026-07-17,
       not started: not a small add — there is no results-metadata-writing
       code in `vxedge-core` yet to hook a `podman inspect --format
