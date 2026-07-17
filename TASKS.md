@@ -245,10 +245,35 @@ exp-001 measurements).
         `infotainment` slices up with live container counts, `down` tears
         everything down cleanly (pods and `vxbr0` both gone). No regression:
         all 44 unit tests plus clippy/fmt stayed clean throughout.
-      Remaining before H2 numbers: **one RAN pod/netns per UE** (precisely
-      characterized above — needed before any multi-slice-simultaneous H2
-      traffic can be measured; single-slice traffic is already provably
-      fine), image-digest recording into results metadata.*
+      - **One RAN pod/netns per UE, delivered and live-verified
+        (2026-07-17)**: fixes the UERANSIM routing-table-1000 collision
+        found in the bridging proof — UERANSIM hardcodes that table id per
+        UE rather than deriving it from the interface, so co-located UEs
+        collided on it. Fix mirrors the CN/RAN split one layer down: each UE
+        now gets its **own pod** (hence its own private netns, hence its own
+        private table 1000 — no shared kernel state left to collide on),
+        joined to gNB through a new bridge *internal to the RAN pod's own
+        netns* (`ran_bridge_name`) rather than a shared namespace;
+        `RAN_TRANSIT_ADDR` moved from the transit veth onto that bridge so
+        it stays reachable from both the CN pod and an arbitrary number of
+        UE pods. New `ue_up`/`ue_down` primitives (not folded into
+        `fiveg_up`, matching the existing vxprobe/vxtraffic provisioning-vs-
+        traffic split) plus a new `SliceSession.ue_ran_link_addr` field
+        (`10.99.0.<50+i>`, regression-tested to never collide with
+        `upf_gtpu_addr`'s range even at the max slice count). **Live-verified
+        in two parts**: the extended `fiveg_podman` integration test (now
+        exercising `ue_up`/`ue_down`, idempotency, teardown) passed clean
+        against real podman; a manual run then inspected both UEs' routing
+        tables directly — neither shows the earlier "TUN configuration
+        failure" log line, and `ip route show table 1000` returns a real
+        default route for each, confirmed by inspection, not just absence of
+        an error. **Re-ran the exact bridging ping test that originally
+        found the bug**: adas still 3/3 0% loss; infotainment now *also*
+        3/3 0% loss (was 100% loss before this fix). This was the last item
+        blocking H2 numbers.
+      Remaining: image-digest recording into results metadata (not H2-
+      blocking — a reproducibility/provenance nicety for the eventual
+      results archive).*
 - [ ] URSP-style `slice_policy`: per-node traffic-class → slice routing over concurrent PDU
       sessions (UE-side slicing; mirrors Snapdragon Auto URSP behavior)
 - [ ] SONiC-VS twin: render slice intent to SONiC config, boot VS qcow2, verify config parity
