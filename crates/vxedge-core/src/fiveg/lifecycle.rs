@@ -144,24 +144,28 @@ fn host_ip(args: &[&str]) -> Result<String, FiveGLifecycleError> {
     run("sudo", &full)
 }
 
-/// Run `ip <args>` inside the network namespace of the process at `pid`
-/// (`sudo nsenter -t <pid> -n`) — for configuring an interface *after* it
-/// has been moved into a pod's netns. Same sudo-scoping rationale as
-/// [`host_ip`]: escalates only this call, never `podman` itself. Podman
-/// pods aren't registered under `ip netns`'s named registry the way
-/// `zones::backend`'s raw netns zones are, hence `nsenter` by PID rather
-/// than `ip netns exec` by name.
-fn nsenter_ip(pid: u32, args: &[&str]) -> Result<String, FiveGLifecycleError> {
+/// Run `<program> <args>` inside the *network* namespace of the process at
+/// `pid` (`sudo nsenter -t <pid> -n`) — for configuring an interface, or
+/// flipping a per-netns sysctl, *after* it has been moved into a pod's
+/// netns. Same sudo-scoping rationale as [`host_ip`]: escalates only this
+/// call, never `podman` itself. Podman pods aren't registered under
+/// `ip netns`'s named registry the way `zones::backend`'s raw netns zones
+/// are, hence `nsenter` by PID rather than `ip netns exec` by name.
+fn nsenter_run(pid: u32, program: &str, args: &[&str]) -> Result<String, FiveGLifecycleError> {
     let mut full = vec![
         "nsenter".to_string(),
         "-t".to_string(),
         pid.to_string(),
         "-n".to_string(),
         "--".to_string(),
-        "ip".to_string(),
+        program.to_string(),
     ];
     full.extend(args.iter().map(|s| s.to_string()));
     run("sudo", &full)
+}
+
+fn nsenter_ip(pid: u32, args: &[&str]) -> Result<String, FiveGLifecycleError> {
+    nsenter_run(pid, "ip", args)
 }
 
 /// PID of a pod's infra container — the anchor for its network namespace.
@@ -396,6 +400,12 @@ pub fn bridge_up(
     let cn_addr = format!("{BRIDGE_ATTACH_CN_ADDR}/24");
     nsenter_ip(cn_pid, &["addr", "add", &cn_addr, "dev", &pod_side])?;
     nsenter_ip(cn_pid, &["link", "set", &pod_side, "up"])?;
+
+    // The CN pod's netns now has two interfaces a packet might need to
+    // cross between (this bridge-side veth and a UPF's vxtun<i>) — off by
+    // default in a fresh netns, so forwarding between them needs enabling
+    // explicitly, same as any Linux router.
+    nsenter_run(cn_pid, "sysctl", &["-w", "net.ipv4.ip_forward=1"])?;
     Ok(())
 }
 
