@@ -55,4 +55,10 @@ serde_yaml_ng (serde_yaml is deprecated upstream — do not reintroduce it).
 AI/contributor skills in `.claude/skills/`: **rust-patterns** (house Rust rules, per the
 Microsoft Rust Patterns book), **testbed-quality** (the OEM-adoption bar), and
 **gateway-verification** (netns/UDS/doctor verification loop + idempotency rule for
-gateway/zone backend changes). Apply all three to every change.
+gateway/zone backend changes). Apply all three to every change. Plus four narrower
+skills, load them when the file you're touching matches their scope: **open5gs-ueransim-
+patterns** (fiveg/ config rendering + UE-netns networking gotchas), **vxapi-protobuf-
+design** (proto/ RPC/message design and versioning), **network-provisioning-patterns**
+(writing gateway/ netops/plan/provision code, as opposed to verifying it), and
+**zone-backend-contract** (the container/qemu-microvm/libvirt attachment + guest-bundle
+contract, shared with `vxzones`).
