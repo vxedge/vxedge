@@ -170,12 +170,55 @@ exp-001 measurements).
         correct subnets, matching every prior proof — but this time NGAP/GTP-U
         genuinely crossed a real inter-pod link, not a shared netns, which is
         stronger, more representative proof than before.
-      Remaining before H2 numbers: **uesimtun↔vxgateway bridging** — the last-mile
-      item, and structurally closer now: the CN pod already has a real transit
-      interface (`CN_TRANSIT_ADDR`) that a second veth can extend into vxgateway's
-      bridge the same way — **GatewayService wiring for s-nssai slices** (the
-      proto/RPC design decision that turns the lifecycle module into something
-      `vxedge up` can call), image-digest recording into results metadata.*
+      - **`GatewayPlan` stops rejecting s-nssai slices, delivered 2026-07-17**
+        (`vxedge-core::gateway::plan`): the reconciler that produces H1/H3/H4's
+        frozen numbers previously hard-errored (`SnssaiNotSupported`) the moment a
+        manifest declared any `mode: s-nssai` slice, forcing mixed vlan+s-nssai
+        manifests to be split by hand. Fixed additively and with zero touch to the
+        vlan/HTB provisioning path itself: `GatewayPlan` now carries a
+        `snssai_slice_ids: Vec<String>` field — tracked, summarized, explicitly
+        **not** provisioned by this reconciler (fiveg owns that lifecycle) — and
+        only rejects a manifest when it has *no* slices of either kind
+        (`PlanError::NoSlices`, renamed from `NoVlanSlices`). Re-ran `manifest
+        validate` against all four existing experiment manifests (001/002/002b/003)
+        after the change: all still `OK`, confirming no regression to the
+        vlan-only path H1/H3/H4 depend on.
+      - **`bridge_up`/`bridge_down` delivered 2026-07-17**
+        (`vxedge-core::fiveg::lifecycle`): extends the CN pod with a second veth,
+        the host side plugged into a Linux bridge (`master <bridge>`) and the pod
+        side given `BRIDGE_ATTACH_CN_ADDR` (`10.98.0.1/24`, a subnet distinct from
+        the CN↔RAN transit subnet) with `ip_forward` turned on in the CN netns so
+        traffic can cross from the bridge into the UPF's GTP-U tunnel. Deliberately
+        does not create the bridge itself or touch `vxbr0`/VLAN membership — that
+        stays the caller's decision, exercised via a new `bridge_up_debug` example
+        against a throwaway test bridge, not the real gateway bridge.
+      - **uesimtun↔vxgateway bridging mechanism proven live, 2026-07-17**: stood up
+        the full CN+RAN split, attached the CN pod to a real Linux bridge
+        (`vx5g-testbr`) via `bridge_up`, added host routes for both slice subnets
+        via the bridge, and pinged both UEs from the host through the bridge and
+        UPF GTP-U tunnel. **adas (10.46.0.2, uesimtun0): 3/3 packets, 0% loss,
+        sub-ms RTT** — the last-mile gate is genuinely crossed: host traffic rides
+        a real bridge into a real PDU session and back. **infotainment
+        (10.47.0.2, uesimtun1): 3/3 sent, 0 received, 100% loss** — root-caused,
+        not left as a mystery: `ip rule show` in the RAN pod showed both UEs'
+        per-source policy rules (`from 10.46.0.2`, `from 10.47.0.2`) pointing at
+        the *same* routing table, `1000` — UERANSIM hardcodes that table ID per UE
+        rather than deriving it from the interface index, so the second UE's
+        `ip route add default ... table 1000` collided with the first's
+        (`RTNETLINK answers: File exists`, previously seen as a benign log line in
+        every earlier single-flow test today). This is UERANSIM's actual deployment
+        assumption — one UE per network namespace — surfacing exactly the same
+        class of co-location bug the CN/RAN split fixed one layer up, now one layer
+        down at UE granularity. **Conclusion**: the bridging *mechanism* is proven
+        for one slice; **simultaneous multi-slice traffic needs one RAN netns/pod
+        per UE**, tracked as a new, specific follow-up below — not a blocker for
+        this milestone, which was the bridging mechanism itself.
+      Remaining before H2 numbers: **one RAN pod/netns per UE** (new, precisely
+      characterized above — needed before any multi-slice-simultaneous H2 traffic
+      can be measured; single-slice traffic is already provably fine),
+      **GatewayService wiring for s-nssai slices** (the proto/RPC design decision
+      that turns the lifecycle module into something `vxedge up` can call),
+      image-digest recording into results metadata.*
 - [ ] URSP-style `slice_policy`: per-node traffic-class → slice routing over concurrent PDU
       sessions (UE-side slicing; mirrors Snapdragon Auto URSP behavior)
 - [ ] SONiC-VS twin: render slice intent to SONiC config, boot VS qcow2, verify config parity
