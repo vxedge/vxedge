@@ -23,6 +23,7 @@ use vxedge_api::v1::{
     ZoneListRequest, ZoneListResponse, ZoneRemoveRequest, ZoneUpRequest,
 };
 use vxedge_core::ExperimentManifest;
+use vxedge_core::fiveg::{self, FiveGLifecycleConfig, FiveGPlan};
 use vxedge_core::gateway::{self, GatewayPlan, Shell};
 use vxedge_core::zones::{self, NodePlan};
 
@@ -37,6 +38,10 @@ pub struct EdgeState {
     pub gateway: Option<GatewayPlan>,
     pub manifest_yaml: Option<String>,
     pub manifest_dir: Option<PathBuf>,
+    /// Set alongside `gateway` whenever the manifest's `network.slices`
+    /// include any `mode: s-nssai` — the fiveg CN/RAN pods' desired state,
+    /// for `down`/`status` to act on without re-parsing the manifest.
+    pub fiveg: Option<FiveGPlan>,
 }
 
 pub type SharedState = Arc<tokio::sync::Mutex<EdgeState>>;
@@ -86,6 +91,16 @@ fn parse_and_plan(yaml: &str) -> Result<GatewayPlan, String> {
     GatewayPlan::from_manifest(&manifest).map_err(|e| e.to_string())
 }
 
+/// Re-parses `yaml` to compile its `mode: s-nssai` slices, if any. Only
+/// called when `GatewayPlan.snssai_slice_ids` is non-empty, so a real error
+/// here (bad `s_nssai` block, duplicate SST/SD, ...) is a genuine manifest
+/// problem, not the "no s-nssai slices" case (already ruled out by the
+/// caller) — surfaced as a hard `Up` failure rather than silently skipped.
+fn parse_and_fiveg_plan(yaml: &str) -> Result<FiveGPlan, String> {
+    let manifest = ExperimentManifest::from_yaml(yaml).map_err(|e| e.to_string())?;
+    FiveGPlan::from_manifest(&manifest).map_err(|e| e.to_string())
+}
+
 /// Run a blocking gateway operation off the async runtime.
 async fn blocking<T, F>(work: F) -> Result<T, String>
 where
@@ -111,6 +126,15 @@ pub struct GatewaySvc {
     /// Active experiment (plan + manifest). Set on up, cleared on down; lost
     /// on daemon restart, in which case Status degrades honestly.
     pub state: SharedState,
+    /// Where fiveg renders its config set (`<runtime_dir>/fiveg-config`).
+    /// Requires `vxedged` deployed as an **unprivileged** process (never
+    /// `sudo vxedged`, never setcap — see [`Shell::escalate`]'s doc comment)
+    /// with a cached or NOPASSWD `sudo` for `ip`/`bridge`/`tc`/`nsenter`:
+    /// running the whole daemon as root switches `podman` to root's own
+    /// separate rootless-podman identity, the exact bug found live
+    /// 2026-07-17 running `sudo cargo test` (see `fiveg::lifecycle`'s module
+    /// doc comment). `TESTBED-SETUP.md` documents the sudoers requirement.
+    pub runtime_dir: PathBuf,
 }
 
 impl GatewaySvc {
@@ -126,6 +150,7 @@ impl GatewaySvc {
             .record(rpc, serde_json::json!({ "manifest_sha256": sha256 }));
         let shell = self.shell.clone();
         let state = self.state.clone();
+        let runtime_dir = self.runtime_dir.clone();
         let job = self
             .engine
             .submit(kind, move |p| async move {
@@ -174,14 +199,57 @@ impl GatewaySvc {
                                 obs.endpoints_expected
                             ));
                         }
+
+                        let five_g_plan = if plan.snssai_slice_ids.is_empty() {
+                            None
+                        } else {
+                            p.update(93, "provisioning 5G core (fiveg)");
+                            let fp = parse_and_fiveg_plan(&yaml)?;
+                            let rt = runtime_dir.clone();
+                            let fp2 = fp.clone();
+                            blocking(move || {
+                                fiveg::fiveg_up(&fp2, &rt, &FiveGLifecycleConfig::default())
+                                    .map_err(|e| e.to_string())
+                            })
+                            .await?;
+
+                            p.update(97, "attaching 5G core to vxbr0");
+                            let sh = shell.clone();
+                            let bridge = plan.bridge.clone();
+                            blocking(move || {
+                                let cfg = FiveGLifecycleConfig::default();
+                                let cn_pid =
+                                    fiveg::pod_pid(&cfg.pod_name).map_err(|e| e.to_string())?;
+                                fiveg::bridge_up(&cfg, &bridge, cn_pid)
+                                    .map_err(|e| e.to_string())?;
+                                let host_veth = fiveg::bridge_host_veth(&cfg.pod_name);
+                                gateway::provision::apply_fiveg_uplink(&sh, &host_veth)
+                                    .map_err(|e| e.to_string())
+                            })
+                            .await?;
+                            Some(fp)
+                        };
+
                         let summary = plan.summary();
                         let mut st = state.lock().await;
                         st.gateway = Some(plan);
                         st.manifest_yaml = Some(yaml.clone());
                         st.manifest_dir = manifest_dir.clone();
+                        st.fiveg = five_g_plan;
                         Ok(format!("vxgateway up — {summary}"))
                     }
                     Verb::Down => {
+                        if !plan.snssai_slice_ids.is_empty() {
+                            p.update(50, "removing 5G core + uplink attachment");
+                            blocking(move || {
+                                let cfg = FiveGLifecycleConfig::default();
+                                fiveg::bridge_down(&cfg).map_err(|e| e.to_string())?;
+                                fiveg::fiveg_down(&cfg)
+                                    .map(|_| ())
+                                    .map_err(|e| e.to_string())
+                            })
+                            .await?;
+                        }
                         p.update(60, "removing endpoints, uplink, bridge");
                         let sh = shell.clone();
                         let pl = plan.clone();
@@ -233,9 +301,13 @@ impl GatewayService for GatewaySvc {
         &self,
         _: Request<GatewayStatusRequest>,
     ) -> Result<Response<GatewayStatus>, Status> {
-        let plan = self.state.lock().await.gateway.clone();
+        let (plan, fiveg_plan) = {
+            let st = self.state.lock().await;
+            (st.gateway.clone(), st.fiveg.clone())
+        };
         let (state, detail, slices) = match plan {
             Some(plan) => {
+                let snssai_count = plan.snssai_slice_ids.len();
                 let shell = self.shell.clone();
                 let obs = tokio::task::spawn_blocking(move || gateway::observe(&shell, &plan))
                     .await
@@ -261,7 +333,7 @@ impl GatewayService for GatewaySvc {
                     (
                         ResourceState::Up,
                         format!(
-                            "up: {} slice(s), {}/{} endpoint(s)",
+                            "up: {} vlan slice(s), {snssai_count} s-nssai slice(s), {}/{} endpoint(s)",
                             slices.len(),
                             obs.endpoints_present,
                             obs.endpoints_expected
@@ -272,7 +344,7 @@ impl GatewayService for GatewaySvc {
                     (
                         ResourceState::Degraded,
                         format!(
-                            "degraded: bridge={} uplink={} endpoints={}/{}",
+                            "degraded: bridge={} uplink={} endpoints={}/{} ({snssai_count} s-nssai slice(s) declared)",
                             obs.bridge_present,
                             obs.uplink_present,
                             obs.endpoints_present,
@@ -306,6 +378,49 @@ impl GatewayService for GatewaySvc {
                 }
             }
         };
+
+        let mut slices = slices;
+        let (mut state, mut detail) = (state, detail);
+        if let Some(fp) = fiveg_plan {
+            let fstatus = tokio::task::spawn_blocking(|| {
+                fiveg::fiveg_status(&FiveGLifecycleConfig::default())
+            })
+            .await
+            .map_err(|e| Status::internal(format!("fiveg status task panicked: {e}")))?
+            .map_err(|e| Status::internal(e.to_string()))?;
+            let fiveg_state = if fstatus.all_running() {
+                ResourceState::Up
+            } else {
+                ResourceState::Degraded
+            };
+            let fiveg_detail = format!(
+                "fiveg: CN {}/{} RAN {}/{} container(s) running",
+                fstatus
+                    .containers
+                    .iter()
+                    .filter(|c| c.state == "running")
+                    .count(),
+                fstatus.containers.len(),
+                fstatus
+                    .ran_containers
+                    .iter()
+                    .filter(|c| c.state == "running")
+                    .count(),
+                fstatus.ran_containers.len(),
+            );
+            for session in &fp.sessions {
+                slices.push(SliceStatus {
+                    slice_id: session.slice_id.clone(),
+                    state: fiveg_state as i32,
+                    detail: fiveg_detail.clone(),
+                });
+            }
+            detail = format!("{detail}; {fiveg_detail}");
+            if fiveg_state != ResourceState::Up {
+                state = ResourceState::Degraded;
+            }
+        }
+
         Ok(Response::new(GatewayStatus {
             status: Some(ResourceStatus {
                 vxid: "vxgateway".into(),

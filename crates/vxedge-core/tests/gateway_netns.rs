@@ -61,7 +61,10 @@ fn gateway_and_container_zone_cycle_in_netns() {
         String::from_utf8_lossy(&created.stderr)
     );
     let _guard = NetnsGuard(ns.clone());
-    let sh = Shell { netns: Some(ns) };
+    let sh = Shell {
+        netns: Some(ns),
+        escalate: false,
+    };
 
     let manifest = ExperimentManifest::from_yaml(MANIFEST).unwrap();
     let plan = GatewayPlan::from_manifest(&manifest).unwrap();

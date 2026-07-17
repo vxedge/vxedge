@@ -369,6 +369,25 @@ fn bridge_veth_names(pod_name: &str) -> (String, String) {
     (format!("{base}-br0"), format!("{base}-brp0"))
 }
 
+/// Host-side device [`bridge_up`] plugs into `bridge` — the port a caller
+/// needs to name when deciding VLAN membership on a `vlan_filtering 1`
+/// bridge (`vxbr0`), since `bridge_up` itself deliberately does not decide
+/// that (see its doc comment).
+pub fn bridge_host_veth(pod_name: &str) -> String {
+    bridge_veth_names(pod_name).0
+}
+
+/// Reserved VLAN for the 5G core's uplink port on `vxgateway`'s bridge.
+/// S-NSSAI slices carry no `vlan:` in the manifest — slice differentiation
+/// happens in the RAN/PDU-session layer, one level below where 802.1Q
+/// operates — so there is no per-slice VLAN to reuse for the CN pod's
+/// attachment. The CN pod is one network function with one attachment
+/// point: by the time traffic reaches a UPF's uplink, S-NSSAI
+/// differentiation has already happened. Fixed and out of the range any
+/// existing experiment manifest declares for a vlan-mode slice (checked:
+/// exp-001/002/002b/003 all use IDs well under 1000).
+pub const FIVEG_UPLINK_VLAN: u16 = 4000;
+
 /// Attach the CN pod's netns to a bridge as a plain access port (no VLAN
 /// tagging — a deliberately minimal mechanism spike, 2026-07-17, proving
 /// that the fiveg CN pod's UE-subnet routing is reachable from *outside*

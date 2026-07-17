@@ -10,8 +10,10 @@ use std::process::Command;
 #[derive(Debug, thiserror::Error)]
 pub enum NetOpsError {
     #[error(
-        "insufficient privileges for `{cmdline}` — vxedged needs CAP_NET_ADMIN \
-         (run under sudo, or `setcap cap_net_admin+ep` on the binary)"
+        "insufficient privileges for `{cmdline}` — vxedged needs CAP_NET_ADMIN for \
+         `ip`/`bridge`/`tc` (cache a sudo credential, or configure NOPASSWD sudo for \
+         those commands; `setcap` on the vxedged binary does not work here — capabilities \
+         don't propagate to the child processes this shells out to)"
     )]
     Permission { cmdline: String },
     #[error("`{cmdline}` failed: {stderr}")]
@@ -31,6 +33,21 @@ pub enum NetOpsError {
 #[derive(Debug, Clone, Default)]
 pub struct Shell {
     pub netns: Option<String>,
+    /// Prefix every command with `sudo`. Off by default — preserves exact
+    /// prior behavior for tests and doctor checks that already run their
+    /// whole process privileged (`gateway_netns.rs`'s own doc comment: "run
+    /// under sudo"). `vxedged`'s real deployment turns this on instead of
+    /// running the daemon itself as root: found live 2026-07-17 that
+    /// `setcap cap_net_admin+ep` on the `vxedged` binary does *not* grant
+    /// the capability to `ip`/`bridge`/`tc` — Linux capabilities don't
+    /// propagate across `fork`+`exec` to a separate child binary without
+    /// explicit ambient-set handling neither `setcap ep` nor this shell-out
+    /// code performs. `sudo`-wrapping here mirrors the pattern already
+    /// proven live in `fiveg::lifecycle`'s `host_ip`/`nsenter_run`, and
+    /// keeps `vxedged` itself an unprivileged process — required for
+    /// `fiveg`'s own child `podman` calls to keep resolving the deploying
+    /// user's own image storage rather than root's separate one.
+    pub escalate: bool,
 }
 
 impl Shell {
@@ -53,18 +70,31 @@ impl Shell {
         args: &[&str],
         wrapped: bool,
     ) -> Result<String, NetOpsError> {
-        let mut cmd = match (&self.netns, wrapped) {
+        let mut full_args: Vec<String> = Vec::new();
+        let exe = match (&self.netns, wrapped) {
             (Some(ns), true) => {
-                let mut c = Command::new("ip");
-                c.args(["netns", "exec", ns, program]);
-                c
+                full_args.extend(["netns", "exec", ns, program].iter().map(|s| s.to_string()));
+                "ip"
             }
-            _ => Command::new(program),
+            _ => program,
         };
-        cmd.args(args);
-        let cmdline = format!("{program} {}", args.join(" "));
+        full_args.extend(args.iter().map(|s| s.to_string()));
+
+        let mut cmd = if self.escalate {
+            let mut c = Command::new("sudo");
+            c.arg(exe);
+            c
+        } else {
+            Command::new(exe)
+        };
+        cmd.args(&full_args);
+        let cmdline = format!(
+            "{}{exe} {}",
+            if self.escalate { "sudo " } else { "" },
+            full_args.join(" ")
+        );
         let out = cmd.output().map_err(|source| NetOpsError::Spawn {
-            program: program.to_string(),
+            program: exe.to_string(),
             source,
         })?;
         if out.status.success() {

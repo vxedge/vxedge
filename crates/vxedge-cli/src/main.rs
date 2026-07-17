@@ -359,6 +359,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             } else if let Some(s) = &status.status {
                 println!("gateway {}: state={} detail={}", s.vxid, s.state, s.detail);
+                for sl in &status.slices {
+                    println!(
+                        "  slice {}: state={} detail={}",
+                        sl.slice_id, sl.state, sl.detail
+                    );
+                }
             } else {
                 println!("gateway: no status reported");
             }
@@ -510,10 +516,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[derive(serde::Serialize)]
+struct JsonSliceStatus {
+    slice_id: String,
+    state: i32,
+    detail: String,
+}
+
+#[derive(serde::Serialize)]
 struct JsonStatus {
     vxid: String,
     state: i32,
     detail: String,
+    slices: Vec<JsonSliceStatus>,
 }
 
 impl From<&vxedge_api::v1::GatewayStatus> for JsonStatus {
@@ -523,6 +537,15 @@ impl From<&vxedge_api::v1::GatewayStatus> for JsonStatus {
             vxid: s.vxid,
             state: s.state,
             detail: s.detail,
+            slices: g
+                .slices
+                .iter()
+                .map(|sl| JsonSliceStatus {
+                    slice_id: sl.slice_id.clone(),
+                    state: sl.state,
+                    detail: sl.detail.clone(),
+                })
+                .collect(),
         }
     }
 }

@@ -205,6 +205,26 @@ pub fn apply_endpoints(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError
     Ok(())
 }
 
+/// VLAN membership for the 5G core's uplink port on a `vlan_filtering 1`
+/// bridge (`vxbr0`): every port needs an explicit membership or it drops
+/// all traffic. `host_veth` must already be attached to the bridge and up
+/// (`fiveg::lifecycle::bridge_up` does that part — this only adds the
+/// membership that primitive deliberately leaves undecided, same convention
+/// [`apply_endpoints`] uses for zone nodes, but on
+/// `fiveg::lifecycle::FIVEG_UPLINK_VLAN` — the S-NSSAI slices attaching via
+/// this port carry no manifest `vlan:` of their own).
+pub fn apply_fiveg_uplink(sh: &Shell, host_veth: &str) -> Result<(), NetOpsError> {
+    let vid = crate::fiveg::FIVEG_UPLINK_VLAN.to_string();
+    sh.run_tolerate_exists(
+        "bridge",
+        &[
+            "vlan", "add", "dev", host_veth, "vid", &vid, "pvid", "untagged",
+        ],
+    )?;
+    sh.run_tolerate_missing("bridge", &["vlan", "del", "dev", host_veth, "vid", "1"])?;
+    Ok(())
+}
+
 /// Full apply, in dependency order.
 pub fn apply(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
     apply_links(sh, plan)?;
