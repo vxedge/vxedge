@@ -68,7 +68,7 @@ amf:
         - uri: http://{nrf}:7777
   ngap:
     server:
-      - address: {amf}
+      - address: {amf_ngap}
   guami:
     - plmn_id: {{ mcc: {mcc}, mnc: {mnc} }}
       amf_id: {{ region: 2, set: 1 }}
@@ -90,6 +90,7 @@ amf:
       value: 540
 "#,
         amf = plan.amf_addr,
+        amf_ngap = plan.amf_ngap_addr,
         nrf = plan.nrf_addr,
         mcc = plan.mcc,
         mnc = plan.mnc,
@@ -267,7 +268,7 @@ linkIp: {gnb}
 ngapIp: {gnb}
 gtpIp: {gnb}
 amfConfigs:
-  - address: {amf}
+  - address: {amf_ngap}
     port: 38412
 slices:
 {slice_list}
@@ -276,8 +277,8 @@ ignoreStreamIds: true
         mcc = plan.mcc,
         mnc = plan.mnc,
         tac = plan.tac,
-        gnb = plan.gnb_addr,
-        amf = plan.amf_addr,
+        gnb = plan.ran_transit_addr,
+        amf_ngap = plan.amf_ngap_addr,
     )
 }
 
@@ -338,7 +339,7 @@ integrityMaxRate:
         mnc = plan.mnc,
         key = TEST_UE_KEY,
         opc = TEST_UE_OPC,
-        gnb = plan.gnb_addr,
+        gnb = plan.ran_transit_addr,
         dnn = s.dnn,
         nssai = nssai_entry,
     )

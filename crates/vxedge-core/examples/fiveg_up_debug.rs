@@ -23,7 +23,9 @@ fn main() -> ExitCode {
     let plan = FiveGPlan::from_manifest(&manifest).expect("plan");
     let cfg = FiveGLifecycleConfig {
         pod_name: pod_name.clone(),
+        ran_pod_name: format!("{pod_name}-ran"),
         core_image: "vx5g-core".to_string(),
+        ran_image: "vx5g-ran".to_string(),
     };
     match fiveg_up(&plan, std::path::Path::new(runtime_dir), &cfg) {
         Ok(msg) => {

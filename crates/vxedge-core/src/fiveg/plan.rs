@@ -1,9 +1,21 @@
 //! FiveGPlan: desired-state compilation of a manifest's `mode: s-nssai`
 //! slices. Pure data — no privileges, no I/O — mirroring `GatewayPlan`.
 //!
-//! Addressing is deterministic per slice ordering (loopback-only, single
-//! host): every run of the same manifest produces byte-identical configs,
-//! which is what makes rendered configs diffable and archives reproducible.
+//! Addressing is deterministic per slice ordering: every run of the same
+//! manifest produces byte-identical configs, which is what makes rendered
+//! configs diffable and archives reproducible.
+//!
+//! Two address families, found necessary live (2026-07-17): the RAN (gNB +
+//! UEs) cannot share a network namespace with the CN (AMF + per-slice
+//! SMF/UPF) — confirmed by isolating the two and finding the UE's own
+//! `uesimtun<i>` and the UPF's `vxtun<i>` device install *identical*
+//! connected routes for the same UE subnet when co-located, an ambiguity
+//! that never occurs in a real deployment (the UE is a physically separate
+//! device). So: **CN-internal** SBI/PFCP traffic (NRF/AUSF/UDM/UDR/PCF/BSF,
+//! SMF↔UPF) stays on loopback, unchanged; **RAN-facing** traffic (AMF's
+//! NGAP, each UPF's GTP-U) moves to the transit subnet between the CN pod
+//! and a separate RAN pod (`TRANSIT_SUBNET`) — the only addresses gNB
+//! actually needs to dial.
 
 use crate::manifest::{ExperimentManifest, SliceMode};
 
@@ -11,6 +23,14 @@ use crate::manifest::{ExperimentManifest, SliceMode};
 /// below caps out well before octet overflow, and >16 slices on one host is
 /// outside any planned experiment.
 const MAX_SNSSAI_SLICES: usize = 16;
+
+/// CN pod ↔ RAN pod transit link (N2/N3 in 5G vocabulary), a dedicated
+/// range distinct from any UE subnet (`10.<46+i>.0.0/16`) or Open5GS's own
+/// documented sample UE subnet (`10.45.0.0/16`, never used by vxedge but
+/// worth staying clear of for anyone cross-referencing upstream docs).
+pub const TRANSIT_SUBNET: &str = "10.99.0.0/24";
+pub const CN_TRANSIT_ADDR: &str = "10.99.0.1";
+pub const RAN_TRANSIT_ADDR: &str = "10.99.0.2";
 
 /// Lab PLMN (the Open5GS documentation/test PLMN — not a real operator).
 pub const PLMN_MCC: &str = "999";
@@ -54,11 +74,12 @@ pub struct SliceSession {
     pub ue_subnet: String,
     /// UPF tunnel gateway address inside `ue_subnet` (`10.<46+i>.0.1`).
     pub ue_gateway: String,
-    /// SMF SBI/PFCP address (`127.0.1.<10+i>`).
+    /// SMF SBI/PFCP address (`127.0.1.<10+i>`, CN-internal).
     pub smf_addr: String,
-    /// UPF PFCP address (`127.0.2.<10+i>`).
+    /// UPF PFCP address (`127.0.2.<10+i>`, CN-internal — talks to SMF only).
     pub upf_pfcp_addr: String,
-    /// UPF GTP-U address (`127.0.2.<110+i>`).
+    /// UPF GTP-U address (`10.99.0.<10+i>`, on the CN↔RAN transit subnet —
+    /// the address gNB dials for this slice's N3 tunnel).
     pub upf_gtpu_addr: String,
     /// UPF tun device (`vxtun<i>`): one per slice — the default `ogstun`
     /// can only serve one UPF instance (found live: EBUSY on the second).
@@ -72,8 +93,11 @@ pub struct FiveGPlan {
     pub mcc: String,
     pub mnc: String,
     pub tac: u32,
-    /// AMF NGAP + SBI address (Open5GS upstream loopback convention).
+    /// AMF SBI address (CN-internal, loopback).
     pub amf_addr: String,
+    /// AMF NGAP address — on the transit subnet; the address gNB dials for
+    /// N2 (`CN_TRANSIT_ADDR`).
+    pub amf_ngap_addr: String,
     /// NRF SBI address.
     pub nrf_addr: String,
     /// NSSF SBI address.
@@ -85,10 +109,12 @@ pub struct FiveGPlan {
     pub udr_addr: String,
     pub pcf_addr: String,
     pub bsf_addr: String,
-    /// Subscriber/policy database (MongoDB inside the vx5g pod).
+    /// Subscriber/policy database (MongoDB inside the CN pod).
     pub db_uri: String,
-    /// UERANSIM gNB link/NGAP/GTP address.
-    pub gnb_addr: String,
+    /// RAN pod's transit address — gNB's link/NGAP/GTP-U bind address
+    /// (`RAN_TRANSIT_ADDR`), and what the UE's simulated radio search
+    /// targets (gNB and UEs share the RAN pod's netns).
+    pub ran_transit_addr: String,
     pub sessions: Vec<SliceSession>,
 }
 
@@ -160,7 +186,7 @@ impl FiveGPlan {
                 ue_gateway: format!("10.{}.0.1", 46 + i),
                 smf_addr: format!("127.0.1.{}", 10 + i),
                 upf_pfcp_addr: format!("127.0.2.{}", 10 + i),
-                upf_gtpu_addr: format!("127.0.2.{}", 110 + i),
+                upf_gtpu_addr: format!("10.99.0.{}", 10 + i),
                 tun_dev: format!("vxtun{i}"),
                 // 15-digit IMSI: MCC(3) + MNC(2) + 10-digit MSIN.
                 supi: format!("imsi-{}{}{:010}", PLMN_MCC, PLMN_MNC, 1 + i),
@@ -172,6 +198,7 @@ impl FiveGPlan {
             mnc: PLMN_MNC.to_string(),
             tac: TAC,
             amf_addr: "127.0.0.5".to_string(),
+            amf_ngap_addr: CN_TRANSIT_ADDR.to_string(),
             nrf_addr: "127.0.0.10".to_string(),
             nssf_addr: "127.0.0.14".to_string(),
             ausf_addr: "127.0.0.11".to_string(),
@@ -180,7 +207,7 @@ impl FiveGPlan {
             pcf_addr: "127.0.0.13".to_string(),
             bsf_addr: "127.0.0.15".to_string(),
             db_uri: "mongodb://127.0.0.1/open5gs".to_string(),
-            gnb_addr: "127.0.0.100".to_string(),
+            ran_transit_addr: RAN_TRANSIT_ADDR.to_string(),
             sessions,
         })
     }
@@ -221,12 +248,15 @@ network:
         assert_eq!(adas.dnn, "adas");
         assert_eq!(adas.ue_subnet, "10.46.0.0/16");
         assert_eq!(adas.smf_addr, "127.0.1.10");
-        assert_eq!(adas.upf_gtpu_addr, "127.0.2.110");
+        assert_eq!(adas.upf_gtpu_addr, "10.99.0.10");
         assert_eq!(adas.supi, "imsi-999700000000001");
         let info = &plan.sessions[1];
         assert_eq!(info.sd, None);
         assert_eq!(info.ue_subnet, "10.47.0.0/16");
+        assert_eq!(info.upf_gtpu_addr, "10.99.0.11");
         assert_eq!(info.supi, "imsi-999700000000002");
+        assert_eq!(plan.amf_ngap_addr, CN_TRANSIT_ADDR);
+        assert_eq!(plan.ran_transit_addr, RAN_TRANSIT_ADDR);
         // Same manifest, same plan — the reproducibility contract.
         assert_eq!(plan, FiveGPlan::from_manifest(&m).expect("plans again"));
     }
