@@ -230,6 +230,22 @@ impl GatewaySvc {
                                     .map_err(|e| e.to_string())
                             })
                             .await?;
+
+                            p.update(99, "bringing up each slice's UE pod");
+                            let rt = runtime_dir.clone();
+                            let fp3 = fp.clone();
+                            blocking(move || {
+                                let cfg = FiveGLifecycleConfig::default();
+                                let ran_pid =
+                                    fiveg::pod_pid(&cfg.ran_pod_name).map_err(|e| e.to_string())?;
+                                let cfg_dir = rt.join("fiveg-config");
+                                for (i, session) in fp3.sessions.iter().enumerate() {
+                                    fiveg::ue_up(&cfg, &cfg_dir, ran_pid, i, session)
+                                        .map_err(|e| e.to_string())?;
+                                }
+                                Ok::<(), String>(())
+                            })
+                            .await?;
                             Some(fp)
                         };
 
@@ -243,6 +259,21 @@ impl GatewaySvc {
                     }
                     Verb::Down => {
                         if !plan.snssai_slice_ids.is_empty() {
+                            p.update(45, "removing UE pods");
+                            let fp = parse_and_fiveg_plan(&yaml)?;
+                            blocking(move || {
+                                let cfg = FiveGLifecycleConfig::default();
+                                for session in &fp.sessions {
+                                    // Best-effort: an already-absent UE pod
+                                    // isn't a teardown failure (ue_down
+                                    // itself is idempotent), so don't let
+                                    // one missing pod abort the rest.
+                                    let _ = fiveg::ue_down(&cfg, session);
+                                }
+                                Ok::<(), String>(())
+                            })
+                            .await?;
+
                             p.update(50, "removing 5G core + uplink attachment");
                             blocking(move || {
                                 let cfg = FiveGLifecycleConfig::default();
