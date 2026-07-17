@@ -257,6 +257,17 @@ fn ensure_reflector(
 /// reflector if this is a round-trip probe (`pps` set), then spawn the
 /// actual `vxprobe send`/`vxtraffic` sender. Idempotent per role: an
 /// already-running process for a given profile+role is left alone.
+///
+/// `duration_s` comes from the manifest's own `experiment.duration_s`
+/// (`TrafficSvc::up` threads it through) — without it, `vxprobe send`/
+/// `vxtraffic` fall back to their own CLI default (10s), which silently
+/// undershoots a real campaign's measured window (H2's own campaign frame
+/// specifies a 60s probe window; 10s would under-sample tail percentiles,
+/// the exact `experiment-methodology` skill violation `run-exp-001.sh`
+/// avoids by passing `--duration-s` explicitly). `payload_bytes` was
+/// already resolved onto `ResolvedProfile` but never threaded to the spawn
+/// args until now — a real, previously-silent gap since the live
+/// verification never needed non-default payload sizes.
 #[allow(clippy::too_many_arguments)]
 pub fn profile_up(
     sh: &Shell,
@@ -267,6 +278,7 @@ pub fn profile_up(
     vxtraffic_bin: &str,
     profile: &ResolvedProfile,
     port: u16,
+    duration_s: u64,
 ) -> Result<String, TrafficLifecycleError> {
     ensure_endpoint(sh, &profile.id, &profile.source)?;
     ensure_endpoint(sh, &profile.id, &profile.target)?;
@@ -301,10 +313,14 @@ pub fn profile_up(
                 format!("{target_addr}:{port}"),
                 "--pps".to_string(),
                 pps.to_string(),
+                "--payload-bytes".to_string(),
+                profile.payload_bytes.to_string(),
+                "--duration-s".to_string(),
+                duration_s.to_string(),
             ],
         )?;
         Ok(format!(
-            "traffic profile `{}` up (vxprobe send/reflect @ {target_addr}:{port}, {pps} pps)",
+            "traffic profile `{}` up (vxprobe send/reflect @ {target_addr}:{port}, {pps} pps, {duration_s}s)",
             profile.id
         ))
     } else {
@@ -328,10 +344,14 @@ pub fn profile_up(
                 format!("{target_addr}:{port}"),
                 "--bandwidth-mbps".to_string(),
                 bandwidth.to_string(),
+                "--payload-bytes".to_string(),
+                profile.payload_bytes.to_string(),
+                "--duration-s".to_string(),
+                duration_s.to_string(),
             ],
         )?;
         Ok(format!(
-            "traffic profile `{}` up (vxtraffic @ {target_addr}:{port}, {bandwidth} mbit)",
+            "traffic profile `{}` up (vxtraffic @ {target_addr}:{port}, {bandwidth} mbit, {duration_s}s)",
             profile.id
         ))
     }
@@ -404,6 +424,7 @@ mod tests {
             "vxtraffic",
             &profile,
             9800,
+            10,
         )
         .unwrap_err();
         assert!(matches!(
@@ -430,6 +451,7 @@ mod tests {
             "vxtraffic",
             &profile,
             9800,
+            10,
         )
         .unwrap_err();
         assert!(matches!(
@@ -470,6 +492,7 @@ network:
             "vxtraffic",
             &profile,
             9800,
+            10,
         )
         .unwrap_err();
         assert!(matches!(
@@ -493,6 +516,7 @@ network:
             "/nonexistent/vxtraffic-binary",
             &profile,
             9900,
+            10,
         )
         .unwrap_err();
         assert!(matches!(

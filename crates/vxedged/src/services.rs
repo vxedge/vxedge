@@ -927,7 +927,7 @@ impl TrafficSvc {
     async fn resolve_plans(
         &self,
         mref: Option<&ManifestRef>,
-    ) -> Result<(TrafficPlan, Option<FiveGPlan>, String), Status> {
+    ) -> Result<(TrafficPlan, Option<FiveGPlan>, String, u64), Status> {
         let (yaml, sha256, _dir) = resolve_manifest(mref).await?;
         let manifest = ExperimentManifest::from_yaml(&yaml)
             .map_err(|e| Status::invalid_argument(format!("manifest invalid: {e}")))?;
@@ -940,7 +940,15 @@ impl TrafficSvc {
         };
         let traffic_plan = TrafficPlan::from_manifest(&manifest, &gateway_plan)
             .map_err(|e| Status::invalid_argument(format!("traffic plan: {e}")))?;
-        Ok((traffic_plan, five_g_plan, sha256))
+        // `experiment.duration_s` is the manifest's own probe/load-window
+        // knob (already used for `results_prefix`-adjacent metadata
+        // elsewhere) — reused here as the run duration handed to
+        // `vxprobe send`/`vxtraffic` rather than letting them silently fall
+        // back to their own 10s CLI default, which would undershoot a real
+        // campaign's measured window. Falls back to 10 (their own default)
+        // when the manifest doesn't set it, e.g. the quick smoke manifests.
+        let duration_s = manifest.experiment.duration_s.unwrap_or(10);
+        Ok((traffic_plan, five_g_plan, sha256, duration_s))
     }
 }
 
@@ -966,7 +974,8 @@ fn select_profiles(
 impl TrafficService for TrafficSvc {
     async fn up(&self, req: Request<TrafficUpRequest>) -> Result<Response<Job>, Status> {
         let req = req.into_inner();
-        let (traffic_plan, five_g_plan, sha256) = self.resolve_plans(req.manifest.as_ref()).await?;
+        let (traffic_plan, five_g_plan, sha256, duration_s) =
+            self.resolve_plans(req.manifest.as_ref()).await?;
         self.audit.record(
             "TrafficService.Up",
             serde_json::json!({ "manifest_sha256": sha256, "profiles": req.profiles }),
@@ -1003,6 +1012,7 @@ impl TrafficService for TrafficSvc {
                             &vxtraffic_bin,
                             &profile,
                             TRAFFIC_PORT,
+                            duration_s,
                         )
                         .map_err(|e| e.to_string())
                     })
@@ -1018,7 +1028,7 @@ impl TrafficService for TrafficSvc {
 
     async fn down(&self, req: Request<TrafficDownRequest>) -> Result<Response<Job>, Status> {
         let req = req.into_inner();
-        let (traffic_plan, _five_g_plan, sha256) =
+        let (traffic_plan, _five_g_plan, sha256, _duration_s) =
             self.resolve_plans(req.manifest.as_ref()).await?;
         self.audit.record(
             "TrafficService.Down",

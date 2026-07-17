@@ -181,6 +181,7 @@ fn traffic_service_runs_vlan_and_snssai_profiles_simultaneously_through_the_real
             &vxtraffic,
             profile,
             PROBE_PORT,
+            12,
         )
         .unwrap_or_else(|e| panic!("profile_up(`{}`) failed: {e}", profile.id));
         assert!(msg.contains("up"), "{msg}");
@@ -199,6 +200,7 @@ fn traffic_service_runs_vlan_and_snssai_profiles_simultaneously_through_the_real
             &vxtraffic,
             profile,
             PROBE_PORT,
+            12,
         )
         .expect("profile_up idempotent");
         assert!(msg.contains("already up"), "{msg}");
