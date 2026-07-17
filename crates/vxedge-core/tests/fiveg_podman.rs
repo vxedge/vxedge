@@ -22,8 +22,10 @@
 use vxedge_core::ExperimentManifest;
 use vxedge_core::fiveg::{
     FiveGLifecycleConfig, FiveGPlan, SliceSession, fiveg_down, fiveg_status, fiveg_up, pod_exists,
-    pod_pid, ue_down, ue_pod_name, ue_up,
+    pod_pid, ue_down, ue_pod_name, ue_probe_up, ue_up,
 };
+
+const PROBE_PORT: u16 = 9800;
 
 const MANIFEST: &str = r#"
 experiment: { id: fiveg-podman-test, name: fiveg lifecycle integration }
@@ -112,6 +114,17 @@ fn fiveg_up_brings_cn_and_ran_pods_up_idempotently_then_tears_down() {
     // Idempotent ue_up: second call per UE is a no-op.
     for (i, session) in plan.sessions.iter().enumerate() {
         let msg = ue_up(&cfg, &cfg_dir, ran_pid, i, session).expect("ue_up idempotent");
+        assert!(msg.contains("already up"));
+    }
+
+    // vxprobe reflector, inside each UE's own pod — the H2 probe data path.
+    for session in &plan.sessions {
+        let msg = ue_probe_up(&cfg, &cfg_dir, session, PROBE_PORT).expect("ue_probe_up");
+        assert!(msg.contains("up"));
+    }
+    // Idempotent ue_probe_up: second call per UE is a no-op.
+    for session in &plan.sessions {
+        let msg = ue_probe_up(&cfg, &cfg_dir, session, PROBE_PORT).expect("ue_probe_up idempotent");
         assert!(msg.contains("already up"));
     }
 

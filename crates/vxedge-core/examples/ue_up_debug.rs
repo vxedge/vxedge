@@ -1,15 +1,21 @@
-//! Dev tool: bring the fiveg CN/RAN pods up (like `fiveg_up_debug`) and
-//! then bring every slice's UE up in its own pod too, leaving everything
-//! running. Used to spot-check the routing-table-1000 fix (2026-07-17):
-//! with each UE in its own pod/netns, `ip rule show`/`ip route show table
-//! 1000` inside any two UE pods should be *independent* — no collision,
-//! unlike the earlier shared-RAN-pod topology.
+//! Dev tool: bring the fiveg CN/RAN pods up (like `fiveg_up_debug`), bring
+//! every slice's UE up in its own pod, and start a `vxprobe` reflector
+//! inside each UE — leaving everything running. Used to spot-check the
+//! routing-table-1000 fix (2026-07-17: with each UE in its own pod/netns,
+//! `ip rule show`/`ip route show table 1000` inside any two UE pods should
+//! be *independent* — no collision) and, since H2, the actual probe data
+//! path an H2 campaign needs: a reflector running *on* the UE, reachable
+//! through its PDU session, not just a bare ping into the tunnel.
 //!
 //! Usage: cargo run -p vxedge-core --example ue_up_debug -- <manifest.yaml> <runtime-dir> <pod-name>
 
 use std::{env, fs, process::ExitCode};
 use vxedge_core::ExperimentManifest;
-use vxedge_core::fiveg::{FiveGLifecycleConfig, FiveGPlan, fiveg_up, pod_pid, ue_pod_name, ue_up};
+use vxedge_core::fiveg::{
+    FiveGLifecycleConfig, FiveGPlan, fiveg_up, pod_pid, ue_pod_name, ue_probe_up, ue_up,
+};
+
+const PROBE_PORT: u16 = 9800;
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
@@ -60,6 +66,14 @@ fn main() -> ExitCode {
         println!(
             "  inspect: podman exec {container} ip rule show; podman exec {container} ip route show table 1000"
         );
+
+        match ue_probe_up(&cfg, &cfg_dir, session, PROBE_PORT) {
+            Ok(msg) => println!("  {msg}"),
+            Err(e) => {
+                eprintln!("ue_probe_up error for `{}`: {e}", session.slice_id);
+                return ExitCode::FAILURE;
+            }
+        }
     }
 
     ExitCode::SUCCESS

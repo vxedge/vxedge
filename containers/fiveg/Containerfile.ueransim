@@ -2,7 +2,15 @@
 # Built from the pinned upstream tag so nr-gnb/nr-ue versions ride the image
 # digest into results metadata (§13) instead of "whatever /usr/local had".
 #
-# Build:  podman build -t vx5g-ran -f Containerfile.ueransim .
+# Also carries vxprobe (vxagents), so an H2 campaign's reflector can run
+# *inside* a UE's own pod/netns — the same way H1's methodology runs the
+# reflector on the ADAS zone node itself, not pinged from outside. vxagents
+# is a separate git repo (not nested under this one), so podman can't reach
+# its source directly from this build context — build-vx5g-ran.sh stages
+# the prebuilt binary into this directory first. Do not `podman build` this
+# Containerfile directly; use that script.
+#
+# Build:  ./build-vx5g-ran.sh
 # Run:    podman run --rm vx5g-ran nr-gnb -c /etc/vx5g/gnb.yaml
 #         nr-ue needs NET_ADMIN + /dev/net/tun (creates uesimtunN);
 #         SCTP comes from the HOST kernel: `modprobe sctp` once per boot.
@@ -25,6 +33,7 @@ RUN apt-get update \
 COPY --from=build /src/UERANSIM/build/nr-gnb /usr/local/bin/nr-gnb
 COPY --from=build /src/UERANSIM/build/nr-ue /usr/local/bin/nr-ue
 COPY --from=build /src/UERANSIM/build/nr-cli /usr/local/bin/nr-cli
+COPY vxprobe.bin /usr/local/bin/vxprobe
 RUN mkdir -p /etc/vx5g
 
 ENTRYPOINT []

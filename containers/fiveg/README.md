@@ -12,7 +12,7 @@ networking. All containers of the stack share one pod's network namespace, so
 | Image | Contents | Build |
 |---|---|---|
 | `vx5g-core` | Open5GS 2.8.x (PPA — the version the renderer is validated against), every NF | `podman build -t vx5g-core -f Containerfile.open5gs .` |
-| `vx5g-ran` | UERANSIM (pinned tag, source build): `nr-gnb`, `nr-ue`, `nr-cli` | `podman build -t vx5g-ran -f Containerfile.ueransim .` |
+| `vx5g-ran` | UERANSIM (pinned tag, source build): `nr-gnb`, `nr-ue`, `nr-cli`, plus `vxprobe` (staged from the sibling `vxagents` repo — an H2 campaign's reflector runs *inside* a UE's own pod) | `./build-vx5g-ran.sh` (stages the `vxprobe` binary into this build context first — `vxagents` is a separate repo podman can't reach directly; do not `podman build` this Containerfile on its own) |
 
 Reproducibility: image digests are the version pin (§13). When the lifecycle
 stage lands, the digests used by a run get recorded into results metadata.

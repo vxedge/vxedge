@@ -495,6 +495,105 @@ pub fn ue_down(
     Ok(format!("UE pod `{pod}` down"))
 }
 
+/// Timeout waiting for a UE's PDU session to assign `uesimtun0` an address.
+/// Registration + PDU Session Establishment normally lands well under this
+/// in every live run so far; bounded so a genuinely broken UE fails loudly
+/// instead of hanging forever.
+const UE_PDU_ADDR_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Poll a UE's `uesimtun0` for its assigned PDU-session address. Needed by
+/// [`ue_probe_up`] because that address is only known once registration
+/// completes — asynchronous, no fixed delay is reliable for it (unlike the
+/// dependency-phase settling elsewhere in this module, a fixed sleep here
+/// risks either failing outright on a slow first run or silently binding
+/// too early). A bounded poll is the correct tool for a real readiness
+/// condition, not a magic number.
+fn wait_for_ue_pdu_addr(ue_pid: u32) -> Result<String, FiveGLifecycleError> {
+    let deadline = std::time::Instant::now() + UE_PDU_ADDR_TIMEOUT;
+    loop {
+        if let Ok(out) = nsenter_ip(ue_pid, &["-4", "-o", "addr", "show", "uesimtun0"]) {
+            let addr = out
+                .split_whitespace()
+                .skip_while(|w| *w != "inet")
+                .nth(1)
+                .and_then(|cidr| cidr.split('/').next());
+            if let Some(addr) = addr {
+                return Ok(addr.to_string());
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(FiveGLifecycleError::Parse {
+                cmdline: "ip -4 -o addr show uesimtun0".to_string(),
+                detail: format!(
+                    "no PDU-session address after {UE_PDU_ADDR_TIMEOUT:?} — UE registration \
+                     may not have completed"
+                ),
+            });
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Start a `vxprobe` reflector inside a UE's own pod — shares its netns, so
+/// once the PDU session exists it is reachable at the UE's own address
+/// (`uesimtun0`), the same way a real ADAS ECU would run the reflector on
+/// itself. This is what makes an H2 campaign topologically comparable to
+/// H1's own methodology (`vxprobe reflect` running *on* the device under
+/// test, probed from the gateway/host side — not pinged from outside as a
+/// mechanism spot-check).
+///
+/// Binds explicitly to the UE's own PDU-session address, not `0.0.0.0` —
+/// found live 2026-07-17: a `0.0.0.0`-bound reflector *did* receive every
+/// probe (confirmed via `uesimtun0`'s own RX packet counter incrementing by
+/// exactly the number sent), but its replies almost never made it back —
+/// TX barely moved. Root cause: with an unbound source, the kernel resolves
+/// the reply's outbound route before the UE's own policy rule
+/// (`from <addr> lookup rt_uesimtun<i>`) can pin it to the tunnel, so
+/// replies leaked out via UERANSIM's own unrelated default route (`tap0`,
+/// its internal management path) instead. Binding to the specific address
+/// forces the correct egress interface regardless — which needs
+/// [`wait_for_ue_pdu_addr`] first, since that address doesn't exist until
+/// registration completes.
+///
+/// Idempotent: an existing reflector container is left running. Torn down
+/// automatically by [`ue_down`] (destroys the whole pod, not addressed
+/// separately here).
+pub fn ue_probe_up(
+    cfg: &FiveGLifecycleConfig,
+    cfg_dir: &Path,
+    session: &SliceSession,
+    port: u16,
+) -> Result<String, FiveGLifecycleError> {
+    let pod = ue_pod_name(&cfg.ran_pod_name, &session.slice_id);
+    let (_, containers) = pod_containers(&pod)?;
+    let probe_name = format!("{pod}-probe");
+    if containers.iter().any(|c| c.name == probe_name) {
+        return Ok(format!(
+            "vxprobe reflector already up in UE pod `{pod}` (idempotent)"
+        ));
+    }
+    let ue_pid = pod_pid(&pod)?;
+    let ue_addr = wait_for_ue_pdu_addr(ue_pid)?;
+    run_detached(
+        &pod,
+        cfg_dir,
+        &RunSpec {
+            name: "probe".to_string(),
+            image: cfg.ran_image.clone(),
+            extra_flags: vec![],
+            cmd: vec![
+                "vxprobe".to_string(),
+                "reflect".to_string(),
+                "--listen".to_string(),
+                format!("{ue_addr}:{port}"),
+            ],
+        },
+    )?;
+    Ok(format!(
+        "vxprobe reflector up in UE pod `{pod}` on {ue_addr}:{port}"
+    ))
+}
+
 /// Address for the CN pod's side of [`bridge_up`]'s attachment — distinct
 /// from the CN↔RAN transit subnet, since this is a different link (CN pod
 /// ↔ bridge, not CN pod ↔ RAN pod).
