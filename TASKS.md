@@ -213,12 +213,42 @@ exp-001 measurements).
         for one slice; **simultaneous multi-slice traffic needs one RAN netns/pod
         per UE**, tracked as a new, specific follow-up below — not a blocker for
         this milestone, which was the bridging mechanism itself.
-      Remaining before H2 numbers: **one RAN pod/netns per UE** (new, precisely
-      characterized above — needed before any multi-slice-simultaneous H2 traffic
-      can be measured; single-slice traffic is already provably fine),
-      **GatewayService wiring for s-nssai slices** (the proto/RPC design decision
-      that turns the lifecycle module into something `vxedge up` can call),
-      image-digest recording into results metadata.*
+      - **GatewayService wiring for s-nssai slices, delivered 2026-07-17**:
+        `vxedge up` now provisions the fiveg CN/RAN pods and attaches the CN
+        pod to the real `vxbr0` (a new reserved `FIVEG_UPLINK_VLAN` for the
+        pvid-untagged port — s-nssai slices carry no manifest `vlan:` of their
+        own to reuse) whenever the manifest declares any s-nssai slice, in the
+        same `Up` Job as the existing vlan/HTB provisioning; `down`/`status`
+        are symmetric. **Three real bugs found live wiring this end to end,
+        all fixed**: (a) `setcap cap_net_admin+ep` on `vxedged` does *not*
+        grant CAP_NET_ADMIN to the `ip`/`bridge`/`tc` child processes
+        `gateway::netops::Shell` shells out to — capabilities don't propagate
+        across `fork`+`exec` without ambient-set handling this shell-out code
+        doesn't do, so the documented "setcap the binary" deployment advice
+        was actually wrong and untested; fixed by extending the `sudo`-wrapping
+        pattern already proven live in `fiveg::lifecycle` to `Shell` itself
+        (new `escalate` flag, default `false` — the existing privileged
+        `gateway_netns.rs` test, which already runs its whole process under
+        `sudo`, is untouched byte for byte); (b) `status` only merged fiveg's
+        health into the top-level detail string when degraded, so a fully
+        healthy 5G core showed no evidence it had even been checked — fixed
+        to always append it, and to label vlan vs s-nssai slice counts
+        separately (they were conflated under one ambiguous "N slice(s)");
+        (c) the CLI's `JsonStatus` never included per-slice detail at all (a
+        pre-existing gap predating this change, applying equally to vlan
+        slices) — added `slices` to both plain-text and `--json` status
+        output, the only way to actually observe the new `SliceStatus`
+        entries live. **Live-verified end to end** against a real `vxedged` +
+        podman + `vxbr0`: CN pod (13 NF containers) and RAN pod (gNB) come up
+        through the real RPC path, `vx5g-br0` lands as VLAN 4000
+        pvid-untagged on `vxbr0`, `status` reports both `adas` and
+        `infotainment` slices up with live container counts, `down` tears
+        everything down cleanly (pods and `vxbr0` both gone). No regression:
+        all 44 unit tests plus clippy/fmt stayed clean throughout.
+      Remaining before H2 numbers: **one RAN pod/netns per UE** (precisely
+      characterized above — needed before any multi-slice-simultaneous H2
+      traffic can be measured; single-slice traffic is already provably
+      fine), image-digest recording into results metadata.*
 - [ ] URSP-style `slice_policy`: per-node traffic-class → slice routing over concurrent PDU
       sessions (UE-side slicing; mirrors Snapdragon Auto URSP behavior)
 - [ ] SONiC-VS twin: render slice intent to SONiC config, boot VS qcow2, verify config parity
