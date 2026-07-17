@@ -110,12 +110,25 @@ exp-001 measurements).
         start clean".
       - Known gap, tracked: dbctl's slice helper needs an SD — a slice declared without
         one currently falls back to the default subscribed slice (`pod-up.sh` comment).
-      Remaining before H2 numbers: vxedged pod lifecycle (Rust-native supervision/
-      health/teardown, replacing the shell `pod-up.sh` reference), explicit subscriber
-      documents (drop the dbctl SD limitation), **uesimtun↔vxgateway bridging** — this
-      is the last-mile item: measured traffic must ride the PDU session tunnels instead
-      of the loopback addresses used for this validation — GatewayService wiring for
-      s-nssai slices, image-digest recording into results metadata.*
+      - **Rust-native pod lifecycle delivered 2026-07-17**
+        (`vxedge-core::fiveg::lifecycle`): ports `pod-up.sh`'s proven sequence into a
+        tested module — `core_run_specs`/`subscriber_commands` are pure data (8 unit
+        tests: phase ordering, per-container flags, sd-present/absent branching),
+        `fiveg_up`/`fiveg_down`/`fiveg_status` are idempotent (`podman pod
+        exists`/`rm --ignore`, status via `podman ps --format json`, field names
+        checked against the live binary rather than assumed). Proven live twice: the
+        `#[ignore]`d integration test (`fiveg_podman.rs`) passed on the first run —
+        pod up, all 13 containers running, idempotent up/down, teardown — and a
+        manual spot-check against a real gNB + both UEs reproduced the exact same
+        result as the shell version (same subnets, same NG Setup, same PDU session
+        establishment). **This module is the mechanism only** — not yet wired to any
+        vxAPI RPC or manifest verb.
+      Remaining before H2 numbers: explicit subscriber documents (drop the dbctl SD
+      limitation), **uesimtun↔vxgateway bridging** — the last-mile item: measured
+      traffic must ride the PDU session tunnels instead of the loopback addresses used
+      for this validation — **GatewayService wiring for s-nssai slices** (the proto/RPC
+      design decision that turns the lifecycle module into something `vxedge up` can
+      call), image-digest recording into results metadata.*
 - [ ] URSP-style `slice_policy`: per-node traffic-class → slice routing over concurrent PDU
       sessions (UE-side slicing; mirrors Snapdragon Auto URSP behavior)
 - [ ] SONiC-VS twin: render slice intent to SONiC config, boot VS qcow2, verify config parity
