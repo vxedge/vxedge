@@ -143,12 +143,39 @@ exp-001 measurements).
         one without) — both PDU sessions established, both UEs on their correct
         distinct subnets, matching every prior proof; MongoDB document inspected
         directly to confirm correct sst/absent-not-blank-sd/array shape.
+      - **RAN split from CN into a separate pod, joined by a real transit link —
+        delivered 2026-07-17.** Investigating uesimtun↔vxgateway bridging found the
+        single-pod topology couldn't support it: isolating a single-slice pod showed
+        the UE's `uesimtun<i>` and the UPF's `vxtun<i>` installing *identical*
+        connected routes for the same subnet in one routing table — an ambiguity a
+        real deployment never has (the UE is a physically separate device). Also
+        found live: Open5GS's UPF creates its tun device but leaves IP configuration
+        to the deployer (standard bare-metal practice) — it came up `DOWN`, unrouted,
+        nothing else configuring it. Fixed: `fiveg_up` now creates a CN pod and a RAN
+        pod, joins them with a veth pair on a new transit subnet (`10.99.0.0/24` —
+        AMF's NGAP and each UPF's GTP-U address moved there; CN-internal SBI/PFCP
+        traffic stays loopback, unchanged), starts gNB in the RAN pod, and
+        explicitly configures each UPF's tun device. Two more real bugs live-caught
+        during verification, both fixed: (a) running the test under `sudo` switched
+        `podman` to root's own separate rootless identity/storage — fixed by scoping
+        `sudo` to only the `ip`/`nsenter` calls that need CAP_NET_ADMIN, keeping
+        `podman` itself unprivileged; (b) phase-ordering, found twice — UPF's and
+        then AMF's daemons tried to bind their new transit-subnet addresses before
+        the transit link existed, both binds failed and both processes exited; fixed
+        by starting AMF/SMF/UPF only after the transit link and each UPF's GTP-U
+        address are in place. **Reverified live after every fix**: the integration
+        test passed clean (CN 13/13, RAN's gNB running, idempotent both ways,
+        teardown), and a manual spot-check registered both UEs against the real
+        split topology — NG Setup and both PDU sessions succeed, both land on their
+        correct subnets, matching every prior proof — but this time NGAP/GTP-U
+        genuinely crossed a real inter-pod link, not a shared netns, which is
+        stronger, more representative proof than before.
       Remaining before H2 numbers: **uesimtun↔vxgateway bridging** — the last-mile
-      item: measured traffic must ride the PDU session tunnels instead of the
-      loopback addresses used for this validation — **GatewayService wiring for
-      s-nssai slices** (the proto/RPC design decision that turns the lifecycle module
-      into something `vxedge up` can call), image-digest recording into results
-      metadata.*
+      item, and structurally closer now: the CN pod already has a real transit
+      interface (`CN_TRANSIT_ADDR`) that a second veth can extend into vxgateway's
+      bridge the same way — **GatewayService wiring for s-nssai slices** (the
+      proto/RPC design decision that turns the lifecycle module into something
+      `vxedge up` can call), image-digest recording into results metadata.*
 - [ ] URSP-style `slice_policy`: per-node traffic-class → slice routing over concurrent PDU
       sessions (UE-side slicing; mirrors Snapdragon Auto URSP behavior)
 - [ ] SONiC-VS twin: render slice intent to SONiC config, boot VS qcow2, verify config parity
