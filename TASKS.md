@@ -375,15 +375,19 @@ exp-001 measurements).
       Remaining: hand-derive `exp-010.yaml`, actually run the campaign
       (repetitions × load levels × 2 arms) and compare against exp-001's
       frozen numbers — the mechanism itself has no known gaps left.
-- [ ] **Image-digest recording into results metadata.** Sized 2026-07-17,
-      not started: not a small add — there is no results-metadata-writing
-      code in `vxedge-core` yet to hook a `podman inspect --format
-      '{{.RepoDigests}}'`-style lookup into. `vxedge telemetry collect`
-      (ARCHITECTURE.md §16, the natural home for this) isn't implemented
-      here; the actual results-artifact pipeline may live in `vxtelemetry`
-      or `vxperiments` instead. First task before writing any digest-lookup
-      code is finding/reading whichever of those repos actually owns
-      results-archive writing today. Not H2-blocking.
+- [x] **Image-digest recording into results metadata — delivered in
+      `vxtelemetry`, not here (2026-07-18).** The investigation this item
+      called for ("find whichever repo actually owns results-archive
+      writing today") answered: `vxtelemetry/src/archive.rs` writes every
+      campaign zip's `metadata.json` — nothing in `vxedge-core` was the
+      right hook point. `vxtelemetry collect` gained a repeatable
+      `--record-image <ref>` flag (caller-driven on purpose: which images
+      matter is the campaign runner's knowledge; vxtelemetry guessing would
+      hardcode this repo's fiveg image naming into that one), resolving via
+      `podman image inspect` with repo-digest-preferred/image-ID-fallback
+      and honest `unresolved: …` values on failure. Live-verified against
+      real podman; wired into `run-exp-010.sh` for the fiveg image set.
+      Full account: `vxtelemetry/TASKS.md`.
 - [x] **Per-slice downlink QoS enforcement for s-nssai slices, delivered and
       live-verified (2026-07-18).** Found via exp-010's first real campaign
       (H2's first live numbers, 5 reps x 5 loads, 60s window): the snssai
