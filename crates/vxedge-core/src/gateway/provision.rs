@@ -310,6 +310,157 @@ pub fn apply_fiveg_ue_routes(
     Ok(())
 }
 
+/// One s-nssai slice's downlink HTB parameters, decoupled from
+/// `fiveg::SliceSession` on purpose — `gateway` doesn't depend on `fiveg`'s
+/// types, matching [`apply_fiveg_ue_routes`]'s own plain-`String` (not
+/// `SliceSession`) convention. The caller (`vxedged`'s `services.rs`, which
+/// already sees both modules) maps `FiveGPlan::sessions` into this shape.
+#[derive(Debug, Clone)]
+pub struct FiveGSliceQos {
+    pub ue_subnet: String,
+    pub min_rate_mbps: u64,
+    pub max_rate_mbps: u64,
+    pub priority: u8,
+    pub class_minor: u16,
+}
+
+/// Downlink HTB shaping for s-nssai slices, on the *host-side* VLAN
+/// subinterface [`apply_fiveg_uplink`] created (`host_iface`) — the direct
+/// analog of [`apply_slices`]'s tree on `plan.uplink`: both `adas-probe`
+/// and `infotainment-load` traffic profiles are `source: internet`
+/// (host-originated), so this one interface is exactly where every
+/// s-nssai slice's downlink traffic converges before
+/// [`apply_fiveg_ue_routes`] fans it out toward its own UE subnet — the
+/// same "one shared bottleneck link, classful HTB, per-slice rate/ceil/
+/// priority" shape [`apply_slices`] already proves live, just classified
+/// by destination subnet (`tc ... u32 match ip dst <ue_subnet>`) instead
+/// of by VLAN tag (s-nssai traffic isn't VLAN-tagged at this point).
+///
+/// Found necessary 2026-07-18, not before: Open5GS's own subscriber-level
+/// AMBR field is recorded by its SMF/UDR but not enforced by its software
+/// UPF in this deployment — confirmed live by patching a subscriber's
+/// session AMBR down to 20mbit and measuring the UE's own `uesimtun0`
+/// still receiving the full offered ~600mbit unconstrained (`docs/
+/// STATUS.md` has the full account). So real per-slice isolation for the
+/// snssai arm needs a kernel-level guarantee, not 5G-core QoS signaling
+/// that isn't actually active here.
+///
+/// Opt-in per slice (`slices` only contains sessions whose manifest
+/// declared a `qos` block — see `fiveg::SliceSession::qos`'s own doc
+/// comment for why an unconditional 1mbit-floor default, the way
+/// [`apply_slices`] defaults an *absent* vlan `qos`, would have silently
+/// broken every s-nssai manifest that predates this field). No teardown
+/// function needed: [`teardown_fiveg_uplink`] deletes `host_iface`
+/// outright, and the kernel frees the whole attached qdisc/class/filter
+/// tree with it — same reasoning [`teardown`] already relies on for
+/// `apply_slices`'s own tree.
+pub fn apply_fiveg_slice_qos(
+    sh: &Shell,
+    host_iface: &str,
+    root_rate_mbps: u64,
+    slices: &[FiveGSliceQos],
+) -> Result<(), NetOpsError> {
+    let root_rate = format!("{root_rate_mbps}mbit");
+    if !htb_root_present(sh, host_iface)? {
+        sh.run(
+            "tc",
+            &[
+                "qdisc",
+                "add",
+                "dev",
+                host_iface,
+                "root",
+                "handle",
+                "1:",
+                "htb",
+                "default",
+                DEFAULT_CLASS,
+            ],
+        )?;
+    }
+    sh.run(
+        "tc",
+        &[
+            "class", "replace", "dev", host_iface, "parent", "1:", "classid", "1:1", "htb", "rate",
+            &root_rate,
+        ],
+    )?;
+    // Default class: any downlink traffic not matching a declared slice's
+    // subnet (shouldn't normally occur — apply_fiveg_ue_routes only routes
+    // declared UE subnets through this interface at all — but the same
+    // low-floor/high-ceil/lowest-priority safety net apply_slices gives
+    // its own unclassified traffic).
+    sh.run(
+        "tc",
+        &[
+            "class",
+            "replace",
+            "dev",
+            host_iface,
+            "parent",
+            "1:1",
+            "classid",
+            &format!("1:{DEFAULT_CLASS}"),
+            "htb",
+            "rate",
+            "1mbit",
+            "ceil",
+            &root_rate,
+            "prio",
+            "7",
+        ],
+    )?;
+
+    for slice in slices {
+        let classid = format!("1:{:x}", slice.class_minor);
+        sh.run(
+            "tc",
+            &[
+                "class",
+                "replace",
+                "dev",
+                host_iface,
+                "parent",
+                "1:1",
+                "classid",
+                &classid,
+                "htb",
+                "rate",
+                &format!("{}mbit", slice.min_rate_mbps),
+                "ceil",
+                &format!("{}mbit", slice.max_rate_mbps),
+                "prio",
+                &slice.priority.to_string(),
+            ],
+        )?;
+        // Classify by destination subnet (s-nssai traffic isn't
+        // VLAN-tagged here, unlike apply_slices's flower/vlan_id match).
+        sh.run_tolerate_exists(
+            "tc",
+            &[
+                "filter",
+                "replace",
+                "dev",
+                host_iface,
+                "parent",
+                "1:",
+                "pref",
+                &format!("{}", slice.class_minor),
+                "protocol",
+                "ip",
+                "u32",
+                "match",
+                "ip",
+                "dst",
+                &slice.ue_subnet,
+                "flowid",
+                &classid,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 /// Look up which bridge `host_veth` is currently enslaved to, so this stays
 /// correct regardless of the caller's own bridge name (`GatewayPlan.bridge`
 /// is always `vxbr0` today, but this function shouldn't assume it) —

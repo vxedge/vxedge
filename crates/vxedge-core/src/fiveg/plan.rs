@@ -99,6 +99,37 @@ pub struct SliceSession {
     /// level — same subnet, so IP-level uniqueness still matters for
     /// routing consistency across it.
     pub ue_ran_link_addr: String,
+    /// Downlink HTB shaping for this slice, opt-in via the manifest's own
+    /// `Slice.qos` block — `None` (not `Some` with a 1mbit-floor default
+    /// the way `gateway::plan::SlicePlan` defaults an *absent* vlan `qos`)
+    /// when the slice doesn't declare one, so every manifest that predates
+    /// this field (including every earlier live-verified s-nssai scenario)
+    /// keeps its exact prior behavior: unclassified, unconstrained traffic
+    /// up to the shared root rate. Only a slice that explicitly opts in
+    /// gets a dedicated class. Found necessary 2026-07-18: Open5GS's own
+    /// subscriber-level AMBR field is recorded but not enforced by its
+    /// software UPF in this deployment (empirically confirmed live — a
+    /// patched 20mbit AMBR had zero effect on measured throughput), so
+    /// real per-slice isolation needs a kernel-level HTB class instead,
+    /// mirroring `gateway::provision::apply_slices`'s already-proven
+    /// mechanism rather than relying on 5G-core QoS signaling that isn't
+    /// actually active here.
+    pub qos: Option<SliceSessionQos>,
+}
+
+/// One session's downlink HTB parameters — same shape and defaulting
+/// convention as `gateway::plan::SlicePlan`'s vlan-side fields (`rate` =
+/// `min_rate_mbps`, `ceil` = `max_rate_mbps`), applied only when present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SliceSessionQos {
+    pub min_rate_mbps: u64,
+    pub max_rate_mbps: u64,
+    pub priority: u8,
+    /// tc classid minor number, distinct range from `SlicePlan`'s
+    /// `0x10 + i` purely for readability in `tc class show` output side by
+    /// side — the two trees live on different interfaces, so there is no
+    /// actual collision risk either way.
+    pub class_minor: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,6 +242,12 @@ impl FiveGPlan {
                 // 15-digit IMSI: MCC(3) + MNC(2) + 10-digit MSIN.
                 supi: format!("imsi-{}{}{:010}", PLMN_MCC, PLMN_MNC, 1 + i),
                 ue_ran_link_addr: format!("10.99.0.{}", 50 + i),
+                qos: s.qos.as_ref().map(|q| SliceSessionQos {
+                    min_rate_mbps: q.min_rate_mbps.unwrap_or(0).max(1),
+                    max_rate_mbps: q.max_rate_mbps.unwrap_or(0).max(1),
+                    priority: q.priority.unwrap_or(4),
+                    class_minor: 0x20 + i as u16,
+                }),
             });
         }
 
@@ -282,6 +319,41 @@ network:
         assert_eq!(plan.ran_transit_addr, RAN_TRANSIT_ADDR);
         // Same manifest, same plan — the reproducibility contract.
         assert_eq!(plan, FiveGPlan::from_manifest(&m).expect("plans again"));
+    }
+
+    #[test]
+    fn session_qos_is_none_when_the_manifest_declares_no_qos_block() {
+        // The compatibility-preserving default: every manifest that predates
+        // this field (including every earlier live-verified s-nssai
+        // scenario) keeps behaving exactly as before — unclassified,
+        // unconstrained traffic — rather than silently getting capped.
+        let m = manifest("    - { id: adas, mode: s-nssai, s_nssai: { sst: 1 } }\n");
+        let plan = FiveGPlan::from_manifest(&m).expect("plans");
+        assert_eq!(plan.sessions[0].qos, None);
+    }
+
+    #[test]
+    fn session_qos_is_opt_in_and_mirrors_slice_plans_own_defaulting() {
+        let m = manifest(
+            "    - { id: adas, mode: s-nssai, s_nssai: { sst: 1 }, \
+             qos: { min_rate_mbps: 100, max_rate_mbps: 200, priority: 1 } }\n\
+             \x20   - { id: infotainment, mode: s-nssai, s_nssai: { sst: 2 }, \
+             qos: { max_rate_mbps: 400 } }\n",
+        );
+        let plan = FiveGPlan::from_manifest(&m).expect("plans");
+        let adas_qos = plan.sessions[0].qos.expect("adas declared qos");
+        assert_eq!(adas_qos.min_rate_mbps, 100);
+        assert_eq!(adas_qos.max_rate_mbps, 200);
+        assert_eq!(adas_qos.priority, 1);
+        assert_eq!(adas_qos.class_minor, 0x20);
+
+        // Partial qos (only max_rate_mbps set) falls back to SlicePlan's own
+        // defaults for the rest, same convention, not a different one.
+        let info_qos = plan.sessions[1].qos.expect("infotainment declared qos");
+        assert_eq!(info_qos.min_rate_mbps, 1, "defaults to 1mbit floor");
+        assert_eq!(info_qos.max_rate_mbps, 400);
+        assert_eq!(info_qos.priority, 4, "defaults to priority 4");
+        assert_eq!(info_qos.class_minor, 0x21);
     }
 
     #[test]

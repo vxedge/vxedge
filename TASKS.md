@@ -384,30 +384,62 @@ exp-001 measurements).
       or `vxperiments` instead. First task before writing any digest-lookup
       code is finding/reading whichever of those repos actually owns
       results-archive writing today. Not H2-blocking.
-- [ ] **Per-slice QoS (5QI/ARP/AMBR) differentiation in `fiveg`.** Found
-      2026-07-18 via exp-010's real campaign (H2's first live numbers, 5
-      reps x 5 loads, 60s window): the snssai arm's adas p99 grew 1.25x
-      baseline->600mbit while the vlan arm's (exp-001, same day comparison)
-      stayed flat at 0.93x — H2 does not hold as measured. Root-caused by
-      code inspection, not left as a data mystery: `fiveg::subscriber`
-      hardcodes an identical QCI/5QI=9, ARP priority_level=8, and 1 Gbps
-      AMBR for *every* subscriber/slice; `render_smf`/`render_upf` in
-      `render.rs` never reference the manifest's `Slice.qos` block at all
-      (confirmed: no `qos`/`5qi`/`ambr` token anywhere in `fiveg/render.rs`).
-      The vlan arm's isolation comes from real HTB priority+min/max-rate
-      enforcement (`gateway::provision::apply_slices`); the snssai arm has
-      no equivalent, so both slices compete undifferentiated for the same
-      gNB/UPF path under load — an unequal comparison, not evidence against
-      the hypothesis. Closing this (rendering per-slice 5QI/ARP/AMBR from
-      `Slice.qos` into each slice's subscriber/SMF/UPF config, and ideally
-      real UPF-side rate limiting to mirror HTB's enforcement) is a
-      precondition for a fair H2 re-test. Distinct from the URSP-style
-      `slice_policy` item just below (that one's about a UE carrying
-      multiple concurrent sessions with client-side traffic-class routing;
-      this one's about the network side actually treating slices
-      differently under contention). Not yet sized/started. Full account
-      + numbers: `docs/STATUS.md`, `vxmodels/models/requirements/
-      verification.sysml`'s `Exp010RealSlicingVerification`.
+- [x] **Per-slice downlink QoS enforcement for s-nssai slices, delivered and
+      live-verified (2026-07-18).** Found via exp-010's first real campaign
+      (H2's first live numbers, 5 reps x 5 loads, 60s window): the snssai
+      arm's adas p99 grew 1.25x baseline->600mbit while the vlan arm's
+      (exp-001, same-day comparison) stayed flat at 0.93x — H2 did not hold
+      as measured. Root-caused by code inspection, not left as a data
+      mystery: `fiveg::subscriber` hardcodes an identical QCI/5QI=9, ARP
+      priority_level=8, and 1 Gbps AMBR for *every* subscriber/slice;
+      `render_smf`/`render_upf` never reference the manifest's `Slice.qos`
+      block at all.
+      **The obvious-looking fix (render `Slice.qos` into subscriber
+      5QI/ARP/AMBR) was checked empirically before writing any code, not
+      assumed** — a subscriber's session AMBR was hand-patched to 20mbit
+      live via `mongosh` and the UE's own `uesimtun0` re-measured under a
+      600mbit offered load: received traffic stayed at the full,
+      unconstrained rate regardless of the AMBR value. Open5GS's software
+      UPF in this deployment records subscriber AMBR but does not enforce
+      it — the originally-planned fix would have been standards-correct
+      and functionally inert.
+      **Real fix**: `gateway::provision::apply_fiveg_slice_qos` — the exact
+      same proven HTB primitives `apply_slices` already uses for the vlan
+      arm (root class + per-slice rate/ceil/priority classes), applied to
+      the host-side `apply_fiveg_uplink` interface (the real convergence
+      point for both `adas-probe`'s and `infotainment-load`'s
+      host-originated downlink traffic — the direct s-nssai analog of
+      `vxup0`), classified by destination UE subnet (`tc ... u32 match ip
+      dst <ue_subnet>`) instead of VLAN tag. `fiveg::SliceSession` gained
+      an opt-in `qos: Option<SliceSessionQos>` (only present when the
+      manifest declares `Slice.qos` — an unconditional default, the way
+      `SlicePlan` defaults an *absent* vlan `qos`, would have silently
+      capped every s-nssai manifest that predates this field at 1mbit). No
+      teardown code needed: `teardown_fiveg_uplink` deleting the host
+      interface already frees the whole attached qdisc/class/filter tree.
+      `exp-010.yaml` now declares `qos` on both slices (copied verbatim
+      from `exp-001.yaml`: adas 100/200/1, infotainment 0/400/5) to opt in.
+      65 unit tests (2 new), clippy/fmt clean.
+      **Live-verified end to end**: `tc class show`/`tc filter show`
+      confirmed the tree installs exactly as designed (`1:20` adas
+      rate=100/ceil=200/prio=1, `1:21` infotainment rate=1/ceil=400/prio=5,
+      filters matching `10.46.0.0/16`/`10.47.0.0/16` respectively). Sending
+      600mbit at infotainment while adas-probe ran simultaneously: the
+      sender's own reported rate dropped to 386.5mbit (kernel backpressure,
+      not application-level throttling), the UE's own `uesimtun0` received
+      ~395.5mbit over its true elapsed window — both landing right at the
+      declared 400mbit ceiling, zero packet loss (paced, not dropped) — a
+      dramatic, unambiguous contrast with the AMBR test's zero effect.
+      adas-probe held p50 276.5µs/p99 340.5µs throughout, comparable to the
+      pre-fix unloaded baseline (329.2µs) rather than the 410.9µs it grew
+      to under load before. Single unpowered rep, not yet a campaign — the
+      real 5x5 re-run is next. Distinct from the URSP-style `slice_policy`
+      item just below (that one's about a UE carrying multiple concurrent
+      sessions with client-side traffic-class routing; this one's about the
+      network side actually treating slices differently under contention,
+      now delivered). Full account: `docs/STATUS.md`,
+      `vxmodels/models/requirements/verification.sysml`'s
+      `Exp010RealSlicingVerification` (verdict pending the campaign re-run).
 - [ ] **URSP-style `slice_policy`.** Sized 2026-07-17, not started: not a
       small add — the manifest schema (ARCHITECTURE.md §6.1) is `match:
       <traffic class|dscp|app id> → slice: <slice-id>` **per zone node**,

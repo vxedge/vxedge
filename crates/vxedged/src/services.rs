@@ -221,6 +221,20 @@ impl GatewaySvc {
                             let bridge = plan.bridge.clone();
                             let ue_subnets: Vec<String> =
                                 fp.sessions.iter().map(|s| s.ue_subnet.clone()).collect();
+                            let slice_qos: Vec<gateway::provision::FiveGSliceQos> = fp
+                                .sessions
+                                .iter()
+                                .filter_map(|s| {
+                                    s.qos.map(|q| gateway::provision::FiveGSliceQos {
+                                        ue_subnet: s.ue_subnet.clone(),
+                                        min_rate_mbps: q.min_rate_mbps,
+                                        max_rate_mbps: q.max_rate_mbps,
+                                        priority: q.priority,
+                                        class_minor: q.class_minor,
+                                    })
+                                })
+                                .collect();
+                            let root_rate_mbps = plan.root_rate_mbps;
                             blocking(move || {
                                 let cfg = FiveGLifecycleConfig::default();
                                 let cn_pid =
@@ -235,6 +249,13 @@ impl GatewaySvc {
                                     &sh,
                                     &host_iface,
                                     &ue_subnets,
+                                )
+                                .map_err(|e| e.to_string())?;
+                                gateway::provision::apply_fiveg_slice_qos(
+                                    &sh,
+                                    &host_iface,
+                                    root_rate_mbps,
+                                    &slice_qos,
                                 )
                                 .map_err(|e| e.to_string())
                             })
