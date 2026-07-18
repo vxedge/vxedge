@@ -432,14 +432,23 @@ exp-001 measurements).
       dramatic, unambiguous contrast with the AMBR test's zero effect.
       adas-probe held p50 276.5µs/p99 340.5µs throughout, comparable to the
       pre-fix unloaded baseline (329.2µs) rather than the 410.9µs it grew
-      to under load before. Single unpowered rep, not yet a campaign — the
-      real 5x5 re-run is next. Distinct from the URSP-style `slice_policy`
-      item just below (that one's about a UE carrying multiple concurrent
-      sessions with client-side traffic-class routing; this one's about the
-      network side actually treating slices differently under contention,
-      now delivered). Full account: `docs/STATUS.md`,
+      to under load before.
+      **Confirmed by the real campaign, same day: H2 HOLDS** (adas p99
+      growth baseline→600mbit 1.00x snssai vs 0.93x vlan). The first 5×5
+      rerun with this mechanism was still formally borderline on an
+      unmitigated host (`vxperiments/scripts/lib/host_pinning.sh` closed
+      that separately — cpu governor, cpu affinity, randomized load order
+      — see `vxperiments/TASKS.md` for the full account); this fix's own
+      correctness was never in question once live-verified, and the final
+      campaign confirms it delivers the isolation it was built for.
+      Distinct from the URSP-style `slice_policy` item just below (that
+      one's about a UE carrying multiple concurrent sessions with
+      client-side traffic-class routing; this one's about the network side
+      actually treating slices differently under contention, now
+      delivered and confirmed). Full account: `docs/STATUS.md`,
       `vxmodels/models/requirements/verification.sysml`'s
-      `Exp010RealSlicingVerification` (verdict pending the campaign re-run).
+      `Exp010RealSlicingVerification` (`campaign` → `htbFixRetest` →
+      `finalRetest`).
 - [ ] **URSP-style `slice_policy`.** Sized 2026-07-17, not started: not a
       small add — the manifest schema (ARCHITECTURE.md §6.1) is `match:
       <traffic class|dscp|app id> → slice: <slice-id>` **per zone node**,
