@@ -384,6 +384,30 @@ exp-001 measurements).
       or `vxperiments` instead. First task before writing any digest-lookup
       code is finding/reading whichever of those repos actually owns
       results-archive writing today. Not H2-blocking.
+- [ ] **Per-slice QoS (5QI/ARP/AMBR) differentiation in `fiveg`.** Found
+      2026-07-18 via exp-010's real campaign (H2's first live numbers, 5
+      reps x 5 loads, 60s window): the snssai arm's adas p99 grew 1.25x
+      baseline->600mbit while the vlan arm's (exp-001, same day comparison)
+      stayed flat at 0.93x — H2 does not hold as measured. Root-caused by
+      code inspection, not left as a data mystery: `fiveg::subscriber`
+      hardcodes an identical QCI/5QI=9, ARP priority_level=8, and 1 Gbps
+      AMBR for *every* subscriber/slice; `render_smf`/`render_upf` in
+      `render.rs` never reference the manifest's `Slice.qos` block at all
+      (confirmed: no `qos`/`5qi`/`ambr` token anywhere in `fiveg/render.rs`).
+      The vlan arm's isolation comes from real HTB priority+min/max-rate
+      enforcement (`gateway::provision::apply_slices`); the snssai arm has
+      no equivalent, so both slices compete undifferentiated for the same
+      gNB/UPF path under load — an unequal comparison, not evidence against
+      the hypothesis. Closing this (rendering per-slice 5QI/ARP/AMBR from
+      `Slice.qos` into each slice's subscriber/SMF/UPF config, and ideally
+      real UPF-side rate limiting to mirror HTB's enforcement) is a
+      precondition for a fair H2 re-test. Distinct from the URSP-style
+      `slice_policy` item just below (that one's about a UE carrying
+      multiple concurrent sessions with client-side traffic-class routing;
+      this one's about the network side actually treating slices
+      differently under contention). Not yet sized/started. Full account
+      + numbers: `docs/STATUS.md`, `vxmodels/models/requirements/
+      verification.sysml`'s `Exp010RealSlicingVerification`.
 - [ ] **URSP-style `slice_policy`.** Sized 2026-07-17, not started: not a
       small add — the manifest schema (ARCHITECTURE.md §6.1) is `match:
       <traffic class|dscp|app id> → slice: <slice-id>` **per zone node**,
