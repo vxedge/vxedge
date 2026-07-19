@@ -453,22 +453,39 @@ exp-001 measurements).
       `vxmodels/models/requirements/verification.sysml`'s
       `Exp010RealSlicingVerification` (`campaign` → `htbFixRetest` →
       `finalRetest`).
-- [ ] **URSP-style `slice_policy`.** Sized 2026-07-17, not started: not a
-      small add — the manifest schema (ARCHITECTURE.md §6.1) is `match:
-      <traffic class|dscp|app id> → slice: <slice-id>` **per zone node**,
-      meaning a single real compute node needs *multiple concurrent PDU
-      sessions* (one per slice) with traffic-class-based policy routing
-      selecting between them. But `FiveGPlan`'s current model is 1 UE = 1
-      `SliceSession` = 1 slice — no UE has more than one PDU session.
-      Supporting URSP means: (1) reworking `FiveGPlan`/`SliceSession` to let
-      one UE carry several concurrent sessions across different S-NSSAIs,
-      (2) rendering multiple `sessions:` entries into a single `ue-*.yaml`
-      (UERANSIM supports this; not yet exercised here), (3) real DSCP/`tc`
-      policy routing on the node side selecting which `uesimtun<i>` a given
-      traffic class rides. This is a real feature needing its own design
-      pass, not a follow-up patch — per-node traffic-class → slice routing
-      over concurrent PDU sessions (UE-side slicing; mirrors Snapdragon Auto
-      URSP behavior). Not H2-blocking.
+- [ ] **URSP-style `slice_policy`.** Sized 2026-07-17, design pass done
+      2026-07-19, deliberately not built: not a small add — the manifest
+      schema (ARCHITECTURE.md §6.1) is `match: <traffic class|dscp|app id>
+      → slice: <slice-id>` **per zone node**, meaning a single real compute
+      node needs *multiple concurrent PDU sessions* (one per slice) with
+      traffic-class-based policy routing selecting between them. But
+      `FiveGPlan`'s current model is 1 UE = 1 `SliceSession` = 1 slice — no
+      UE has more than one PDU session. Supporting URSP means: (1) reworking
+      `FiveGPlan`/`SliceSession` to let one UE carry several concurrent
+      sessions across different S-NSSAIs, (2) rendering multiple
+      `sessions:` entries into a single `ue-*.yaml` (UERANSIM supports
+      this; not yet exercised here), (3) real DSCP/`tc` policy routing on
+      the node side selecting which `uesimtun<i>` a given traffic class
+      rides. Weighed against building it now and decided against: not
+      H2-blocking, reworks `FiveGPlan` (load-bearing for H2's now-verified
+      HOLDS result), and depends on unexercised UERANSIM multi-session
+      routing-table behavior in the exact area (per-UE routing table 1000)
+      that already caused a real bug earlier in this program. Nothing in
+      remaining phase-2/M2/M3 work needs it. Left genuinely open until a
+      concrete OEM use case needs multi-session UE-side routing.
+      **Guard delivered instead (2026-07-19)**: the manifest schema already
+      accepted `slice_policy` and validated its `slice:` reference while
+      execution silently ignored it — a real footgun (a declared policy
+      with zero effect, no warning). `ExperimentManifest::validate()` now
+      rejects any node with a non-empty `slice_policy` via
+      `ValidationError::SlicePolicyNotImplemented`, so `vxedge manifest
+      validate` / `vxedge up`'s pre-provisioning check fail loudly instead
+      of accepting a no-op. Zero touch to `fiveg/`, zero regression risk
+      (manifests without `slice_policy` are unaffected — see
+      `rejects_slice_policy_as_not_yet_implemented` and the unchanged
+      `parses_and_validates_worked_example` in
+      `crates/vxedge-core/src/manifest.rs`). Remove the guard when/if this
+      item above is actually implemented.
 - [ ] SONiC-VS twin: render slice intent to SONiC config, boot VS qcow2, verify config parity
 - [ ] TrafficService: synthetic generator (pps/bandwidth/payload per profile)
 - [ ] TS SDK (connect-es) generation + tonic-web enablement; minimal web dashboard repo/dir

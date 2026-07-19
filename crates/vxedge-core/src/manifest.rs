@@ -24,6 +24,12 @@ pub enum ValidationError {
     SnssaiSliceWithoutSnssai(String),
     #[error("service `{svc}` referenced by `{referrer}` is not declared under `services`")]
     UnknownService { referrer: String, svc: String },
+    #[error(
+        "node `{0}` declares `slice_policy` but execution doesn't implement URSP-style \
+         routing yet (schema-only, sized 2026-07-17 in vxedge/TASKS.md) — remove it or bind \
+         the node to a single slice via `network[].slice` instead"
+    )]
+    SlicePolicyNotImplemented(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -480,6 +486,13 @@ impl ExperimentManifest {
                         });
                     }
                 }
+                // Execution doesn't implement URSP-style multi-session
+                // routing yet — a manifest that declares slice_policy and
+                // passes validation would silently have it ignored at
+                // provisioning time. Reject it loudly instead.
+                if !node.slice_policy.is_empty() {
+                    errors.push(ValidationError::SlicePolicyNotImplemented(node.id.clone()));
+                }
             }
         }
 
@@ -609,6 +622,24 @@ traffic_profiles:
         match err {
             ManifestError::Invalid(errors) => assert!(errors.iter().any(
                 |e| matches!(e, ValidationError::DuplicateVxid(id) if id == "vxzone-front-left-01")
+            )),
+            other => panic!("expected validation error, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn rejects_slice_policy_as_not_yet_implemented() {
+        // slice_policy parses fine (the schema exists) but execution doesn't
+        // implement URSP-style routing yet — validate() must reject it
+        // loudly rather than silently accepting a no-op policy.
+        let bad = EXAMPLE.replace(
+            "        network:\n          - iface: eth0\n            vlan: 101\n            slice: adas\n",
+            "        network:\n          - iface: eth0\n            vlan: 101\n            slice: adas\n        slice_policy:\n          - match: \"dscp:46\"\n            slice: adas\n",
+        );
+        let err = ExperimentManifest::from_yaml(&bad).unwrap_err();
+        match err {
+            ManifestError::Invalid(errors) => assert!(errors.iter().any(
+                |e| matches!(e, ValidationError::SlicePolicyNotImplemented(node) if node == "node-ecu-01")
             )),
             other => panic!("expected validation error, got: {other}"),
         }
