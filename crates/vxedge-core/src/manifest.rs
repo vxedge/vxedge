@@ -425,99 +425,215 @@ impl ExperimentManifest {
 
     /// Semantic checks the type system can't express: vxid uniqueness,
     /// slice references, slice-mode consistency, service references.
+    /// Shared with `VehicleManifest`, which reuses the same
+    /// zones/compute/network/services blocks (§6.2).
     pub fn validate(&self) -> Vec<ValidationError> {
-        let mut errors = Vec::new();
+        validate_composition(&self.zones, &self.compute, &self.network, &self.services)
+    }
+}
 
-        // vxid uniqueness across zones, compute, and nodes.
-        let mut seen = std::collections::BTreeSet::new();
-        let mut check_unique = |id: &str, errors: &mut Vec<ValidationError>| {
-            if !seen.insert(id.to_string()) {
-                errors.push(ValidationError::DuplicateVxid(id.to_string()));
+/// The vxid-uniqueness/slice-reference/service-reference checks common to
+/// both manifest kinds: an experiment manifest and a vehicle manifest both
+/// carry `zones`/`compute`/`network`/`services` (§6.1, §6.2) and must be
+/// internally consistent the same way.
+fn validate_composition(
+    zones: &[Zone],
+    compute: &[ComputeNode],
+    network: &Option<Network>,
+    services: &BTreeMap<String, ServiceDef>,
+) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+
+    // vxid uniqueness across zones, compute, and nodes.
+    let mut seen = std::collections::BTreeSet::new();
+    let mut check_unique = |id: &str, errors: &mut Vec<ValidationError>| {
+        if !seen.insert(id.to_string()) {
+            errors.push(ValidationError::DuplicateVxid(id.to_string()));
+        }
+    };
+    for zone in zones {
+        check_unique(&zone.id, &mut errors);
+        for node in &zone.nodes {
+            check_unique(&node.id, &mut errors);
+        }
+    }
+    for c in compute {
+        check_unique(&c.id, &mut errors);
+    }
+
+    // Slice-mode consistency.
+    let slice_ids: std::collections::BTreeSet<&str> = network
+        .as_ref()
+        .map(|n| n.slices.iter().map(|s| s.id.as_str()).collect())
+        .unwrap_or_default();
+    if let Some(network) = network {
+        for slice in &network.slices {
+            match slice.mode {
+                SliceMode::Vlan if slice.vlan.is_none() => {
+                    errors.push(ValidationError::VlanSliceWithoutVlan(slice.id.clone()));
+                }
+                SliceMode::Snssai if slice.s_nssai.is_none() => {
+                    errors.push(ValidationError::SnssaiSliceWithoutSnssai(slice.id.clone()));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Slice references from node ifaces and slice policies.
+    for zone in zones {
+        for node in &zone.nodes {
+            for iface in &node.network {
+                if let Some(slice) = &iface.slice
+                    && !slice_ids.contains(slice.as_str())
+                {
+                    errors.push(ValidationError::UnknownSlice {
+                        node: node.id.clone(),
+                        slice: slice.clone(),
+                    });
+                }
+            }
+            for rule in &node.slice_policy {
+                if !slice_ids.contains(rule.slice.as_str()) {
+                    errors.push(ValidationError::UnknownSlice {
+                        node: node.id.clone(),
+                        slice: rule.slice.clone(),
+                    });
+                }
+            }
+            // Execution doesn't implement URSP-style multi-session routing
+            // yet — a manifest that declares slice_policy and passes
+            // validation would silently have it ignored at provisioning
+            // time. Reject it loudly instead.
+            if !node.slice_policy.is_empty() {
+                errors.push(ValidationError::SlicePolicyNotImplemented(node.id.clone()));
+            }
+        }
+    }
+
+    // Service references from zones and compute nodes.
+    let service_ids: std::collections::BTreeSet<&str> =
+        services.values().map(|s| s.id.as_str()).collect();
+    let check_service_refs =
+        |referrer: &str, refs: &[String], errors: &mut Vec<ValidationError>| {
+            for svc in refs {
+                if !service_ids.contains(svc.as_str()) {
+                    errors.push(ValidationError::UnknownService {
+                        referrer: referrer.to_string(),
+                        svc: svc.clone(),
+                    });
+                }
             }
         };
-        for zone in &self.zones {
-            check_unique(&zone.id, &mut errors);
-            for node in &zone.nodes {
-                check_unique(&node.id, &mut errors);
-            }
-        }
-        for c in &self.compute {
-            check_unique(&c.id, &mut errors);
-        }
+    for zone in zones {
+        check_service_refs(&zone.id, &zone.services, &mut errors);
+    }
+    for c in compute {
+        check_service_refs(&c.id, &c.services, &mut errors);
+    }
 
-        // Slice-mode consistency.
-        let slice_ids: std::collections::BTreeSet<&str> = self
-            .network
-            .as_ref()
-            .map(|n| n.slices.iter().map(|s| s.id.as_str()).collect())
-            .unwrap_or_default();
-        if let Some(network) = &self.network {
-            for slice in &network.slices {
-                match slice.mode {
-                    SliceMode::Vlan if slice.vlan.is_none() => {
-                        errors.push(ValidationError::VlanSliceWithoutVlan(slice.id.clone()));
-                    }
-                    SliceMode::Snssai if slice.s_nssai.is_none() => {
-                        errors.push(ValidationError::SnssaiSliceWithoutSnssai(slice.id.clone()));
-                    }
-                    _ => {}
-                }
-            }
-        }
+    errors
+}
 
-        // Slice references from node ifaces and slice policies.
-        for zone in &self.zones {
-            for node in &zone.nodes {
-                for iface in &node.network {
-                    if let Some(slice) = &iface.slice
-                        && !slice_ids.contains(slice.as_str())
-                    {
-                        errors.push(ValidationError::UnknownSlice {
-                            node: node.id.clone(),
-                            slice: slice.clone(),
-                        });
-                    }
-                }
-                for rule in &node.slice_policy {
-                    if !slice_ids.contains(rule.slice.as_str()) {
-                        errors.push(ValidationError::UnknownSlice {
-                            node: node.id.clone(),
-                            slice: rule.slice.clone(),
-                        });
-                    }
-                }
-                // Execution doesn't implement URSP-style multi-session
-                // routing yet — a manifest that declares slice_policy and
-                // passes validation would silently have it ignored at
-                // provisioning time. Reject it loudly instead.
-                if !node.slice_policy.is_empty() {
-                    errors.push(ValidationError::SlicePolicyNotImplemented(node.id.clone()));
-                }
-            }
-        }
+/// Vehicle manifest (§6.2): composes an entire SDV in software, reusing the
+/// `zones`/`compute`/`network`/`services` blocks an experiment manifest
+/// also carries. An experiment manifest may reference one via
+/// `experiment.vehicle` (a path); the CLI/daemon still validate this
+/// document independently before composing it in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VehicleManifest {
+    pub vehicle: Vehicle,
+    #[serde(default)]
+    pub network: Option<Network>,
+    #[serde(default)]
+    pub services: BTreeMap<String, ServiceDef>,
+    #[serde(default)]
+    pub compute: Vec<ComputeNode>,
+    #[serde(default)]
+    pub zones: Vec<Zone>,
+}
 
-        // Service references from zones and compute nodes.
-        let service_ids: std::collections::BTreeSet<&str> =
-            self.services.values().map(|s| s.id.as_str()).collect();
-        let check_service_refs =
-            |referrer: &str, refs: &[String], errors: &mut Vec<ValidationError>| {
-                for svc in refs {
-                    if !service_ids.contains(svc.as_str()) {
-                        errors.push(ValidationError::UnknownService {
-                            referrer: referrer.to_string(),
-                            svc: svc.clone(),
-                        });
-                    }
-                }
-            };
-        for zone in &self.zones {
-            check_service_refs(&zone.id, &zone.services, &mut errors);
-        }
-        for c in &self.compute {
-            check_service_refs(&c.id, &c.services, &mut errors);
-        }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Vehicle {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Phase 3: COVESA VSS signal plane via the Kuksa databroker.
+    #[serde(default)]
+    pub signal_plane: Option<SignalPlane>,
+    #[serde(default)]
+    pub comms: Option<Comms>,
+    /// Optional co-simulation source (CARLA/AlpaSim) driving traffic
+    /// profiles with `carla:` blocks (§6.1).
+    #[serde(default)]
+    pub world: Option<World>,
+}
 
-        errors
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignalPlane {
+    pub kuksa: KuksaCfg,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KuksaCfg {
+    pub image: Image,
+    /// Path to the COVESA VSS signal catalog.
+    #[serde(default)]
+    pub vss_catalog: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Comms {
+    pub ros2_rmw: Ros2Rmw,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Ros2Rmw {
+    #[serde(rename = "rmw_zenoh")]
+    RmwZenoh,
+    #[serde(rename = "rmw_fastrtps")]
+    RmwFastrtps,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct World {
+    pub simulator: Simulator,
+    #[serde(default)]
+    pub image: Option<Image>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Simulator {
+    #[serde(rename = "carla")]
+    Carla,
+    #[serde(rename = "alpasim")]
+    Alpasim,
+    #[serde(rename = "none")]
+    None,
+}
+
+impl VehicleManifest {
+    /// Parse YAML and run the same semantic validation an experiment
+    /// manifest gets (§6.2 reuses §6.1's zones/compute/network/services).
+    pub fn from_yaml(yaml: &str) -> Result<Self, ManifestError> {
+        let manifest: Self = serde_yaml_ng::from_str(yaml)?;
+        let errors = manifest.validate();
+        if errors.is_empty() {
+            Ok(manifest)
+        } else {
+            Err(ManifestError::Invalid(errors))
+        }
+    }
+
+    pub fn validate(&self) -> Vec<ValidationError> {
+        validate_composition(&self.zones, &self.compute, &self.network, &self.services)
     }
 }
 
@@ -657,5 +773,104 @@ traffic_profiles:
     fn rejects_unknown_fields() {
         let bad = EXAMPLE.replace("duration_s: 1800", "duration_s: 1800\n  surprise_field: 1");
         assert!(ExperimentManifest::from_yaml(&bad).is_err());
+    }
+
+    const VEHICLE_EXAMPLE: &str = r#"
+vehicle:
+  id: vx-vehicle-01
+  name: "vx-vehicle-01 OEM-representative zonal E/E"
+  description: Four-zone + central-hpc reference vehicle
+  comms:
+    ros2_rmw: rmw_zenoh
+  world:
+    simulator: carla
+    image: { url: registry/carla-server:0.10, kind: container }
+
+network:
+  slices:
+    - id: adas
+      mode: vlan
+      vlan: 101
+      qos: { min_rate_mbps: 100, max_rate_mbps: 200, priority: 1 }
+
+services:
+  telemetry:
+    id: telemetry-01
+    type: telemetry
+    image:
+      url: registry/vxtelemetry:latest
+      kind: container
+    config:
+      scrape_interval_s: 5
+
+zones:
+  - id: vxzone-front-left-01
+    role: front-left
+    services: [telemetry-01]
+    nodes:
+      - id: node-ecu-01
+        type: ecu
+        image: { url: registry/zephyr-probe:1, kind: rtimage }
+        backend: qemu-microvm
+        network:
+          - iface: eth0
+            vlan: 101
+            slice: adas
+
+compute:
+  - id: vxcompute-central-01
+    name: central
+    image: { url: registry/responder:1, kind: container }
+    resources: { cpu: 4, memory: 8, gpu: passthrough }
+"#;
+
+    #[test]
+    fn parses_and_validates_vehicle_manifest() {
+        let m = VehicleManifest::from_yaml(VEHICLE_EXAMPLE).expect("valid vehicle manifest");
+        assert_eq!(m.vehicle.id, "vx-vehicle-01");
+        assert_eq!(m.vehicle.comms.unwrap().ros2_rmw, Ros2Rmw::RmwZenoh);
+        assert_eq!(m.vehicle.world.unwrap().simulator, Simulator::Carla);
+        assert_eq!(m.zones[0].nodes[0].backend, Some(Backend::QemuMicrovm));
+        assert_eq!(m.compute[0].id, "vxcompute-central-01");
+    }
+
+    #[test]
+    fn vehicle_manifest_reuses_the_same_slice_reference_check() {
+        // §6.2 reuses §6.1's zones/compute/network/services blocks — a
+        // vehicle manifest must fail the same way an experiment manifest
+        // would for an unknown slice reference, via the shared
+        // validate_composition() path.
+        let bad = VEHICLE_EXAMPLE.replace("slice: adas", "slice: nonexistent");
+        let err = VehicleManifest::from_yaml(&bad).unwrap_err();
+        match err {
+            ManifestError::Invalid(errors) => assert!(errors.iter().any(
+                |e| matches!(e, ValidationError::UnknownSlice { slice, .. } if slice == "nonexistent")
+            )),
+            other => panic!("expected validation error, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn vehicle_manifest_rejects_slice_policy_as_not_yet_implemented() {
+        let bad = VEHICLE_EXAMPLE.replace(
+            "            slice: adas\n",
+            "            slice: adas\n        slice_policy:\n          - match: \"dscp:46\"\n            slice: adas\n",
+        );
+        let err = VehicleManifest::from_yaml(&bad).unwrap_err();
+        match err {
+            ManifestError::Invalid(errors) => assert!(errors.iter().any(
+                |e| matches!(e, ValidationError::SlicePolicyNotImplemented(node) if node == "node-ecu-01")
+            )),
+            other => panic!("expected validation error, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn vehicle_manifest_rejects_unknown_fields() {
+        let bad = VEHICLE_EXAMPLE.replace(
+            "  description: Four-zone + central-hpc reference vehicle",
+            "  description: Four-zone + central-hpc reference vehicle\n  surprise_field: 1",
+        );
+        assert!(VehicleManifest::from_yaml(&bad).is_err());
     }
 }

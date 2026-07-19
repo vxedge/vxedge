@@ -1250,6 +1250,7 @@ dependencies = [
  "hyper-util",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
  "tokio",
  "tonic",
  "tower",

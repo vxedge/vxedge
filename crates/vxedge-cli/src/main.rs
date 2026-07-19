@@ -504,13 +504,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ManifestCmd::Validate { manifest } => {
                 let yaml = std::fs::read_to_string(manifest)
                     .map_err(|e| format!("cannot read manifest `{manifest}`: {e}"))?;
+                // Vehicle manifests (§6.2) and experiment manifests (§6.1)
+                // are distinguished by their required top-level key — sniff
+                // it instead of asking the caller to declare the kind, so
+                // `vxedge manifest validate` stays a single command for
+                // both (M2's `vxmodel render` needs to validate rendered
+                // vehicle manifests too).
+                let is_vehicle = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&yaml)
+                    .ok()
+                    .and_then(|v| v.get("vehicle").is_some().then_some(()))
+                    .is_some();
+                if is_vehicle {
+                    match vxedge_core::VehicleManifest::from_yaml(&yaml) {
+                        Ok(m) => {
+                            if cli.json {
+                                println!(
+                                    "{}",
+                                    serde_json::json!({
+                                        "manifest": manifest, "valid": true, "kind": "vehicle",
+                                        "vehicle_id": m.vehicle.id,
+                                        "zones": m.zones.len(), "compute": m.compute.len(),
+                                        "services": m.services.len(),
+                                    })
+                                );
+                            } else {
+                                println!(
+                                    "OK: {manifest} — vehicle `{}`, {} zone(s), {} compute node(s), {} service(s)",
+                                    m.vehicle.id,
+                                    m.zones.len(),
+                                    m.compute.len(),
+                                    m.services.len()
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            if cli.json {
+                                println!(
+                                    "{}",
+                                    serde_json::json!({
+                                        "manifest": manifest, "valid": false, "error": e.to_string(),
+                                    })
+                                );
+                            } else {
+                                eprintln!("INVALID: {manifest}\n{e}");
+                            }
+                            std::process::exit(1);
+                        }
+                    }
+                    return Ok(());
+                }
                 match vxedge_core::ExperimentManifest::from_yaml(&yaml) {
                     Ok(m) => {
                         if cli.json {
                             println!(
                                 "{}",
                                 serde_json::json!({
-                                    "manifest": manifest, "valid": true,
+                                    "manifest": manifest, "valid": true, "kind": "experiment",
                                     "experiment_id": m.experiment.id,
                                     "zones": m.zones.len(), "compute": m.compute.len(),
                                     "services": m.services.len(),

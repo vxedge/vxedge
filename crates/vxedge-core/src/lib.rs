@@ -12,4 +12,4 @@ pub mod services;
 pub mod traffic;
 pub mod zones;
 
-pub use manifest::{ExperimentManifest, ValidationError};
+pub use manifest::{ExperimentManifest, ValidationError, VehicleManifest};

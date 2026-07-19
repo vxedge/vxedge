@@ -12,8 +12,22 @@ Ordered for the phase-1 critical path (see ../docs/TASKS.md). Each task should l
 - [x] `vxedge-core`: experiment-manifest structs (§6.1 incl. slices/slice_policy/backend/
       realtime/carla/gpu/`telemetry.prometheus.optional_scrape_targets`) + serde_yaml
       parsing + semantic validation (slice refs, vxid uniqueness, slice-mode consistency,
-      service refs) — vehicle manifest (§6.2) still TODO
-- [ ] `vxedge-core`: vehicle-manifest structs (§6.2) + validation
+      service refs) — vehicle manifest structs delivered below (2026-07-19)
+- [x] `vxedge-core`: vehicle-manifest structs (§6.2) + validation (2026-07-19).
+      `VehicleManifest` (`vehicle`/`network`/`services`/`compute`/`zones`) reuses the same
+      `Zone`/`ComputeNode`/`Network`/`ServiceDef` types an experiment manifest carries;
+      `Vehicle` adds `signal_plane.kuksa` (phase 3), `comms.ros2_rmw`, and
+      `world.simulator`/`world.image` per §6.2 exactly. Semantic validation (vxid
+      uniqueness, slice refs, slice-mode consistency, service refs, the
+      `slice_policy` guard above) is shared with `ExperimentManifest` via a new
+      `validate_composition()` free function rather than duplicated — both manifest
+      kinds must be internally consistent the same way. `vxedge manifest validate`
+      now sniffs the top-level key (`vehicle:` vs `experiment:`) and validates
+      accordingly, so it stays one command for both — unblocks M2's `vxmodel render`
+      pipeline (`vxmodels/TASKS.md`), which needs to run `vxedge manifest validate
+      --json` against a rendered vehicle manifest. 4 new vxedge-core tests + CLI
+      live-verified both directions (vehicle manifest OK + JSON, experiment manifest
+      still OK); 70 unit tests, clippy/fmt clean.
 - [x] `vxedged`: job engine (async tasks + watch-channel progress), event bus
       (EventService.Subscribe live), structured JSONL audit log of mutating calls; Gateway
       Apply/Up/Down submit real jobs (validate + plan; Up/Down fail honestly at the
