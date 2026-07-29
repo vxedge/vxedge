@@ -8,8 +8,10 @@
 pub mod fiveg;
 pub mod gateway;
 pub mod manifest;
+pub mod scaffold;
 pub mod services;
 pub mod traffic;
 pub mod zones;
 
 pub use manifest::{ExperimentManifest, ValidationError, VehicleManifest};
+pub use scaffold::{ScaffoldError, Template, Workspace};

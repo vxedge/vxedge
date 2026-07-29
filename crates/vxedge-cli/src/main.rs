@@ -94,7 +94,7 @@ enum Command {
     /// Manifest-driven experiments.
     Experiment {
         #[command(subcommand)]
-        cmd: ManifestLifecycleCmd,
+        cmd: ExperimentCmd,
     },
     /// Traffic generation per manifest profiles.
     Traffic {
@@ -219,6 +219,51 @@ enum TelemetryCmd {
         #[arg(long)]
         out: String,
     },
+}
+
+/// Experiments add `new` to the shared lifecycle verbs: scaffolding a workspace is local
+/// file generation, not a daemon call, so it does not fit `ManifestLifecycleCmd`.
+#[derive(Subcommand, Debug)]
+enum ExperimentCmd {
+    /// Create a workspace that is ready to edit — no daemon, no network, no GPU.
+    New {
+        /// Workspace id; also the directory name and the published repository path component.
+        id: String,
+        #[arg(long, value_enum, default_value_t = TemplateArg::Minimal)]
+        template: TemplateArg,
+        /// Parent directory to create the workspace in.
+        #[arg(long, default_value = ".")]
+        path: String,
+    },
+    Up {
+        #[arg(long)]
+        manifest: String,
+    },
+    Down {
+        #[arg(long)]
+        manifest: String,
+    },
+    Status {
+        #[arg(long)]
+        manifest: String,
+    },
+}
+
+/// Mirrors `vxedge_core::Template`. Kept here so the domain library stays free of a clap
+/// dependency (house rule: binaries own arg parsing, libraries own logic).
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum TemplateArg {
+    Minimal,
+    Slicing,
+}
+
+impl From<TemplateArg> for vxedge_core::Template {
+    fn from(value: TemplateArg) -> Self {
+        match value {
+            TemplateArg::Minimal => vxedge_core::Template::Minimal,
+            TemplateArg::Slicing => vxedge_core::Template::Slicing,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -473,7 +518,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         Command::Telemetry { .. } => scaffold_notice("telemetry"),
         Command::Vehicle { .. } => scaffold_notice("vehicle"),
-        Command::Experiment { .. } => scaffold_notice("experiment"),
+        Command::Experiment { cmd } => match cmd {
+            ExperimentCmd::New { id, template, path } => {
+                let template: vxedge_core::Template = (*template).into();
+                let ws = vxedge_core::Workspace::plan(id, template)?;
+                let root = ws.write(std::path::Path::new(path))?;
+                println!("created {}", root.display());
+                for file in &ws.files {
+                    println!("  {}", file.path.display());
+                }
+                println!(
+                    "\nnext:  cd {} && $EDITOR main.yaml\nsee:   {}/README.md",
+                    root.display(),
+                    root.display()
+                );
+                if template.requires_gpu() {
+                    // Stated at scaffold time so the requirement is known before a long
+                    // build rather than after one.
+                    eprintln!(
+                        "note: this template needs a Tier 2 GPU host \
+                         (RTX-class, >=12 GB VRAM, tensor cores)"
+                    );
+                }
+            }
+            ExperimentCmd::Up { .. }
+            | ExperimentCmd::Down { .. }
+            | ExperimentCmd::Status { .. } => scaffold_notice("experiment"),
+        },
         Command::Traffic { cmd } => match cmd {
             TrafficCmd::Up { manifest, profiles } => {
                 let channel = connect(&cli.endpoint).await?;

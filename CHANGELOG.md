@@ -6,6 +6,23 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- `vxedge experiment new <id> [--template minimal|slicing]` — scaffolds an experiment
+  workspace that is ready to edit, with no daemon, no network and no GPU. Generates the
+  folder-workspace shape from `docs/TASKS.md` Track D: every file declares its `kind`, and
+  everything is referenced by unique id rather than by path, so the files can be renamed
+  freely. `vxedge-core::scaffold` follows the house layering — `Workspace::plan` is pure data
+  and unit-tested, `Workspace::write` is the only part that touches the filesystem, and it
+  refuses to write into an existing directory rather than merging into someone's folder.
+  Workspace ids are validated against OCI repository-name rules at creation time, because the
+  id becomes a repository path component on publish and failing there instead is much worse.
+
+  **The generated workspace uses the proposed ARCHITECTURE.md §6 schema, which is still
+  awaiting sign-off, and `experiment up` does not consume it yet.** It exists so §6 can be
+  reviewed as something you can open and edit rather than as prose; the generated README says
+  so plainly.
+
 ## [0.1.0] - 2026-07-13
 
 **Phase-1 gate passed**: H1, H3, and H4 all have reproducible numbers (`vxperiments`).
