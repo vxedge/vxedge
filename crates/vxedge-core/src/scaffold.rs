@@ -10,8 +10,8 @@
 //! rather than against prose. The generated README says so plainly; claiming otherwise would
 //! ship a scaffold whose output cannot run.
 //!
-//! Layering follows the house rule: [`Workspace::plan`] is pure data and unit-testable
-//! anywhere, [`Workspace::write`] is the only part that touches the filesystem.
+//! Layering follows the house rule: [`WorkspacePlan::plan`] is pure data and unit-testable
+//! anywhere, [`WorkspacePlan::write`] is the only part that touches the filesystem.
 
 use std::path::{Path, PathBuf};
 
@@ -91,7 +91,7 @@ pub struct WorkspaceFile {
 
 /// A planned workspace. Pure data: building one performs no I/O and touches no filesystem.
 #[derive(Debug, Clone)]
-pub struct Workspace {
+pub struct WorkspacePlan {
     pub id: String,
     pub template: Template,
     pub files: Vec<WorkspaceFile>,
@@ -111,7 +111,7 @@ fn valid_id(id: &str) -> bool {
         && !id.contains("--")
 }
 
-impl Workspace {
+impl WorkspacePlan {
     /// Build the workspace contents. Pure — no filesystem access.
     pub fn plan(id: &str, template: Template) -> Result<Self, ScaffoldError> {
         if !valid_id(id) {
@@ -146,7 +146,7 @@ impl Workspace {
             },
         ];
 
-        Ok(Workspace {
+        Ok(WorkspacePlan {
             id: id.to_string(),
             template,
             files,
@@ -371,7 +371,7 @@ mod tests {
 
     #[test]
     fn plan_is_pure_and_complete() {
-        let ws = Workspace::plan("h1-slice-isolation", Template::Slicing).expect("valid id");
+        let ws = WorkspacePlan::plan("h1-slice-isolation", Template::Slicing).expect("valid id");
         let names: Vec<_> = ws.files.iter().map(|f| f.path.to_string_lossy()).collect();
         assert!(names.contains(&"h1-slice-isolation.vxp".into()));
         assert!(names.contains(&"main.yaml".into()));
@@ -383,7 +383,7 @@ mod tests {
     fn every_entity_file_declares_kind_and_id() {
         // The loader indexes by (kind, id); a generated file missing either would be
         // unaddressable, which is the one defect that would make the whole model unusable.
-        let ws = Workspace::plan("demo", Template::Minimal).unwrap();
+        let ws = WorkspacePlan::plan("demo", Template::Minimal).unwrap();
         for f in &ws.files {
             if f.path.extension().and_then(|e| e.to_str()) == Some("yaml") {
                 assert!(f.contents.contains("kind: "), "{:?} has no kind", f.path);
@@ -395,7 +395,7 @@ mod tests {
     #[test]
     fn generated_yaml_parses() {
         for template in [Template::Minimal, Template::Slicing] {
-            let ws = Workspace::plan("demo", template).unwrap();
+            let ws = WorkspacePlan::plan("demo", template).unwrap();
             for f in &ws.files {
                 let is_yaml = f.path.extension().and_then(|e| e.to_str()) == Some("yaml")
                     || f.path.to_string_lossy().ends_with(".vxp");
@@ -409,7 +409,7 @@ mod tests {
 
     #[test]
     fn slicing_template_defines_both_slices_and_the_overload() {
-        let ws = Workspace::plan("demo", Template::Slicing).unwrap();
+        let ws = WorkspacePlan::plan("demo", Template::Slicing).unwrap();
         let main = ws
             .files
             .iter()
@@ -435,13 +435,13 @@ mod tests {
             "9start",
         ] {
             assert!(
-                Workspace::plan(bad, Template::Minimal).is_err(),
+                WorkspacePlan::plan(bad, Template::Minimal).is_err(),
                 "expected `{bad}` to be rejected"
             );
         }
         for good in ["h1", "h1-slice-isolation", "exp-011", "a1"] {
             assert!(
-                Workspace::plan(good, Template::Minimal).is_ok(),
+                WorkspacePlan::plan(good, Template::Minimal).is_ok(),
                 "expected `{good}` to be accepted"
             );
         }
@@ -453,13 +453,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("taken")).unwrap();
 
-        let ws = Workspace::plan("taken", Template::Minimal).unwrap();
+        let ws = WorkspacePlan::plan("taken", Template::Minimal).unwrap();
         assert!(matches!(
             ws.write(&tmp),
             Err(ScaffoldError::AlreadyExists(_))
         ));
 
-        let ws = Workspace::plan("fresh", Template::Minimal).unwrap();
+        let ws = WorkspacePlan::plan("fresh", Template::Minimal).unwrap();
         let root = ws.write(&tmp).expect("writes into a clean directory");
         assert!(root.join("main.yaml").is_file());
         assert!(root.join("results").is_dir());

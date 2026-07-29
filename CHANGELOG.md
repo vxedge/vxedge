@@ -8,6 +8,18 @@ All notable changes to this repo are documented here. Format follows
 
 ### Added
 
+- `vxedge experiment validate [path]` and `vxedge-core::workspace` — loads a workspace folder
+  and runs every cross-file check, reporting all problems at once rather than the first.
+  Checks: exactly one experiment; document- and component-id uniqueness across the workspace;
+  vehicle/baseline references; `target_ids`, link endpoints and channel endpoints resolving to
+  real components; `carried_by` naming real links **and the channel's endpoints actually being
+  reachable over them**; the cross-file slice join (the vehicle names a slice, the experiment
+  must define it); and published refs being digest-pinned while local refs need not be.
+
+  Additive: it sits alongside the existing manifest path and changes nothing about it, so
+  every current experiment keeps parsing. Loading is deliberately non-recursive so a
+  `results/` archive cannot be absorbed into the experiment.
+
 - `vxedge experiment new <id> [--template minimal|slicing]` — scaffolds an experiment
   workspace that is ready to edit, with no daemon, no network and no GPU. Generates the
   folder-workspace shape from `docs/TASKS.md` Track D: every file declares its `kind`, and

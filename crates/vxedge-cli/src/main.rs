@@ -235,6 +235,12 @@ enum ExperimentCmd {
         #[arg(long, default_value = ".")]
         path: String,
     },
+    /// Load and cross-check a workspace folder (local — no daemon, no network).
+    Validate {
+        /// Workspace directory.
+        #[arg(default_value = ".")]
+        path: String,
+    },
     Up {
         #[arg(long)]
         manifest: String,
@@ -521,7 +527,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Experiment { cmd } => match cmd {
             ExperimentCmd::New { id, template, path } => {
                 let template: vxedge_core::Template = (*template).into();
-                let ws = vxedge_core::Workspace::plan(id, template)?;
+                let ws = vxedge_core::WorkspacePlan::plan(id, template)?;
                 let root = ws.write(std::path::Path::new(path))?;
                 println!("created {}", root.display());
                 for file in &ws.files {
@@ -539,6 +545,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "note: this template needs a Tier 2 GPU host \
                          (RTX-class, >=12 GB VRAM, tensor cores)"
                     );
+                }
+            }
+            ExperimentCmd::Validate { path } => {
+                let root = std::path::Path::new(path);
+                let ws = vxedge_core::Workspace::load(root)?;
+                let errors = ws.validate();
+                if errors.is_empty() {
+                    println!(
+                        "ok: {} experiment, {} vehicle(s), {} baseline(s), {} road(s)",
+                        ws.experiments.len(),
+                        ws.vehicles.len(),
+                        ws.baselines.len(),
+                        ws.roads.len()
+                    );
+                } else {
+                    // Every problem at once: an engineer fixing a workspace wants the list,
+                    // not a fix-one-rerun loop.
+                    eprintln!("{} problem(s) in {}:", errors.len(), root.display());
+                    for e in &errors {
+                        eprintln!("  - {e}");
+                    }
+                    std::process::exit(1);
                 }
             }
             ExperimentCmd::Up { .. }

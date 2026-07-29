@@ -11,7 +11,9 @@ pub mod manifest;
 pub mod scaffold;
 pub mod services;
 pub mod traffic;
+pub mod workspace;
 pub mod zones;
 
 pub use manifest::{ExperimentManifest, ValidationError, VehicleManifest};
-pub use scaffold::{ScaffoldError, Template, Workspace};
+pub use scaffold::{ScaffoldError, Template, WorkspacePlan};
+pub use workspace::{Workspace, WorkspaceError, WorkspaceValidationError};
