@@ -46,8 +46,10 @@
 
 use std::collections::BTreeMap;
 
+pub mod adapt;
 pub mod build;
 
+pub use adapt::AdaptError;
 pub use build::{ModelError, build};
 
 /// A software-defined mobility entity. A car today; the class axis is what keeps an eVTOL,
@@ -62,6 +64,19 @@ pub struct Entity {
     pub subtype: Option<String>,
     pub zones: BTreeMap<String, Zone>,
     pub devices: BTreeMap<String, Device>,
+    /// Device ids in **traversal order**, which is load-bearing rather than cosmetic: gateway
+    /// endpoints are numbered positionally (`vz0`, `vz1`, …) and campaign scripts address those
+    /// names directly.
+    ///
+    /// Explicit because the two schemas order differently and neither is wrong. §6.0 stores
+    /// components in a map, so declaration order is already lost and sorted id is the only
+    /// deterministic choice; §6.1 declares zones and nodes as sequences, so declaration order is
+    /// what its existing plans were built from. Sorting a §6.1 manifest would renumber
+    /// endpoints: exp-002 declares `cont, microvm, libvirt` and sorts to `cont, libvirt,
+    /// microvm`, so its H3 arms would have attached to each other's interfaces and the campaign
+    /// would have measured libvirt while reporting microvm. Ordering therefore travels with the
+    /// model rather than being re-derived.
+    pub device_order: Vec<String>,
     pub functions: BTreeMap<String, Function>,
     pub links: Vec<Link>,
     pub channels: Vec<Channel>,
@@ -350,11 +365,12 @@ pub enum TrafficEndpoint {
 }
 
 impl Entity {
-    /// Devices in a stable order, so anything derived from the traversal (gateway endpoint
-    /// numbering, and therefore interface names campaign scripts address directly) is
-    /// reproducible across runs.
+    /// Devices in traversal order — see [`Entity::device_order`] for why this is not simply
+    /// map order.
     pub fn devices_in_order(&self) -> impl Iterator<Item = &Device> {
-        self.devices.values()
+        self.device_order
+            .iter()
+            .filter_map(move |id| self.devices.get(id))
     }
 
     pub fn device(&self, id: &str) -> Option<&Device> {
@@ -447,6 +463,16 @@ pub enum InvariantError {
     UnknownTrafficDevice { profile: String, device: String },
     #[error("link `{link}` binds slice `{slice}`, which the experiment does not define")]
     UndefinedSlice { link: String, slice: String },
+    #[error(
+        "entity `{entity}`: `device_order` lists {listed} device(s) but the entity declares \
+         {declared} — traversal order decides positional endpoint names, so a device missing \
+         from it would never be provisioned and a duplicate would be provisioned twice"
+    )]
+    DeviceOrderMismatch {
+        entity: String,
+        listed: usize,
+        declared: usize,
+    },
 }
 
 impl Experiment {
@@ -473,6 +499,15 @@ impl Experiment {
         let mut device_owner: BTreeMap<&str, &str> = BTreeMap::new();
 
         for entity in &self.entities {
+            let ordered: std::collections::BTreeSet<&str> =
+                entity.device_order.iter().map(String::as_str).collect();
+            if ordered.len() != entity.devices.len() || entity.device_order.len() != ordered.len() {
+                errors.push(E::DeviceOrderMismatch {
+                    entity: entity.id.clone(),
+                    listed: entity.device_order.len(),
+                    declared: entity.devices.len(),
+                });
+            }
             for (id, device) in &self.devices_of(entity) {
                 if device_owner.insert(id, entity.id.as_str()).is_some() {
                     errors.push(E::DuplicateDevice {

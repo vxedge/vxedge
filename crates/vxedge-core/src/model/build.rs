@@ -271,6 +271,9 @@ fn build_entity(ws: &Workspace, doc: &VehicleDoc) -> Result<Entity, ModelError> 
         class: EntityClass::Road,
         subtype: None,
         zones,
+        // §6.0 stores components in a map, so declaration order is already lost by the time we
+        // see them and sorted id is the only deterministic order available.
+        device_order: devices.keys().cloned().collect(),
         devices,
         functions,
         links,
