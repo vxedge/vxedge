@@ -51,6 +51,11 @@ pub type SharedState = Arc<tokio::sync::Mutex<EdgeState>>;
 
 /// Resolve a ManifestRef to (yaml, sha256, source dir), enforcing the
 /// checksum guard when the caller supplied one.
+/// Just the YAML, for callers that resolve once and pass the document on (`ExperimentSvc`).
+pub(crate) async fn resolve_manifest_yaml(mref: &ManifestRef) -> Result<String, Status> {
+    resolve_manifest(Some(mref)).await.map(|(yaml, _, _)| yaml)
+}
+
 async fn resolve_manifest(
     mref: Option<&ManifestRef>,
 ) -> Result<(String, String, Option<PathBuf>), Status> {
@@ -58,6 +63,9 @@ async fn resolve_manifest(
         Status::invalid_argument("a manifest is required (pass --manifest <path> on the CLI)")
     })?;
     let (yaml, dir) = match &mref.source {
+        Some(Source::Path(path)) if PathBuf::from(path).is_dir() => {
+            (lower_workspace(path).await?, Some(PathBuf::from(path)))
+        }
         Some(Source::Path(path)) => {
             let yaml = tokio::fs::read_to_string(path).await.map_err(|e| {
                 Status::invalid_argument(format!(
@@ -81,6 +89,27 @@ async fn resolve_manifest(
         )));
     }
     Ok((yaml, sha256, dir))
+}
+
+/// A `ManifestRef.path` pointing at a **directory** is a §6.0 workspace: load it, validate it,
+/// and lower it to the §6.1 manifest the provisioning layer consumes.
+///
+/// This lives daemon-side on purpose. Lowering is a manifest transformation, so putting it in
+/// the CLI would make every frontend reimplement it — and §6.0 is the only schema an OEM
+/// engineer authors, so no frontend should need to know the older one exists at all.
+///
+/// The reproducibility checksum therefore covers the **lowered** manifest, which is the right
+/// thing: results are keyed to what actually ran. Lowering is pure, so the same workspace
+/// always produces the same hash.
+async fn lower_workspace(dir: &str) -> Result<String, Status> {
+    let root = PathBuf::from(dir);
+    // std::fs, so it must not run on the async runtime.
+    tokio::task::spawn_blocking(move || {
+        vxedge_core::lower::lower_path_to_yaml(&root)
+            .map_err(|e| Status::invalid_argument(format!("workspace `{}`: {e}", root.display())))
+    })
+    .await
+    .map_err(|e| Status::internal(format!("workspace task panicked: {e}")))?
 }
 
 mod hex {
@@ -597,7 +626,8 @@ impl ZoneSvc {
             (Some(y), Some(g)) => (y.clone(), g.clone()),
             _ => {
                 return Err(Status::failed_precondition(
-                    "no active experiment — run `vxedge up --manifest <exp.yaml>` first",
+                    "no active experiment: zone verbs act on the topology the gateway registered, so \
+                     bring one up first (`vxedge experiment up` from a workspace directory)",
                 ));
             }
         };

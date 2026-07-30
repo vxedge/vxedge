@@ -20,6 +20,7 @@ use tower::service_fn;
 
 mod doctor;
 
+use vxedge_api::v1::experiment_service_client::ExperimentServiceClient;
 use vxedge_api::v1::gateway_service_client::GatewayServiceClient;
 use vxedge_api::v1::job_service_client::JobServiceClient;
 use vxedge_api::v1::manifest_ref::Source;
@@ -27,9 +28,10 @@ use vxedge_api::v1::svc_service_client::SvcServiceClient;
 use vxedge_api::v1::traffic_service_client::TrafficServiceClient;
 use vxedge_api::v1::zone_service_client::ZoneServiceClient;
 use vxedge_api::v1::{
-    GatewayDownRequest, GatewayStatusRequest, GatewayUpRequest, Job, JobState, ManifestRef,
-    SvcDownRequest, SvcUpRequest, TrafficDownRequest, TrafficUpRequest, VxidRef, WatchJobRequest,
-    ZoneDownRequest, ZoneListRequest, ZoneUpRequest,
+    ExperimentDownRequest, ExperimentStatusRequest, ExperimentUpRequest, GatewayDownRequest,
+    GatewayStatusRequest, GatewayUpRequest, Job, JobState, ManifestRef, SvcDownRequest,
+    SvcUpRequest, TrafficDownRequest, TrafficUpRequest, VxidRef, WatchJobRequest, ZoneDownRequest,
+    ZoneListRequest, ZoneUpRequest,
 };
 
 #[derive(Parser, Debug)]
@@ -252,15 +254,6 @@ enum ExperimentCmd {
     },
     /// Load and cross-check the workspace here (local — no daemon, no network).
     Validate,
-    /// Lower the workspace here to the §6.1 manifest today's daemon runs.
-    ///
-    /// Transitional: `experiment up` will lower server-side, at which point this verb goes
-    /// away (`TASKS.md` section 0 task 3). An OEM engineer should never need to run it.
-    Lower {
-        /// Write here instead of stdout.
-        #[arg(long, short)]
-        out: Option<String>,
-    },
     /// Bring the workspace here up.
     Up,
     /// Tear the workspace here down.
@@ -380,10 +373,20 @@ async fn watch_job(
         if json {
             println!("{}", serde_json::to_string(&JsonJob::from(&snapshot))?);
         } else if !snapshot.message.is_empty() || snapshot.progress_percent > 0 {
-            println!(
-                "[{:>3}%] {} {}",
-                snapshot.progress_percent, snapshot.kind, snapshot.message
-            );
+            // A watch stream delivers the current snapshot on subscribe and then again on the
+            // first change, so the same step would otherwise print twice. Compare on what is
+            // actually shown rather than on the whole job — `updated_unix_ms` differs every
+            // time and would defeat the check.
+            let shown = (snapshot.progress_percent, snapshot.message.as_str());
+            let repeat = last
+                .as_ref()
+                .is_some_and(|l| (l.progress_percent, l.message.as_str()) == shown);
+            if !repeat {
+                println!(
+                    "[{:>3}%] {} {}",
+                    snapshot.progress_percent, snapshot.kind, snapshot.message
+                );
+            }
         }
         last = Some(snapshot);
     }
@@ -619,36 +622,47 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
             }
-            ExperimentCmd::Lower { out } => {
-                let found = vxedge_core::discover(&here()?)?;
-                let ws = vxedge_core::Workspace::load_validated(&found.root)?;
-                let manifest = vxedge_core::lower(&ws)?;
-                let yaml = serde_yaml_ng::to_string(&manifest)?;
-                match out {
-                    Some(f) => {
-                        std::fs::write(f, &yaml)?;
-                        println!("wrote {f}");
-                    }
-                    None => print!("{yaml}"),
-                }
-            }
-            // Addressing is live; the daemon side is not. Resolving and validating the
-            // workspace first means the *addressing* is exercised end to end now, and the
-            // failure an engineer hits is about the missing service rather than a vague
-            // "not implemented" that hides whether their workspace was even found.
+            // The daemon receives the workspace *directory* and lowers it itself. The CLI
+            // never learns that §6.1 exists — which is the point of §6.0 being the only
+            // authored schema.
             ExperimentCmd::Up | ExperimentCmd::Down | ExperimentCmd::Status => {
                 let found = vxedge_core::discover(&here()?)?;
-                vxedge_core::Workspace::load_validated(&found.root)?;
-                println!(
-                    "resolved workspace `{}` at {}",
-                    found.package.id,
-                    found.root.display()
-                );
-                eprintln!(
-                    "vxedge: ExperimentService is not implemented in vxedged yet \
-                     (vxedge/TASKS.md section 0, task 2)."
-                );
-                std::process::exit(2);
+                let workspace = found.root.to_string_lossy().to_string();
+                let channel = connect(&cli.endpoint).await?;
+                let mut exp = ExperimentServiceClient::new(channel.clone());
+                match cmd {
+                    ExperimentCmd::Status => {
+                        let st = exp
+                            .status(ExperimentStatusRequest {
+                                manifest: manifest_ref(&Some(workspace)),
+                            })
+                            .await?
+                            .into_inner();
+                        let top = st.status.clone().unwrap_or_default();
+                        println!("{}: {}", top.vxid, top.detail);
+                        for c in &st.components {
+                            println!("  {} [{}] {}", c.vxid, c.state, c.detail);
+                        }
+                    }
+                    ExperimentCmd::Up => {
+                        let job = exp
+                            .up(ExperimentUpRequest {
+                                manifest: manifest_ref(&Some(workspace)),
+                            })
+                            .await?
+                            .into_inner();
+                        watch_job(channel, job, cli.json).await?;
+                    }
+                    _ => {
+                        let job = exp
+                            .down(ExperimentDownRequest {
+                                manifest: manifest_ref(&Some(workspace)),
+                            })
+                            .await?
+                            .into_inner();
+                        watch_job(channel, job, cli.json).await?;
+                    }
+                }
             }
         },
         Command::Traffic { cmd } => match cmd {

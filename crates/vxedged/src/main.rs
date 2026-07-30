@@ -6,6 +6,7 @@
 
 mod audit;
 mod events;
+mod experiment;
 mod jobs;
 mod services;
 
@@ -16,6 +17,7 @@ use tonic::transport::Server;
 use tracing::info;
 
 use vxedge_api::v1::event_service_server::EventServiceServer;
+use vxedge_api::v1::experiment_service_server::ExperimentServiceServer;
 use vxedge_api::v1::gateway_service_server::GatewayServiceServer;
 use vxedge_api::v1::job_service_server::JobServiceServer;
 use vxedge_api::v1::svc_service_server::SvcServiceServer;
@@ -109,26 +111,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state: services::SharedState =
         Arc::new(tokio::sync::Mutex::new(services::EdgeState::default()));
 
+    // One instance of each service, shared between its own gRPC endpoint and `ExperimentSvc`,
+    // which composes them. Two independent instances would each hold a handle to the same
+    // `EdgeState` while looking unrelated — the kind of aliasing that is fine until it isn't.
+    let gateway = Arc::new(services::GatewaySvc {
+        engine: engine.clone(),
+        audit: audit.clone(),
+        shell: shell.clone(),
+        state: state.clone(),
+        runtime_dir: args.runtime_dir.clone(),
+    });
+    let zones = Arc::new(services::ZoneSvc {
+        engine: engine.clone(),
+        audit: audit.clone(),
+        shell: shell.clone(),
+        state,
+        runtime_dir: args.runtime_dir.clone(),
+    });
+    let svcs = Arc::new(services::SvcSvc {
+        engine: engine.clone(),
+        audit: audit.clone(),
+        runtime_dir: args.runtime_dir.clone(),
+        vxota_bin: args.vxota_bin.clone(),
+    });
+
     Server::builder()
-        .add_service(GatewayServiceServer::new(services::GatewaySvc {
-            engine: engine.clone(),
+        .add_service(GatewayServiceServer::from_arc(gateway.clone()))
+        .add_service(ZoneServiceServer::from_arc(zones.clone()))
+        .add_service(SvcServiceServer::from_arc(svcs.clone()))
+        .add_service(ExperimentServiceServer::new(experiment::ExperimentSvc {
             audit: audit.clone(),
-            shell: shell.clone(),
-            state: state.clone(),
-            runtime_dir: args.runtime_dir.clone(),
-        }))
-        .add_service(ZoneServiceServer::new(services::ZoneSvc {
-            engine: engine.clone(),
-            audit: audit.clone(),
-            shell: shell.clone(),
-            state,
-            runtime_dir: args.runtime_dir.clone(),
-        }))
-        .add_service(SvcServiceServer::new(services::SvcSvc {
-            engine: engine.clone(),
-            audit: audit.clone(),
-            runtime_dir: args.runtime_dir.clone(),
-            vxota_bin: args.vxota_bin.clone(),
+            handles: experiment::Handles {
+                engine: engine.clone(),
+                gateway,
+                zones,
+                svcs,
+            },
         }))
         .add_service(TrafficServiceServer::new(services::TrafficSvc {
             engine: engine.clone(),

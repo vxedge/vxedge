@@ -57,6 +57,28 @@ pub enum LowerError {
     Serialise(#[from] serde_yaml_ng::Error),
 }
 
+/// Everything that can go wrong turning a workspace directory into a runnable manifest.
+#[derive(Debug, thiserror::Error)]
+pub enum WorkspaceLowerError {
+    #[error(transparent)]
+    Workspace(#[from] crate::workspace::WorkspaceError),
+    #[error(transparent)]
+    Lower(#[from] LowerError),
+    #[error("serialising the lowered manifest: {0}")]
+    Serialise(#[from] serde_yaml_ng::Error),
+}
+
+/// Load, validate and lower the workspace at `root`, returning §6.1 YAML.
+///
+/// The whole path from "a folder on disk" to "a manifest the provisioning layer runs", in one
+/// call, so a caller never has to know the intermediate steps exist. `vxedged` uses this when a
+/// `ManifestRef.path` names a directory — which is what keeps lowering out of every frontend.
+pub fn lower_path_to_yaml(root: &std::path::Path) -> Result<String, WorkspaceLowerError> {
+    let ws = Workspace::load_validated(root)?;
+    let manifest = lower(&ws)?;
+    Ok(serde_yaml_ng::to_string(&manifest)?)
+}
+
 fn s(v: &str) -> Value {
     Value::String(v.to_string())
 }
@@ -545,6 +567,19 @@ mod tests {
             }
             other => panic!("expected ComputeTrafficEndpoint, got {other:?}"),
         }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The exact call `vxedged` makes when a `ManifestRef.path` names a directory. Worth its own
+    /// test because it is the whole daemon-side path from "a folder" to "a runnable manifest",
+    /// and nothing else exercises the three steps as one unit.
+    #[test]
+    fn a_workspace_directory_lowers_straight_to_yaml() {
+        let (tmp, _) = scaffolded(Template::Slicing, "topath");
+        let root = tmp.join("demo");
+        let yaml = lower_path_to_yaml(&root).expect("workspace lowers to yaml");
+        let manifest = ExperimentManifest::from_yaml(&yaml).expect("and that yaml is valid §6.1");
+        assert_eq!(manifest.experiment.id, "demo");
         std::fs::remove_dir_all(&tmp).ok();
     }
 
