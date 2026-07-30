@@ -153,7 +153,7 @@ fn is_symbolic_endpoint(ep: &str) -> bool {
     SYMBOLIC_ENDPOINTS.split(", ").any(|s| s == ep)
 }
 
-/// Accepts either a scalar or a sequence, so `target_ids: hpc1` and `target_ids: [a, b]` both
+/// Accepts either a scalar or a sequence, so `target_ids: fn-hpc1` and `target_ids: [fn-a, fn-b]` both
 /// work — the schema should not make a single target more verbose than it needs to be.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
@@ -227,34 +227,75 @@ pub struct SliceDoc {
 pub struct VehicleDoc {
     pub id: String,
     #[serde(default)]
-    pub composition: Composition,
+    pub class: Option<String>,
+    #[serde(default)]
+    pub subtype: Option<String>,
+    /// Regions of the entity. Named, not enumerated: `front-left`/`rear-right` are road-vehicle
+    /// conventions and another mobility entity has its own.
+    #[serde(default)]
+    pub zones: BTreeMap<String, ZoneDoc>,
+    /// Units located in zones. Replaces `composition: {zones, compute, gateway}`, which grouped
+    /// devices by what they are and called one group "zones" — but a zone is a *place*. `role`
+    /// is a field now, so a sensor or actuator needs no fourth group.
+    #[serde(default)]
+    pub devices: BTreeMap<String, DeviceDoc>,
+    /// Units of behaviour, each deployed onto a device. Software attaches here, not to a device,
+    /// so one device can host several and a study can redeploy without rewriting `channels`.
+    #[serde(default)]
+    pub functions: BTreeMap<String, FunctionDoc>,
     #[serde(default)]
     pub links: Vec<LinkDoc>,
     #[serde(default)]
     pub channels: Vec<ChannelDoc>,
 }
 
-/// Fixed groups rather than one `components:` map: it reads better and validates more sharply,
-/// and widening later is additive.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Composition {
+#[serde(deny_unknown_fields)]
+pub struct ZoneDoc {
     #[serde(default)]
-    pub zones: BTreeMap<String, serde_yaml_ng::Value>,
+    pub name: Option<String>,
+    /// Pointer into an external zoning standard (an ATA zone number, a compartment
+    /// designation). Carried, never interpreted.
     #[serde(default)]
-    pub compute: BTreeMap<String, serde_yaml_ng::Value>,
-    #[serde(default)]
-    pub gateway: BTreeMap<String, serde_yaml_ng::Value>,
+    pub reference: Option<String>,
 }
 
-impl Composition {
-    /// Every component id declared in this vehicle, in declaration groups.
-    pub fn ids(&self) -> Vec<&str> {
-        self.zones
-            .keys()
-            .chain(self.compute.keys())
-            .chain(self.gateway.keys())
-            .map(String::as_str)
-            .collect()
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceDoc {
+    /// `zone-controller` | `hpc` | `gateway` | `ecu` | `sensor` | `actuator` | `switch`.
+    pub role: String,
+    #[serde(default)]
+    pub zone: Option<String>,
+    /// `container` | `qemu-microvm` | `libvirt`. Required for anything attached to a slice: the
+    /// planner has to know whether to build a veth or a tap, and guessing is what produced a
+    /// workspace that validated and then could not boot.
+    #[serde(default)]
+    pub backend: Option<String>,
+    #[serde(default)]
+    pub resources: Option<serde_yaml_ng::Value>,
+    #[serde(default)]
+    pub realtime: Option<serde_yaml_ng::Value>,
+    /// COVESA VSS path, for a sensor or actuator.
+    #[serde(default)]
+    pub vss: Option<String>,
+    #[serde(default)]
+    pub dbc: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FunctionDoc {
+    pub deployed_on: String,
+    #[serde(default)]
+    pub asil: Option<String>,
+}
+
+impl VehicleDoc {
+    /// Device ids in map order — which is traversal order, and therefore what positional
+    /// endpoint names (`vz0`, `vz1`, …) derive from.
+    pub fn device_ids(&self) -> Vec<&str> {
+        self.devices.keys().map(String::as_str).collect()
     }
 }
 
@@ -449,9 +490,16 @@ impl Workspace {
         // Component ids must be unique workspace-wide: `target_ids` is flat, so an id repeated
         // across two vehicles would make a part's destination ambiguous. This is the cost of
         // choosing flat ids over structural paths, and it has to be an actual check.
+        // Parts target *functions*: software runs as a function, and one device may host several.
+        let mut function_owner: BTreeMap<String, String> = BTreeMap::new();
+        for v in &self.vehicles {
+            for id in v.functions.keys() {
+                function_owner.insert(id.clone(), v.id.clone());
+            }
+        }
         let mut component_owner: BTreeMap<String, String> = BTreeMap::new();
         for v in &self.vehicles {
-            for id in v.composition.ids() {
+            for id in v.device_ids() {
                 if component_owner
                     .insert(id.to_string(), v.id.clone())
                     .is_some()
@@ -492,7 +540,7 @@ impl Workspace {
         }
 
         for v in &self.vehicles {
-            let own: BTreeSet<&str> = v.composition.ids().into_iter().collect();
+            let own: BTreeSet<&str> = v.device_ids().into_iter().collect();
             let link_ids: BTreeSet<&str> = v.links.iter().map(|l| l.id.as_str()).collect();
 
             for l in &v.links {
@@ -519,12 +567,15 @@ impl Workspace {
                 }
             }
 
+            let own_functions: BTreeSet<&str> = v.functions.keys().map(String::as_str).collect();
             for ch in &v.channels {
                 let mut endpoints = vec![&ch.from];
                 endpoints.extend(ch.to.iter());
                 for ep in &endpoints {
                     let c = component_of(ep);
-                    if !own.contains(c) {
+                    // Channels connect functions, not devices — the distinction the model exists
+                    // to make, enforced where the author can act on it.
+                    if !own_functions.contains(c) {
                         errors.push(E::UnknownChannelEndpoint {
                             vehicle: v.id.clone(),
                             channel: ch.id.clone(),
@@ -549,8 +600,11 @@ impl Workspace {
                 // it, a channel could claim any link list and per-topic-per-slice attribution
                 // would be built on a lie.
                 if !ch.carried_by.is_empty() {
+                    let host = |f: &str| v.functions.get(f).map(|x| x.deployed_on.as_str());
                     let mut reachable: BTreeSet<&str> = BTreeSet::new();
-                    reachable.insert(component_of(&ch.from));
+                    if let Some(h) = host(component_of(&ch.from)) {
+                        reachable.insert(h);
+                    }
                     // Small graphs; iterate to a fixed point rather than build a real DSU.
                     loop {
                         let before = reachable.len();
@@ -568,7 +622,9 @@ impl Workspace {
                         }
                     }
                     for ep in &ch.to {
-                        let c = component_of(ep);
+                        let Some(c) = host(component_of(ep)) else {
+                            continue;
+                        };
                         if own.contains(c) && !reachable.contains(c) {
                             errors.push(E::ChannelNotCarried {
                                 vehicle: v.id.clone(),
@@ -594,7 +650,7 @@ impl Workspace {
                 .flat_map(|t| t.as_slice())
                 .collect();
             for v in &self.vehicles {
-                for c in v.composition.ids() {
+                for c in v.functions.keys().map(String::as_str) {
                     if !targeted.contains(c) {
                         errors.push(E::ComponentWithoutPart {
                             vehicle: v.id.clone(),
@@ -635,7 +691,7 @@ impl Workspace {
             for p in &b.parts {
                 if let Some(targets) = &p.target_ids {
                     for t in targets.as_slice() {
-                        if !component_owner.contains_key(t) {
+                        if !function_owner.contains_key(t) {
                             errors.push(E::UnknownTarget {
                                 baseline: b.id.clone(),
                                 part: p.reference.clone(),
@@ -710,20 +766,23 @@ network:
     const GOOD_VEHICLE: &str = r#"
 kind: vehicle
 id: car1
-composition:
-  zones:
-    zonefl: { class: zone, subtype: linux }
-  compute:
-    hpc1: { class: compute, subtype: ad }
-  gateway:
-    gw1: { class: gw, subtype: tcu }
+zones:
+  front-left: {}
+devices:
+  zonefl: { role: zone-controller, zone: front-left, backend: container }
+  hpc1: { role: hpc, backend: container }
+  gw1: { role: gateway, backend: container }
+functions:
+  fn-zonefl: { deployed_on: zonefl }
+  fn-hpc1: { deployed_on: hpc1 }
+  fn-gw1: { deployed_on: gw1 }
 links:
   - { id: trunk-fl, endpoints: [gw1:eth0, zonefl:eth0], slice: adas }
   - { id: trunk-hpc, endpoints: [gw1:eth2, hpc1:eth0] }
 channels:
   - id: obj
-    from: hpc1:perception
-    to: [zonefl:actuation]
+    from: fn-hpc1
+    to: [fn-zonefl]
     carried_by: [trunk-hpc, trunk-fl]
 "#;
 
@@ -732,10 +791,10 @@ kind: baseline
 id: bl1
 parts:
   - ref: ./images/local-thing
-    target_ids: [hpc1, gw1]
+    target_ids: [fn-hpc1, fn-gw1]
   - ref: ghcr.io/vxedge/parts/zone/linux/stack/probe-bundle:0.1.0
     digest: sha256:33c9c8d8625bd5c6d1f4d3d0c561fdaa930e057fcd1fb24fb3badb402f25429d
-    target_ids: [zonefl]
+    target_ids: [fn-zonefl]
 "#;
 
     #[test]
@@ -791,7 +850,10 @@ parts:
 
     #[test]
     fn dangling_target_ids_and_endpoints_are_caught() {
-        let baseline = GOOD_BASELINE.replace("target_ids: [hpc1, gw1]", "target_ids: [hpc99, gw1]");
+        let baseline = GOOD_BASELINE.replace(
+            "target_ids: [fn-hpc1, fn-gw1]",
+            "target_ids: [fn-hpc99, fn-gw1]",
+        );
         let vehicle = GOOD_VEHICLE.replace("gw1:eth2, hpc1:eth0", "gw1:eth2, ghost:eth0");
         let root = workspace(
             "dangling",
@@ -804,7 +866,7 @@ parts:
         let errs = Workspace::load(&root).unwrap().validate();
         assert!(errs.iter().any(|e| matches!(
             e,
-            WorkspaceValidationError::UnknownTarget { target, .. } if target == "hpc99"
+            WorkspaceValidationError::UnknownTarget { target, .. } if target == "fn-hpc99"
         )));
         assert!(errs.iter().any(|e| matches!(
             e,
@@ -916,10 +978,11 @@ parts:
 
     #[test]
     fn target_ids_accepts_a_scalar_or_a_list() {
-        let one: PartEntry = serde_yaml_ng::from_str("ref: ./x\ntarget_ids: hpc1").unwrap();
-        let many: PartEntry = serde_yaml_ng::from_str("ref: ./x\ntarget_ids: [a, b]").unwrap();
-        assert_eq!(one.target_ids.unwrap().as_slice(), vec!["hpc1"]);
-        assert_eq!(many.target_ids.unwrap().as_slice(), vec!["a", "b"]);
+        let one: PartEntry = serde_yaml_ng::from_str("ref: ./x\ntarget_ids: fn-hpc1").unwrap();
+        let many: PartEntry =
+            serde_yaml_ng::from_str("ref: ./x\ntarget_ids: [fn-a, fn-b]").unwrap();
+        assert_eq!(one.target_ids.unwrap().as_slice(), vec!["fn-hpc1"]);
+        assert_eq!(many.target_ids.unwrap().as_slice(), vec!["fn-a", "fn-b"]);
     }
 
     #[test]

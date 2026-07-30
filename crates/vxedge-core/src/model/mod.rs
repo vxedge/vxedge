@@ -507,7 +507,7 @@ impl Experiment {
         let slice_ids: Vec<&str> = self.slices.iter().map(|s| s.id.as_str()).collect();
 
         // Device ids stay unique across the *whole experiment*, not merely per entity: parts
-        // target them flatly (`target_ids: hpc1`) and traffic profiles name them flatly, so a
+        // target them flatly (`target_ids: fn-hpc1`) and traffic profiles name them flatly, so a
         // repeat across two entities would make both references ambiguous. This is the cost of
         // flat ids over structural paths, and it has to be an actual check.
         let mut device_owner: BTreeMap<&str, &str> = BTreeMap::new();

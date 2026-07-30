@@ -261,47 +261,55 @@ fn main_yaml(id: &str, template: Template) -> String {
 }
 
 fn vehicle_yaml(template: Template) -> String {
-    let extra_zone = match template {
-        Template::Minimal => String::new(),
-        Template::Slicing => {
-            "    zonerl: { class: zone, subtype: linux, position: rear-left }\n".to_string()
-        }
-    };
-    let extra_link = match template {
-        Template::Minimal => String::new(),
-        Template::Slicing => {
-            "  - { id: trunk-rl, endpoints: [gw1:eth1, zonerl:eth0], slice: infotainment }\n"
-                .to_string()
-        }
+    let (extra_zone, extra_dev, extra_fn, extra_link) = match template {
+        Template::Minimal => ("", "", "", ""),
+        Template::Slicing => (
+            "\x20 rear-left: {}\n",
+            "\x20 zonerl: { role: zone-controller, zone: rear-left, backend: container }\n",
+            "\x20 infotainment: { deployed_on: zonerl }\n",
+            "\x20 - { id: trunk-rl, endpoints: [gw1:eth1, zonerl:eth0], slice: infotainment }\n",
+        ),
     };
 
     format!(
         "kind: vehicle\n\
          id: car1\n\
-         class: road\n\
-         subtype: car\n\n\
-         # Component definitions are inline until they are reused; `vxedge vehicle extract`\n\
-         # promotes them to their own files when that day comes.\n\
-         composition:\n\
-         \x20 zones:\n\
-         \x20   zonefl: {{ class: zone, subtype: linux, position: front-left }}\n\
+         class: road          # road | air | marine | rail — the axis that keeps other mobility\n\
+         subtype: car         # entities expressible; nothing is built on it yet\n\n\
+         # Zones are REGIONS of the entity, not devices. Named rather than chosen from an enum,\n\
+         # because front-left/rear-right are road conventions and an eVTOL has nacelles.\n\
+         zones:\n\
+         \x20 front-left: {{}}\n\
          {extra_zone}\
-         \x20 compute:\n\
-         \x20   hpc1: {{ class: compute, subtype: ad, resources: {{ cpu: 4, memory: 8 }} }}\n\
-         \x20 gateway:\n\
-         \x20   gw1: {{ class: gw, subtype: tcu }}\n\n\
-         # Transport: how bytes move. `slice` names a slice the experiment defines.\n\
+         \x20 central: {{}}\n\n\
+         # Devices are units LOCATED IN zones. `role` says what one is; `backend` says how it is\n\
+         # realised — H3's experimental variable, and required for anything on a slice, because\n\
+         # the planner must know whether to build a veth or a tap.\n\
+         devices:\n\
+         \x20 zonefl: {{ role: zone-controller, zone: front-left, backend: container }}\n\
+         {extra_dev}\
+         \x20 hpc1:   {{ role: hpc, zone: central, backend: container, resources: {{ cpu: 4, memory: 8 }} }}\n\
+         \x20 gw1:    {{ role: gateway, backend: container }}\n\n\
+         # Functions are units of BEHAVIOUR, deployed ONTO devices. Software attaches here, so one\n\
+         # device can host several and a study can redeploy without rewriting `channels`.\n\
+         # `parts.yaml` targets these ids.\n\
+         functions:\n\
+         \x20 adas:    {{ deployed_on: zonefl }}\n\
+         {extra_fn}\
+         \x20 percept: {{ deployed_on: hpc1 }}\n\
+         \x20 tcu:     {{ deployed_on: gw1 }}\n\n\
+         # Transport: how bytes move. This is the wiring harness (ARCHITECTURE.md §7).\n\
          links:\n\
          \x20 - {{ id: trunk-fl,  endpoints: [gw1:eth0, zonefl:eth0], slice: adas }}\n\
          {extra_link}\
          \x20 - {{ id: trunk-hpc, endpoints: [gw1:eth2, hpc1:eth0] }}\n\n\
-         # Interaction: what is exchanged. `carried_by` binds a channel to the links carrying\n\
-         # it, which is what makes latency attributable per topic per slice rather than only\n\
-         # per link.\n\
+         # Interaction: what is exchanged, between FUNCTIONS. `carried_by` binds a channel to the\n\
+         # links carrying it — what makes latency attributable per topic per slice, not just per\n\
+         # link.\n\
          channels:\n\
          \x20 - id: adas.probe\n\
-         \x20   from: zonefl:probe\n\
-         \x20   to: [hpc1:probe]\n\
+         \x20   from: adas\n\
+         \x20   to: [percept]\n\
          \x20   protocol: udp\n\
          \x20   carried_by: [trunk-fl, trunk-hpc]\n"
     )
@@ -309,8 +317,8 @@ fn vehicle_yaml(template: Template) -> String {
 
 fn parts_yaml(template: Template) -> String {
     let targets = match template {
-        Template::Minimal => "[zonefl]",
-        Template::Slicing => "[zonefl, zonerl]",
+        Template::Minimal => "[adas]",
+        Template::Slicing => "[adas, infotainment]",
     };
     format!(
         "kind: baseline\n\
@@ -323,9 +331,9 @@ fn parts_yaml(template: Template) -> String {
          \x20   digest: sha256:33c9c8d8625bd5c6d1f4d3d0c561fdaa930e057fcd1fb24fb3badb402f25429d\n\
          \x20   target_ids: {targets}     # one declaration, however many nodes share the part\n\n\
          \x20 - ref: ./images/hpc-reflector\n\
-         \x20   target_ids: hpc1\n\n\
+         \x20   target_ids: percept\n\n\
          \x20 - ref: ./images/gw-tcu\n\
-         \x20   target_ids: gw1\n"
+         \x20   target_ids: tcu\n"
     )
 }
 
@@ -353,7 +361,7 @@ fn readme(id: &str, template: Template) -> String {
          2. **The isolation mechanism** — `network.slices[].mode`. Switching `vlan` to\n\
             `s-nssai` is the whole difference between H1 and H2, over an unchanged vehicle.\n\
          3. **The vehicle** — `composition` and `links` in `car1.yaml`.\n\
-            Component ids (`zonefl`, `hpc1`, `gw1`) are how everything else refers to them.\n\
+            Device ids (`zonefl`, `hpc1`, `gw1`) name hardware; function ids (`adas`, `percept`)\n            name software, and are what `parts.yaml` targets.\n\
          4. **The software** — `parts.yaml`. `target_ids` takes one id or a list.\n\n\
          ## Sharing it\n\n\
          `vxedge experiment publish` refuses while any local ref (`./images/...`) is still\n\

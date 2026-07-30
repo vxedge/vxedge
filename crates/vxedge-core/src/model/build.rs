@@ -38,6 +38,11 @@ pub enum ModelError {
         "device `{device}` declares backend `{backend}`, which is not container, qemu-microvm or libvirt"
     )]
     UnknownBackend { device: String, backend: String },
+    #[error(
+        "device `{device}` declares role `{role}` — expected zone-controller, hpc, gateway, ecu, \
+         sensor, actuator or switch"
+    )]
+    UnknownRole { device: String, role: String },
     #[error("`{field}` is {value}, which does not fit a {ty} (max {max})")]
     OutOfRange {
         field: String,
@@ -186,109 +191,144 @@ fn link_kind(slice: Option<&String>) -> LinkKind {
     }
 }
 
-fn build_entity(ws: &Workspace, doc: &VehicleDoc) -> Result<Entity, ModelError> {
-    let mut zones: BTreeMap<String, Zone> = BTreeMap::new();
-    let mut devices: BTreeMap<String, Device> = BTreeMap::new();
-    let mut functions: BTreeMap<String, Function> = BTreeMap::new();
-
-    // Three §6.0 groups collapse into one device map keyed by role. `position` becomes a *zone*
-    // the device sits in, rather than the device's own identity — the conflation this model
-    // exists to undo.
-    let groups: [(&BTreeMap<String, Value>, DeviceRole); 3] = [
-        (&doc.composition.zones, DeviceRole::ZoneController),
-        (&doc.composition.compute, DeviceRole::Hpc),
-        (&doc.composition.gateway, DeviceRole::Gateway),
-    ];
-
-    for (group, role) in groups {
-        for (id, spec) in group {
-            let zone = str_of(spec, "position").map(str::to_owned);
-            if let Some(z) = &zone {
-                zones.entry(z.clone()).or_insert_with(|| Zone {
-                    id: z.clone(),
-                    name: None,
-                    reference: None,
-                });
-            }
-            devices.insert(
-                id.clone(),
-                Device {
-                    id: id.clone(),
-                    role,
-                    zone,
-                    resources: resources_of(id, spec)?,
-                    backend: backend_of(id, spec)?,
-                    signals: Vec::new(),
-                    pinned_cpus: spec
-                        .get("realtime")
-                        .and_then(|r| r.get("pinned_cpus"))
-                        .and_then(|v| v.as_sequence())
-                        .map(|seq| {
-                            seq.iter()
-                                .filter_map(|v| v.as_u64())
-                                .filter_map(|v| u32::try_from(v).ok())
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                },
-            );
-
-            // One synthesized function per device, named after it. §6.0 attaches software to a
-            // component, so the function layer has no separate identity yet — this keeps
-            // channels and parts resolvable through the model without inventing names an
-            // author never wrote and could not refer to.
-            functions.insert(
-                id.clone(),
-                Function {
-                    id: id.clone(),
-                    deployed_on: id.clone(),
-                    part: Some(sole_part(ws, id, backend_of(id, spec)?)?),
-                    asil: None,
-                },
-            );
+fn role_of(device: &str, raw: &str) -> Result<DeviceRole, ModelError> {
+    Ok(match raw {
+        "zone-controller" => DeviceRole::ZoneController,
+        "hpc" => DeviceRole::Hpc,
+        "gateway" => DeviceRole::Gateway,
+        "ecu" => DeviceRole::Ecu,
+        "sensor" => DeviceRole::Sensor,
+        "actuator" => DeviceRole::Actuator,
+        "switch" => DeviceRole::Switch,
+        other => {
+            return Err(ModelError::UnknownRole {
+                device: device.to_string(),
+                role: other.to_string(),
+            });
         }
+    })
+}
+
+fn asil_of(raw: &str) -> Option<Asil> {
+    match raw.to_ascii_uppercase().as_str() {
+        "QM" => Some(Asil::Qm),
+        "A" => Some(Asil::A),
+        "B" => Some(Asil::B),
+        "C" => Some(Asil::C),
+        "D" => Some(Asil::D),
+        _ => None,
+    }
+}
+
+/// §6.0 → entity. Nothing is synthesized: the schema declares zones, devices and functions as
+/// separate things, so this reads them. The earlier builder had to invent a function per device
+/// because §6.0 could not say what a function was — that was the gap this schema closed.
+fn build_entity(ws: &Workspace, doc: &VehicleDoc) -> Result<Entity, ModelError> {
+    let zones = doc
+        .zones
+        .iter()
+        .map(|(id, z)| {
+            (
+                id.clone(),
+                Zone {
+                    id: id.clone(),
+                    name: z.name.clone(),
+                    reference: z.reference.clone(),
+                },
+            )
+        })
+        .collect();
+
+    let mut devices: BTreeMap<String, Device> = BTreeMap::new();
+    for (id, d) in &doc.devices {
+        let spec = serde_yaml_ng::to_value(d).unwrap_or(Value::Null);
+        devices.insert(
+            id.clone(),
+            Device {
+                id: id.clone(),
+                role: role_of(id, &d.role)?,
+                zone: d.zone.clone(),
+                resources: if d.resources.is_some() {
+                    resources_of(id, &spec)?
+                } else {
+                    None
+                },
+                backend: backend_of(id, &spec)?,
+                signals: match (&d.vss, &d.dbc) {
+                    (None, None) => Vec::new(),
+                    (vss, dbc) => vec![SignalBinding {
+                        id: id.clone(),
+                        vss: vss.clone(),
+                        dbc: dbc.clone(),
+                    }],
+                },
+                pinned_cpus: d
+                    .realtime
+                    .as_ref()
+                    .and_then(|r| r.get("pinned_cpus"))
+                    .and_then(|v| v.as_sequence())
+                    .map(|q| {
+                        q.iter()
+                            .filter_map(|v| v.as_u64())
+                            .filter_map(|v| u32::try_from(v).ok())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            },
+        );
     }
 
-    let links = doc
-        .links
-        .iter()
-        .map(|l| Link {
-            id: l.id.clone(),
-            endpoints: l.endpoints.iter().map(|e| endpoint(e)).collect(),
-            kind: link_kind(l.slice.as_ref()),
-            slice: l.slice.clone(),
-            harness: None,
-        })
-        .collect();
-
-    let channels = doc
-        .channels
-        .iter()
-        .map(|c| Channel {
-            id: c.id.clone(),
-            from: endpoint(&c.from),
-            to: c.to.iter().map(|e| endpoint(e)).collect(),
-            // §6.0 carries `protocol:` as a string today; anything unrecognised falls back to
-            // UDP rather than failing, because the interaction plane is not yet executed and a
-            // hard error here would reject workspaces over a field nothing reads.
-            protocol: Protocol::Udp,
-            qos: None,
-            carried_by: c.carried_by.clone(),
-        })
-        .collect();
+    let mut functions: BTreeMap<String, Function> = BTreeMap::new();
+    for (id, f) in &doc.functions {
+        let backend = devices.get(&f.deployed_on).and_then(|d| d.backend);
+        functions.insert(
+            id.clone(),
+            Function {
+                id: id.clone(),
+                deployed_on: f.deployed_on.clone(),
+                part: sole_part(ws, id, backend).ok(),
+                asil: f.asil.as_deref().and_then(asil_of),
+            },
+        );
+    }
 
     Ok(Entity {
         id: doc.id.clone(),
-        class: EntityClass::Road,
-        subtype: None,
-        zones,
-        // §6.0 stores components in a map, so declaration order is already lost by the time we
-        // see them and sorted id is the only deterministic order available.
+        class: match doc.class.as_deref() {
+            Some("air") => EntityClass::Air,
+            Some("marine") => EntityClass::Marine,
+            Some("rail") => EntityClass::Rail,
+            Some("road") | None => EntityClass::Road,
+            Some(other) => EntityClass::Other(other.to_string()),
+        },
+        subtype: doc.subtype.clone(),
         device_order: devices.keys().cloned().collect(),
+        zones,
         devices,
         functions,
-        links,
-        channels,
+        links: doc
+            .links
+            .iter()
+            .map(|l| Link {
+                id: l.id.clone(),
+                endpoints: l.endpoints.iter().map(|e| endpoint(e)).collect(),
+                kind: link_kind(l.slice.as_ref()),
+                slice: l.slice.clone(),
+                harness: None,
+            })
+            .collect(),
+        channels: doc
+            .channels
+            .iter()
+            .map(|c| Channel {
+                id: c.id.clone(),
+                from: endpoint(&c.from),
+                to: c.to.iter().map(|e| endpoint(e)).collect(),
+                protocol: Protocol::Udp,
+                qos: None,
+                carried_by: c.carried_by.clone(),
+            })
+            .collect(),
     })
 }
 
@@ -487,10 +527,10 @@ mod tests {
         let (tmp, ws) = scaffolded("fn");
         let m = build(&ws).unwrap();
         let e = &m.entities[0];
-        let f = e.functions.get("zonefl").expect("function synthesized");
+        let f = e.functions.get("adas").expect("declared function");
         assert_eq!(f.deployed_on, "zonefl");
         assert!(f.part.as_ref().unwrap().reference.contains("probe-bundle"));
-        assert_eq!(e.host_of("zonefl").unwrap().id, "zonefl");
+        assert_eq!(e.host_of("adas").unwrap().id, "zonefl");
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -552,10 +592,15 @@ traffic_profiles:
             r#"
 kind: vehicle
 id: veh
-composition:
-  zones:
-    node-a: { class: zone, position: front-left, backend: container }
-    node-b: { class: zone, position: rear-left, backend: container }
+zones:
+  front-left: {}
+  rear-left: {}
+devices:
+  node-a: { role: zone-controller, zone: front-left, backend: container }
+  node-b: { role: zone-controller, zone: rear-left, backend: container }
+functions:
+  fn-node-a: { deployed_on: node-a }
+  fn-node-b: { deployed_on: node-b }
 links:
   - { id: la, endpoints: [node-a:eth0], slice: adas }
   - { id: lb, endpoints: [node-b:eth0], slice: infot }
@@ -568,8 +613,8 @@ links:
 kind: baseline
 id: bl
 parts:
-  - { ref: "local/vxprobe:host-process", target_ids: node-a }
-  - { ref: "local/vxtraffic:host-process", target_ids: node-b }
+  - { ref: "local/vxprobe:host-process", target_ids: fn-node-a }
+  - { ref: "local/vxtraffic:host-process", target_ids: fn-node-b }
 "#,
         )
         .unwrap();
@@ -723,7 +768,9 @@ parts:
     #[test]
     fn a_slice_attached_device_without_a_backend_is_refused() {
         use crate::gateway::GatewayPlan;
-        let (tmp, ws) = scaffolded("nobackend");
+        // The scaffold declares a backend on every device now, so strip one to test the refusal.
+        let (tmp, mut ws) = scaffolded("nobackend");
+        ws.vehicles[0].devices.get_mut("zonefl").unwrap().backend = None;
         let m = build(&ws).unwrap();
         match GatewayPlan::from_model(&m) {
             Err(crate::gateway::plan::PlanError::DeviceWithoutBackend(d)) => {
@@ -737,14 +784,7 @@ parts:
     #[test]
     fn a_backend_the_testbed_cannot_run_is_refused() {
         let (tmp, mut ws) = scaffolded("badbackend");
-        ws.vehicles[0]
-            .composition
-            .zones
-            .get_mut("zonefl")
-            .unwrap()
-            .as_mapping_mut()
-            .unwrap()
-            .insert(Value::String("backend".into()), Value::String("xen".into()));
+        ws.vehicles[0].devices.get_mut("zonefl").unwrap().backend = Some("xen".into());
         match build(&ws) {
             Err(ModelError::UnknownBackend { backend, .. }) => assert_eq!(backend, "xen"),
             other => panic!("expected UnknownBackend, got {other:?}"),

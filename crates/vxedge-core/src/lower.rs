@@ -115,6 +115,16 @@ fn image_kind(group: &str, reference: &str) -> &'static str {
     }
 }
 
+/// The function deployed on `device`. Parts target *functions*, so reaching a device's software
+/// goes through its function — an indirection the old schema could not express.
+fn function_on<'a>(vehicle: &'a crate::workspace::VehicleDoc, device: &str) -> Option<&'a str> {
+    vehicle
+        .functions
+        .iter()
+        .find(|(_, f)| f.deployed_on == device)
+        .map(|(id, _)| id.as_str())
+}
+
 /// Parts targeting one component, in baseline order.
 fn parts_for<'a>(ws: &'a Workspace, component: &str) -> Vec<(&'a str, &'a PartEntry)> {
     let mut out = Vec::new();
@@ -324,35 +334,43 @@ pub fn lower(ws: &Workspace) -> Result<ExperimentManifest, LowerError> {
         vehicle,
         vlans: &vlans,
     };
+
+    // Devices are routed back into §6.1's groups by role — re-imposing the conflation §6.0
+    // split, visible here because lowering has to undo it. This file is deleted once
+    // `vxtelemetry` consumes the model (docs/TASKS.md row 16b/17); it is ported rather than
+    // rewritten because it exists only to leave.
     let mut zones = Vec::new();
-    for (id, spec) in &vehicle.composition.zones {
-        let position = spec
-            .get("position")
-            .and_then(|p| p.as_str())
-            .ok_or_else(|| LowerError::ZoneWithoutPosition {
-                component: id.clone(),
-            })?;
-        zones.push(zone_value(&ctx, id, position, "ecu", "zones", spec)?);
-    }
-    for (id, spec) in &vehicle.composition.gateway {
-        zones.push(zone_value(&ctx, id, "gateway", "gateway", "gateway", spec)?);
+    let mut compute = Vec::new();
+    for (id, dev) in &vehicle.devices {
+        let spec = serde_yaml_ng::to_value(dev)?;
+        match dev.role.as_str() {
+            "hpc" => {
+                let part = sole_part(ws, function_on(vehicle, id).unwrap_or(id))?;
+                let (backend, kind) = realisation(&spec);
+                let mut m = Mapping::new();
+                m.insert(s("id"), s(id));
+                m.insert(s("image"), image_value_for(part, "compute", backend, kind));
+                if let Some(r) = &dev.resources {
+                    m.insert(s("resources"), r.clone());
+                }
+                compute.push(Value::Mapping(m));
+            }
+            "gateway" => zones.push(zone_value(
+                &ctx, id, "gateway", "gateway", "gateway", &spec,
+            )?),
+            _ => {
+                let region =
+                    dev.zone
+                        .as_deref()
+                        .ok_or_else(|| LowerError::ZoneWithoutPosition {
+                            component: id.clone(),
+                        })?;
+                zones.push(zone_value(&ctx, id, region, "ecu", "zones", &spec)?);
+            }
+        }
     }
     if !zones.is_empty() {
         root.insert(s("zones"), Value::Sequence(zones));
-    }
-
-    // compute
-    let mut compute = Vec::new();
-    for (id, spec) in &vehicle.composition.compute {
-        let part = sole_part(ws, id)?;
-        let mut m = Mapping::new();
-        let (backend, kind) = realisation(spec);
-        m.insert(s("id"), s(id));
-        m.insert(s("image"), image_value_for(part, "compute", backend, kind));
-        if let Some(r) = spec.get("resources") {
-            m.insert(s("resources"), r.clone());
-        }
-        compute.push(Value::Mapping(m));
     }
     if !compute.is_empty() {
         root.insert(s("compute"), Value::Sequence(compute));
@@ -410,16 +428,18 @@ fn lower_traffic(
             let Some(component) = fields.get(field).and_then(|v| v.as_str()) else {
                 continue;
             };
-            if vehicle.composition.compute.contains_key(component) {
+            if vehicle
+                .devices
+                .get(component)
+                .is_some_and(|d| d.role == "hpc")
+            {
                 return Err(LowerError::ComputeTrafficEndpoint {
                     profile: profile_id.to_string(),
                     field,
                     component: component.to_string(),
                 });
             }
-            if vehicle.composition.zones.contains_key(component)
-                || vehicle.composition.gateway.contains_key(component)
-            {
+            if vehicle.devices.contains_key(component) {
                 lowered.insert(s(field), s(&format!("vxzone-{component}:{component}")));
             }
         }
@@ -445,7 +465,7 @@ fn zone_value(
     spec: &Value,
 ) -> Result<Value, LowerError> {
     let (ws, vehicle, vlans) = (ctx.ws, ctx.vehicle, ctx.vlans);
-    let part = sole_part(ws, id)?;
+    let part = sole_part(ws, function_on(vehicle, id).unwrap_or(id))?;
     let (backend, kind) = realisation(spec);
     let mut node = Mapping::new();
     node.insert(s("id"), s(id));
@@ -696,10 +716,15 @@ network:
             r#"
 kind: vehicle
 id: veh
-composition:
-  zones:
-    node-a: { class: zone, position: front-left, backend: container }
-    node-b: { class: zone, position: rear-left, backend: container }
+zones:
+  front-left: {}
+  rear-left: {}
+devices:
+  node-a: { role: zone-controller, zone: front-left, backend: container }
+  node-b: { role: zone-controller, zone: rear-left, backend: container }
+functions:
+  fn-node-a: { deployed_on: node-a }
+  fn-node-b: { deployed_on: node-b }
 links:
   - { id: la, endpoints: [node-a:eth0], slice: adas }
   - { id: lb, endpoints: [node-b:eth0], slice: infot }
@@ -712,8 +737,8 @@ links:
 kind: baseline
 id: bl
 parts:
-  - { ref: "local/vxprobe:host-process", target_ids: node-a }
-  - { ref: "local/vxtraffic:host-process", target_ids: node-b }
+  - { ref: "local/vxprobe:host-process", target_ids: fn-node-a }
+  - { ref: "local/vxtraffic:host-process", target_ids: fn-node-b }
 "#,
         )
         .unwrap();
