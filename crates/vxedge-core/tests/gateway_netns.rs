@@ -11,7 +11,7 @@
 use vxedge_core::ExperimentManifest;
 use vxedge_core::gateway::{GatewayPlan, Shell, apply, observe, teardown};
 use vxedge_core::zones::backend::NodeState;
-use vxedge_core::zones::{node_down, node_status, node_up, plan_nodes};
+use vxedge_core::zones::{node_down, node_status, node_up, plan_nodes_from_model};
 
 const MANIFEST: &str = r#"
 experiment: { id: exp-netns, name: netns integration }
@@ -67,7 +67,7 @@ fn gateway_and_container_zone_cycle_in_netns() {
     };
 
     let manifest = ExperimentManifest::from_yaml(MANIFEST).unwrap();
-    let plan = GatewayPlan::from_manifest(&manifest).unwrap();
+    let plan = GatewayPlan::from_model(&manifest.to_model().expect("adapts")).unwrap();
 
     // --- gateway: apply, observe, idempotency -------------------------------
     apply(&sh, &plan).unwrap();
@@ -89,7 +89,12 @@ fn gateway_and_container_zone_cycle_in_netns() {
     // --- container zone backend ---------------------------------------------
     let runtime = std::env::temp_dir().join(format!("vxzones-test-{}", std::process::id()));
     std::fs::create_dir_all(&runtime).unwrap();
-    let nodes = plan_nodes(&manifest, &plan, std::path::Path::new("/")).unwrap();
+    let nodes = plan_nodes_from_model(
+        &manifest.to_model().expect("adapts"),
+        &plan,
+        std::path::Path::new("/"),
+    )
+    .unwrap();
     let container = nodes
         .iter()
         .find(|n| n.node_id == "node-info-01")

@@ -198,10 +198,24 @@ pub enum Asil {
 #[derive(Debug, Clone)]
 pub struct Part {
     pub reference: String,
+    /// Whether the reference names a bootable bundle or a container image.
+    ///
+    /// §6.1 carried this as `image.kind`, and dropping it lost a real check: a VM backend
+    /// pointed at a container image has no bundle to boot, which `plan_nodes` refused and the
+    /// first model port silently accepted.
+    pub kind: PartKind,
     pub digest: Option<String>,
     /// `local/…`, a relative path, or an absolute path — none of which name a registry artifact,
     /// so none of which can be digest-pinned.
     pub local: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartKind {
+    /// A container image; nothing to resolve on disk.
+    Container,
+    /// A guest bundle directory (kernel + initramfs) a VM backend boots.
+    Bundle,
 }
 
 /// Structural connectivity: the harness.

@@ -106,16 +106,22 @@ impl ExperimentManifest {
                         deployed_on: node.id.clone(),
                         part: Some(Part {
                             reference: node.image.url.clone(),
+                            kind: match node.image.kind {
+                                crate::manifest::ImageKind::Container => PartKind::Container,
+                                _ => PartKind::Bundle,
+                            },
                             digest: None,
                             local: true,
                         }),
                         asil: None,
                     },
                 );
-                // One link per gateway-attached iface, in iface order — this is what preserves
-                // §6.1's endpoint numbering exactly.
+                // One link per slice-bound iface, in iface order — this is what preserves §6.1's
+                // endpoint numbering exactly. Keyed on `slice`, not `vlan`: an `s-nssai`
+                // attachment has a slice and no vlan, and filtering on vlan dropped those
+                // entirely, which silently removed every H2 attachment from the model.
                 for iface in &node.network {
-                    if iface.vlan.is_none() {
+                    if iface.slice.is_none() {
                         continue;
                     }
                     links.push(Link {
@@ -125,7 +131,11 @@ impl ExperimentManifest {
                             port: Some(iface.iface.clone()),
                             ip_cidr: iface.ip.clone(),
                         }],
-                        kind: LinkKind::VlanTrunk,
+                        kind: if iface.vlan.is_some() {
+                            LinkKind::VlanTrunk
+                        } else {
+                            LinkKind::Direct
+                        },
                         slice: iface.slice.clone(),
                         harness: None,
                     });
@@ -158,6 +168,7 @@ impl ExperimentManifest {
                     deployed_on: c.id.clone(),
                     part: Some(Part {
                         reference: c.image.url.clone(),
+                        kind: PartKind::Container,
                         digest: None,
                         local: true,
                     }),
@@ -295,7 +306,7 @@ zones:
         );
 
         let via_model = GatewayPlan::from_model(&model).unwrap();
-        let via_manifest = GatewayPlan::from_manifest(&m).unwrap();
+        let via_manifest = GatewayPlan::from_model(&m.to_model().expect("adapts")).unwrap();
         assert_eq!(via_model.endpoints, via_manifest.endpoints);
         // Spelled out, because this is the pairing a campaign script hardcodes. Note the peer
         // name differs by backend: a container gets a veth (`vzp1`), a VM gets a tap whose peer

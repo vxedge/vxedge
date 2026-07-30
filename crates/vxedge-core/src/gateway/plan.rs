@@ -3,7 +3,7 @@
 //! run anywhere. Interface names are deterministic per manifest ordering,
 //! which is what lets the reconciler match observed state on re-runs.
 
-use crate::manifest::{Backend, ExperimentManifest, ImageKind, Node, SliceMode};
+use crate::manifest::{Backend, ImageKind, Node};
 
 /// Linux IFNAMSIZ is 16 incl. NUL; our generated names stay well below it.
 const MAX_SLICES: usize = 200;
@@ -230,72 +230,6 @@ impl GatewayPlan {
         })
     }
 
-    pub fn from_manifest(manifest: &ExperimentManifest) -> Result<Self, PlanError> {
-        let network = manifest.network.as_ref();
-        let manifest_slices = network.map(|n| n.slices.as_slice()).unwrap_or(&[]);
-
-        // Routed through the same planner as the model path, so class minors and default rates
-        // cannot drift between the two while both exist.
-        let flat: Vec<SliceInput> = manifest_slices
-            .iter()
-            .map(|s| {
-                let q = s.qos.as_ref();
-                SliceInput {
-                    id: s.id.clone(),
-                    is_vlan: s.mode == SliceMode::Vlan,
-                    vlan: s.vlan,
-                    min_rate_mbps: q.and_then(|q| q.min_rate_mbps).unwrap_or(0),
-                    max_rate_mbps: q.and_then(|q| q.max_rate_mbps).unwrap_or(0),
-                    priority: q.and_then(|q| q.priority).unwrap_or(4),
-                }
-            })
-            .collect();
-        let (slices, snssai_slice_ids) = plan_slices(&flat)?;
-
-        let mut endpoints = Vec::new();
-        for zone in &manifest.zones {
-            for node in &zone.nodes {
-                let kind = match resolved_backend(node) {
-                    Backend::Container => EndpointKind::Veth,
-                    Backend::Libvirt | Backend::QemuMicrovm => EndpointKind::Tap,
-                };
-                for iface in &node.network {
-                    if let Some(vlan) = iface.vlan {
-                        let idx = endpoints.len();
-                        let name = format!("vz{idx}");
-                        endpoints.push(EndpointPlan {
-                            peer: match kind {
-                                EndpointKind::Veth => format!("vzp{idx}"),
-                                EndpointKind::Tap => name.clone(),
-                            },
-                            name,
-                            kind,
-                            node: node.id.clone(),
-                            vlan,
-                            slice: iface.slice.clone(),
-                        });
-                    }
-                }
-            }
-        }
-
-        let root_rate_mbps = network
-            .and_then(|n| n.defaults.as_ref())
-            .and_then(|d| d.bandwidth)
-            .map(|bps| (bps / 1_000_000).max(1))
-            .unwrap_or(1000);
-
-        Ok(Self {
-            bridge: "vxbr0".into(),
-            uplink: "vxup0".into(),
-            uplink_peer: "vxup0p".into(),
-            root_rate_mbps,
-            slices,
-            endpoints,
-            snssai_slice_ids,
-        })
-    }
-
     /// Human-readable plan summary (Apply output, logs).
     pub fn summary(&self) -> String {
         let slices = self
@@ -330,9 +264,15 @@ impl GatewayPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::ExperimentManifest;
 
-    fn manifest(yaml: &str) -> ExperimentManifest {
-        ExperimentManifest::from_yaml(yaml).expect("valid test manifest")
+    /// §6.1 text → model. Test fixtures stay in §6.1 while it is still an accepted input
+    /// format; they reach the planners the same single way production code does.
+    fn manifest(yaml: &str) -> crate::model::Experiment {
+        ExperimentManifest::from_yaml(yaml)
+            .expect("valid test manifest")
+            .to_model()
+            .expect("adapts to the model")
     }
 
     const BASE: &str = r#"
@@ -358,7 +298,7 @@ zones:
 
     #[test]
     fn builds_deterministic_plan() {
-        let plan = GatewayPlan::from_manifest(&manifest(BASE)).unwrap();
+        let plan = GatewayPlan::from_model(&manifest(BASE)).unwrap();
         assert_eq!(plan.bridge, "vxbr0");
         assert_eq!(plan.root_rate_mbps, 500);
         assert_eq!(plan.slices.len(), 2);
@@ -374,7 +314,7 @@ zones:
         assert_eq!(plan.endpoints[0].kind, EndpointKind::Tap);
         assert_eq!(plan.endpoints[0].peer, "vz0");
         // Determinism: same manifest, same plan.
-        assert_eq!(plan, GatewayPlan::from_manifest(&manifest(BASE)).unwrap());
+        assert_eq!(plan, GatewayPlan::from_model(&manifest(BASE)).unwrap());
     }
 
     #[test]
@@ -385,7 +325,7 @@ network:
   slices:
     - { id: adas, mode: vlan, vlan: 4000 }
 "#;
-        let err = GatewayPlan::from_manifest(&manifest(yaml)).unwrap_err();
+        let err = GatewayPlan::from_model(&manifest(yaml)).unwrap_err();
         assert!(matches!(
             err,
             PlanError::VlanCollidesWithFiveGUplink(id, 4000) if id == "adas"
@@ -396,7 +336,7 @@ network:
     fn vlan_only_manifest_has_no_snssai_ids_tracked() {
         // Regression guard: adding s-nssai tracking must not change the
         // vlan-only plan at all (zero risk to the frozen H1/H3/H4 numbers).
-        let plan = GatewayPlan::from_manifest(&manifest(BASE)).unwrap();
+        let plan = GatewayPlan::from_model(&manifest(BASE)).unwrap();
         assert!(plan.snssai_slice_ids.is_empty());
     }
 
@@ -411,7 +351,7 @@ network:
             "    - { id: adas, mode: vlan, vlan: 101, qos: { min_rate_mbps: 100, max_rate_mbps: 200, priority: 1 } }\n    - { id: adas5g, mode: s-nssai, s_nssai: { sst: 1, sd: '000001' } }",
             1,
         ));
-        let plan = GatewayPlan::from_manifest(&m).expect("mixed manifest now succeeds");
+        let plan = GatewayPlan::from_model(&m).expect("mixed manifest now succeeds");
         // vlan slices provisioned exactly as the vlan-only case (BASE).
         assert_eq!(plan.slices.len(), 2);
         assert_eq!(plan.slices[0].id, "adas");
@@ -424,7 +364,7 @@ network:
         let m = manifest(
             "experiment: { id: e, name: n }\nnetwork:\n  slices:\n    - { id: adas5g, mode: s-nssai, s_nssai: { sst: 1, sd: '000001' } }\n",
         );
-        let plan = GatewayPlan::from_manifest(&m).expect("s-nssai-only manifest now succeeds");
+        let plan = GatewayPlan::from_model(&m).expect("s-nssai-only manifest now succeeds");
         assert!(plan.slices.is_empty());
         assert_eq!(plan.snssai_slice_ids, vec!["adas5g".to_string()]);
         // Bridge/uplink are still planned — an s-nssai-only experiment still
@@ -436,7 +376,7 @@ network:
     fn rejects_manifest_without_any_slices() {
         let m = manifest("experiment: { id: e, name: n }\n");
         assert!(matches!(
-            GatewayPlan::from_manifest(&m),
+            GatewayPlan::from_model(&m),
             Err(PlanError::NoSlices)
         ));
     }

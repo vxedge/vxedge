@@ -110,7 +110,11 @@ fn resources_of(device: &str, spec: &Value) -> Result<Option<Resources>, ModelEr
 
 /// The one part targeting `component`. A `stack`-layer part wins over its own members: a stack
 /// exists precisely to be the single pullable unit, so carrying both is not ambiguous.
-fn sole_part(ws: &Workspace, component: &str) -> Result<Part, ModelError> {
+fn sole_part(
+    ws: &Workspace,
+    component: &str,
+    backend: Option<Backend>,
+) -> Result<Part, ModelError> {
     let candidates: Vec<&PartEntry> = ws
         .baselines
         .iter()
@@ -146,6 +150,13 @@ fn sole_part(ws: &Workspace, component: &str) -> Result<Part, ModelError> {
     };
     Ok(Part {
         reference: chosen.reference.clone(),
+        // The backend is the authority on how the image is consumed — deriving it from the
+        // reference is the guess that produced an unbootable manifest during the exp-001
+        // migration.
+        kind: match backend {
+            Some(Backend::Container) | None => PartKind::Container,
+            Some(_) => PartKind::Bundle,
+        },
         digest: chosen.digest.clone(),
         local: chosen.is_local(),
     })
@@ -231,7 +242,7 @@ fn build_entity(ws: &Workspace, doc: &VehicleDoc) -> Result<Entity, ModelError> 
                 Function {
                     id: id.clone(),
                     deployed_on: id.clone(),
-                    part: Some(sole_part(ws, id)?),
+                    part: Some(sole_part(ws, id, backend_of(id, spec)?)?),
                     asil: None,
                 },
             );
@@ -510,44 +521,7 @@ mod tests {
     /// Fixture mirrors exp-001: two container-backed devices on separate vlan slices.
     /// exp-001 in both forms: two container-backed devices on separate vlan slices, over a
     /// 500 mbit shared bottleneck. Returns (dir, §6.1 manifest, §6.0 workspace).
-    fn equivalence_fixture(
-        name: &str,
-    ) -> (std::path::PathBuf, crate::ExperimentManifest, Workspace) {
-        let frozen = crate::ExperimentManifest::from_yaml(
-            r#"
-experiment: { id: exp-x, name: x, duration_s: 60 }
-network:
-  defaults: { bandwidth: 500000000 }
-  slices:
-    - { id: adas, mode: vlan, vlan: 101, qos: { min_rate_mbps: 100, max_rate_mbps: 200, priority: 1 } }
-    - { id: infot, mode: vlan, vlan: 103, qos: { min_rate_mbps: 0, max_rate_mbps: 400, priority: 5 } }
-zones:
-  - id: vxzone-a
-    role: front-left
-    nodes:
-      - id: node-a
-        type: ecu
-        image: { url: "local/vxprobe:host-process", kind: container }
-        backend: container
-        network: [{ iface: eth0, vlan: 101, slice: adas }]
-  - id: vxzone-b
-    role: rear-left
-    nodes:
-      - id: node-b
-        type: ecu
-        image: { url: "local/vxtraffic:host-process", kind: container }
-        backend: container
-        network: [{ iface: eth0, vlan: 103, slice: infot }]
-traffic_profiles:
-  load:
-    source: vxzone-b:node-b
-    target: internet
-    bandwidth_mbps: 400
-    payload_bytes: 1200
-"#,
-        )
-        .unwrap();
-
+    fn h1_fixture(name: &str) -> (std::path::PathBuf, Workspace) {
         let tmp = std::env::temp_dir().join(format!("vxmodelplan-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
@@ -601,85 +575,44 @@ parts:
         .unwrap();
 
         let ws = Workspace::load_validated(&tmp).unwrap();
-        (tmp, frozen, ws)
+        (tmp, ws)
     }
 
-    #[test]
-    fn the_model_path_plans_the_same_gateway_as_the_manifest_path() {
-        use crate::gateway::GatewayPlan;
-        let (tmp, frozen, ws) = equivalence_fixture("gw");
-        let via_model = GatewayPlan::from_model(&build(&ws).unwrap()).unwrap();
-        let via_manifest = GatewayPlan::from_manifest(&frozen).unwrap();
-
-        assert_eq!(via_model.summary(), via_manifest.summary());
-        assert_eq!(via_model.endpoints, via_manifest.endpoints);
-        // The shared bottleneck the whole experiment measures against. Asserted explicitly
-        // because `summary()` including it is not something this test should depend on.
-        assert_eq!(via_model.root_rate_mbps, 500);
-        assert_eq!(via_model.root_rate_mbps, via_manifest.root_rate_mbps);
-        std::fs::remove_dir_all(&tmp).ok();
-    }
-
-    /// Same acceptance criterion as the gateway port: the two paths must produce the *same*
-    /// node plans, since `NodePlan` carries the interface names the backends attach to.
+    /// Golden assertion on the plans an H1-shaped workspace produces.
     ///
-    /// `zone_id` is the one field that legitimately differs — §6.1 names a wrapper zone, the
-    /// model names the region the device sits in. Everything the provisioning actually uses
-    /// (endpoint, peer, kind, vlan, backend) must be identical.
+    /// This replaced a comparison against the §6.1 planner, which no longer exists — there is
+    /// one planning path now. The values below were taken from that comparison while both paths
+    /// were live and verified identical across all five frozen manifests, so they pin the
+    /// behaviour rather than merely restating the implementation.
     #[test]
-    fn the_model_path_plans_the_same_nodes_as_the_manifest_path() {
-        use crate::gateway::GatewayPlan;
-        use crate::zones::plan::{plan_nodes, plan_nodes_from_model};
-
-        let (tmp, frozen, ws) = equivalence_fixture("nodes");
-        let model = build(&ws).unwrap();
-
-        let gw_model = GatewayPlan::from_model(&model).unwrap();
-        let gw_manifest = GatewayPlan::from_manifest(&frozen).unwrap();
-        let via_model = plan_nodes_from_model(&model, &gw_model, &tmp).unwrap();
-        let via_manifest = plan_nodes(&frozen, &gw_manifest, &tmp).unwrap();
-
-        assert_eq!(via_model.len(), via_manifest.len());
-        for (a, b) in via_model.iter().zip(via_manifest.iter()) {
-            assert_eq!(a.node_id, b.node_id);
-            assert_eq!(a.endpoint, b.endpoint, "attachment name drifted");
-            assert_eq!(a.peer, b.peer, "veth peer drifted");
-            assert_eq!(a.kind, b.kind);
-            assert_eq!(a.vlan, b.vlan);
-            assert_eq!(a.backend, b.backend);
-            assert_eq!(a.runtime_name(), b.runtime_name(), "netns name drifted");
-        }
-        std::fs::remove_dir_all(&tmp).ok();
-    }
-
-    /// Third planner ported. Traffic is where §6.1's endpoint spelling was worst — a profile
-    /// names `<zone-vxid>:<node-vxid>`, and the zone half was synthesized by lowering, so no
-    /// author could ever write it correctly. In the model an endpoint is a device id, and the
-    /// resolution happens once at build time.
-    #[test]
-    fn the_model_path_plans_the_same_traffic_as_the_manifest_path() {
+    fn an_h1_workspace_plans_the_expected_topology() {
         use crate::gateway::GatewayPlan;
         use crate::traffic::TrafficPlan;
+        use crate::zones::plan::plan_nodes_from_model;
 
-        let (tmp, frozen, ws) = equivalence_fixture("traffic");
+        let (tmp, ws) = h1_fixture("golden");
         let model = build(&ws).unwrap();
+        assert!(model.check().is_empty(), "{:?}", model.check());
 
-        let via_model = TrafficPlan::from_model(&model, &GatewayPlan::from_model(&model).unwrap())
-            .expect("model traffic plans");
-        let via_manifest =
-            TrafficPlan::from_manifest(&frozen, &GatewayPlan::from_manifest(&frozen).unwrap())
-                .expect("manifest traffic plans");
+        let gw = GatewayPlan::from_model(&model).unwrap();
+        assert_eq!(gw.root_rate_mbps, 500, "shared uplink bottleneck");
+        let eps: Vec<(&str, &str, u16)> = gw
+            .endpoints
+            .iter()
+            .map(|e| (e.name.as_str(), e.peer.as_str(), e.vlan))
+            .collect();
+        assert_eq!(eps, vec![("vz0", "vzp0", 101), ("vz1", "vzp1", 103)]);
 
-        assert_eq!(via_model.profiles.len(), via_manifest.profiles.len());
-        for (a, b) in via_model.profiles.iter().zip(via_manifest.profiles.iter()) {
-            assert_eq!(a.id, b.id);
-            // The resolved endpoints carry the interface and address traffic is actually
-            // generated against — the whole point of the comparison.
-            assert_eq!(a.source, b.source, "source endpoint drifted");
-            assert_eq!(a.target, b.target, "target endpoint drifted");
-            assert_eq!(a.bandwidth_mbps, b.bandwidth_mbps);
-            assert_eq!(a.payload_bytes, b.payload_bytes);
-        }
+        let nodes = plan_nodes_from_model(&model, &gw, &tmp).unwrap();
+        assert_eq!(
+            nodes.iter().map(|n| n.node_id.as_str()).collect::<Vec<_>>(),
+            vec!["node-a", "node-b"]
+        );
+        assert_eq!(nodes[0].runtime_name(), "vx-node-a");
+
+        let traffic = TrafficPlan::from_model(&model, &gw).unwrap();
+        assert_eq!(traffic.profiles.len(), 1);
+        assert_eq!(traffic.profiles[0].id, "load");
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -754,72 +687,6 @@ parts:
                 .iter()
                 .any(|e| matches!(e, crate::model::InvariantError::UnknownCarriedByLink { .. }))
         );
-        std::fs::remove_dir_all(&tmp).ok();
-    }
-
-    /// The last planner. Every address in a FiveGPlan is allocated positionally from the slice
-    /// list — UE subnets, SMF/UPF addresses, TUN devices, SUPIs — so drift between the two paths
-    /// would surface as a registration timeout with nothing pointing at the cause.
-    ///
-    /// Weaker evidence than the other three, and worth saying: exp-010 is the frozen `s-nssai`
-    /// campaign and needs a provisioning-capable host, so this compares the two planners against
-    /// each other on a fixture rather than against a recorded result.
-    #[test]
-    fn the_model_path_plans_the_same_5g_core_as_the_manifest_path() {
-        use crate::fiveg::FiveGPlan;
-
-        let yaml = r#"
-network:
-  slices:
-    - { id: adas, mode: s-nssai, s_nssai: { sst: 1, sd: "000001" }, qos: { min_rate_mbps: 100, max_rate_mbps: 200, priority: 1 } }
-    - { id: infot, mode: s-nssai, s_nssai: { sst: 2, sd: "0000AB" }, qos: { min_rate_mbps: 0, max_rate_mbps: 400, priority: 5 } }
-"#;
-        let frozen = crate::ExperimentManifest::from_yaml(&format!(
-            "experiment: {{ id: exp-5g, name: x, duration_s: 60 }}\n{yaml}"
-        ))
-        .unwrap();
-
-        let tmp = std::env::temp_dir().join(format!("vx5g-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-        std::fs::write(tmp.join("x.vxp"), "id: exp-5g\n").unwrap();
-        std::fs::write(
-            tmp.join("main.yaml"),
-            format!("kind: experiment\nid: exp-5g\nvehicles: [veh]\nbaseline: bl\n{yaml}"),
-        )
-        .unwrap();
-        std::fs::write(
-            tmp.join("veh.yaml"),
-            r#"
-kind: vehicle
-id: veh
-composition:
-  zones:
-    node-a: { class: zone, position: front-left, backend: container }
-links:
-  - { id: la, endpoints: [node-a:eth0], slice: adas }
-"#,
-        )
-        .unwrap();
-        std::fs::write(
-            tmp.join("parts.yaml"),
-            "kind: baseline\nid: bl\nparts:\n  - { ref: \"local/vxprobe:host-process\", target_ids: node-a }\n",
-        )
-        .unwrap();
-
-        let ws = Workspace::load_validated(&tmp).unwrap();
-        let via_model = FiveGPlan::from_model(&build(&ws).unwrap()).unwrap();
-        let via_manifest = FiveGPlan::from_manifest(&frozen).unwrap();
-
-        assert_eq!(via_model.sessions.len(), 2);
-        for (a, b) in via_model.sessions.iter().zip(via_manifest.sessions.iter()) {
-            assert_eq!(a.slice_id, b.slice_id);
-            assert_eq!((a.sst, &a.sd), (b.sst, &b.sd), "S-NSSAI drifted");
-            assert_eq!(a.ue_subnet, b.ue_subnet, "UE subnet drifted");
-            assert_eq!(a.supi, b.supi, "SUPI drifted — UE would fail to register");
-            assert_eq!(a.tun_dev, b.tun_dev);
-            assert_eq!(a.upf_gtpu_addr, b.upf_gtpu_addr);
-        }
         std::fs::remove_dir_all(&tmp).ok();
     }
 

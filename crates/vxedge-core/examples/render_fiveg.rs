@@ -31,7 +31,7 @@ fn main() -> ExitCode {
 fn run(manifest_path: &str, outdir: &str) -> Result<(), Box<dyn std::error::Error>> {
     let yaml = fs::read_to_string(manifest_path)?;
     let manifest = ExperimentManifest::from_yaml(&yaml)?;
-    let plan = FiveGPlan::from_manifest(&manifest)?;
+    let plan = FiveGPlan::from_model(&manifest.to_model().expect("adapts"))?;
     for path in write_all(&plan, Path::new(outdir))? {
         println!("wrote {}", path.display());
     }

@@ -92,7 +92,7 @@ network:
     - { id: infotainment, mode: s-nssai, s_nssai: { sst: 2 } }
 "#;
         let m = ExperimentManifest::from_yaml(yaml).expect("test manifest parses");
-        FiveGPlan::from_manifest(&m).expect("plans")
+        FiveGPlan::from_model(&m.to_model().expect("adapts")).expect("plans")
     }
 
     #[test]

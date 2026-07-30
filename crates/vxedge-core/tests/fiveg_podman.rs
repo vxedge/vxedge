@@ -54,7 +54,7 @@ impl Drop for PodGuard {
 #[ignore = "needs root + podman + the vx5g-core/vx5g-ran images (see module docs)"]
 fn fiveg_up_brings_cn_and_ran_pods_up_idempotently_then_tears_down() {
     let manifest = ExperimentManifest::from_yaml(MANIFEST).expect("manifest parses");
-    let plan = FiveGPlan::from_manifest(&manifest).expect("plans");
+    let plan = FiveGPlan::from_model(&manifest.to_model().expect("adapts")).expect("plans");
     let runtime_dir = tempfile::tempdir().expect("tempdir");
     let cfg = FiveGLifecycleConfig {
         pod_name: "vx5g-cargo-test".to_string(),

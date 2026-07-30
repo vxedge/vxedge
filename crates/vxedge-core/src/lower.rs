@@ -580,10 +580,10 @@ mod tests {
         use crate::traffic::TrafficPlan;
         for template in [Template::Minimal, Template::Slicing] {
             let (tmp, ws) = scaffolded(template, &format!("plan-{}", template.as_str()));
-            let m = lower(&ws).unwrap();
-            let gw = GatewayPlan::from_manifest(&m)
+            let model = lower(&ws).unwrap().to_model().expect("adapts");
+            let gw = GatewayPlan::from_model(&model)
                 .unwrap_or_else(|e| panic!("{} does not gateway-plan: {e}", template.as_str()));
-            let tp = TrafficPlan::from_manifest(&m, &gw)
+            let tp = TrafficPlan::from_model(&model, &gw)
                 .unwrap_or_else(|e| panic!("{} does not traffic-plan: {e}", template.as_str()));
             assert!(
                 !tp.profiles.is_empty(),
@@ -719,8 +719,8 @@ parts:
         .unwrap();
 
         let migrated = ExperimentManifest::from_yaml(&lower_path_to_yaml(&tmp).unwrap()).unwrap();
-        let a = GatewayPlan::from_manifest(&frozen).unwrap();
-        let b = GatewayPlan::from_manifest(&migrated).unwrap();
+        let a = GatewayPlan::from_model(&frozen.to_model().expect("adapts")).unwrap();
+        let b = GatewayPlan::from_model(&migrated.to_model().expect("adapts")).unwrap();
 
         let names = |p: &GatewayPlan| {
             p.endpoints

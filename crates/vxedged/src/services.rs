@@ -118,9 +118,27 @@ mod hex {
     }
 }
 
-fn parse_and_plan(yaml: &str) -> Result<GatewayPlan, String> {
+/// YAML → domain model. The single entry point for §6.1 text.
+///
+/// §6.1 is an input *format*, not a planner input: every planner takes the model, so a manifest
+/// reaches provisioning through exactly one adapter. That is what keeps there from being two
+/// planning paths that can disagree.
+fn parse_to_model(yaml: &str) -> Result<vxedge_core::model::Experiment, String> {
     let manifest = ExperimentManifest::from_yaml(yaml).map_err(|e| e.to_string())?;
-    GatewayPlan::from_manifest(&manifest).map_err(|e| e.to_string())
+    let model = manifest.to_model().map_err(|e| e.to_string())?;
+    let violations = model.check();
+    if !violations.is_empty() {
+        return Err(violations
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("; "));
+    }
+    Ok(model)
+}
+
+fn parse_and_plan(yaml: &str) -> Result<GatewayPlan, String> {
+    GatewayPlan::from_model(&parse_to_model(yaml)?).map_err(|e| e.to_string())
 }
 
 /// Re-parses `yaml` to compile its `mode: s-nssai` slices, if any. Only
@@ -129,8 +147,7 @@ fn parse_and_plan(yaml: &str) -> Result<GatewayPlan, String> {
 /// problem, not the "no s-nssai slices" case (already ruled out by the
 /// caller) — surfaced as a hard `Up` failure rather than silently skipped.
 fn parse_and_fiveg_plan(yaml: &str) -> Result<FiveGPlan, String> {
-    let manifest = ExperimentManifest::from_yaml(yaml).map_err(|e| e.to_string())?;
-    FiveGPlan::from_manifest(&manifest).map_err(|e| e.to_string())
+    FiveGPlan::from_model(&parse_to_model(yaml)?).map_err(|e| e.to_string())
 }
 
 /// Run a blocking gateway operation off the async runtime.
@@ -648,9 +665,9 @@ impl ZoneSvc {
             .clone()
             .unwrap_or_else(|| PathBuf::from("."));
         drop(st);
-        let manifest = ExperimentManifest::from_yaml(&yaml)
-            .map_err(|e| Status::internal(format!("stored manifest no longer parses: {e}")))?;
-        let plans = zones::plan_nodes(&manifest, &gateway, &dir)
+        let model = parse_to_model(&yaml)
+            .map_err(|e| Status::internal(format!("stored manifest no longer models: {e}")))?;
+        let plans = zones::plan_nodes_from_model(&model, &gateway, &dir)
             .map_err(|e| Status::internal(e.to_string()))?;
         let filtered: Vec<NodePlan> = match zone_vxid {
             Some(z) => plans.into_iter().filter(|p| p.zone_id == z).collect(),
@@ -992,16 +1009,16 @@ impl TrafficSvc {
         mref: Option<&ManifestRef>,
     ) -> Result<(TrafficPlan, Option<FiveGPlan>, String, u64), Status> {
         let (yaml, sha256, _dir) = resolve_manifest(mref).await?;
-        let manifest = ExperimentManifest::from_yaml(&yaml)
+        let model = parse_to_model(&yaml)
             .map_err(|e| Status::invalid_argument(format!("manifest invalid: {e}")))?;
-        let gateway_plan = GatewayPlan::from_manifest(&manifest)
+        let gateway_plan = GatewayPlan::from_model(&model)
             .map_err(|e| Status::invalid_argument(format!("gateway plan: {e}")))?;
-        let five_g_plan = match FiveGPlan::from_manifest(&manifest) {
+        let five_g_plan = match FiveGPlan::from_model(&model) {
             Ok(p) => Some(p),
             Err(fiveg::FiveGPlanError::NoSnssaiSlices) => None,
             Err(e) => return Err(Status::invalid_argument(format!("fiveg plan: {e}"))),
         };
-        let traffic_plan = TrafficPlan::from_manifest(&manifest, &gateway_plan)
+        let traffic_plan = TrafficPlan::from_model(&model, &gateway_plan)
             .map_err(|e| Status::invalid_argument(format!("traffic plan: {e}")))?;
         // `experiment.duration_s` is the manifest's own probe/load-window
         // knob (already used for `results_prefix`-adjacent metadata
@@ -1010,7 +1027,7 @@ impl TrafficSvc {
         // back to their own 10s CLI default, which would undershoot a real
         // campaign's measured window. Falls back to 10 (their own default)
         // when the manifest doesn't set it, e.g. the quick smoke manifests.
-        let duration_s = manifest.experiment.duration_s.unwrap_or(10);
+        let duration_s = u64::from(model.method.duration_s.unwrap_or(10));
         Ok((traffic_plan, five_g_plan, sha256, duration_s))
     }
 }

@@ -118,9 +118,13 @@ impl Drop for Guard {
 #[ignore = "needs root + podman + vx5g-core/vx5g-ran images + built vxprobe/vxtraffic (see module docs)"]
 fn traffic_service_runs_vlan_and_snssai_profiles_simultaneously_through_the_real_bridge() {
     let manifest = ExperimentManifest::from_yaml(MANIFEST).expect("manifest parses");
-    let gateway_plan = GatewayPlan::from_manifest(&manifest).expect("gateway plan");
-    let five_g_plan = FiveGPlan::from_manifest(&manifest).expect("fiveg plan");
-    let traffic_plan = TrafficPlan::from_manifest(&manifest, &gateway_plan).expect("traffic plan");
+    let gateway_plan =
+        GatewayPlan::from_model(&manifest.to_model().expect("adapts")).expect("gateway plan");
+    let five_g_plan =
+        FiveGPlan::from_model(&manifest.to_model().expect("adapts")).expect("fiveg plan");
+    let traffic_plan =
+        TrafficPlan::from_model(&manifest.to_model().expect("adapts"), &gateway_plan)
+            .expect("traffic plan");
     assert_eq!(traffic_plan.profiles.len(), 3);
 
     let sh = Shell::default();

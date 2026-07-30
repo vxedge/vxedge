@@ -4,8 +4,8 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::gateway::plan::{EndpointKind, GatewayPlan, resolved_backend};
-use crate::manifest::{Backend, ExperimentManifest, ImageKind};
+use crate::gateway::plan::{EndpointKind, GatewayPlan};
+use crate::manifest::Backend;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ZonePlanError {
@@ -76,8 +76,18 @@ pub fn plan_nodes_from_model(
     for entity in &exp.entities {
         for device in entity.devices_in_order() {
             for (link, endpoint) in entity.links_for(&device.id) {
-                if link.slice.is_none() {
-                    continue; // not a gateway-attached link
+                // Join only what `GatewayPlan::from_model` produced an endpoint for: a slice
+                // with a vlan. An `s-nssai` attachment is slice-bound but has no vlan and no
+                // bridge port — its lifecycle belongs to `fiveg`, not here — so counting it
+                // would desynchronise the 1:1 index join with the gateway plan.
+                let is_vlan_attached = link
+                    .slice
+                    .as_deref()
+                    .and_then(|s| exp.slices.iter().find(|sl| sl.id == s))
+                    .and_then(|sl| sl.vlan)
+                    .is_some();
+                if !is_vlan_attached {
+                    continue;
                 }
                 let Some(ep) = gateway.endpoints.get(idx) else {
                     return Err(ZonePlanError::EndpointMismatch {
@@ -103,11 +113,15 @@ pub fn plan_nodes_from_model(
                         return Err(ZonePlanError::DeviceWithoutBackend(device.id.clone()));
                     }
                 };
+                // A VM backend boots a bundle. A part that is a container image is not one, and
+                // saying so is the check §6.1 made through `image.kind` — losing it let a
+                // libvirt node pointed at a container image plan cleanly and fail at boot.
                 let bundle = match backend {
                     Backend::Libvirt | Backend::QemuMicrovm => entity
                         .functions
                         .get(&device.id)
                         .and_then(|f| f.part.as_ref())
+                        .filter(|part| part.kind == crate::model::PartKind::Bundle)
                         .map(|part| {
                             let p = Path::new(&part.reference);
                             if p.is_absolute() {
@@ -134,72 +148,6 @@ pub fn plan_nodes_from_model(
                     ip_cidr: endpoint.ip_cidr.clone(),
                     bundle,
                     pinned_cpus: device.pinned_cpus.clone(),
-                });
-                idx += 1;
-            }
-        }
-    }
-    if idx != gateway.endpoints.len() {
-        return Err(ZonePlanError::EndpointMismatch {
-            gateway: gateway.endpoints.len(),
-            zones: idx,
-        });
-    }
-    Ok(plans)
-}
-
-/// Join manifest nodes with the gateway plan's endpoints.
-pub fn plan_nodes(
-    manifest: &ExperimentManifest,
-    gateway: &GatewayPlan,
-    manifest_dir: &Path,
-) -> Result<Vec<NodePlan>, ZonePlanError> {
-    let mut plans = Vec::new();
-    let mut idx = 0usize;
-    for zone in &manifest.zones {
-        for node in &zone.nodes {
-            let backend = resolved_backend(node);
-            for iface in &node.network {
-                if iface.vlan.is_none() {
-                    continue; // not a gateway-attached iface
-                }
-                let Some(ep) = gateway.endpoints.get(idx) else {
-                    return Err(ZonePlanError::EndpointMismatch {
-                        gateway: gateway.endpoints.len(),
-                        zones: idx + 1,
-                    });
-                };
-                debug_assert_eq!(ep.node, node.id, "traversal order invariant");
-                let bundle = match node.image.kind {
-                    ImageKind::Vm | ImageKind::Rtimage => {
-                        let p = Path::new(&node.image.url);
-                        Some(if p.is_absolute() {
-                            p.to_path_buf()
-                        } else {
-                            manifest_dir.join(p)
-                        })
-                    }
-                    ImageKind::Container => None,
-                };
-                if bundle.is_none() && matches!(backend, Backend::Libvirt | Backend::QemuMicrovm) {
-                    return Err(ZonePlanError::MissingBundle(node.id.clone(), backend));
-                }
-                plans.push(NodePlan {
-                    zone_id: zone.id.clone(),
-                    node_id: node.id.clone(),
-                    backend,
-                    endpoint: ep.name.clone(),
-                    peer: ep.peer.clone(),
-                    kind: ep.kind,
-                    vlan: ep.vlan,
-                    slice: ep.slice.clone(),
-                    ip_cidr: iface.ip.clone(),
-                    bundle,
-                    pinned_cpus: node
-                        .realtime
-                        .as_ref()
-                        .map(|r| r.pinned_cpus.clone())
-                        .unwrap_or_default(),
                 });
                 idx += 1;
             }
@@ -243,8 +191,10 @@ zones:
     #[test]
     fn joins_nodes_with_gateway_endpoints() {
         let m = ExperimentManifest::from_yaml(YAML).unwrap();
-        let gw = GatewayPlan::from_manifest(&m).unwrap();
-        let plans = plan_nodes(&m, &gw, Path::new("/manifests")).unwrap();
+        let gw = GatewayPlan::from_model(&m.to_model().expect("adapts")).unwrap();
+        let plans =
+            plan_nodes_from_model(&m.to_model().expect("adapts"), &gw, Path::new("/manifests"))
+                .unwrap();
         assert_eq!(plans.len(), 2);
         assert_eq!(plans[0].backend, Backend::QemuMicrovm);
         assert_eq!(plans[0].kind, EndpointKind::Tap);
@@ -267,9 +217,9 @@ zones:
             "image: { url: whatever, kind: container }\n        backend: qemu-microvm",
         );
         let m = ExperimentManifest::from_yaml(&bad).unwrap();
-        let gw = GatewayPlan::from_manifest(&m).unwrap();
+        let gw = GatewayPlan::from_model(&m.to_model().expect("adapts")).unwrap();
         assert!(matches!(
-            plan_nodes(&m, &gw, Path::new("/x")),
+            plan_nodes_from_model(&m.to_model().expect("adapts"), &gw, Path::new("/x")),
             Err(ZonePlanError::MissingBundle(id, _)) if id == "node-b"
         ));
     }

@@ -17,7 +17,7 @@
 //! discovers it live — this plan only records *which slice*.
 
 use crate::gateway::GatewayPlan;
-use crate::manifest::{ExperimentManifest, NodeIface, SliceMode, TrafficProfile};
+use crate::manifest::SliceMode;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TrafficPlanError {
@@ -227,6 +227,19 @@ impl TrafficPlan {
                 TE::Simulator(s) => s.clone(),
             };
 
+            if profile.pps.is_none() && profile.bandwidth_mbps.is_none() {
+                return Err(TrafficPlanError::NoRateSpecified(profile.id.clone()));
+            }
+            // Two real nodes on the same vlan cannot be told apart by the far-side addressing
+            // scheme — both would resolve to the same peer address. §6.1 refused this; losing
+            // the check would have produced a profile that generated traffic to itself.
+            if let (Some(a), Some(b)) = (&src, &dst)
+                && a.slice_id == b.slice_id
+            {
+                return Err(TrafficPlanError::BothEndpointsRealOnSameVlan(
+                    profile.id.clone(),
+                ));
+            }
             let (source, target) = match (src, dst) {
                 (Some(s), Some(t)) => (
                     endpoint_for(
@@ -299,137 +312,6 @@ impl TrafficPlan {
         }
         Ok(TrafficPlan { profiles })
     }
-
-    pub fn from_manifest(
-        manifest: &ExperimentManifest,
-        gateway_plan: &GatewayPlan,
-    ) -> Result<Self, TrafficPlanError> {
-        let mut profiles = Vec::with_capacity(manifest.traffic_profiles.len());
-        for (id, profile) in &manifest.traffic_profiles {
-            profiles.push(resolve_profile(manifest, gateway_plan, id, profile)?);
-        }
-        Ok(TrafficPlan { profiles })
-    }
-}
-
-fn resolve_profile(
-    manifest: &ExperimentManifest,
-    gateway_plan: &GatewayPlan,
-    id: &str,
-    profile: &TrafficProfile,
-) -> Result<ResolvedProfile, TrafficPlanError> {
-    if profile.pps.is_none() && profile.bandwidth_mbps.is_none() {
-        return Err(TrafficPlanError::NoRateSpecified(id.to_string()));
-    }
-
-    let source_ref = find_real_ref(manifest, id, "source", &profile.source)?;
-    let target_ref = find_real_ref(manifest, id, "target", &profile.target)?;
-
-    let (source, target) = match (source_ref, target_ref) {
-        (Some(s), Some(t)) => {
-            // The `10.<vlan>.0.x` addressing convention only has two slots
-            // (near `.2`, far `.1`) — it has no way to give two *real* node
-            // references on the *same* vlan distinct addresses without
-            // colliding. H1's own methodology never needs this (every
-            // profile pairs exactly one real node with the symbolic
-            // `internet`); reject explicitly rather than silently handing
-            // both endpoints the same address.
-            if s.mode == SliceMode::Vlan && t.mode == SliceMode::Vlan {
-                let source_vlan = gateway_plan
-                    .endpoints
-                    .iter()
-                    .find(|ep| ep.node == s.node_id)
-                    .map(|ep| ep.vlan);
-                let target_vlan = gateway_plan
-                    .endpoints
-                    .iter()
-                    .find(|ep| ep.node == t.node_id)
-                    .map(|ep| ep.vlan);
-                if source_vlan.is_some() && source_vlan == target_vlan {
-                    return Err(TrafficPlanError::BothEndpointsRealOnSameVlan(
-                        id.to_string(),
-                    ));
-                }
-            }
-            (
-                endpoint_for(gateway_plan, id, "source", &profile.source, s)?,
-                endpoint_for(gateway_plan, id, "target", &profile.target, t)?,
-            )
-        }
-        (Some(s), None) => {
-            let target = far_side_for(gateway_plan, id, "source", &profile.source, &s)?;
-            let source = endpoint_for(gateway_plan, id, "source", &profile.source, s)?;
-            (source, target)
-        }
-        (None, Some(t)) => {
-            let source = far_side_for(gateway_plan, id, "target", &profile.target, &t)?;
-            let target = endpoint_for(gateway_plan, id, "target", &profile.target, t)?;
-            (source, target)
-        }
-        (None, None) => return Err(TrafficPlanError::BothEndpointsSymbolic(id.to_string())),
-    };
-
-    Ok(ResolvedProfile {
-        id: id.to_string(),
-        source,
-        target,
-        pps: profile.pps,
-        bandwidth_mbps: profile.bandwidth_mbps,
-        payload_bytes: profile.payload_bytes.unwrap_or(64),
-    })
-}
-
-/// `reference` is either `<zone-vxid>:<node-vxid>` (resolved to `Some`) or a
-/// symbolic string like `internet`/`carla` (resolved to `None` — not an
-/// error by itself; only an error if *both* sides of a profile are
-/// symbolic, checked by the caller).
-fn find_real_ref<'a>(
-    manifest: &'a ExperimentManifest,
-    profile: &str,
-    field: &'static str,
-    reference: &'a str,
-) -> Result<Option<RealRef<'a>>, TrafficPlanError> {
-    let Some((zone_id, node_id)) = reference.split_once(':') else {
-        return Ok(None);
-    };
-    let node = manifest
-        .zones
-        .iter()
-        .find(|z| z.id == zone_id)
-        .and_then(|z| z.nodes.iter().find(|n| n.id == node_id))
-        .ok_or_else(|| TrafficPlanError::UnknownNode {
-            profile: profile.to_string(),
-            field,
-            reference: reference.to_string(),
-        })?;
-    let iface: &NodeIface = node
-        .network
-        .iter()
-        .find(|i| i.slice.is_some())
-        .ok_or_else(|| TrafficPlanError::NodeHasNoSlice {
-            profile: profile.to_string(),
-            field,
-            reference: reference.to_string(),
-        })?;
-    let slice_id = iface.slice.as_deref().expect("checked by find above");
-    let slice = manifest
-        .network
-        .as_ref()
-        .map(|n| n.slices.as_slice())
-        .unwrap_or(&[])
-        .iter()
-        .find(|s| s.id == slice_id)
-        .ok_or_else(|| TrafficPlanError::UnknownSlice {
-            profile: profile.to_string(),
-            field,
-            reference: reference.to_string(),
-            slice: slice_id.to_string(),
-        })?;
-    Ok(Some(RealRef {
-        node_id,
-        slice_id: &slice.id,
-        mode: slice.mode,
-    }))
 }
 
 fn endpoint_for(
@@ -500,9 +382,15 @@ fn far_side_for(
 mod tests {
     use super::*;
     use crate::gateway::GatewayPlan;
+    use crate::manifest::ExperimentManifest;
 
-    fn manifest(yaml: &str) -> ExperimentManifest {
-        ExperimentManifest::from_yaml(yaml).expect("valid test manifest")
+    /// §6.1 text → model. Test fixtures stay in §6.1 while it is still an accepted input
+    /// format; they reach the planners the same single way production code does.
+    fn manifest(yaml: &str) -> crate::model::Experiment {
+        ExperimentManifest::from_yaml(yaml)
+            .expect("valid test manifest")
+            .to_model()
+            .expect("adapts to the model")
     }
 
     const BASE: &str = r#"
@@ -536,16 +424,27 @@ traffic_profiles:
     bandwidth_mbps: 400
 "#;
 
-    fn plans(yaml: &str) -> (ExperimentManifest, GatewayPlan) {
+    /// Mutable access to one profile by id — the model stores traffic as a list, not a map.
+    fn profile_mut<'a>(
+        m: &'a mut crate::model::Experiment,
+        id: &str,
+    ) -> &'a mut crate::model::TrafficProfile {
+        m.traffic
+            .iter_mut()
+            .find(|p| p.id == id)
+            .expect("profile exists")
+    }
+
+    fn plans(yaml: &str) -> (crate::model::Experiment, GatewayPlan) {
         let m = manifest(yaml);
-        let gw = GatewayPlan::from_manifest(&m).expect("gateway plans");
+        let gw = GatewayPlan::from_model(&m).expect("gateway plans");
         (m, gw)
     }
 
     #[test]
     fn vlan_profile_resolves_to_node_peer_and_uplink_far_side() {
         let (m, gw) = plans(BASE);
-        let plan = TrafficPlan::from_manifest(&m, &gw).expect("traffic plans");
+        let plan = TrafficPlan::from_model(&m, &gw).expect("traffic plans");
         let p = plan
             .profiles
             .iter()
@@ -574,7 +473,7 @@ traffic_profiles:
     #[test]
     fn snssai_profile_resolves_to_ue_and_far_side() {
         let (m, gw) = plans(BASE);
-        let plan = TrafficPlan::from_manifest(&m, &gw).expect("traffic plans");
+        let plan = TrafficPlan::from_model(&m, &gw).expect("traffic plans");
         let p = plan
             .profiles
             .iter()
@@ -622,7 +521,7 @@ traffic_profiles:
     pps: 500
 "#;
         let (m, gw) = plans(yaml);
-        let err = TrafficPlan::from_manifest(&m, &gw).unwrap_err();
+        let err = TrafficPlan::from_model(&m, &gw).unwrap_err();
         assert!(matches!(
             err,
             TrafficPlanError::BothEndpointsRealOnSameVlan(id) if id == "node-to-node"
@@ -660,7 +559,7 @@ traffic_profiles:
     pps: 500
 "#;
         let (m, gw) = plans(yaml);
-        let plan = TrafficPlan::from_manifest(&m, &gw).expect("traffic plans");
+        let plan = TrafficPlan::from_model(&m, &gw).expect("traffic plans");
         let p = &plan.profiles[0];
         assert_eq!(
             p.source,
@@ -684,8 +583,9 @@ traffic_profiles:
     fn rejects_unknown_node_reference() {
         let (m, gw) = plans(BASE);
         let mut m = m;
-        m.traffic_profiles.get_mut("adas-probe").unwrap().source = "no-such-zone:no-node".into();
-        let err = TrafficPlan::from_manifest(&m, &gw).unwrap_err();
+        profile_mut(&mut m, "adas-probe").source =
+            crate::model::TrafficEndpoint::Device("no-such-device".into());
+        let err = TrafficPlan::from_model(&m, &gw).unwrap_err();
         assert!(matches!(err, TrafficPlanError::UnknownNode { .. }));
     }
 
@@ -693,8 +593,8 @@ traffic_profiles:
     fn rejects_profile_with_no_rate() {
         let (m, gw) = plans(BASE);
         let mut m = m;
-        m.traffic_profiles.get_mut("adas-probe").unwrap().pps = None;
-        let err = TrafficPlan::from_manifest(&m, &gw).unwrap_err();
+        profile_mut(&mut m, "adas-probe").pps = None;
+        let err = TrafficPlan::from_model(&m, &gw).unwrap_err();
         assert!(matches!(err, TrafficPlanError::NoRateSpecified(id) if id == "adas-probe"));
     }
 
@@ -702,8 +602,8 @@ traffic_profiles:
     fn rejects_both_endpoints_symbolic() {
         let (m, gw) = plans(BASE);
         let mut m = m;
-        m.traffic_profiles.get_mut("adas-probe").unwrap().source = "internet".into();
-        let err = TrafficPlan::from_manifest(&m, &gw).unwrap_err();
+        profile_mut(&mut m, "adas-probe").source = crate::model::TrafficEndpoint::Internet;
+        let err = TrafficPlan::from_model(&m, &gw).unwrap_err();
         assert!(matches!(err, TrafficPlanError::BothEndpointsSymbolic(id) if id == "adas-probe"));
     }
 
@@ -730,7 +630,7 @@ traffic_profiles:
     pps: 100
 "#;
         let (m, gw) = plans(yaml);
-        let err = TrafficPlan::from_manifest(&m, &gw).unwrap_err();
+        let err = TrafficPlan::from_model(&m, &gw).unwrap_err();
         assert!(matches!(err, TrafficPlanError::NodeHasNoSlice { .. }));
     }
 
@@ -757,7 +657,7 @@ traffic_profiles:
     pps: 100
 "#;
         let (m, gw) = plans(yaml);
-        let err = TrafficPlan::from_manifest(&m, &gw).unwrap_err();
+        let err = TrafficPlan::from_model(&m, &gw).unwrap_err();
         assert!(matches!(
             err,
             TrafficPlanError::VlanTooLargeForAddressing(300)

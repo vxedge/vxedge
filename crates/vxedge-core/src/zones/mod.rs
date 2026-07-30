@@ -8,4 +8,4 @@ pub mod backend;
 pub mod plan;
 
 pub use backend::{node_down, node_status, node_up};
-pub use plan::{NodePlan, ZonePlanError, plan_nodes};
+pub use plan::{NodePlan, ZonePlanError, plan_nodes_from_model};

@@ -479,7 +479,7 @@ network:
 "#,
         )
         .unwrap();
-        let plan = FiveGPlan::from_manifest(&manifest);
+        let plan = FiveGPlan::from_model(&manifest.to_model().expect("adapts"));
         // "adas" isn't declared, so this manifest actually has a session
         // for "infotainment" only -- confirms the lookup misses cleanly.
         let plan = plan.unwrap_or_else(|e| panic!("expected a plan: {e:?}"));

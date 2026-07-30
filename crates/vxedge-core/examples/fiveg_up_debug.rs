@@ -20,7 +20,7 @@ fn main() -> ExitCode {
     };
     let yaml = fs::read_to_string(manifest_path).expect("read manifest");
     let manifest = ExperimentManifest::from_yaml(&yaml).expect("parse manifest");
-    let plan = FiveGPlan::from_manifest(&manifest).expect("plan");
+    let plan = FiveGPlan::from_model(&manifest.to_model().expect("adapts")).expect("plan");
     let cfg = FiveGLifecycleConfig {
         pod_name: pod_name.clone(),
         ran_pod_name: format!("{pod_name}-ran"),

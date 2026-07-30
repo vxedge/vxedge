@@ -17,8 +17,6 @@
 //! and a separate RAN pod (`TRANSIT_SUBNET`) — the only addresses gNB
 //! actually needs to dial.
 
-use crate::manifest::{ExperimentManifest, SliceMode};
-
 /// Loopback addressing gives each slice its own SMF/UPF pair; the scheme
 /// below caps out well before octet overflow, and >16 slices on one host is
 /// outside any planned experiment.
@@ -225,30 +223,6 @@ impl FiveGPlan {
         Self::allocate(&slices)
     }
 
-    pub fn from_manifest(manifest: &ExperimentManifest) -> Result<Self, FiveGPlanError> {
-        let slices: Vec<SnssaiInput> = manifest
-            .network
-            .as_ref()
-            .map(|n| n.slices.as_slice())
-            .unwrap_or(&[])
-            .iter()
-            .filter(|s| s.mode == SliceMode::Snssai)
-            .map(|s| SnssaiInput {
-                id: s.id.clone(),
-                sst: s.s_nssai.as_ref().map(|n| n.sst),
-                sd: s.s_nssai.as_ref().and_then(|n| n.sd.clone()),
-                qos: s.qos.as_ref().map(|q| {
-                    (
-                        q.min_rate_mbps.unwrap_or(0),
-                        q.max_rate_mbps.unwrap_or(0),
-                        q.priority.unwrap_or(4),
-                    )
-                }),
-            })
-            .collect();
-        Self::allocate(&slices)
-    }
-
     /// The one allocator both schema paths use.
     fn allocate(slices: &[SnssaiInput]) -> Result<Self, FiveGPlanError> {
         if slices.is_empty() {
@@ -344,7 +318,7 @@ network:
             "    - { id: adas, mode: s-nssai, s_nssai: { sst: 1, sd: '0A0B0C' } }\n\
              \x20   - { id: infotainment, mode: s-nssai, s_nssai: { sst: 2 } }\n",
         );
-        let plan = FiveGPlan::from_manifest(&m).expect("plans");
+        let plan = FiveGPlan::from_model(&m.to_model().expect("adapts")).expect("plans");
         assert_eq!(plan.sessions.len(), 2);
         let adas = &plan.sessions[0];
         assert_eq!(adas.sst, 1);
@@ -368,7 +342,10 @@ network:
         assert_eq!(plan.amf_ngap_addr, CN_TRANSIT_ADDR);
         assert_eq!(plan.ran_transit_addr, RAN_TRANSIT_ADDR);
         // Same manifest, same plan — the reproducibility contract.
-        assert_eq!(plan, FiveGPlan::from_manifest(&m).expect("plans again"));
+        assert_eq!(
+            plan,
+            FiveGPlan::from_model(&m.to_model().expect("adapts")).expect("plans again")
+        );
     }
 
     #[test]
@@ -378,7 +355,7 @@ network:
         // scenario) keeps behaving exactly as before — unclassified,
         // unconstrained traffic — rather than silently getting capped.
         let m = manifest("    - { id: adas, mode: s-nssai, s_nssai: { sst: 1 } }\n");
-        let plan = FiveGPlan::from_manifest(&m).expect("plans");
+        let plan = FiveGPlan::from_model(&m.to_model().expect("adapts")).expect("plans");
         assert_eq!(plan.sessions[0].qos, None);
     }
 
@@ -390,7 +367,7 @@ network:
              \x20   - { id: infotainment, mode: s-nssai, s_nssai: { sst: 2 }, \
              qos: { max_rate_mbps: 400 } }\n",
         );
-        let plan = FiveGPlan::from_manifest(&m).expect("plans");
+        let plan = FiveGPlan::from_model(&m.to_model().expect("adapts")).expect("plans");
         let adas_qos = plan.sessions[0].qos.expect("adas declared qos");
         assert_eq!(adas_qos.min_rate_mbps, 100);
         assert_eq!(adas_qos.max_rate_mbps, 200);
@@ -416,7 +393,8 @@ network:
             })
             .collect();
         let m = manifest(&slices);
-        let plan = FiveGPlan::from_manifest(&m).expect("plans at the max slice count");
+        let plan = FiveGPlan::from_model(&m.to_model().expect("adapts"))
+            .expect("plans at the max slice count");
         let gtpu: std::collections::HashSet<_> =
             plan.sessions.iter().map(|s| &s.upf_gtpu_addr).collect();
         let link: std::collections::HashSet<_> =
@@ -431,7 +409,7 @@ network:
     fn vlan_only_manifest_is_no_snssai() {
         let m = manifest("    - { id: adas, mode: vlan, vlan: 101 }\n");
         assert!(matches!(
-            FiveGPlan::from_manifest(&m),
+            FiveGPlan::from_model(&m.to_model().expect("adapts")),
             Err(FiveGPlanError::NoSnssaiSlices)
         ));
     }
@@ -442,7 +420,7 @@ network:
             "    - { id: adas, mode: vlan, vlan: 101 }\n\
              \x20   - { id: ota, mode: s-nssai, s_nssai: { sst: 3 } }\n",
         );
-        let plan = FiveGPlan::from_manifest(&m).expect("plans");
+        let plan = FiveGPlan::from_model(&m.to_model().expect("adapts")).expect("plans");
         assert_eq!(plan.sessions.len(), 1);
         assert_eq!(plan.sessions[0].slice_id, "ota");
     }
@@ -451,7 +429,7 @@ network:
     fn rejects_bad_sd() {
         let m = manifest("    - { id: adas, mode: s-nssai, s_nssai: { sst: 1, sd: 'xyz' } }\n");
         assert!(matches!(
-            FiveGPlan::from_manifest(&m),
+            FiveGPlan::from_model(&m.to_model().expect("adapts")),
             Err(FiveGPlanError::InvalidSd { .. })
         ));
     }
@@ -463,7 +441,7 @@ network:
              \x20   - { id: b, mode: s-nssai, s_nssai: { sst: 1, sd: '000001' } }\n",
         );
         assert!(matches!(
-            FiveGPlan::from_manifest(&m),
+            FiveGPlan::from_model(&m.to_model().expect("adapts")),
             Err(FiveGPlanError::DuplicateSnssai { .. })
         ));
     }
