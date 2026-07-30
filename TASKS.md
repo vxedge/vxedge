@@ -2,6 +2,33 @@
 
 Ordered for the phase-1 critical path (see ../docs/TASKS.md). Each task should land with tests.
 
+## 0. Workspace model (Track D — `docs/ARCHITECTURE.md` §6.0)
+
+- [x] `vxedge experiment new <id> [--template minimal|slicing]` (2026-07-29) —
+      `vxedge-core::scaffold`. `WorkspacePlan::plan` is pure data and unit-tested;
+      `write` is the only I/O and refuses to clobber an existing directory. Ids are
+      validated against OCI repository-name rules at creation, since the id becomes a
+      repository path component on publish — failing there instead is the same trap a
+      leading-underscore name set during the vxparts container work.
+- [x] `vxedge experiment validate [path]` + `vxedge-core::workspace` (2026-07-30) — loads a
+      folder by `(kind, id)` and runs every cross-file check, reporting all problems at once.
+      The load-bearing ones: the cross-file **slice join** (vehicle names it, experiment
+      defines it), **`carried_by` reachability** (without it per-topic-per-slice attribution
+      rests on an unchecked assertion), workspace-wide component-id uniqueness (the cost of
+      flat ids over structural paths), and digest-pinning for published refs only.
+      Non-recursive load so `results/` is never absorbed. Tests are hand-written workspaces,
+      not scaffold output, plus a generate→load→validate round-trip over every template.
+- [ ] Wire `vxedge experiment up` to consume the §6.0 workspace shape — the one remaining
+      gap between "a workspace validates" and "a workspace runs"
+- [ ] `vxedge vehicle extract` — inline component defs to their own files, once reused
+- [ ] `vxedge manifest bom` (Track D dimension 3) + `vxedge experiment publish` (refuses
+      while any local ref is unpublished — a shared workspace with a local path is broken
+      for the recipient by construction)
+- [ ] `requires` → `resources` → host checking, once `part.yaml` carries `requires`
+      (`vxparts/TASKS.md`)
+- [ ] Publish the manifest JSON Schema generated from `vxedge-core` as a config part —
+      editor autocomplete and inline validation while hand-authoring
+
 ## 1. Scaffolding & contract (phase 1)
 
 - [x] Cargo workspace: `vxedge-api` + `vxedge-core` + `vxedged` + `vxedge-cli` crates; CI
