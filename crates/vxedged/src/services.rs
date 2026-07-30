@@ -308,6 +308,18 @@ impl GatewaySvc {
                             Some(fp)
                         };
 
+                        // Persist exactly what was provisioned. When the request named a §6.0
+                        // workspace this is the *lowered* manifest, which exists nowhere on
+                        // disk otherwise — so without this there is no artifact recording what
+                        // actually ran. Campaign tooling that still consumes §6.1 files
+                        // (vxtelemetry) reads it from here, and it makes a run inspectable
+                        // after the fact rather than only reconstructable.
+                        let active = runtime_dir.join("manifest.yaml");
+                        if let Err(e) = tokio::fs::write(&active, &yaml).await {
+                            tracing::warn!(path = %active.display(), error = %e,
+                                "could not persist the active manifest");
+                        }
+
                         let summary = plan.summary();
                         let mut st = state.lock().await;
                         st.gateway = Some(plan);
