@@ -96,8 +96,43 @@ because result archives are keyed to manifest SHA256.
       requirement stated rather than failing partway through provisioning. This is the mechanism
       that lets GPU-dependent experiments be authored, validated and committed while inert, so
       the unresolved GPU decision blocks nothing else.
-- [ ] **(5) Demote §6.1** — no new authoring surface, doc comments restate it as internal
-      representation, `deny_unknown_fields` unchanged.
+### Decided 2026-07-30 (supersedes "demote §6.1") — reject §6.1 and model natively
+
+The demote-not-delete compromise is withdrawn by owner decision: §6.1 is to be **rejected**, not
+kept as an internal representation, and `vxedge-core` is to be refactored so the planners consume
+the §6.0 model directly. Lowering then has nothing to lower to and goes away.
+
+**What this buys, concretely: `channels` becomes executable.** §6.1 has no interaction layer, so
+a workspace's messaging topology is modelled and validated today but cannot run. No amount of
+lowering fixes that — it is a missing concept in the target schema, not a translation gap. Native
+modelling is the only thing that delivers dimension 2, and dimension 2 is half of the vehicle
+model. Second payoff: the six §6.0 defects lowering surfaced were all *translation* defects
+(vlan resolution, endpoint qualification, vxid collisions, backend/image-kind). They stop
+existing rather than being fixed.
+
+**Dependency inversion, so nothing is stranded mid-refactor.** Today
+`§6.0 → lower → §6.1 → planners`. Target `§6.0 → model → planners`, with §6.1 reduced to a
+*temporary input adapter* that builds the same model. Frozen exp-001/002/003 keep running from
+their §6.1 files throughout; the adapter is deleted last, once the equivalence runs pass and
+every experiment is migrated. Deleting §6.1 before that evidence exists would remove the very
+baseline the migration is being checked against.
+
+- [ ] **(5a) `vxedge_core::model`** — the domain model as the in-code SSOT: `Experiment`,
+      `Vehicle`, `Component`, `Link`, `Channel`, `Slice`, `Baseline`, `Part`. Built from
+      `Workspace`; no serde-shaped types in it, so the schema and the model can differ where
+      §6.0's YAML ergonomics and the planners' needs legitimately differ.
+- [ ] **(5b) Port the planners onto the model**, one at a time, each keeping its tests green:
+      `GatewayPlan` → `zones::plan` → `TrafficPlan` → `FiveGPlan`. The plan types themselves do
+      not change, so the reconciler, backends and every integration test are untouched — this is
+      a change of input type, not of provisioning.
+- [ ] **(5c) §6.1 becomes an adapter** — `ExperimentManifest` gains `into_model()` and stops
+      being a planner input. This is the step that keeps the frozen experiments runnable.
+- [ ] **(5d) Delete `lower.rs`** once no planner consumes §6.1, along with the workspace-directory
+      special case in `resolve_manifest` (the daemon builds the model directly instead).
+- [ ] **(5e) Execute `channels`** — the point of the exercise. Needs the messaging plane's own
+      design (`docs/ARCHITECTURE.md` §7), so it lands after 5b.
+- [ ] **(5f) Delete `ExperimentManifest`/`VehicleManifest` and the adapter** — last, gated on the
+      exp-001/002/003 equivalence runs passing and every experiment being migrated.
 - [ ] **(6) Migrate the remaining verbs** (`up`, `zone`, `compute`, `ota`, `telemetry`,
       `traffic`) off `--manifest` onto workspace resolution.
 - [ ] **(7) `vehicle up` from a §6.0 vehicle document** — the phase-3 gate itself. Needs (2).
