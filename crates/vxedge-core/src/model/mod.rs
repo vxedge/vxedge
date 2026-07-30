@@ -381,3 +381,211 @@ impl Entity {
             .and_then(|f| self.devices.get(&f.deployed_on))
     }
 }
+
+/// A violated model invariant.
+///
+/// The model introduces id spaces §6.0 did not have — zones, devices and functions are now
+/// distinct kinds, where §6.0 had one flat "component" namespace. New namespaces mean new ways
+/// to collide, and every reference between them is a new way to dangle. Checking that here
+/// rather than trusting the builder means a hand-constructed model (a future adapter, a test
+/// fixture, an alternative frontend) cannot skip it.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum InvariantError {
+    #[error(
+        "entity `{entity}`: `{id}` is both a zone and a device — a reference to it would be ambiguous"
+    )]
+    ZoneDeviceCollision { entity: String, id: String },
+    #[error(
+        "device id `{id}` is used by more than one entity; device ids are unique across the experiment because parts and traffic profiles address them flatly"
+    )]
+    DuplicateDevice { id: String },
+    #[error(
+        "entity `{entity}`: device `{device}` is located in zone `{zone}`, which the entity does not declare"
+    )]
+    UnknownZone {
+        entity: String,
+        device: String,
+        zone: String,
+    },
+    #[error(
+        "entity `{entity}`: function `{function}` is deployed on `{device}`, which is not a device of this entity"
+    )]
+    UnknownDeployment {
+        entity: String,
+        function: String,
+        device: String,
+    },
+    #[error("entity `{entity}`: link `{link}` has endpoint `{endpoint}`, which is not a device")]
+    UnknownLinkEndpoint {
+        entity: String,
+        link: String,
+        endpoint: String,
+    },
+    #[error(
+        "entity `{entity}`: channel `{channel}` has endpoint `{endpoint}`, which is not a function — channels connect functions, not devices"
+    )]
+    UnknownChannelEndpoint {
+        entity: String,
+        channel: String,
+        endpoint: String,
+    },
+    #[error(
+        "entity `{entity}`: channel `{channel}` says it is carried by link `{link}`, which does not exist"
+    )]
+    UnknownCarriedByLink {
+        entity: String,
+        channel: String,
+        link: String,
+    },
+    #[error("entity `{entity}`: link id `{id}` is declared more than once")]
+    DuplicateLink { entity: String, id: String },
+    #[error("entity `{entity}`: channel id `{id}` is declared more than once")]
+    DuplicateChannel { entity: String, id: String },
+    #[error("slice id `{id}` is declared more than once")]
+    DuplicateSlice { id: String },
+    #[error("traffic profile `{profile}` names device `{device}`, which does not exist")]
+    UnknownTrafficDevice { profile: String, device: String },
+    #[error("link `{link}` binds slice `{slice}`, which the experiment does not define")]
+    UndefinedSlice { link: String, slice: String },
+}
+
+impl Experiment {
+    /// Check every model invariant, reporting all violations rather than the first.
+    ///
+    /// A fix-one-rerun loop is the wrong shape for a validator an engineer runs while authoring;
+    /// the workspace validator already reports everything at once and this matches it.
+    pub fn check(&self) -> Vec<InvariantError> {
+        use InvariantError as E;
+        let mut errors = Vec::new();
+
+        let mut seen_slices: BTreeMap<&str, ()> = BTreeMap::new();
+        for s in &self.slices {
+            if seen_slices.insert(s.id.as_str(), ()).is_some() {
+                errors.push(E::DuplicateSlice { id: s.id.clone() });
+            }
+        }
+        let slice_ids: Vec<&str> = self.slices.iter().map(|s| s.id.as_str()).collect();
+
+        // Device ids stay unique across the *whole experiment*, not merely per entity: parts
+        // target them flatly (`target_ids: hpc1`) and traffic profiles name them flatly, so a
+        // repeat across two entities would make both references ambiguous. This is the cost of
+        // flat ids over structural paths, and it has to be an actual check.
+        let mut device_owner: BTreeMap<&str, &str> = BTreeMap::new();
+
+        for entity in &self.entities {
+            for (id, device) in &self.devices_of(entity) {
+                if device_owner.insert(id, entity.id.as_str()).is_some() {
+                    errors.push(E::DuplicateDevice {
+                        id: (*id).to_string(),
+                    });
+                }
+                if entity.zones.contains_key(*id) {
+                    errors.push(E::ZoneDeviceCollision {
+                        entity: entity.id.clone(),
+                        id: (*id).to_string(),
+                    });
+                }
+                if let Some(z) = &device.zone
+                    && !entity.zones.contains_key(z)
+                {
+                    errors.push(E::UnknownZone {
+                        entity: entity.id.clone(),
+                        device: (*id).to_string(),
+                        zone: z.clone(),
+                    });
+                }
+            }
+
+            for (id, f) in &entity.functions {
+                if !entity.devices.contains_key(&f.deployed_on) {
+                    errors.push(E::UnknownDeployment {
+                        entity: entity.id.clone(),
+                        function: id.clone(),
+                        device: f.deployed_on.clone(),
+                    });
+                }
+            }
+
+            let mut link_ids: BTreeMap<&str, ()> = BTreeMap::new();
+            for l in &entity.links {
+                if link_ids.insert(l.id.as_str(), ()).is_some() {
+                    errors.push(E::DuplicateLink {
+                        entity: entity.id.clone(),
+                        id: l.id.clone(),
+                    });
+                }
+                for ep in &l.endpoints {
+                    if !entity.devices.contains_key(&ep.node) {
+                        errors.push(E::UnknownLinkEndpoint {
+                            entity: entity.id.clone(),
+                            link: l.id.clone(),
+                            endpoint: ep.node.clone(),
+                        });
+                    }
+                }
+                // The cross-file join: an entity names a slice, the experiment must define it.
+                if let Some(slice) = &l.slice
+                    && !slice_ids.contains(&slice.as_str())
+                {
+                    errors.push(E::UndefinedSlice {
+                        link: l.id.clone(),
+                        slice: slice.clone(),
+                    });
+                }
+            }
+
+            let mut channel_ids: BTreeMap<&str, ()> = BTreeMap::new();
+            for c in &entity.channels {
+                if channel_ids.insert(c.id.as_str(), ()).is_some() {
+                    errors.push(E::DuplicateChannel {
+                        entity: entity.id.clone(),
+                        id: c.id.clone(),
+                    });
+                }
+                // Channels connect *functions*. That is the distinction the model exists to
+                // make, so it has to be enforced rather than merely documented.
+                for ep in std::iter::once(&c.from).chain(c.to.iter()) {
+                    if !entity.functions.contains_key(&ep.node) {
+                        errors.push(E::UnknownChannelEndpoint {
+                            entity: entity.id.clone(),
+                            channel: c.id.clone(),
+                            endpoint: ep.node.clone(),
+                        });
+                    }
+                }
+                for link in &c.carried_by {
+                    if !link_ids.contains_key(link.as_str()) {
+                        errors.push(E::UnknownCarriedByLink {
+                            entity: entity.id.clone(),
+                            channel: c.id.clone(),
+                            link: link.clone(),
+                        });
+                    }
+                }
+            }
+        }
+
+        for t in &self.traffic {
+            for ep in [&t.source, &t.target] {
+                if let TrafficEndpoint::Device(d) = ep
+                    && !device_owner.contains_key(d.as_str())
+                {
+                    errors.push(E::UnknownTrafficDevice {
+                        profile: t.id.clone(),
+                        device: d.clone(),
+                    });
+                }
+            }
+        }
+
+        errors
+    }
+
+    fn devices_of<'a>(&self, entity: &'a Entity) -> Vec<(&'a str, &'a Device)> {
+        entity
+            .devices
+            .iter()
+            .map(|(k, v)| (k.as_str(), v))
+            .collect()
+    }
+}

@@ -636,6 +636,80 @@ parts:
         std::fs::remove_dir_all(&tmp).ok();
     }
 
+    /// Every scaffolded template must satisfy every model invariant. If the generator can emit
+    /// something the model rejects, one of the two is wrong.
+    #[test]
+    fn scaffolded_workspaces_satisfy_every_model_invariant() {
+        for template in [Template::Minimal, Template::Slicing] {
+            let tmp = std::env::temp_dir().join(format!(
+                "vxinv-{}-{}",
+                std::process::id(),
+                template.as_str()
+            ));
+            let _ = std::fs::remove_dir_all(&tmp);
+            std::fs::create_dir_all(&tmp).unwrap();
+            let root = WorkspacePlan::plan("demo", template)
+                .unwrap()
+                .write(&tmp)
+                .unwrap();
+            let ws = Workspace::load(&root).unwrap();
+            let errors = build(&ws).unwrap().check();
+            assert!(errors.is_empty(), "{}: {errors:?}", template.as_str());
+            std::fs::remove_dir_all(&tmp).ok();
+        }
+    }
+
+    /// The collision the new id spaces make possible: §6.0 derives a zone id from `position` and
+    /// a device id from the component key, so a component named after its own region produces
+    /// two different things answering to one name.
+    #[test]
+    fn a_device_named_after_its_zone_is_a_collision() {
+        let (tmp, ws) = scaffolded("collide");
+        let mut m = build(&ws).unwrap();
+        let e = &mut m.entities[0];
+        let mut d = e.devices.get("zonefl").unwrap().clone();
+        d.id = "front-left".into();
+        e.devices.insert("front-left".into(), d);
+        assert!(
+            m.check()
+                .iter()
+                .any(|e| matches!(e, crate::model::InvariantError::ZoneDeviceCollision { .. })),
+            "{:?}",
+            m.check()
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Channels connect functions, not devices. That is the distinction the model exists to
+    /// make, so pointing one at a device has to be an error rather than a silent near-miss.
+    #[test]
+    fn a_channel_pointed_at_a_non_function_is_caught() {
+        let (tmp, ws) = scaffolded("chan");
+        let mut m = build(&ws).unwrap();
+        m.entities[0].channels.push(crate::model::Channel {
+            id: "bogus".into(),
+            from: crate::model::Endpoint {
+                node: "not-a-function".into(),
+                ..Default::default()
+            },
+            to: vec![],
+            protocol: crate::model::Protocol::Udp,
+            qos: None,
+            carried_by: vec!["also-not-a-link".into()],
+        });
+        let errors = m.check();
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            crate::model::InvariantError::UnknownChannelEndpoint { .. }
+        )));
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, crate::model::InvariantError::UnknownCarriedByLink { .. }))
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
     /// A device the planner cannot realise is refused with the fix in the message rather than
     /// defaulted — the guess is exactly what produced a workspace that validated and then could
     /// not boot during the exp-001 migration.
