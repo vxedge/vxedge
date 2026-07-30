@@ -16,6 +16,11 @@ pub enum ZonePlanError {
     EndpointMismatch { gateway: usize, zones: usize },
     #[error("node `{0}`: backend `{1:?}` requires an image bundle path (kind vm/rtimage)")]
     MissingBundle(String, Backend),
+    #[error(
+        "device `{0}` declares no `backend`, so there is no way to know whether it attaches by \
+         veth or by tap. Add `backend: container|qemu-microvm|libvirt`."
+    )]
+    DeviceWithoutBackend(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,13 +95,12 @@ pub fn plan_nodes_from_model(
                     Some(crate::model::Backend::Container) => Backend::Container,
                     Some(crate::model::Backend::Libvirt) => Backend::Libvirt,
                     Some(crate::model::Backend::QemuMicrovm) => Backend::QemuMicrovm,
-                    // GatewayPlan::from_model already refused this, so reaching it means the
-                    // two plans came from different models.
+                    // GatewayPlan::from_model refuses this too, so reaching it means the two
+                    // plans came from different models. Reported as what it is: an
+                    // "endpoint mismatch" here would point at plan joining and send someone
+                    // looking in entirely the wrong place.
                     None => {
-                        return Err(ZonePlanError::EndpointMismatch {
-                            gateway: gateway.endpoints.len(),
-                            zones: idx,
-                        });
+                        return Err(ZonePlanError::DeviceWithoutBackend(device.id.clone()));
                     }
                 };
                 let bundle = match backend {

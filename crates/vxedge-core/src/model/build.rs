@@ -38,6 +38,41 @@ pub enum ModelError {
         "device `{device}` declares backend `{backend}`, which is not container, qemu-microvm or libvirt"
     )]
     UnknownBackend { device: String, backend: String },
+    #[error("`{field}` is {value}, which does not fit a {ty} (max {max})")]
+    OutOfRange {
+        field: String,
+        value: u64,
+        ty: &'static str,
+        max: u64,
+    },
+}
+
+/// Range-checked narrowing from YAML's `u64`.
+///
+/// §6.1 got this for free: serde types the field `u16`/`u8` and rejects anything larger. The
+/// model reads `as_u64()` and used to cast, which silently wraps — `vlan: 70000` became VLAN
+/// 4464 and provisioned the wrong slice with nothing reported. Narrowing has to be checked, so
+/// it is checked in one place.
+fn narrow<T>(spec: &Value, key: &str, field: &str) -> Result<Option<T>, ModelError>
+where
+    T: TryFrom<u64> + Copy,
+{
+    let Some(v) = spec.get(key).and_then(|v| v.as_u64()) else {
+        return Ok(None);
+    };
+    T::try_from(v)
+        .map(Some)
+        .map_err(|_| ModelError::OutOfRange {
+            field: field.to_string(),
+            value: v,
+            ty: std::any::type_name::<T>(),
+            max: match std::mem::size_of::<T>() {
+                1 => u64::from(u8::MAX),
+                2 => u64::from(u16::MAX),
+                4 => u64::from(u32::MAX),
+                _ => u64::MAX,
+            },
+        })
 }
 
 fn str_of<'a>(spec: &'a Value, key: &str) -> Option<&'a str> {
@@ -57,17 +92,20 @@ fn backend_of(device: &str, spec: &Value) -> Result<Option<Backend>, ModelError>
     }
 }
 
-fn resources_of(spec: &Value) -> Option<Resources> {
-    let r = spec.get("resources")?;
-    Some(Resources {
-        cpu: r.get("cpu").and_then(|v| v.as_u64()).map(|v| v as u32),
-        memory_gb: r
-            .get("memory")
-            .or_else(|| r.get("memory_gb"))
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32),
+fn resources_of(device: &str, spec: &Value) -> Result<Option<Resources>, ModelError> {
+    let Some(r) = spec.get("resources") else {
+        return Ok(None);
+    };
+    let memory_key = if r.get("memory").is_some() {
+        "memory"
+    } else {
+        "memory_gb"
+    };
+    Ok(Some(Resources {
+        cpu: narrow(r, "cpu", &format!("{device}.resources.cpu"))?,
+        memory_gb: narrow(r, memory_key, &format!("{device}.resources.{memory_key}"))?,
         gpu: r.get("gpu").and_then(|v| v.as_str()).map(str::to_owned),
-    })
+    }))
 }
 
 /// The one part targeting `component`. A `stack`-layer part wins over its own members: a stack
@@ -167,7 +205,7 @@ fn build_entity(ws: &Workspace, doc: &VehicleDoc) -> Result<Entity, ModelError> 
                     id: id.clone(),
                     role,
                     zone,
-                    resources: resources_of(spec),
+                    resources: resources_of(id, spec)?,
                     backend: backend_of(id, spec)?,
                     signals: Vec::new(),
                     pinned_cpus: spec
@@ -177,7 +215,7 @@ fn build_entity(ws: &Workspace, doc: &VehicleDoc) -> Result<Entity, ModelError> 
                         .map(|seq| {
                             seq.iter()
                                 .filter_map(|v| v.as_u64())
-                                .map(|v| v as u32)
+                                .filter_map(|v| u32::try_from(v).ok())
                                 .collect()
                         })
                         .unwrap_or_default(),
@@ -240,46 +278,57 @@ fn build_entity(ws: &Workspace, doc: &VehicleDoc) -> Result<Entity, ModelError> 
     })
 }
 
-fn slices_of(raw: &Value) -> Vec<Slice> {
+fn slices_of(raw: &Value) -> Result<Vec<Slice>, ModelError> {
     let Some(list) = raw
         .get("network")
         .and_then(|n| n.get("slices"))
         .and_then(|s| s.as_sequence())
     else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    list.iter()
-        .filter_map(|s| {
-            let id = s.get("id")?.as_str()?.to_string();
-            let mode = match s.get("mode").and_then(|m| m.as_str()) {
-                Some("s-nssai") => SliceMode::SNssai,
-                _ => SliceMode::Vlan,
-            };
-            let qos = s.get("qos").map(|q| SliceQos {
-                min_rate_mbps: q
-                    .get("min_rate_mbps")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as u32),
-                max_rate_mbps: q
-                    .get("max_rate_mbps")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as u32),
-                priority: q.get("priority").and_then(|v| v.as_u64()).map(|v| v as u8),
-            });
-            Some(Slice {
-                id,
-                mode,
-                vlan: s.get("vlan").and_then(|v| v.as_u64()).map(|v| v as u16),
-                s_nssai: s.get("s_nssai").and_then(|n| {
-                    Some(SNssai {
-                        sst: n.get("sst")?.as_u64()? as u8,
-                        sd: n.get("sd").and_then(|v| v.as_str()).map(str::to_owned),
-                    })
-                }),
-                qos,
-            })
-        })
-        .collect()
+    let mut out = Vec::new();
+    for s in list {
+        let Some(id) = s.get("id").and_then(|v| v.as_str()).map(str::to_owned) else {
+            continue;
+        };
+        let mode = match s.get("mode").and_then(|m| m.as_str()) {
+            Some("s-nssai") => SliceMode::SNssai,
+            _ => SliceMode::Vlan,
+        };
+        let qos = match s.get("qos") {
+            Some(q) => Some(SliceQos {
+                min_rate_mbps: narrow(
+                    q,
+                    "min_rate_mbps",
+                    &format!("slice {id}.qos.min_rate_mbps"),
+                )?,
+                max_rate_mbps: narrow(
+                    q,
+                    "max_rate_mbps",
+                    &format!("slice {id}.qos.max_rate_mbps"),
+                )?,
+                priority: narrow(q, "priority", &format!("slice {id}.qos.priority"))?,
+            }),
+            None => None,
+        };
+        let s_nssai = match s.get("s_nssai") {
+            Some(n) => {
+                narrow::<u8>(n, "sst", &format!("slice {id}.s_nssai.sst"))?.map(|sst| SNssai {
+                    sst,
+                    sd: n.get("sd").and_then(|v| v.as_str()).map(str::to_owned),
+                })
+            }
+            None => None,
+        };
+        out.push(Slice {
+            vlan: narrow(s, "vlan", &format!("slice {id}.vlan"))?,
+            id,
+            mode,
+            s_nssai,
+            qos,
+        });
+    }
+    Ok(out)
 }
 
 fn traffic_endpoint(raw: &str, devices: &BTreeMap<String, Device>) -> TrafficEndpoint {
@@ -330,15 +379,10 @@ pub fn build(ws: &Workspace) -> Result<Experiment, ModelError> {
                         id: k.as_str()?.to_string(),
                         source: traffic_endpoint(v.get("source")?.as_str()?, devices),
                         target: traffic_endpoint(v.get("target")?.as_str()?, devices),
-                        pps: v.get("pps").and_then(|x| x.as_u64()).map(|x| x as u32),
-                        bandwidth_mbps: v
-                            .get("bandwidth_mbps")
-                            .and_then(|x| x.as_u64())
-                            .map(|x| x as u32),
-                        payload_bytes: v
-                            .get("payload_bytes")
-                            .and_then(|x| x.as_u64())
-                            .map(|x| x as u32),
+                        pps: narrow(v, "pps", "traffic.pps").ok()?,
+                        bandwidth_mbps: narrow(v, "bandwidth_mbps", "traffic.bandwidth_mbps")
+                            .ok()?,
+                        payload_bytes: narrow(v, "payload_bytes", "traffic.payload_bytes").ok()?,
                     })
                 })
                 .collect()
@@ -374,7 +418,7 @@ pub fn build(ws: &Workspace) -> Result<Experiment, ModelError> {
             .and_then(|n| n.get("defaults"))
             .and_then(|d| d.get("bandwidth"))
             .and_then(|v| v.as_u64()),
-        slices: slices_of(&raw),
+        slices: slices_of(&raw)?,
         entities,
         traffic,
         method,
@@ -772,6 +816,33 @@ links:
             assert_eq!(a.supi, b.supi, "SUPI drifted — UE would fail to register");
             assert_eq!(a.tun_dev, b.tun_dev);
             assert_eq!(a.upf_gtpu_addr, b.upf_gtpu_addr);
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// §6.1 gets range checking free: serde types the field `u16` and rejects anything larger.
+    /// The model reads `as_u64()`, so narrowing had to be checked — it was not, and `vlan: 70000`
+    /// silently became VLAN 4464, provisioning a different slice with nothing reported.
+    #[test]
+    fn an_out_of_range_vlan_is_rejected_rather_than_wrapped() {
+        let (tmp, mut ws) = scaffolded("range");
+        let net = ws.experiments_raw[0]
+            .as_mapping_mut()
+            .unwrap()
+            .get_mut("network")
+            .unwrap()
+            .as_mapping_mut()
+            .unwrap();
+        net.get_mut("slices").unwrap().as_sequence_mut().unwrap()[0]
+            .as_mapping_mut()
+            .unwrap()
+            .insert(
+                serde_yaml_ng::Value::String("vlan".into()),
+                serde_yaml_ng::Value::Number(70000.into()),
+            );
+        match build(&ws) {
+            Err(ModelError::OutOfRange { value, .. }) => assert_eq!(value, 70000),
+            other => panic!("expected OutOfRange, got {other:?}"),
         }
         std::fs::remove_dir_all(&tmp).ok();
     }
