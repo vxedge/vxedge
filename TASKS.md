@@ -178,6 +178,55 @@ baseline the migration is being checked against.
       `run-exp-002.sh` would have measured libvirt and reported microvm, passing every test and
       validation. Ordering now travels with the model as `device_order`, with an invariant
       asserting it lists every device exactly once.
+- [ ] **(5a-schema) §6.0 declares zones/devices/functions natively** — the remaining half of 5a,
+      and the **next thing to do**. Attempted 2026-07-30 and reverted: the change is right and the
+      design below is settled, but it touches every fixture at once and was left half-finished
+      rather than committed broken. Do it as one deliberate pass.
+
+      Replace `composition: {zones, compute, gateway}` with three blocks, because that grouping
+      calls a *place* a device:
+
+      ```yaml
+      kind: vehicle
+      id: car1
+      class: road            # road | air | marine | rail — extension point, nothing built on it
+      subtype: car
+      zones:                 # REGIONS, named not enumerated (an eVTOL has nacelles, not rear-left)
+        front-left: {}
+        central: {}
+      devices:               # units LOCATED IN zones; role replaces the three groups
+        zonefl: { role: zone-controller, zone: front-left, backend: container }
+        hpc1:   { role: hpc, zone: central, backend: container, resources: { cpu: 4, memory: 8 } }
+        gw1:    { role: gateway, backend: container }
+        cam-fl: { role: sensor, zone: front-left, vss: Vehicle.Camera.FL }
+      functions:             # units of BEHAVIOUR, deployed onto devices
+        adas:    { deployed_on: zonefl, asil: B }
+        percept: { deployed_on: hpc1 }
+      links:                 # unchanged — the harness
+        - { id: trunk-fl, endpoints: [gw1:eth0, zonefl:eth0], slice: adas }
+      channels:              # endpoints are FUNCTIONS, not devices
+        - { id: adas.probe, from: adas, to: [percept], carried_by: [trunk-fl, trunk-hpc] }
+      ```
+
+      Consequences that have to land in the same pass — this is what made a partial attempt
+      break, and each is deliberate rather than incidental:
+
+      - **`parts.yaml` targets function ids, not device ids.** Software runs as a function, and
+        one device can host several. This is the change that ripples furthest.
+      - **Channel endpoints validate against `functions`**; link endpoints against `devices`.
+      - **`carried_by` reachability** walks devices, so a channel endpoint must first be resolved
+        through its function's `deployed_on`.
+      - **`ComponentWithoutPart` becomes per-function**, since a device without software is
+        legitimate (a switch, a dumb sensor) while a function without software is not.
+      - **`lower.rs` needs device → function → part**, one indirection the old schema could not
+        express. It is deleted at 5f anyway, so consider deleting it in this pass instead: its
+        only consumer is the daemon's workspace-directory path, which exists only because
+        `vxtelemetry` still reads a §6.1 file. That makes it a cross-repo change.
+      - Every hand-written test fixture and `exp-001-ws` migrate with it.
+
+      Sequencing note: do this **before** migrating exp-002/002b/003/010, so they are migrated
+      once rather than twice — the same argument that pairs exp-002's schema and vxparts cutovers.
+
 - [ ] **(5d) Delete `lower.rs`** once no planner consumes §6.1, along with the workspace-directory
       special case in `resolve_manifest` (the daemon builds the model directly instead).
 - [ ] **(5e) Execute `channels`** — the point of the exercise. Needs the messaging plane's own
