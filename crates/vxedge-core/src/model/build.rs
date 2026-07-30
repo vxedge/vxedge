@@ -356,6 +356,11 @@ pub fn build(ws: &Workspace) -> Result<Experiment, ModelError> {
 
     Ok(Experiment {
         id: exp.id.clone(),
+        uplink_bandwidth_bps: raw
+            .get("network")
+            .and_then(|n| n.get("defaults"))
+            .and_then(|d| d.get("bandwidth"))
+            .and_then(|v| v.as_u64()),
         slices: slices_of(&raw),
         entities,
         traffic,
@@ -435,6 +440,120 @@ mod tests {
                 .any(|t| t.source == TrafficEndpoint::Device("zonefl".into())
                     && t.target == TrafficEndpoint::Internet)
         );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 5b's acceptance criterion: the model path and the §6.1 path must produce the **same**
+    /// `GatewayPlan`. Endpoint names are the sharp edge — campaign scripts address `vzp0`/`vzp1`
+    /// directly — so "both plan successfully" is not enough; they have to plan identically.
+    ///
+    /// Fixture mirrors exp-001: two container-backed devices on separate vlan slices.
+    #[test]
+    fn the_model_path_plans_the_same_gateway_as_the_manifest_path() {
+        use crate::gateway::GatewayPlan;
+
+        let frozen = crate::ExperimentManifest::from_yaml(
+            r#"
+experiment: { id: exp-x, name: x, duration_s: 60 }
+network:
+  defaults: { bandwidth: 500000000 }
+  slices:
+    - { id: adas, mode: vlan, vlan: 101, qos: { min_rate_mbps: 100, max_rate_mbps: 200, priority: 1 } }
+    - { id: infot, mode: vlan, vlan: 103, qos: { min_rate_mbps: 0, max_rate_mbps: 400, priority: 5 } }
+zones:
+  - id: vxzone-a
+    role: front-left
+    nodes:
+      - id: node-a
+        type: ecu
+        image: { url: "local/vxprobe:host-process", kind: container }
+        backend: container
+        network: [{ iface: eth0, vlan: 101, slice: adas }]
+  - id: vxzone-b
+    role: rear-left
+    nodes:
+      - id: node-b
+        type: ecu
+        image: { url: "local/vxtraffic:host-process", kind: container }
+        backend: container
+        network: [{ iface: eth0, vlan: 103, slice: infot }]
+"#,
+        )
+        .unwrap();
+
+        let tmp = std::env::temp_dir().join(format!("vxmodelplan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("x.vxp"), "id: exp-x\n").unwrap();
+        std::fs::write(
+            tmp.join("main.yaml"),
+            r#"
+kind: experiment
+id: exp-x
+vehicles: [veh]
+baseline: bl
+network:
+  defaults: { bandwidth: 500000000 }
+  slices:
+    - { id: adas, mode: vlan, vlan: 101, qos: { min_rate_mbps: 100, max_rate_mbps: 200, priority: 1 } }
+    - { id: infot, mode: vlan, vlan: 103, qos: { min_rate_mbps: 0, max_rate_mbps: 400, priority: 5 } }
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join("veh.yaml"),
+            r#"
+kind: vehicle
+id: veh
+composition:
+  zones:
+    node-a: { class: zone, position: front-left, backend: container }
+    node-b: { class: zone, position: rear-left, backend: container }
+links:
+  - { id: la, endpoints: [node-a:eth0], slice: adas }
+  - { id: lb, endpoints: [node-b:eth0], slice: infot }
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join("parts.yaml"),
+            r#"
+kind: baseline
+id: bl
+parts:
+  - { ref: "local/vxprobe:host-process", target_ids: node-a }
+  - { ref: "local/vxtraffic:host-process", target_ids: node-b }
+"#,
+        )
+        .unwrap();
+
+        let ws = Workspace::load_validated(&tmp).unwrap();
+        let via_model = GatewayPlan::from_model(&build(&ws).unwrap()).unwrap();
+        let via_manifest = GatewayPlan::from_manifest(&frozen).unwrap();
+
+        assert_eq!(via_model.summary(), via_manifest.summary());
+        assert_eq!(via_model.endpoints, via_manifest.endpoints);
+        // The shared bottleneck the whole experiment measures against. Asserted explicitly
+        // because `summary()` including it is not something this test should depend on.
+        assert_eq!(via_model.root_rate_mbps, 500);
+        assert_eq!(via_model.root_rate_mbps, via_manifest.root_rate_mbps);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A device the planner cannot realise is refused with the fix in the message rather than
+    /// defaulted — the guess is exactly what produced a workspace that validated and then could
+    /// not boot during the exp-001 migration.
+    #[test]
+    fn a_slice_attached_device_without_a_backend_is_refused() {
+        use crate::gateway::GatewayPlan;
+        let (tmp, ws) = scaffolded("nobackend");
+        let m = build(&ws).unwrap();
+        match GatewayPlan::from_model(&m) {
+            Err(crate::gateway::plan::PlanError::DeviceWithoutBackend(d)) => {
+                assert!(!d.is_empty())
+            }
+            other => panic!("expected DeviceWithoutBackend, got {other:?}"),
+        }
         std::fs::remove_dir_all(&tmp).ok();
     }
 

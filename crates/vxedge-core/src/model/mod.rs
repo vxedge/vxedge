@@ -301,6 +301,12 @@ pub struct Experiment {
     pub id: String,
     pub entities: Vec<Entity>,
     pub slices: Vec<Slice>,
+    /// Aggregate rate of the shared uplink bottleneck, in bits per second.
+    ///
+    /// This is where slice contention is actually measured, so dropping it silently would change
+    /// every number an experiment produces while everything still validated and ran — exp-001
+    /// declares 500 mbit and would have planned at the 1000 mbit default.
+    pub uplink_bandwidth_bps: Option<u64>,
     pub traffic: Vec<TrafficProfile>,
     pub method: Method,
     /// Everything §6.0 carries that the model does not yet interpret — telemetry, results,

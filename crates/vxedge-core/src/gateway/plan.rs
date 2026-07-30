@@ -10,6 +10,13 @@ const MAX_SLICES: usize = 200;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PlanError {
+    #[error(
+        "device `{0}` is attached to a slice but declares no `backend` — the planner has to know \
+         whether to build a veth (container) or a tap (qemu-microvm/libvirt), and guessing is \
+         what produced a manifest that validated and then could not boot. Add \
+         `backend: container|qemu-microvm|libvirt`."
+    )]
+    DeviceWithoutBackend(String),
     #[error("no `network.slices` at all — nothing to provision")]
     NoSlices,
     #[error("too many slices: {0} (max {MAX_SLICES})")]
@@ -91,45 +98,159 @@ pub struct GatewayPlan {
     pub snssai_slice_ids: Vec<String>,
 }
 
+/// A slice as the planner needs it, independent of which schema it came from. Exists so the
+/// §6.1 and model paths feed the *same* planner and cannot drift in class minors or defaults.
+struct SliceInput {
+    id: String,
+    is_vlan: bool,
+    vlan: Option<u16>,
+    min_rate_mbps: u64,
+    max_rate_mbps: u64,
+    priority: u8,
+}
+
+/// Slice planning, shared by both constructors so the HTB class ids, minor numbers and default
+/// rates cannot drift between the §6.1 and model paths while both exist.
+fn plan_slices(slices: &[SliceInput]) -> Result<(Vec<SlicePlan>, Vec<String>), PlanError> {
+    if slices.len() > MAX_SLICES {
+        return Err(PlanError::TooManySlices(slices.len()));
+    }
+    let vlan_slices: Vec<SlicePlan> = slices
+        .iter()
+        .filter(|s| s.is_vlan)
+        .enumerate()
+        .map(|(i, s)| {
+            let vlan = s.vlan.expect("validated: vlan slice has vlan id");
+            if vlan == crate::fiveg::FIVEG_UPLINK_VLAN {
+                return Err(PlanError::VlanCollidesWithFiveGUplink(s.id.clone(), vlan));
+            }
+            Ok(SlicePlan {
+                id: s.id.clone(),
+                vlan,
+                min_rate_mbps: s.min_rate_mbps.max(1),
+                max_rate_mbps: s.max_rate_mbps.max(1),
+                priority: s.priority,
+                class_minor: 0x10 + i as u16,
+            })
+        })
+        .collect::<Result<_, PlanError>>()?;
+    let snssai: Vec<String> = slices
+        .iter()
+        .filter(|s| !s.is_vlan)
+        .map(|s| s.id.clone())
+        .collect();
+    if vlan_slices.is_empty() && snssai.is_empty() {
+        return Err(PlanError::NoSlices);
+    }
+    Ok((vlan_slices, snssai))
+}
+
 impl GatewayPlan {
+    /// Plan from the domain model (task 5b). The §6.1 path below stays until every experiment
+    /// has migrated; both produce the same `GatewayPlan`, which is what makes the migration
+    /// checkable rather than merely plausible.
+    ///
+    /// **Endpoint numbering is positional** — `vz0`, `vz1`, … in traversal order — and campaign
+    /// scripts address those names directly. Traversal here is sorted device id, because §6.0
+    /// stores components in a map and declaration order is not preserved. That is deterministic
+    /// and reproducible, but it does mean adding a device whose id sorts earlier renumbers the
+    /// rest. The §6.1 path has the same hazard (adding a zone renumbers), so this is not a
+    /// regression — it is a fragility worth removing later, tracked in TASKS.md.
+    pub fn from_model(exp: &crate::model::Experiment) -> Result<Self, PlanError> {
+        let flat: Vec<SliceInput> = exp
+            .slices
+            .iter()
+            .map(|s| {
+                let q = s.qos.clone().unwrap_or_default();
+                SliceInput {
+                    id: s.id.clone(),
+                    is_vlan: s.mode == crate::model::SliceMode::Vlan,
+                    vlan: s.vlan,
+                    min_rate_mbps: u64::from(q.min_rate_mbps.unwrap_or(0)),
+                    max_rate_mbps: u64::from(q.max_rate_mbps.unwrap_or(0)),
+                    priority: q.priority.unwrap_or(4),
+                }
+            })
+            .collect();
+        let (slices, snssai_slice_ids) = plan_slices(&flat)?;
+
+        let vlan_of = |slice: &str| -> Option<u16> {
+            exp.slices
+                .iter()
+                .find(|s| s.id == slice)
+                .and_then(|s| s.vlan)
+        };
+
+        let mut endpoints = Vec::new();
+        for entity in &exp.entities {
+            for device in entity.devices_in_order() {
+                for (link, _) in entity.links_for(&device.id) {
+                    let Some(slice) = &link.slice else { continue };
+                    let Some(vlan) = vlan_of(slice) else { continue };
+                    // Guessing how a device is realised is what produced a manifest that
+                    // validated and then could not boot (exp-001 migration, 2026-07-30). Say so
+                    // instead.
+                    let backend = device
+                        .backend
+                        .ok_or_else(|| PlanError::DeviceWithoutBackend(device.id.clone()))?;
+                    let kind = match backend {
+                        crate::model::Backend::Container => EndpointKind::Veth,
+                        crate::model::Backend::Libvirt | crate::model::Backend::QemuMicrovm => {
+                            EndpointKind::Tap
+                        }
+                    };
+                    let idx = endpoints.len();
+                    let name = format!("vz{idx}");
+                    endpoints.push(EndpointPlan {
+                        peer: match kind {
+                            EndpointKind::Veth => format!("vzp{idx}"),
+                            EndpointKind::Tap => name.clone(),
+                        },
+                        name,
+                        kind,
+                        node: device.id.clone(),
+                        vlan,
+                        slice: Some(slice.clone()),
+                    });
+                }
+            }
+        }
+
+        Ok(Self {
+            bridge: "vxbr0".into(),
+            uplink: "vxup0".into(),
+            uplink_peer: "vxup0p".into(),
+            root_rate_mbps: exp
+                .uplink_bandwidth_bps
+                .map(|bps| (bps / 1_000_000).max(1))
+                .unwrap_or(1000),
+            slices,
+            endpoints,
+            snssai_slice_ids,
+        })
+    }
+
     pub fn from_manifest(manifest: &ExperimentManifest) -> Result<Self, PlanError> {
         let network = manifest.network.as_ref();
         let manifest_slices = network.map(|n| n.slices.as_slice()).unwrap_or(&[]);
 
-        if manifest_slices.len() > MAX_SLICES {
-            return Err(PlanError::TooManySlices(manifest_slices.len()));
-        }
-
-        let slices: Vec<SlicePlan> = manifest_slices
+        // Routed through the same planner as the model path, so class minors and default rates
+        // cannot drift between the two while both exist.
+        let flat: Vec<SliceInput> = manifest_slices
             .iter()
-            .filter(|s| s.mode == SliceMode::Vlan)
-            .enumerate()
-            .map(|(i, s)| {
-                let qos = s.qos.as_ref();
-                let vlan = s.vlan.expect("validated: vlan slice has vlan id");
-                if vlan == crate::fiveg::FIVEG_UPLINK_VLAN {
-                    return Err(PlanError::VlanCollidesWithFiveGUplink(s.id.clone(), vlan));
-                }
-                Ok(SlicePlan {
+            .map(|s| {
+                let q = s.qos.as_ref();
+                SliceInput {
                     id: s.id.clone(),
-                    vlan,
-                    min_rate_mbps: qos.and_then(|q| q.min_rate_mbps).unwrap_or(0).max(1),
-                    max_rate_mbps: qos.and_then(|q| q.max_rate_mbps).unwrap_or(0).max(1),
-                    priority: qos.and_then(|q| q.priority).unwrap_or(4),
-                    class_minor: 0x10 + i as u16,
-                })
+                    is_vlan: s.mode == SliceMode::Vlan,
+                    vlan: s.vlan,
+                    min_rate_mbps: q.and_then(|q| q.min_rate_mbps).unwrap_or(0),
+                    max_rate_mbps: q.and_then(|q| q.max_rate_mbps).unwrap_or(0),
+                    priority: q.and_then(|q| q.priority).unwrap_or(4),
+                }
             })
-            .collect::<Result<_, PlanError>>()?;
-
-        let snssai_slice_ids: Vec<String> = manifest_slices
-            .iter()
-            .filter(|s| s.mode == SliceMode::Snssai)
-            .map(|s| s.id.clone())
             .collect();
-
-        if slices.is_empty() && snssai_slice_ids.is_empty() {
-            return Err(PlanError::NoSlices);
-        }
+        let (slices, snssai_slice_ids) = plan_slices(&flat)?;
 
         let mut endpoints = Vec::new();
         for zone in &manifest.zones {
