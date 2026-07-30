@@ -227,6 +227,29 @@ baseline the migration is being checked against.
       Sequencing note: do this **before** migrating exp-002/002b/003/010, so they are migrated
       once rather than twice — the same argument that pairs exp-002's schema and vxparts cutovers.
 
+### Open, found by dogfooding (2026-07-30)
+
+Tracked here so they are not rediscovered. None block the critical path.
+
+- [x] `experiment new <dir> --id <experiment-id>`; `.vxp` named for the id (2026-07-30)
+- [x] `car1.yaml` → `vehicle.yaml` (2026-07-30)
+- [ ] **Multi-document YAML in `Workspace::load`** — one file per document today, so an engineer
+      who wants everything in one file cannot have it. Because every reference is by id and never
+      by path, `---`-separated documents would collapse a workspace to one file with **no other
+      change**. The design already allows it; the loader does not reach it. Separate files stay
+      the scaffold default because they teach the model.
+- [ ] **Re-derive `exp-001-ws` through `experiment new`** — it was hand-built before the scaffold
+      was used for migrations. It validates and plan-diffs clean, so it is correct, but it was
+      never shown to be something the tool can produce, which is the point of dogfooding.
+- [ ] **Positional endpoint numbering** — `vz0`/`vz1` are assigned in traversal order and
+      campaign scripts address them by name, so adding a device renumbers the rest and a campaign
+      silently measures the wrong interface. Pre-existing in both schema paths. The fix (derive
+      the name from the device id) breaks every campaign script, so it wants doing once,
+      deliberately.
+- [ ] **H2/`s-nssai` verification is the thinnest evidence in the port** — `FiveGPlan` and
+      exp-010 are checked against fixtures, not a recorded result. Migrating exp-010 is what
+      improves it.
+
 - [ ] **(5d) Delete `lower.rs`** once no planner consumes §6.1, along with the workspace-directory
       special case in `resolve_manifest` (the daemon builds the model directly instead).
 - [ ] **(5e) Execute `channels`** — the point of the exercise. Needs the messaging plane's own
