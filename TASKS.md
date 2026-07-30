@@ -121,10 +121,26 @@ baseline the migration is being checked against.
       `Vehicle`, `Component`, `Link`, `Channel`, `Slice`, `Baseline`, `Part`. Built from
       `Workspace`; no serde-shaped types in it, so the schema and the model can differ where
       §6.0's YAML ergonomics and the planners' needs legitimately differ.
-- [ ] **(5b) Port the planners onto the model**, one at a time, each keeping its tests green:
-      `GatewayPlan` → `zones::plan` → `TrafficPlan` → `FiveGPlan`. The plan types themselves do
-      not change, so the reconciler, backends and every integration test are untouched — this is
-      a change of input type, not of provisioning.
+- [ ] **(5b) Port the planners onto the model**, one at a time, each keeping its tests green.
+      The plan types themselves do not change, so the reconciler, backends and every integration
+      test are untouched — this is a change of input type, not of provisioning. Acceptance for
+      each is **plan identity** with the §6.1 path, not merely that both succeed: campaign
+      scripts address `vzp0`/`vzp1` by name.
+  - [x] `GatewayPlan::from_model` (2026-07-30) — both paths share one slice planner so class
+        minors and defaults cannot drift. Found that the model dropped
+        `network.defaults.bandwidth`: exp-001's 500 mbit bottleneck would have planned at the
+        1000 mbit default, changing every number while still validating and running. A
+        slice-attached device with no `backend` is now refused rather than guessed.
+  - [ ] `zones::plan` from the model
+  - [ ] `TrafficPlan` from the model
+  - [ ] `FiveGPlan` from the model
+
+- [ ] **Positional endpoint numbering is fragile** — `vz0`/`vzp0` are assigned in traversal
+      order, and campaign scripts address those names directly, so adding a device (model path:
+      one whose id sorts earlier; §6.1 path: an earlier zone) silently renumbers the rest and a
+      campaign measures the wrong interface. Pre-existing in both paths, not a migration
+      regression. Fix is to derive the name from the device id, which is a breaking change to
+      every campaign script and so wants doing once, deliberately.
 - [ ] **(5c) §6.1 becomes an adapter** — `ExperimentManifest` gains `into_model()` and stops
       being a planner input. This is the step that keeps the frozen experiments runnable.
 - [ ] **(5d) Delete `lower.rs`** once no planner consumes §6.1, along with the workspace-directory
