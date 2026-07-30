@@ -295,10 +295,20 @@ pub struct PartEntry {
 }
 
 impl PartEntry {
-    /// A ref is local when it looks like a path. Everything else is a registry reference and
-    /// must be digest-pinned — see [`WorkspaceValidationError::PublishedRefWithoutDigest`].
+    /// A ref is local when it names something on this machine rather than in a registry.
+    /// Everything else must be digest-pinned — see
+    /// [`WorkspaceValidationError::PublishedRefWithoutDigest`].
+    ///
+    /// Three forms count as local: a relative path, an absolute path, and the **`local/`
+    /// namespace** the existing manifests use for a node that runs as a host process
+    /// (`local/vxprobe:host-process` in exp-001). The last one was found by migrating exp-001:
+    /// a container-backed node ignores `image.url` entirely, so `local/…` names no artifact at
+    /// all — demanding a digest for it would mean inventing one for a thing that does not
+    /// exist, which is worse than not checking.
     pub fn is_local(&self) -> bool {
-        self.reference.starts_with('.') || self.reference.starts_with('/')
+        self.reference.starts_with('.')
+            || self.reference.starts_with('/')
+            || self.reference.starts_with("local/")
     }
 }
 

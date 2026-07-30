@@ -212,6 +212,23 @@ fn ifaces_for(
     out
 }
 
+/// How a component is *realised* — `backend` (the H3 variable itself) and `image.kind`.
+///
+/// Found by migrating exp-001: neither was expressible in §6.0, so every zone lowered to
+/// `kind: vm` with no backend, which `resolved_backend` turns into `libvirt`, which then fails
+/// at zone-plan time with `MissingBundle` because a host-process ref is not a bundle. exp-001
+/// would have validated cleanly and refused to run.
+///
+/// These belong on the component rather than on the part because they describe how this node
+/// is realised, not what software it carries — which is precisely why H3 can vary the backend
+/// across arms while holding the software identical.
+fn realisation(spec: &Value) -> (Option<&str>, Option<&str>) {
+    (
+        spec.get("backend").and_then(|b| b.as_str()),
+        spec.get("image_kind").and_then(|k| k.as_str()),
+    )
+}
+
 fn image_value(part: &PartEntry, group: &str) -> Value {
     let mut m = Mapping::new();
     // Digest-pinned refs lower to the pinned form: the point of pinning is that the thing
@@ -223,6 +240,26 @@ fn image_value(part: &PartEntry, group: &str) -> Value {
     m.insert(s("url"), s(&url));
     m.insert(s("kind"), s(image_kind(group, &part.reference)));
     Value::Mapping(m)
+}
+
+/// `image_value` with the component's declared `image_kind`, or a backend-implied one, winning
+/// over the group heuristic. A `container` backend cannot boot a `vm` image, so leaving the
+/// guess in place would produce a manifest that contradicts itself.
+fn image_value_for(
+    part: &PartEntry,
+    group: &str,
+    backend: Option<&str>,
+    image_kind_override: Option<&str>,
+) -> Value {
+    let mut v = image_value(part, group);
+    let explicit = image_kind_override.or(match backend {
+        Some("container") => Some("container"),
+        _ => None,
+    });
+    if let (Some(kind), Some(m)) = (explicit, v.as_mapping_mut()) {
+        m.insert(s("kind"), s(kind));
+    }
+    v
 }
 
 /// Lower `ws` to a §6.1 experiment manifest.
@@ -282,6 +319,11 @@ pub fn lower(ws: &Workspace) -> Result<ExperimentManifest, LowerError> {
     // zones + gateway → §6.1 `zones` (the gateway lands as ZoneRole::Gateway, which is exactly
     // the conflation §6.0 splits — visible here because lowering has to undo the split).
     let vlans = slice_vlans(raw.get("network"));
+    let ctx = ZoneCtx {
+        ws,
+        vehicle,
+        vlans: &vlans,
+    };
     let mut zones = Vec::new();
     for (id, spec) in &vehicle.composition.zones {
         let position = spec
@@ -290,14 +332,10 @@ pub fn lower(ws: &Workspace) -> Result<ExperimentManifest, LowerError> {
             .ok_or_else(|| LowerError::ZoneWithoutPosition {
                 component: id.clone(),
             })?;
-        zones.push(zone_value(
-            ws, vehicle, id, position, "ecu", "zones", &vlans,
-        )?);
+        zones.push(zone_value(&ctx, id, position, "ecu", "zones", spec)?);
     }
-    for id in vehicle.composition.gateway.keys() {
-        zones.push(zone_value(
-            ws, vehicle, id, "gateway", "gateway", "gateway", &vlans,
-        )?);
+    for (id, spec) in &vehicle.composition.gateway {
+        zones.push(zone_value(&ctx, id, "gateway", "gateway", "gateway", spec)?);
     }
     if !zones.is_empty() {
         root.insert(s("zones"), Value::Sequence(zones));
@@ -308,8 +346,9 @@ pub fn lower(ws: &Workspace) -> Result<ExperimentManifest, LowerError> {
     for (id, spec) in &vehicle.composition.compute {
         let part = sole_part(ws, id)?;
         let mut m = Mapping::new();
+        let (backend, kind) = realisation(spec);
         m.insert(s("id"), s(id));
-        m.insert(s("image"), image_value(part, "compute"));
+        m.insert(s("image"), image_value_for(part, "compute", backend, kind));
         if let Some(r) = spec.get("resources") {
             m.insert(s("resources"), r.clone());
         }
@@ -389,20 +428,32 @@ fn lower_traffic(
     Ok(Value::Mapping(out))
 }
 
+/// The parts of a lowering that are the same for every component: the workspace, the vehicle
+/// being lowered, and the slice→vlan table. Grouped so `zone_value` takes what varies.
+struct ZoneCtx<'a> {
+    ws: &'a Workspace,
+    vehicle: &'a crate::workspace::VehicleDoc,
+    vlans: &'a [(String, Value)],
+}
+
 fn zone_value(
-    ws: &Workspace,
-    vehicle: &crate::workspace::VehicleDoc,
+    ctx: &ZoneCtx<'_>,
     id: &str,
     role: &str,
     node_type: &str,
     group: &str,
-    vlans: &[(String, Value)],
+    spec: &Value,
 ) -> Result<Value, LowerError> {
+    let (ws, vehicle, vlans) = (ctx.ws, ctx.vehicle, ctx.vlans);
     let part = sole_part(ws, id)?;
+    let (backend, kind) = realisation(spec);
     let mut node = Mapping::new();
     node.insert(s("id"), s(id));
     node.insert(s("type"), s(node_type));
-    node.insert(s("image"), image_value(part, group));
+    node.insert(s("image"), image_value_for(part, group, backend, kind));
+    if let Some(b) = backend {
+        node.insert(s("backend"), s(b));
+    }
     let ifaces = ifaces_for(ws, &vehicle.id, id, vlans);
     if !ifaces.is_empty() {
         node.insert(s("network"), Value::Sequence(ifaces));
@@ -580,6 +631,113 @@ mod tests {
         let yaml = lower_path_to_yaml(&root).expect("workspace lowers to yaml");
         let manifest = ExperimentManifest::from_yaml(&yaml).expect("and that yaml is valid §6.1");
         assert_eq!(manifest.experiment.id, "demo");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The migration invariant: a workspace that replaces a frozen §6.1 manifest must produce
+    /// the **same provisioning plan**, not merely a valid one. Endpoint names are the sharp
+    /// edge — `run-exp-001.sh` addresses `vzp0`/`vzp1` directly, so a migration that renumbered
+    /// them would keep validating, keep running, and quietly measure the wrong interface.
+    ///
+    /// Modelled on exp-001 (H1): two container-backed zone nodes on separate vlan slices.
+    #[test]
+    fn a_migrated_workspace_plans_identically_to_the_manifest_it_replaces() {
+        use crate::gateway::GatewayPlan;
+
+        let frozen = ExperimentManifest::from_yaml(
+            r#"
+experiment: { id: exp-x, name: x, duration_s: 60 }
+network:
+  slices:
+    - { id: adas, mode: vlan, vlan: 101, qos: { min_rate_mbps: 100, priority: 1 } }
+    - { id: infot, mode: vlan, vlan: 103, qos: { min_rate_mbps: 0, priority: 5 } }
+zones:
+  - id: vxzone-a
+    role: front-left
+    nodes:
+      - id: node-a
+        type: ecu
+        image: { url: "local/vxprobe:host-process", kind: container }
+        backend: container
+        network: [{ iface: eth0, vlan: 101, slice: adas }]
+  - id: vxzone-b
+    role: rear-left
+    nodes:
+      - id: node-b
+        type: ecu
+        image: { url: "local/vxtraffic:host-process", kind: container }
+        backend: container
+        network: [{ iface: eth0, vlan: 103, slice: infot }]
+"#,
+        )
+        .expect("frozen manifest parses");
+
+        let tmp = std::env::temp_dir().join(format!("vxequiv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("x.vxp"), "id: exp-x\n").unwrap();
+        std::fs::write(
+            tmp.join("main.yaml"),
+            r#"
+kind: experiment
+id: exp-x
+vehicles: [veh]
+baseline: bl
+method: { duration_s: 60 }
+network:
+  slices:
+    - { id: adas, mode: vlan, vlan: 101, qos: { min_rate_mbps: 100, priority: 1 } }
+    - { id: infot, mode: vlan, vlan: 103, qos: { min_rate_mbps: 0, priority: 5 } }
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join("veh.yaml"),
+            r#"
+kind: vehicle
+id: veh
+composition:
+  zones:
+    node-a: { class: zone, position: front-left, backend: container }
+    node-b: { class: zone, position: rear-left, backend: container }
+links:
+  - { id: la, endpoints: [node-a:eth0], slice: adas }
+  - { id: lb, endpoints: [node-b:eth0], slice: infot }
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join("parts.yaml"),
+            r#"
+kind: baseline
+id: bl
+parts:
+  - { ref: "local/vxprobe:host-process", target_ids: node-a }
+  - { ref: "local/vxtraffic:host-process", target_ids: node-b }
+"#,
+        )
+        .unwrap();
+
+        let migrated = ExperimentManifest::from_yaml(&lower_path_to_yaml(&tmp).unwrap()).unwrap();
+        let a = GatewayPlan::from_manifest(&frozen).unwrap();
+        let b = GatewayPlan::from_manifest(&migrated).unwrap();
+
+        let names = |p: &GatewayPlan| {
+            p.endpoints
+                .iter()
+                .map(|e| {
+                    (
+                        e.name.clone(),
+                        e.peer.clone(),
+                        e.node.clone(),
+                        e.vlan,
+                        e.slice.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&a), names(&b), "endpoint identity drifted");
+        assert_eq!(a.summary(), b.summary(), "gateway plan drifted");
         std::fs::remove_dir_all(&tmp).ok();
     }
 

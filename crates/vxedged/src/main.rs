@@ -92,13 +92,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let engine = jobs::JobEngine::new(bus.clone());
     let audit = Arc::new(audit::Audit::new(&args.runtime_dir));
     // Optional netns confinement of all gateway objects (used by tests/dev).
-    // `escalate: true` sudo-wraps every `ip`/`bridge`/`tc` call: found live
-    // 2026-07-17 that `setcap cap_net_admin+ep` on this binary does *not*
-    // grant the capability to these child processes (capabilities don't
-    // propagate across fork+exec without ambient-set handling this shell-out
-    // code doesn't do) — vxedged needs a cached/passwordless `sudo` for
-    // `ip`/`bridge`/`tc` regardless of the binary's own capabilities.
-    // TESTBED-SETUP.md documents the sudoers requirement.
+    // `escalate: true` means "escalate if the children would not already be privileged" —
+    // `Shell` skips `sudo` when vxedged is itself uid 0, which is how the campaign scripts run
+    // it. Found live 2026-07-17 that `setcap cap_net_admin+ep` on this binary does *not* grant
+    // the capability to these child processes (capabilities don't propagate across fork+exec
+    // without ambient-set handling this shell-out code doesn't do), so when vxedged is
+    // unprivileged it needs passwordless `sudo` for `ip`/`bridge`/`tc` regardless of its own
+    // capabilities. TESTBED-SETUP.md documents the sudoers requirement.
     let shell = vxedge_core::gateway::Shell {
         netns: std::env::var("VXEDGE_NETNS").ok().filter(|s| !s.is_empty()),
         escalate: true,
