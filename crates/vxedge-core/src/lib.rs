@@ -9,6 +9,7 @@ pub mod fiveg;
 pub mod gateway;
 pub mod lower;
 pub mod manifest;
+pub mod package;
 pub mod scaffold;
 pub mod services;
 pub mod traffic;
@@ -17,5 +18,6 @@ pub mod zones;
 
 pub use lower::{LowerError, lower};
 pub use manifest::{ExperimentManifest, ValidationError, VehicleManifest};
+pub use package::{DiscoverError, DiscoveredWorkspace, PackageDoc, discover};
 pub use scaffold::{ScaffoldError, Template, WorkspacePlan};
 pub use workspace::{Workspace, WorkspaceError, WorkspaceValidationError};

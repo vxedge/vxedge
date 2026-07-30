@@ -6,6 +6,11 @@
 //! validate` and `doctor` are local-only (no daemon connection — see their
 //! own doc comments for why that's not a hard-rule violation). Remaining
 //! verbs print a scaffold notice until their daemon-side services land.
+//!
+//! `experiment` verbs are **addressed by the working directory**, not by
+//! `--manifest`: they resolve the single `.vxp` where they were run, the way
+//! `terraform apply` resolves the configuration in the current directory.
+//! `--chdir` is the escape hatch for scripts.
 
 use clap::{Parser, Subcommand};
 use hyper_util::rt::TokioIo;
@@ -46,6 +51,11 @@ struct Cli {
     /// Emit machine-readable JSON instead of human output.
     #[arg(long, global = true)]
     json: bool,
+
+    /// Run as if started in this directory. The escape hatch for scripts that would otherwise
+    /// have to `cd` — experiment verbs resolve the workspace from the working directory.
+    #[arg(long, global = true, value_name = "DIR")]
+    chdir: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -223,6 +233,11 @@ enum TelemetryCmd {
 
 /// Experiments add `new` to the shared lifecycle verbs: scaffolding a workspace is local
 /// file generation, not a daemon call, so it does not fit `ManifestLifecycleCmd`.
+///
+/// Every verb except `new` is **addressed by the working directory** — no `--manifest`, no
+/// name. `vxedge experiment up` resolves the single `.vxp` where it was run, exactly as
+/// `terraform apply` resolves the configuration in the current directory. Use `--chdir` to
+/// run from elsewhere.
 #[derive(Subcommand, Debug)]
 enum ExperimentCmd {
     /// Create a workspace that is ready to edit — no daemon, no network, no GPU.
@@ -235,36 +250,23 @@ enum ExperimentCmd {
         #[arg(long, default_value = ".")]
         path: String,
     },
-    /// Load and cross-check a workspace folder (local — no daemon, no network).
-    Validate {
-        /// Workspace directory.
-        #[arg(default_value = ".")]
-        path: String,
-    },
-    /// Lower a workspace to the §6.1 experiment manifest today's daemon runs.
+    /// Load and cross-check the workspace here (local — no daemon, no network).
+    Validate,
+    /// Lower the workspace here to the §6.1 manifest today's daemon runs.
     ///
-    /// A pure transformation, not orchestration: it emits a manifest the existing verbs
-    /// (`vxedge up`, `zone up`, `traffic up`) already consume, so a workspace is runnable
-    /// before `experiment up` learns the workspace shape.
+    /// Transitional: `experiment up` will lower server-side, at which point this verb goes
+    /// away (`TASKS.md` section 0 task 3). An OEM engineer should never need to run it.
     Lower {
-        #[arg(default_value = ".")]
-        path: String,
         /// Write here instead of stdout.
         #[arg(long, short)]
         out: Option<String>,
     },
-    Up {
-        #[arg(long)]
-        manifest: String,
-    },
-    Down {
-        #[arg(long)]
-        manifest: String,
-    },
-    Status {
-        #[arg(long)]
-        manifest: String,
-    },
+    /// Bring the workspace here up.
+    Up,
+    /// Tear the workspace here down.
+    Down,
+    /// Show status for the workspace here.
+    Status,
 }
 
 /// Mirrors `vxedge_core::Template`. Kept here so the domain library stays free of a clap
@@ -408,9 +410,43 @@ fn scaffold_notice(what: &str) {
     );
 }
 
+/// The directory an experiment verb is addressed against. Always the process working
+/// directory — `--chdir` has already moved it by the time this is called, so there is exactly
+/// one notion of "here" and no second code path to keep in agreement.
+fn here() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    Ok(std::env::current_dir()?)
+}
+
+/// Errors reach the user through `Display`, not `Debug`.
+///
+/// `fn main() -> Result<_, _>` formats its error with `{:?}`, which for a `thiserror` type
+/// prints the struct — `NotAWorkspace { dir: "/x" }` instead of the sentence explaining what to
+/// do about it. Every actionable error message in this crate and in `vxedge-core` was being
+/// discarded that way. So `main` handles the error itself and walks the `source` chain, which
+/// also surfaces the underlying cause (an io error, a YAML parse position) that
+/// `Box<dyn Error>`'s own `Display` stops short of.
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() {
+    if let Err(e) = run().await {
+        eprintln!("error: {e}");
+        let mut source = e.source();
+        while let Some(cause) = source {
+            eprintln!("  caused by: {cause}");
+            source = cause.source();
+        }
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+
+    // Applied before anything else, so every relative path in the run — workspace discovery,
+    // `--manifest` on the verbs that still take one, output files — resolves against the same
+    // directory. Terraform's `-chdir` works this way for the same reason.
+    if let Some(dir) = &cli.chdir {
+        std::env::set_current_dir(dir).map_err(|e| format!("--chdir {dir}: {e}"))?;
+    }
 
     match &cli.command {
         Command::Status => {
@@ -559,13 +595,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
             }
-            ExperimentCmd::Validate { path } => {
-                let root = std::path::Path::new(path);
-                let ws = vxedge_core::Workspace::load(root)?;
+            ExperimentCmd::Validate => {
+                let here = here()?;
+                let found = vxedge_core::discover(&here)?;
+                let ws = vxedge_core::Workspace::load(&found.root)?;
                 let errors = ws.validate();
                 if errors.is_empty() {
                     println!(
-                        "ok: {} experiment, {} vehicle(s), {} baseline(s), {} road(s)",
+                        "ok: {} — {} experiment, {} vehicle(s), {} baseline(s), {} road(s)",
+                        found.package.id,
                         ws.experiments.len(),
                         ws.vehicles.len(),
                         ws.baselines.len(),
@@ -574,15 +612,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     // Every problem at once: an engineer fixing a workspace wants the list,
                     // not a fix-one-rerun loop.
-                    eprintln!("{} problem(s) in {}:", errors.len(), root.display());
+                    eprintln!("{} problem(s) in {}:", errors.len(), found.root.display());
                     for e in &errors {
                         eprintln!("  - {e}");
                     }
                     std::process::exit(1);
                 }
             }
-            ExperimentCmd::Lower { path, out } => {
-                let ws = vxedge_core::Workspace::load_validated(std::path::Path::new(path))?;
+            ExperimentCmd::Lower { out } => {
+                let found = vxedge_core::discover(&here()?)?;
+                let ws = vxedge_core::Workspace::load_validated(&found.root)?;
                 let manifest = vxedge_core::lower(&ws)?;
                 let yaml = serde_yaml_ng::to_string(&manifest)?;
                 match out {
@@ -593,9 +632,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     None => print!("{yaml}"),
                 }
             }
-            ExperimentCmd::Up { .. }
-            | ExperimentCmd::Down { .. }
-            | ExperimentCmd::Status { .. } => scaffold_notice("experiment"),
+            // Addressing is live; the daemon side is not. Resolving and validating the
+            // workspace first means the *addressing* is exercised end to end now, and the
+            // failure an engineer hits is about the missing service rather than a vague
+            // "not implemented" that hides whether their workspace was even found.
+            ExperimentCmd::Up | ExperimentCmd::Down | ExperimentCmd::Status => {
+                let found = vxedge_core::discover(&here()?)?;
+                vxedge_core::Workspace::load_validated(&found.root)?;
+                println!(
+                    "resolved workspace `{}` at {}",
+                    found.package.id,
+                    found.root.display()
+                );
+                eprintln!(
+                    "vxedge: ExperimentService is not implemented in vxedged yet \
+                     (vxedge/TASKS.md section 0, task 2)."
+                );
+                std::process::exit(2);
+            }
         },
         Command::Traffic { cmd } => match cmd {
             TrafficCmd::Up { manifest, profiles } => {
