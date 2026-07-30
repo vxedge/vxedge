@@ -8,13 +8,45 @@ All notable changes to this repo are documented here. Format follows
 
 ### Added
 
+- `vxedge experiment lower [path] [-o <file>]` and `vxedge-core::lower` — a pure transformation
+  from a §6.0 workspace folder to the §6.1 experiment manifest the daemon already runs. This is
+  what closes the gap between "a workspace validates" and "a workspace runs" without putting
+  orchestration in a frontend: the CLI stays a 1:1 vxAPI wrapper and the daemon is unchanged.
+
+  Lowering hands its output to `ExperimentManifest::from_yaml`, so a lowering bug surfaces as a
+  §6.1 validation error rather than a silently wrong manifest. It resolves what §6.0 keeps
+  normalised and §6.1 repeats: a slice's `vlan` onto every node iface bound to that slice, and a
+  traffic endpoint's component id into §6.1's `<zone-vxid>:<node-vxid>` form (the zone vxid is
+  synthesized during lowering, so a workspace author cannot name it and must not have to). What
+  it cannot carry is refused with the fix in the message, never guessed: a component with more
+  than one part (§6.1 has one `image` per node — publish a `stack` composite), a component with
+  no part, a zone with no `position`, a compute component used as a traffic endpoint.
+
+  `channels` does not survive lowering — §6.1 has no interaction layer. That is a limitation of
+  the older schema rather than of the workspace model, and it is why wiring `experiment up` to
+  the workspace shape directly is the follow-up rather than this.
+
+  Building it found six defects in the §6.0 scaffold and validator that neither review nor the
+  validator caught, because none of them are shape errors — they are completeness ones. A
+  gateway with no part; an invented `traffic_profiles[].slice` field that is not in §6.1;
+  `memory_gb` where §6.1 says `memory`; a zone/node vxid collision; traffic endpoints and
+  Prometheus scrape targets in forms nothing resolves. Four are fixed in the scaffold, two
+  became new validation errors (below). Tests assert the lowered manifest survives
+  `GatewayPlan::from_manifest` **and** `TrafficPlan::from_manifest`, not merely that it parses:
+  §6.1's composition validator never looks at traffic endpoints, so "valid" was not enough to
+  know the topology is provisionable.
+
 - `vxedge experiment validate [path]` and `vxedge-core::workspace` — loads a workspace folder
   and runs every cross-file check, reporting all problems at once rather than the first.
   Checks: exactly one experiment; document- and component-id uniqueness across the workspace;
   vehicle/baseline references; `target_ids`, link endpoints and channel endpoints resolving to
   real components; `carried_by` naming real links **and the channel's endpoints actually being
   reachable over them**; the cross-file slice join (the vehicle names a slice, the experiment
-  must define it); and published refs being digest-pinned while local refs need not be.
+  must define it); published refs being digest-pinned while local refs need not be; **every
+  component being given software by some baseline** (a gateway that boots nothing validated
+  cleanly before); and **traffic endpoints resolving** to a real component or one of the
+  symbolic endpoints (§6.1 only rejects a profile when *both* sides fail to resolve, so a single
+  typo would otherwise run and measure the wrong thing).
 
   Additive: it sits alongside the existing manifest path and changes nothing about it, so
   every current experiment keeps parsing. Loading is deliberately non-recursive so a

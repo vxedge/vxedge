@@ -18,8 +18,24 @@ Ordered for the phase-1 critical path (see ../docs/TASKS.md). Each task should l
       flat ids over structural paths), and digest-pinning for published refs only.
       Non-recursive load so `results/` is never absorbed. Tests are hand-written workspaces,
       not scaffold output, plus a generate→load→validate round-trip over every template.
-- [ ] Wire `vxedge experiment up` to consume the §6.0 workspace shape — the one remaining
-      gap between "a workspace validates" and "a workspace runs"
+- [x] `vxedge experiment lower` + `vxedge-core::lower` (2026-07-30) — §6.0 workspace → §6.1
+      manifest, so a workspace runs on today's execution path without any orchestration moving
+      into the CLI. Output crosses `ExperimentManifest::from_yaml`, so lowering bugs surface as
+      §6.1 validation errors. Resolves what §6.0 normalises and §6.1 repeats (slice `vlan` onto
+      node ifaces; traffic endpoints into `<zone-vxid>:<node-vxid>`); refuses what it cannot
+      carry with the fix in the message rather than guessing.
+
+      Building it found **six** defects nothing else had: a gateway with no part, an invented
+      `traffic_profiles[].slice` field, `memory_gb` vs §6.1's `memory`, a zone/node vxid
+      collision, and traffic endpoints + scrape targets in unresolvable forms. None are shape
+      errors, which is why the validator missed them — this is the argument for building the
+      consumer before declaring a schema done. Two became new validator checks
+      (`ComponentWithoutPart`, `UnknownTrafficEndpoint`); the rest were scaffold fixes.
+      Tests plan the lowered manifest through `GatewayPlan` **and** `TrafficPlan`, since §6.1's
+      composition validator never inspects traffic endpoints.
+- [ ] Wire `vxedge experiment up` to consume the §6.0 workspace shape directly — needs a
+      daemon-side ExperimentService that takes a workspace; `lower` covers the running path in
+      the meantime, at the cost of dropping `channels`
 - [ ] `vxedge vehicle extract` — inline component defs to their own files, once reused
 - [ ] `vxedge manifest bom` (Track D dimension 3) + `vxedge experiment publish` (refuses
       while any local ref is unpublished — a shared workspace with a local path is broken

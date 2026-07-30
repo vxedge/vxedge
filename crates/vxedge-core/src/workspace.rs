@@ -63,6 +63,11 @@ pub enum WorkspaceValidationError {
         experiment: String,
         baseline: String,
     },
+    #[error(
+        "component `{component}` (vehicle `{vehicle}`) has no part in any baseline — it would \
+         boot nothing. Add a `parts` entry with `target_ids: {component}`."
+    )]
+    ComponentWithoutPart { vehicle: String, component: String },
     #[error("baseline `{baseline}`: part `{part}` targets unknown component `{target}`")]
     UnknownTarget {
         baseline: String,
@@ -126,6 +131,26 @@ pub enum WorkspaceValidationError {
         part: String,
         digest: String,
     },
+    #[error(
+        "experiment `{experiment}`: traffic profile `{profile}` has `{field}: {endpoint}`, which \
+         is neither a component in this workspace nor one of the symbolic endpoints \
+         ({SYMBOLIC_ENDPOINTS})"
+    )]
+    UnknownTrafficEndpoint {
+        experiment: String,
+        profile: String,
+        field: &'static str,
+        endpoint: String,
+    },
+}
+
+/// Traffic endpoints that name no component. `internet` is the host-side reflector on the far
+/// side of the gateway; `carla` is the simulator. Kept as a closed list so a typo'd component id
+/// is an error at authoring time rather than a profile that silently measures nothing.
+const SYMBOLIC_ENDPOINTS: &str = "internet, carla";
+
+fn is_symbolic_endpoint(ep: &str) -> bool {
+    SYMBOLIC_ENDPOINTS.split(", ").any(|s| s == ep)
 }
 
 /// Accepts either a scalar or a sequence, so `target_ids: hpc1` and `target_ids: [a, b]` both
@@ -283,6 +308,11 @@ impl PartEntry {
 pub struct Workspace {
     pub root: PathBuf,
     pub experiments: Vec<ExperimentDoc>,
+    /// Raw YAML of each experiment document, in the same order as `experiments`.
+    /// `network`, `traffic_profiles`, `telemetry` and `results` keep their §6.1 shape
+    /// (ARCHITECTURE.md §6.0.3), so lowering passes them through untouched rather than
+    /// modelling them twice and risking the two definitions drifting.
+    pub experiments_raw: Vec<serde_yaml_ng::Value>,
     pub vehicles: Vec<VehicleDoc>,
     pub baselines: Vec<BaselineDoc>,
     pub roads: Vec<String>,
@@ -340,9 +370,12 @@ impl Workspace {
                 source,
             };
             match header.kind {
-                Kind::Experiment => ws
-                    .experiments
-                    .push(serde_yaml_ng::from_str(&text).map_err(parse_err)?),
+                Kind::Experiment => {
+                    ws.experiments
+                        .push(serde_yaml_ng::from_str(&text).map_err(parse_err)?);
+                    ws.experiments_raw
+                        .push(serde_yaml_ng::from_str(&text).map_err(parse_err)?);
+                }
                 Kind::Vehicle => ws
                     .vehicles
                     .push(serde_yaml_ng::from_str(&text).map_err(parse_err)?),
@@ -538,6 +571,56 @@ impl Workspace {
             }
         }
 
+        // Every component must be given software by some baseline. Found by the lowering
+        // (2026-07-30) rather than by review: a gateway with no part validated cleanly and
+        // then could not be lowered to anything runnable, because "boots nothing" is not a
+        // shape error — it is a completeness one.
+        if !self.baselines.is_empty() {
+            let targeted: BTreeSet<&str> = self
+                .baselines
+                .iter()
+                .flat_map(|b| b.parts.iter())
+                .filter_map(|p| p.target_ids.as_ref())
+                .flat_map(|t| t.as_slice())
+                .collect();
+            for v in &self.vehicles {
+                for c in v.composition.ids() {
+                    if !targeted.contains(c) {
+                        errors.push(E::ComponentWithoutPart {
+                            vehicle: v.id.clone(),
+                            component: c.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Traffic endpoints. `traffic_profiles` keeps its §6.1 shape, so it is read from the raw
+        // document rather than modelled twice — but its *references* are §6.0 component ids, and
+        // an unresolvable one has to be caught here: §6.1 only rejects a profile when *both*
+        // sides fail to resolve, so a single typo would otherwise run and measure the wrong thing.
+        for (e, raw) in self.experiments.iter().zip(self.experiments_raw.iter()) {
+            let Some(profiles) = raw.get("traffic_profiles").and_then(|v| v.as_mapping()) else {
+                continue;
+            };
+            for (name, profile) in profiles {
+                let profile_id = name.as_str().unwrap_or("<unnamed>").to_string();
+                for field in ["source", "target"] {
+                    let Some(ep) = profile.get(field).and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    if !component_owner.contains_key(ep) && !is_symbolic_endpoint(ep) {
+                        errors.push(E::UnknownTrafficEndpoint {
+                            experiment: e.id.clone(),
+                            profile: profile_id.clone(),
+                            field,
+                            endpoint: ep.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
         for b in &self.baselines {
             for p in &b.parts {
                 if let Some(targets) = &p.target_ids {
@@ -639,7 +722,7 @@ kind: baseline
 id: bl1
 parts:
   - ref: ./images/local-thing
-    target_ids: hpc1
+    target_ids: [hpc1, gw1]
   - ref: ghcr.io/vxedge/parts/zone/linux/stack/probe-bundle:0.1.0
     digest: sha256:33c9c8d8625bd5c6d1f4d3d0c561fdaa930e057fcd1fb24fb3badb402f25429d
     target_ids: [zonefl]
@@ -698,7 +781,7 @@ parts:
 
     #[test]
     fn dangling_target_ids_and_endpoints_are_caught() {
-        let baseline = GOOD_BASELINE.replace("target_ids: hpc1", "target_ids: hpc99");
+        let baseline = GOOD_BASELINE.replace("target_ids: [hpc1, gw1]", "target_ids: [hpc99, gw1]");
         let vehicle = GOOD_VEHICLE.replace("gw1:eth2, hpc1:eth0", "gw1:eth2, ghost:eth0");
         let root = workspace(
             "dangling",

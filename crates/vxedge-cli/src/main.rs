@@ -241,6 +241,18 @@ enum ExperimentCmd {
         #[arg(default_value = ".")]
         path: String,
     },
+    /// Lower a workspace to the §6.1 experiment manifest today's daemon runs.
+    ///
+    /// A pure transformation, not orchestration: it emits a manifest the existing verbs
+    /// (`vxedge up`, `zone up`, `traffic up`) already consume, so a workspace is runnable
+    /// before `experiment up` learns the workspace shape.
+    Lower {
+        #[arg(default_value = ".")]
+        path: String,
+        /// Write here instead of stdout.
+        #[arg(long, short)]
+        out: Option<String>,
+    },
     Up {
         #[arg(long)]
         manifest: String,
@@ -567,6 +579,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         eprintln!("  - {e}");
                     }
                     std::process::exit(1);
+                }
+            }
+            ExperimentCmd::Lower { path, out } => {
+                let ws = vxedge_core::Workspace::load_validated(std::path::Path::new(path))?;
+                let manifest = vxedge_core::lower(&ws)?;
+                let yaml = serde_yaml_ng::to_string(&manifest)?;
+                match out {
+                    Some(f) => {
+                        std::fs::write(f, &yaml)?;
+                        println!("wrote {f}");
+                    }
+                    None => print!("{yaml}"),
                 }
             }
             ExperimentCmd::Up { .. }
