@@ -227,6 +227,41 @@ baseline the migration is being checked against.
       Sequencing note: do this **before** migrating exp-002/002b/003/010, so they are migrated
       once rather than twice — the same argument that pairs exp-002's schema and vxparts cutovers.
 
+### Blocking exp-002/002b (found 2026-07-31 by attempting the migration)
+
+Both are §6.0 expressiveness gaps. They are the next code to write — exp-002 and exp-002b cannot
+migrate without them, and those two are the last experiments before §6.1 can be deleted.
+
+- [ ] **Link endpoints need an object form carrying a node address.** exp-002's three arms are
+      distinguished by IP (`10.101.0.11/.12/.13` on one shared vlan) — that is how the probe
+      reaches each arm separately. §6.1 has `network[].ip`; §6.0's endpoints are bare strings with
+      nowhere to put one. `model::Endpoint.ip_cidr` already exists and is populated only by the
+      §6.1 adapter, so this is schema + builder, not model.
+
+      ```yaml
+      links:
+        - id: arm-cont
+          endpoints: [{ node: node-cont-01, port: eth0, ip: 10.101.0.11/24 }]
+          slice: adas
+      ```
+      Keep the bare-string form: it is right whenever no address is needed, and every existing
+      workspace uses it.
+
+- [ ] **§6.0 needs a way to state device traversal order.** Devices live in a map, so traversal
+      is sorted id, and endpoint names are positional. exp-002 declares `cont, microvm, libvirt`
+      and sorts to `cont, libvirt, microvm` — `vzp1`/`vzp2` swap, and `run-exp-002.sh`, which
+      addresses them by name, would measure libvirt while reporting microvm. Passing every test.
+
+      The §6.1 adapter already preserves declaration order through `device_order`; §6.0 has no
+      way to say one. Renaming arms so sorted order coincides is not a fix — it makes correctness
+      depend on id spelling and re-breaks on the next experiment.
+
+      This is the same fragility as the positional-numbering item below, approached from the
+      other side. **Worth considering fixing them together**: if an endpoint's name derived from
+      its device id rather than its position, order would stop being load-bearing at all and both
+      items would close. That change breaks every campaign script once, deliberately — which is
+      cheaper now, while only three workspaces exist, than after all of them are migrated.
+
 ### Open, found by dogfooding (2026-07-30)
 
 Tracked here so they are not rediscovered. None block the critical path.
