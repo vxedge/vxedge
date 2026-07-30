@@ -6,6 +6,34 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **`vxedge experiment up|down|status` are addressed by the working directory**, not by
+  `--manifest`. They resolve the single `.vxp` in the directory they were run from, the way
+  `terraform apply` resolves the configuration in the current directory; `vxedge experiment new
+  <name>` creates `./<name>/`; the global `--chdir <dir>` is the escape hatch for scripts.
+  `experiment validate` and `experiment lower` lose their path argument for the same reason.
+
+  Two behaviours are deliberate, both Terraform's. **Discovery does not walk up to parent
+  directories** — `git` searches upward, Terraform does not, and running from inside `results/`
+  must fail rather than silently resolve the parent experiment and re-provision it. And
+  **exactly one `.vxp`** is required: the ambiguous error names the files it found, because
+  which one to remove is the engineer's call and they cannot make it from a count.
+
+  New `vxedge-core::package` owns the `.vxp` descriptor and discovery, kept separate from
+  `Workspace::load` so a broken experiment document still produces a good "which workspace is
+  this" error. `requires` is parsed but not yet enforced.
+
+### Fixed
+
+- **Every error message the CLI produced was rendered with `Debug`, not `Display`.**
+  `fn main() -> Result<_, _>` formats its error with `{:?}`, so a `thiserror` type printed as a
+  struct dump — `NotAWorkspace { dir: "/x" }` instead of the sentence explaining what to do
+  about it. Every actionable message in `vxedge-cli` and `vxedge-core` was being discarded that
+  way. `main` now handles the error itself and walks the `source` chain, which additionally
+  surfaces the underlying cause (an io error, a YAML parse position) that `Box<dyn Error>`'s own
+  `Display` stops short of.
+
 ### Added
 
 - `vxedge experiment lower [path] [-o <file>]` and `vxedge-core::lower` — a pure transformation

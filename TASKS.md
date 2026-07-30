@@ -61,9 +61,18 @@ Terraform conventions **rejected**: a state file — manifests are the sole sour
 daemon state is ephemeral by design; and variables/interpolation, already rejected with HCL
 because result archives are keyed to manifest SHA256.
 
-- [ ] **(1) Positional/cwd addressing.** `experiment up|down|status` resolve `.vxp` in the cwd;
-      exactly one required (zero → "no vxedge experiment workspace found in <dir>"; more than
-      one → name them). Global `--chdir <dir>`. Remove `--manifest` from the experiment verbs.
+- [x] **(1) cwd addressing** (2026-07-30) — `vxedge-core::package` owns the `.vxp` descriptor and
+      discovery, separate from `Workspace::load` so a broken experiment document still yields a
+      good "which workspace is this" error. Exactly one `.vxp`; the ambiguous error names the
+      files, since which to remove is the engineer's call. **No walking up** — running from
+      `results/` must not resolve the parent, and there is a test for exactly that. `--chdir`
+      applied before dispatch so there is one notion of "here". `requires` is parsed, not
+      enforced (that is task 4). `up|down|status` discover *and validate* before reporting the
+      missing service, so addressing is exercisable end to end before task 2 lands.
+
+      Fixed a pre-existing defect this surfaced: `fn main() -> Result<_, _>` formats with
+      `Debug`, so every actionable error in this crate and in `vxedge-core` reached users as a
+      struct dump. `main` now prints `Display` and walks the `source` chain.
 - [ ] **(2) `ExperimentService` in `vxedged`** (Up/Down/Status → `Job`, progress over
       `JobService.Watch`). Sequences gateway → zones → compute → services → traffic, reconciler
       semantics throughout so `up` twice is a no-op. The verb has existed in `proto/` since
