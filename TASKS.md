@@ -166,8 +166,18 @@ baseline the migration is being checked against.
       campaign measures the wrong interface. Pre-existing in both paths, not a migration
       regression. Fix is to derive the name from the device id, which is a breaking change to
       every campaign script and so wants doing once, deliberately.
-- [ ] **(5c) §6.1 becomes an adapter** — `ExperimentManifest` gains `into_model()` and stops
-      being a planner input. This is the step that keeps the frozen experiments runnable.
+- [x] **(5c) §6.1 becomes an adapter** (2026-07-30) — `ExperimentManifest::to_model()`. §6.1 is
+      now an input *format* with one way in, not a planner input. Verified with the
+      `adapter-diff` example over all five frozen manifests: every gateway plan, endpoint list,
+      node plan and traffic profile identical.
+
+      Found an ordering hazard that would have silently corrupted an H3 result. Endpoint names
+      are positional and campaign scripts address them directly; §6.1 declares nodes as a
+      sequence while §6.0 stores components in a map. exp-002 declares `cont, microvm, libvirt`
+      and **sorts to** `cont, libvirt, microvm` — a sorted model would have swapped two arms, so
+      `run-exp-002.sh` would have measured libvirt and reported microvm, passing every test and
+      validation. Ordering now travels with the model as `device_order`, with an invariant
+      asserting it lists every device exactly once.
 - [ ] **(5d) Delete `lower.rs`** once no planner consumes §6.1, along with the workspace-directory
       special case in `resolve_manifest` (the daemon builds the model directly instead).
 - [ ] **(5e) Execute `channels`** — the point of the exercise. Needs the messaging plane's own
