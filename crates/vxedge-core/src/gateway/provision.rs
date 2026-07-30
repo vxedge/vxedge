@@ -198,7 +198,16 @@ pub fn apply_endpoints(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError
         )?;
         sh.run_tolerate_missing("bridge", &["vlan", "del", "dev", &ep.name, "vid", "1"])?;
         sh.run("ip", &["link", "set", &ep.name, "up"])?;
-        if ep.kind == super::plan::EndpointKind::Veth {
+        // Bringing the peer up is only meaningful while the peer is still on this side. A
+        // running container zone has already taken it into its own netns and renamed it `eth0`
+        // (`zones::backend`), so its *absence here* is the converged state, not a failure.
+        //
+        // Without this guard `up` is not idempotent, which the hard rule forbids: the first
+        // `experiment up` provisions the gateway and then starts the zones, and the second one
+        // dies on `ip link set vzp0 up: Cannot find device`. Latent until `experiment up` made
+        // gateway-then-zones a single command anyone would naturally re-run — found on the
+        // first real provisioning run, 2026-07-30.
+        if ep.kind == super::plan::EndpointKind::Veth && sh.link_exists(&ep.peer) {
             sh.run("ip", &["link", "set", &ep.peer, "up"])?;
         }
     }
