@@ -113,12 +113,23 @@ fn valid_id(id: &str) -> bool {
 
 impl WorkspacePlan {
     /// Build the workspace contents. Pure — no filesystem access.
-    pub fn plan(id: &str, template: Template) -> Result<Self, ScaffoldError> {
+    ///
+    /// `dir` names the folder; `id` is the experiment's identity. They are usually the same, and
+    /// [`WorkspacePlan::plan`] keeps them so. They must be separable because a migration wants
+    /// the folder distinguished from the frozen manifest beside it (`exp-003-ws/`) while the
+    /// experiment id stays `exp-003`, so results and comparisons line up — found while migrating
+    /// exp-003, where the `.vxp` had to be hand-edited afterwards.
+    pub fn plan_with_id(dir: &str, id: &str, template: Template) -> Result<Self, ScaffoldError> {
+        if !valid_id(dir) {
+            return Err(ScaffoldError::InvalidId(dir.to_string()));
+        }
         if !valid_id(id) {
             return Err(ScaffoldError::InvalidId(id.to_string()));
         }
 
         let files = vec![
+            // Named for the id, not the folder: the descriptor carries the workspace's identity,
+            // and a file called after its directory says nothing the directory did not.
             WorkspaceFile {
                 path: PathBuf::from(format!("{id}.vxp")),
                 contents: vxp(id, template),
@@ -127,8 +138,10 @@ impl WorkspacePlan {
                 path: PathBuf::from("main.yaml"),
                 contents: main_yaml(id, template),
             },
+            // `vehicle.yaml`, not `vehicle.yaml`: the name is purely pedagogical (documents route
+            // by `kind`, never by path) and `car1` teaches nothing about what the file is for.
             WorkspaceFile {
-                path: PathBuf::from("car1.yaml"),
+                path: PathBuf::from("vehicle.yaml"),
                 contents: vehicle_yaml(template),
             },
             WorkspaceFile {
@@ -147,10 +160,15 @@ impl WorkspacePlan {
         ];
 
         Ok(WorkspacePlan {
-            id: id.to_string(),
+            id: dir.to_string(),
             template,
             files,
         })
+    }
+
+    /// Scaffold a workspace whose folder and experiment id are the same — the common case.
+    pub fn plan(id: &str, template: Template) -> Result<Self, ScaffoldError> {
+        Self::plan_with_id(id, id, template)
     }
 
     /// Write the planned workspace under `parent`. The only I/O in this module.
@@ -350,7 +368,7 @@ fn readme(id: &str, template: Template) -> String {
          |---|---|---|\n\
          | `{id}.vxp` | — | identity, version, entry point, host requirements |\n\
          | `main.yaml` | `experiment` | the test: slices, traffic, method, telemetry |\n\
-         | `car1.yaml` | `vehicle` | the system under test: composition, links, channels |\n\
+         | `vehicle.yaml` | `vehicle` | the system under test: composition, links, channels |\n\
          | `parts.yaml` | `baseline` | which software, by ref + digest |\n\n\
          Every file declares its `kind` and `id`. Nothing references anything by path, so you\n\
          can rename these files freely. Add a file, it joins the experiment; delete one you do\n\
@@ -360,7 +378,7 @@ fn readme(id: &str, template: Template) -> String {
          1. **The load** — `traffic_profiles` in `main.yaml`.\n\
          2. **The isolation mechanism** — `network.slices[].mode`. Switching `vlan` to\n\
             `s-nssai` is the whole difference between H1 and H2, over an unchanged vehicle.\n\
-         3. **The vehicle** — `composition` and `links` in `car1.yaml`.\n\
+         3. **The vehicle** — `composition` and `links` in `vehicle.yaml`.\n\
             Device ids (`zonefl`, `hpc1`, `gw1`) name hardware; function ids (`adas`, `percept`)\n            name software, and are what `parts.yaml` targets.\n\
          4. **The software** — `parts.yaml`. `target_ids` takes one id or a list.\n\n\
          ## Sharing it\n\n\
@@ -382,7 +400,7 @@ mod tests {
         let names: Vec<_> = ws.files.iter().map(|f| f.path.to_string_lossy()).collect();
         assert!(names.contains(&"h1-slice-isolation.vxp".into()));
         assert!(names.contains(&"main.yaml".into()));
-        assert!(names.contains(&"car1.yaml".into()));
+        assert!(names.contains(&"vehicle.yaml".into()));
         assert!(names.contains(&"parts.yaml".into()));
     }
 

@@ -244,8 +244,14 @@ enum TelemetryCmd {
 enum ExperimentCmd {
     /// Create a workspace that is ready to edit — no daemon, no network, no GPU.
     New {
-        /// Workspace id; also the directory name and the published repository path component.
-        id: String,
+        /// Directory to create. Also the experiment id unless `--id` overrides it, and the
+        /// published repository path component.
+        name: String,
+        /// Experiment id, when it should differ from the directory name — a migration keeps the
+        /// folder distinct from the frozen manifest beside it (`exp-003-ws`) while the
+        /// experiment id stays `exp-003`, so results and comparisons line up.
+        #[arg(long, value_name = "EXPERIMENT_ID")]
+        id: Option<String>,
         #[arg(long, value_enum, default_value_t = TemplateArg::Minimal)]
         template: TemplateArg,
         /// Parent directory to create the workspace in.
@@ -576,9 +582,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Telemetry { .. } => scaffold_notice("telemetry"),
         Command::Vehicle { .. } => scaffold_notice("vehicle"),
         Command::Experiment { cmd } => match cmd {
-            ExperimentCmd::New { id, template, path } => {
+            ExperimentCmd::New {
+                name,
+                id,
+                template,
+                path,
+            } => {
                 let template: vxedge_core::Template = (*template).into();
-                let ws = vxedge_core::WorkspacePlan::plan(id, template)?;
+                let ws = vxedge_core::WorkspacePlan::plan_with_id(
+                    name,
+                    id.as_deref().unwrap_or(name),
+                    template,
+                )?;
                 let root = ws.write(std::path::Path::new(path))?;
                 println!("created {}", root.display());
                 for file in &ws.files {
