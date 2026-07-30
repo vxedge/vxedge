@@ -710,6 +710,72 @@ parts:
         std::fs::remove_dir_all(&tmp).ok();
     }
 
+    /// The last planner. Every address in a FiveGPlan is allocated positionally from the slice
+    /// list — UE subnets, SMF/UPF addresses, TUN devices, SUPIs — so drift between the two paths
+    /// would surface as a registration timeout with nothing pointing at the cause.
+    ///
+    /// Weaker evidence than the other three, and worth saying: exp-010 is the frozen `s-nssai`
+    /// campaign and needs a provisioning-capable host, so this compares the two planners against
+    /// each other on a fixture rather than against a recorded result.
+    #[test]
+    fn the_model_path_plans_the_same_5g_core_as_the_manifest_path() {
+        use crate::fiveg::FiveGPlan;
+
+        let yaml = r#"
+network:
+  slices:
+    - { id: adas, mode: s-nssai, s_nssai: { sst: 1, sd: "000001" }, qos: { min_rate_mbps: 100, max_rate_mbps: 200, priority: 1 } }
+    - { id: infot, mode: s-nssai, s_nssai: { sst: 2, sd: "0000AB" }, qos: { min_rate_mbps: 0, max_rate_mbps: 400, priority: 5 } }
+"#;
+        let frozen = crate::ExperimentManifest::from_yaml(&format!(
+            "experiment: {{ id: exp-5g, name: x, duration_s: 60 }}\n{yaml}"
+        ))
+        .unwrap();
+
+        let tmp = std::env::temp_dir().join(format!("vx5g-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("x.vxp"), "id: exp-5g\n").unwrap();
+        std::fs::write(
+            tmp.join("main.yaml"),
+            format!("kind: experiment\nid: exp-5g\nvehicles: [veh]\nbaseline: bl\n{yaml}"),
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join("veh.yaml"),
+            r#"
+kind: vehicle
+id: veh
+composition:
+  zones:
+    node-a: { class: zone, position: front-left, backend: container }
+links:
+  - { id: la, endpoints: [node-a:eth0], slice: adas }
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join("parts.yaml"),
+            "kind: baseline\nid: bl\nparts:\n  - { ref: \"local/vxprobe:host-process\", target_ids: node-a }\n",
+        )
+        .unwrap();
+
+        let ws = Workspace::load_validated(&tmp).unwrap();
+        let via_model = FiveGPlan::from_model(&build(&ws).unwrap()).unwrap();
+        let via_manifest = FiveGPlan::from_manifest(&frozen).unwrap();
+
+        assert_eq!(via_model.sessions.len(), 2);
+        for (a, b) in via_model.sessions.iter().zip(via_manifest.sessions.iter()) {
+            assert_eq!(a.slice_id, b.slice_id);
+            assert_eq!((a.sst, &a.sd), (b.sst, &b.sd), "S-NSSAI drifted");
+            assert_eq!(a.ue_subnet, b.ue_subnet, "UE subnet drifted");
+            assert_eq!(a.supi, b.supi, "SUPI drifted — UE would fail to register");
+            assert_eq!(a.tun_dev, b.tun_dev);
+            assert_eq!(a.upf_gtpu_addr, b.upf_gtpu_addr);
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
     /// A device the planner cannot realise is refused with the fix in the message rather than
     /// defaulted — the guess is exactly what produced a workspace that validated and then could
     /// not boot during the exp-001 migration.

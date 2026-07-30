@@ -188,17 +188,69 @@ fn normalize_sd(slice: &str, sd: &str) -> Result<String, FiveGPlanError> {
     }
 }
 
+/// An `s-nssai` slice as the allocator needs it, independent of which schema it came from.
+struct SnssaiInput {
+    id: String,
+    sst: Option<u8>,
+    sd: Option<String>,
+    /// `(min_rate_mbps, max_rate_mbps, priority)`.
+    qos: Option<(u64, u64, u8)>,
+}
+
 impl FiveGPlan {
+    /// Plan from the domain model (task 5b).
+    ///
+    /// Delegates to the same allocator as the §6.1 path. Every address in a `FiveGPlan` — UE
+    /// subnets, SMF/UPF addresses, TUN devices, SUPIs — is derived positionally from the slice
+    /// list, so two allocators would be two chances to drift and a drifted SUPI or subnet fails
+    /// as a registration timeout with nothing pointing at the cause.
+    pub fn from_model(exp: &crate::model::Experiment) -> Result<Self, FiveGPlanError> {
+        let slices: Vec<SnssaiInput> = exp
+            .slices
+            .iter()
+            .filter(|s| s.mode == crate::model::SliceMode::SNssai)
+            .map(|s| SnssaiInput {
+                id: s.id.clone(),
+                sst: s.s_nssai.as_ref().map(|n| n.sst),
+                sd: s.s_nssai.as_ref().and_then(|n| n.sd.clone()),
+                qos: s.qos.as_ref().map(|q| {
+                    (
+                        u64::from(q.min_rate_mbps.unwrap_or(0)),
+                        u64::from(q.max_rate_mbps.unwrap_or(0)),
+                        q.priority.unwrap_or(4),
+                    )
+                }),
+            })
+            .collect();
+        Self::allocate(&slices)
+    }
+
     pub fn from_manifest(manifest: &ExperimentManifest) -> Result<Self, FiveGPlanError> {
-        let slices: Vec<_> = manifest
+        let slices: Vec<SnssaiInput> = manifest
             .network
             .as_ref()
             .map(|n| n.slices.as_slice())
             .unwrap_or(&[])
             .iter()
             .filter(|s| s.mode == SliceMode::Snssai)
+            .map(|s| SnssaiInput {
+                id: s.id.clone(),
+                sst: s.s_nssai.as_ref().map(|n| n.sst),
+                sd: s.s_nssai.as_ref().and_then(|n| n.sd.clone()),
+                qos: s.qos.as_ref().map(|q| {
+                    (
+                        q.min_rate_mbps.unwrap_or(0),
+                        q.max_rate_mbps.unwrap_or(0),
+                        q.priority.unwrap_or(4),
+                    )
+                }),
+            })
             .collect();
+        Self::allocate(&slices)
+    }
 
+    /// The one allocator both schema paths use.
+    fn allocate(slices: &[SnssaiInput]) -> Result<Self, FiveGPlanError> {
         if slices.is_empty() {
             return Err(FiveGPlanError::NoSnssaiSlices);
         }
@@ -211,17 +263,15 @@ impl FiveGPlan {
             if !valid_slice_id(&s.id) {
                 return Err(FiveGPlanError::InvalidSliceId(s.id.clone()));
             }
-            let snssai = s
-                .s_nssai
-                .as_ref()
+            let sst = s
+                .sst
                 .ok_or_else(|| FiveGPlanError::MissingSnssai(s.id.clone()))?;
-            let sd = snssai
-                .sd
-                .as_deref()
-                .map(|sd| normalize_sd(&s.id, sd))
-                .transpose()?;
+            let sd =
+                s.sd.as_deref()
+                    .map(|sd| normalize_sd(&s.id, sd))
+                    .transpose()?;
 
-            if let Some(prev) = sessions.iter().find(|p| p.sst == snssai.sst && p.sd == sd) {
+            if let Some(prev) = sessions.iter().find(|p| p.sst == sst && p.sd == sd) {
                 return Err(FiveGPlanError::DuplicateSnssai {
                     a: prev.slice_id.clone(),
                     b: s.id.clone(),
@@ -230,7 +280,7 @@ impl FiveGPlan {
 
             sessions.push(SliceSession {
                 slice_id: s.id.clone(),
-                sst: snssai.sst,
+                sst,
                 sd,
                 dnn: s.id.clone(),
                 ue_subnet: format!("10.{}.0.0/16", 46 + i),
@@ -242,10 +292,10 @@ impl FiveGPlan {
                 // 15-digit IMSI: MCC(3) + MNC(2) + 10-digit MSIN.
                 supi: format!("imsi-{}{}{:010}", PLMN_MCC, PLMN_MNC, 1 + i),
                 ue_ran_link_addr: format!("10.99.0.{}", 50 + i),
-                qos: s.qos.as_ref().map(|q| SliceSessionQos {
-                    min_rate_mbps: q.min_rate_mbps.unwrap_or(0).max(1),
-                    max_rate_mbps: q.max_rate_mbps.unwrap_or(0).max(1),
-                    priority: q.priority.unwrap_or(4),
+                qos: s.qos.map(|(min, max, prio)| SliceSessionQos {
+                    min_rate_mbps: min.max(1),
+                    max_rate_mbps: max.max(1),
+                    priority: prio,
                     class_minor: 0x20 + i as u16,
                 }),
             });
