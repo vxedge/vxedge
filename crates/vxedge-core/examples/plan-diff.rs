@@ -104,6 +104,44 @@ fn main() {
         }
     }
 
+    // The 5G core plan. Omitted at first, which mattered: for an `s-nssai` experiment the
+    // gateway and node comparisons are vacuous (no VLAN endpoints exist), so without this an
+    // H2 migration was being signed off on almost nothing. Every address here is allocated
+    // positionally, and a drifted SUPI surfaces as a UE registration timeout with nothing
+    // pointing at the cause.
+    use vxedge_core::fiveg::FiveGPlan;
+    match (FiveGPlan::from_model(&a), FiveGPlan::from_model(&b)) {
+        (Ok(fa), Ok(fb)) => {
+            cmp(
+                "5g session count",
+                fa.sessions.len().to_string(),
+                fb.sessions.len().to_string(),
+            );
+            for (x, y) in fa.sessions.iter().zip(fb.sessions.iter()) {
+                cmp(
+                    &format!("5g session {}", x.slice_id),
+                    format!(
+                        "{} {} {:?} {} {} {}",
+                        x.slice_id, x.sst, x.sd, x.ue_subnet, x.supi, x.tun_dev
+                    ),
+                    format!(
+                        "{} {} {:?} {} {} {}",
+                        y.slice_id, y.sst, y.sd, y.ue_subnet, y.supi, y.tun_dev
+                    ),
+                );
+            }
+        }
+        (Err(_), Err(_)) => println!("  n/a   no s-nssai slices"),
+        (x, y) => {
+            println!(
+                "  DIFF  5g plan: workspace={:?} frozen={:?}",
+                x.err(),
+                y.err()
+            );
+            bad += 1;
+        }
+    }
+
     println!("\n{}", if bad == 0 { "IDENTICAL" } else { "DIVERGENT" });
     std::process::exit(if bad == 0 { 0 } else { 1 });
 }
