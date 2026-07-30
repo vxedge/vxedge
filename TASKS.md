@@ -33,9 +33,57 @@ Ordered for the phase-1 critical path (see ../docs/TASKS.md). Each task should l
       (`ComponentWithoutPart`, `UnknownTrafficEndpoint`); the rest were scaffold fixes.
       Tests plan the lowered manifest through `GatewayPlan` **and** `TrafficPlan`, since §6.1's
       composition validator never inspects traffic endpoints.
-- [ ] Wire `vxedge experiment up` to consume the §6.0 workspace shape directly — needs a
-      daemon-side ExperimentService that takes a workspace; `lower` covers the running path in
-      the meantime, at the cost of dropping `channels`
+### Decided 2026-07-30 — §6.0 is the only authored schema; the working directory is the workspace
+
+Two owner decisions close the dual-schema question and the addressing question.
+
+**One schema.** Maintaining §6.0 and §6.1 as parallel authoring surfaces was rejected: it splits
+the thing an OEM engineer has to learn in two, for no gain. **§6.0 becomes the only schema
+anyone writes.** §6.1 is *demoted, not deleted* — its structs stay as the internal representation
+`GatewayPlan`/`TrafficPlan`/the zone backends consume, and lowering targets them. Deleting them
+outright is a rewrite of the whole provisioning layer and is a phase-4 cleanup, not a blocker.
+What changes now is that §6.1 stops being documented as an authoring contract and stops being
+hand-written anywhere.
+
+This is safe because **phase-1 reproducibility is anchored at the `v0.1.0` tag**, already cut
+across all seven contributing repos. A frozen result reproduces at the release it was produced
+at, not at HEAD — so retiring the old authoring path at HEAD costs nothing.
+
+**The working directory is the workspace** (Terraform's model, and consistent with the
+non-recursive loader). `vxedge experiment up|down|status` takes no name: it reads `.vxp` from the
+current directory, and says so plainly when there isn't one. `vxedge experiment new <name>`
+creates `./<name>/`.
+
+Terraform conventions **adopted**: cwd as the unit of work; every `*.yaml` in the folder loads
+together, order-independent; a `--chdir` escape hatch so scripts need not `cd`; no walking up to
+parent directories (being inside `results/` must not silently resolve the parent experiment).
+Terraform conventions **rejected**: a state file — manifests are the sole source of truth and
+daemon state is ephemeral by design; and variables/interpolation, already rejected with HCL
+because result archives are keyed to manifest SHA256.
+
+- [ ] **(1) Positional/cwd addressing.** `experiment up|down|status` resolve `.vxp` in the cwd;
+      exactly one required (zero → "no vxedge experiment workspace found in <dir>"; more than
+      one → name them). Global `--chdir <dir>`. Remove `--manifest` from the experiment verbs.
+- [ ] **(2) `ExperimentService` in `vxedged`** (Up/Down/Status → `Job`, progress over
+      `JobService.Watch`). Sequences gateway → zones → compute → services → traffic, reconciler
+      semantics throughout so `up` twice is a no-op. The verb has existed in `proto/` since
+      phase 1 and was never implemented; this implements it.
+- [ ] **(3) The daemon accepts a workspace directory** — `ManifestRef.path` pointing at a folder
+      makes the daemon load + lower server-side. **No proto change required.** Then **delete the
+      `experiment lower` CLI verb**: lowering is a manifest transformation the daemon owns, and
+      it was never something an OEM engineer should have had to run.
+- [ ] **(4) `.vxp` `requires` preflight** — `gpu: none|tier2` checked at `up`, refused with the
+      requirement stated rather than failing partway through provisioning. This is the mechanism
+      that lets GPU-dependent experiments be authored, validated and committed while inert, so
+      the unresolved GPU decision blocks nothing else.
+- [ ] **(5) Demote §6.1** — no new authoring surface, doc comments restate it as internal
+      representation, `deny_unknown_fields` unchanged.
+- [ ] **(6) Migrate the remaining verbs** (`up`, `zone`, `compute`, `ota`, `telemetry`,
+      `traffic`) off `--manifest` onto workspace resolution.
+- [ ] **(7) `vehicle up` from a §6.0 vehicle document** — the phase-3 gate itself. Needs (2).
+- [ ] Candidate, from Terraform's `init`: `experiment init` pre-pulls every part ref by digest
+      into a local cache before `up`, so a run either has everything or fails before it starts.
+      Fits the offline-first direction; not yet scheduled.
 - [ ] `vxedge vehicle extract` — inline component defs to their own files, once reused
 - [ ] `vxedge manifest bom` (Track D dimension 3) + `vxedge experiment publish` (refuses
       while any local ref is unpublished — a shared workspace with a local path is broken
