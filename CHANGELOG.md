@@ -6,6 +6,39 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`ExperimentService` is implemented in `vxedged`** — `vxedge experiment up` provisions the
+  gateway (including the 5G core when the manifest declares `s-nssai` slices), then every zone,
+  then the declared services; `down` reverses it; `status` aggregates. The RPC had been in
+  `proto/vxedge/v1/lifecycle.proto` since phase 1 with nothing behind it, and campaign scripts
+  did the sequencing themselves. **No proto change was needed.**
+
+  **`up` does not start traffic, by design.** `up` is required to be idempotent and reconciling —
+  running it twice is a no-op — and traffic generation is a time-bounded process rather than a
+  converged state, so "start a 60-second load run" cannot be made idempotent. It stays
+  `vxedge traffic up`. The split is also what a measurement campaign needs: a sweep varies
+  offered load over a topology that must be identical across arms. The success message says so
+  outright, so nobody waits for numbers that are not coming.
+
+  Composition rather than reimplementation: each stage submits the *existing* service's job and
+  awaits it, so nothing is duplicated and sub-jobs stay individually visible through
+  `JobService` — a failure is attributable to a stage. `down` is best-effort, because a teardown
+  that stops at the first error strands everything after it. The manifest is resolved once and
+  handed to every stage as `inline_yaml`, so an edit made mid-run cannot leave the gateway on one
+  revision and the zones on another.
+
+- **A `ManifestRef.path` naming a directory is a §6.0 workspace.** The daemon loads, validates
+  and lowers it via `vxedge_core::lower::lower_path_to_yaml`. The reproducibility checksum
+  therefore covers the *lowered* manifest, which is the correct thing to hash: results are keyed
+  to what actually ran, and lowering is pure, so the same workspace always yields the same hash.
+
+### Removed
+
+- **`vxedge experiment lower`.** Lowering is a manifest transformation the daemon owns; a verb
+  for it in the CLI would have made every frontend reimplement it, and §6.0 is the only schema an
+  OEM engineer authors — no frontend should need to know the older one exists.
+
 ### Changed
 
 - **`vxedge experiment up|down|status` are addressed by the working directory**, not by
@@ -25,6 +58,13 @@ All notable changes to this repo are documented here. Format follows
   this" error. `requires` is parsed but not yet enforced.
 
 ### Fixed
+
+- **`watch_job` printed every progress step twice.** A watch stream delivers the current snapshot
+  on subscribe and again on the first change. Dedup compares what is actually displayed, since
+  `updated_unix_ms` differs on every message and would defeat a whole-value comparison.
+
+- **`ZoneService`'s "no active experiment" error still told users to run
+  `vxedge up --manifest <exp.yaml>`** — a flow that no longer exists.
 
 - **Every error message the CLI produced was rendered with `Debug`, not `Display`.**
   `fn main() -> Result<_, _>` formats its error with `{:?}`, so a `thiserror` type printed as a

@@ -73,14 +73,25 @@ because result archives are keyed to manifest SHA256.
       Fixed a pre-existing defect this surfaced: `fn main() -> Result<_, _>` formats with
       `Debug`, so every actionable error in this crate and in `vxedge-core` reached users as a
       struct dump. `main` now prints `Display` and walks the `source` chain.
-- [ ] **(2) `ExperimentService` in `vxedged`** (Up/Down/Status → `Job`, progress over
-      `JobService.Watch`). Sequences gateway → zones → compute → services → traffic, reconciler
-      semantics throughout so `up` twice is a no-op. The verb has existed in `proto/` since
-      phase 1 and was never implemented; this implements it.
-- [ ] **(3) The daemon accepts a workspace directory** — `ManifestRef.path` pointing at a folder
-      makes the daemon load + lower server-side. **No proto change required.** Then **delete the
-      `experiment lower` CLI verb**: lowering is a manifest transformation the daemon owns, and
-      it was never something an OEM engineer should have had to run.
+- [x] **(2) `ExperimentService` in `vxedged`** (2026-07-30) — `up` provisions gateway (with the
+      5G core when the manifest declares `s-nssai` slices) → zones → services. No proto change
+      needed. **`up` does not start traffic**, and that is a decision, not an omission: `up` must
+      be idempotent and reconciling, and traffic is a time-bounded process, not a converged
+      state — "start a 60-second load run" cannot be made idempotent. It also happens to be what
+      a campaign needs, since exp-001 sweeps offered load over a topology that must be identical
+      each arm. The success message says so outright.
+
+      Composition, not reimplementation: each stage submits the existing service's job and
+      awaits it, so sub-jobs stay individually visible through `JobService` and a failure is
+      attributable to a stage. `down` is best-effort — a teardown that stops at the first error
+      strands everything after it. The manifest is resolved once and passed to every stage as
+      `inline_yaml`, so an edit mid-run cannot leave the gateway on one revision and the zones
+      on another.
+- [x] **(3) The daemon accepts a workspace directory** (2026-07-30) — a `ManifestRef.path`
+      naming a folder is loaded, validated and lowered daemon-side via
+      `vxedge_core::lower::lower_path_to_yaml`. **The `experiment lower` CLI verb is deleted.**
+      The reproducibility checksum now covers the *lowered* manifest, which is correct: results
+      are keyed to what actually ran, and lowering is pure.
 - [ ] **(4) `.vxp` `requires` preflight** — `gpu: none|tier2` checked at `up`, refused with the
       requirement stated rather than failing partway through provisioning. This is the mechanism
       that lets GPU-dependent experiments be authored, validated and committed while inert, so
