@@ -106,6 +106,9 @@ pub struct Device {
     /// Signal bindings for sensors and actuators (`ARCHITECTURE.md` §6.2): a VSS path, and a
     /// DBC for CAN-attached devices.
     pub signals: Vec<SignalBinding>,
+    /// CPUs this device's runtime is pinned to. A determinism control, not an allocation —
+    /// which is why it sits here rather than in [`Resources`].
+    pub pinned_cpus: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,10 +224,15 @@ pub struct Harness {
 }
 
 /// One end of a link or channel: a device (or function) and an optional port.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Endpoint {
     pub node: String,
     pub port: Option<String>,
+    /// Address (CIDR) the zone backend configures on this attachment. Only meaningful on a
+    /// link; a channel endpoint leaves it unset. §6.0's `endpoints: [a:eth0, b:eth0]` string
+    /// form cannot express it yet — the §6.1 adapter populates it, and the schema change that
+    /// finishes 5a gives authors an object form that can.
+    pub ip_cidr: Option<String>,
 }
 
 /// A logical information flow between functions.

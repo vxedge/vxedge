@@ -51,6 +51,99 @@ impl NodePlan {
     }
 }
 
+/// Join model devices with the gateway plan's endpoints (task 5b).
+///
+/// Traversal must match [`GatewayPlan::from_model`]'s exactly — sorted device id, then the links
+/// touching it — because the two plans are joined 1:1 by index. That invariant is asserted here
+/// rather than assumed, the same way the §6.1 path does it.
+///
+/// `zone_id` becomes the **region** the device sits in, not a per-device wrapper. That is the
+/// model's whole point, and it gives `vxedge zone up --vxid front-left` a real meaning: bring up
+/// everything in that region. A device belonging to no region (a gateway, a central computer)
+/// falls back to its own id so the field is never empty.
+pub fn plan_nodes_from_model(
+    exp: &crate::model::Experiment,
+    gateway: &GatewayPlan,
+    workspace_dir: &Path,
+) -> Result<Vec<NodePlan>, ZonePlanError> {
+    let mut plans = Vec::new();
+    let mut idx = 0usize;
+    for entity in &exp.entities {
+        for device in entity.devices_in_order() {
+            for (link, endpoint) in entity.links_for(&device.id) {
+                if link.slice.is_none() {
+                    continue; // not a gateway-attached link
+                }
+                let Some(ep) = gateway.endpoints.get(idx) else {
+                    return Err(ZonePlanError::EndpointMismatch {
+                        gateway: gateway.endpoints.len(),
+                        zones: idx + 1,
+                    });
+                };
+                debug_assert_eq!(ep.node, device.id, "traversal order invariant");
+
+                // A VM-ish backend boots a bundle directory; a container has no image to
+                // resolve. The backend is the authority here — deriving it from the part
+                // reference is the guess that produced an unbootable manifest during the
+                // exp-001 migration.
+                let backend = match device.backend {
+                    Some(crate::model::Backend::Container) => Backend::Container,
+                    Some(crate::model::Backend::Libvirt) => Backend::Libvirt,
+                    Some(crate::model::Backend::QemuMicrovm) => Backend::QemuMicrovm,
+                    // GatewayPlan::from_model already refused this, so reaching it means the
+                    // two plans came from different models.
+                    None => {
+                        return Err(ZonePlanError::EndpointMismatch {
+                            gateway: gateway.endpoints.len(),
+                            zones: idx,
+                        });
+                    }
+                };
+                let bundle = match backend {
+                    Backend::Libvirt | Backend::QemuMicrovm => entity
+                        .functions
+                        .get(&device.id)
+                        .and_then(|f| f.part.as_ref())
+                        .map(|part| {
+                            let p = Path::new(&part.reference);
+                            if p.is_absolute() {
+                                p.to_path_buf()
+                            } else {
+                                workspace_dir.join(p)
+                            }
+                        }),
+                    Backend::Container => None,
+                };
+                if bundle.is_none() && matches!(backend, Backend::Libvirt | Backend::QemuMicrovm) {
+                    return Err(ZonePlanError::MissingBundle(device.id.clone(), backend));
+                }
+
+                plans.push(NodePlan {
+                    zone_id: device.zone.clone().unwrap_or_else(|| device.id.clone()),
+                    node_id: device.id.clone(),
+                    backend,
+                    endpoint: ep.name.clone(),
+                    peer: ep.peer.clone(),
+                    kind: ep.kind,
+                    vlan: ep.vlan,
+                    slice: ep.slice.clone(),
+                    ip_cidr: endpoint.ip_cidr.clone(),
+                    bundle,
+                    pinned_cpus: device.pinned_cpus.clone(),
+                });
+                idx += 1;
+            }
+        }
+    }
+    if idx != gateway.endpoints.len() {
+        return Err(ZonePlanError::EndpointMismatch {
+            gateway: gateway.endpoints.len(),
+            zones: idx,
+        });
+    }
+    Ok(plans)
+}
+
 /// Join manifest nodes with the gateway plan's endpoints.
 pub fn plan_nodes(
     manifest: &ExperimentManifest,

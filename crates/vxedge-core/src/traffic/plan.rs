@@ -159,6 +159,147 @@ struct RealRef<'a> {
 }
 
 impl TrafficPlan {
+    /// Plan from the domain model (task 5b).
+    ///
+    /// The model already resolved each endpoint to [`crate::model::TrafficEndpoint`] at build
+    /// time, so this does not re-parse `zone:node` strings. That is the point of the port: §6.1
+    /// spells an endpoint `<zone-vxid>:<node-vxid>`, a form whose zone half lowering had to
+    /// synthesize and an author could never write. In the model an endpoint is just a device id.
+    pub fn from_model(
+        exp: &crate::model::Experiment,
+        gateway_plan: &GatewayPlan,
+    ) -> Result<Self, TrafficPlanError> {
+        use crate::model::TrafficEndpoint as TE;
+
+        let mut profiles = Vec::with_capacity(exp.traffic.len());
+        for profile in &exp.traffic {
+            // A device endpoint resolves against the gateway plan; anything symbolic
+            // (`internet`, a simulator) has no device and resolves to the far side of whichever
+            // concrete endpoint the other half found.
+            let resolve =
+                |ep: &TE, field: &'static str| -> Result<Option<RealRef<'_>>, TrafficPlanError> {
+                    let TE::Device(id) = ep else { return Ok(None) };
+                    let device =
+                        exp.entities
+                            .iter()
+                            .find_map(|e| e.device(id))
+                            .ok_or_else(|| TrafficPlanError::UnknownNode {
+                                profile: profile.id.clone(),
+                                field,
+                                reference: id.clone(),
+                            })?;
+                    let link = exp
+                        .entities
+                        .iter()
+                        .flat_map(|e| e.links_for(&device.id))
+                        .find(|(l, _)| l.slice.is_some())
+                        .ok_or_else(|| TrafficPlanError::NodeHasNoSlice {
+                            profile: profile.id.clone(),
+                            field,
+                            reference: id.clone(),
+                        })?;
+                    let slice_id = link.0.slice.as_deref().expect("checked by find above");
+                    let slice = exp
+                        .slices
+                        .iter()
+                        .find(|s| s.id == slice_id)
+                        .ok_or_else(|| TrafficPlanError::UnknownSlice {
+                            profile: profile.id.clone(),
+                            field,
+                            reference: id.clone(),
+                            slice: slice_id.to_string(),
+                        })?;
+                    Ok(Some(RealRef {
+                        node_id: &device.id,
+                        slice_id: &slice.id,
+                        mode: match slice.mode {
+                            crate::model::SliceMode::Vlan => SliceMode::Vlan,
+                            crate::model::SliceMode::SNssai => SliceMode::Snssai,
+                        },
+                    }))
+                };
+
+            let src = resolve(&profile.source, "source")?;
+            let dst = resolve(&profile.target, "target")?;
+            let name = |ep: &TE| match ep {
+                TE::Device(d) => d.clone(),
+                TE::Internet => "internet".to_string(),
+                TE::Simulator(s) => s.clone(),
+            };
+
+            let (source, target) = match (src, dst) {
+                (Some(s), Some(t)) => (
+                    endpoint_for(
+                        gateway_plan,
+                        &profile.id,
+                        "source",
+                        &name(&profile.source),
+                        s,
+                    )?,
+                    endpoint_for(
+                        gateway_plan,
+                        &profile.id,
+                        "target",
+                        &name(&profile.target),
+                        t,
+                    )?,
+                ),
+                (Some(s), None) => {
+                    let far = far_side_for(
+                        gateway_plan,
+                        &profile.id,
+                        "target",
+                        &name(&profile.target),
+                        &s,
+                    )?;
+                    (
+                        endpoint_for(
+                            gateway_plan,
+                            &profile.id,
+                            "source",
+                            &name(&profile.source),
+                            s,
+                        )?,
+                        far,
+                    )
+                }
+                (None, Some(t)) => {
+                    let far = far_side_for(
+                        gateway_plan,
+                        &profile.id,
+                        "source",
+                        &name(&profile.source),
+                        &t,
+                    )?;
+                    (
+                        far,
+                        endpoint_for(
+                            gateway_plan,
+                            &profile.id,
+                            "target",
+                            &name(&profile.target),
+                            t,
+                        )?,
+                    )
+                }
+                // Both symbolic: no slice can be derived, so the profile would measure nothing.
+                (None, None) => {
+                    return Err(TrafficPlanError::BothEndpointsSymbolic(profile.id.clone()));
+                }
+            };
+
+            profiles.push(ResolvedProfile {
+                id: profile.id.clone(),
+                source,
+                target,
+                pps: profile.pps.map(u64::from),
+                bandwidth_mbps: profile.bandwidth_mbps.map(u64::from),
+                payload_bytes: profile.payload_bytes.unwrap_or(64),
+            });
+        }
+        Ok(TrafficPlan { profiles })
+    }
+
     pub fn from_manifest(
         manifest: &ExperimentManifest,
         gateway_plan: &GatewayPlan,
@@ -211,18 +352,18 @@ fn resolve_profile(
                 }
             }
             (
-                endpoint_for(manifest, gateway_plan, id, "source", &profile.source, s)?,
-                endpoint_for(manifest, gateway_plan, id, "target", &profile.target, t)?,
+                endpoint_for(gateway_plan, id, "source", &profile.source, s)?,
+                endpoint_for(gateway_plan, id, "target", &profile.target, t)?,
             )
         }
         (Some(s), None) => {
             let target = far_side_for(gateway_plan, id, "source", &profile.source, &s)?;
-            let source = endpoint_for(manifest, gateway_plan, id, "source", &profile.source, s)?;
+            let source = endpoint_for(gateway_plan, id, "source", &profile.source, s)?;
             (source, target)
         }
         (None, Some(t)) => {
             let source = far_side_for(gateway_plan, id, "target", &profile.target, &t)?;
-            let target = endpoint_for(manifest, gateway_plan, id, "target", &profile.target, t)?;
+            let target = endpoint_for(gateway_plan, id, "target", &profile.target, t)?;
             (source, target)
         }
         (None, None) => return Err(TrafficPlanError::BothEndpointsSymbolic(id.to_string())),
@@ -292,7 +433,6 @@ fn find_real_ref<'a>(
 }
 
 fn endpoint_for(
-    _manifest: &ExperimentManifest,
     gateway_plan: &GatewayPlan,
     profile: &str,
     field: &'static str,

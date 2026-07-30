@@ -118,10 +118,12 @@ fn endpoint(raw: &str) -> Endpoint {
         Some((n, p)) => Endpoint {
             node: n.to_string(),
             port: Some(p.to_string()),
+            ip_cidr: None,
         },
         None => Endpoint {
             node: raw.to_string(),
             port: None,
+            ip_cidr: None,
         },
     }
 }
@@ -168,6 +170,17 @@ fn build_entity(ws: &Workspace, doc: &VehicleDoc) -> Result<Entity, ModelError> 
                     resources: resources_of(spec),
                     backend: backend_of(id, spec)?,
                     signals: Vec::new(),
+                    pinned_cpus: spec
+                        .get("realtime")
+                        .and_then(|r| r.get("pinned_cpus"))
+                        .and_then(|v| v.as_sequence())
+                        .map(|seq| {
+                            seq.iter()
+                                .filter_map(|v| v.as_u64())
+                                .map(|v| v as u32)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                 },
             );
 
@@ -448,10 +461,11 @@ mod tests {
     /// directly — so "both plan successfully" is not enough; they have to plan identically.
     ///
     /// Fixture mirrors exp-001: two container-backed devices on separate vlan slices.
-    #[test]
-    fn the_model_path_plans_the_same_gateway_as_the_manifest_path() {
-        use crate::gateway::GatewayPlan;
-
+    /// exp-001 in both forms: two container-backed devices on separate vlan slices, over a
+    /// 500 mbit shared bottleneck. Returns (dir, §6.1 manifest, §6.0 workspace).
+    fn equivalence_fixture(
+        name: &str,
+    ) -> (std::path::PathBuf, crate::ExperimentManifest, Workspace) {
         let frozen = crate::ExperimentManifest::from_yaml(
             r#"
 experiment: { id: exp-x, name: x, duration_s: 60 }
@@ -477,11 +491,17 @@ zones:
         image: { url: "local/vxtraffic:host-process", kind: container }
         backend: container
         network: [{ iface: eth0, vlan: 103, slice: infot }]
+traffic_profiles:
+  load:
+    source: vxzone-b:node-b
+    target: internet
+    bandwidth_mbps: 400
+    payload_bytes: 1200
 "#,
         )
         .unwrap();
 
-        let tmp = std::env::temp_dir().join(format!("vxmodelplan-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("vxmodelplan-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(tmp.join("x.vxp"), "id: exp-x\n").unwrap();
@@ -497,6 +517,12 @@ network:
   slices:
     - { id: adas, mode: vlan, vlan: 101, qos: { min_rate_mbps: 100, max_rate_mbps: 200, priority: 1 } }
     - { id: infot, mode: vlan, vlan: 103, qos: { min_rate_mbps: 0, max_rate_mbps: 400, priority: 5 } }
+traffic_profiles:
+  load:
+    source: node-b
+    target: internet
+    bandwidth_mbps: 400
+    payload_bytes: 1200
 "#,
         )
         .unwrap();
@@ -528,6 +554,13 @@ parts:
         .unwrap();
 
         let ws = Workspace::load_validated(&tmp).unwrap();
+        (tmp, frozen, ws)
+    }
+
+    #[test]
+    fn the_model_path_plans_the_same_gateway_as_the_manifest_path() {
+        use crate::gateway::GatewayPlan;
+        let (tmp, frozen, ws) = equivalence_fixture("gw");
         let via_model = GatewayPlan::from_model(&build(&ws).unwrap()).unwrap();
         let via_manifest = GatewayPlan::from_manifest(&frozen).unwrap();
 
@@ -537,6 +570,69 @@ parts:
         // because `summary()` including it is not something this test should depend on.
         assert_eq!(via_model.root_rate_mbps, 500);
         assert_eq!(via_model.root_rate_mbps, via_manifest.root_rate_mbps);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Same acceptance criterion as the gateway port: the two paths must produce the *same*
+    /// node plans, since `NodePlan` carries the interface names the backends attach to.
+    ///
+    /// `zone_id` is the one field that legitimately differs — §6.1 names a wrapper zone, the
+    /// model names the region the device sits in. Everything the provisioning actually uses
+    /// (endpoint, peer, kind, vlan, backend) must be identical.
+    #[test]
+    fn the_model_path_plans_the_same_nodes_as_the_manifest_path() {
+        use crate::gateway::GatewayPlan;
+        use crate::zones::plan::{plan_nodes, plan_nodes_from_model};
+
+        let (tmp, frozen, ws) = equivalence_fixture("nodes");
+        let model = build(&ws).unwrap();
+
+        let gw_model = GatewayPlan::from_model(&model).unwrap();
+        let gw_manifest = GatewayPlan::from_manifest(&frozen).unwrap();
+        let via_model = plan_nodes_from_model(&model, &gw_model, &tmp).unwrap();
+        let via_manifest = plan_nodes(&frozen, &gw_manifest, &tmp).unwrap();
+
+        assert_eq!(via_model.len(), via_manifest.len());
+        for (a, b) in via_model.iter().zip(via_manifest.iter()) {
+            assert_eq!(a.node_id, b.node_id);
+            assert_eq!(a.endpoint, b.endpoint, "attachment name drifted");
+            assert_eq!(a.peer, b.peer, "veth peer drifted");
+            assert_eq!(a.kind, b.kind);
+            assert_eq!(a.vlan, b.vlan);
+            assert_eq!(a.backend, b.backend);
+            assert_eq!(a.runtime_name(), b.runtime_name(), "netns name drifted");
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Third planner ported. Traffic is where §6.1's endpoint spelling was worst — a profile
+    /// names `<zone-vxid>:<node-vxid>`, and the zone half was synthesized by lowering, so no
+    /// author could ever write it correctly. In the model an endpoint is a device id, and the
+    /// resolution happens once at build time.
+    #[test]
+    fn the_model_path_plans_the_same_traffic_as_the_manifest_path() {
+        use crate::gateway::GatewayPlan;
+        use crate::traffic::TrafficPlan;
+
+        let (tmp, frozen, ws) = equivalence_fixture("traffic");
+        let model = build(&ws).unwrap();
+
+        let via_model = TrafficPlan::from_model(&model, &GatewayPlan::from_model(&model).unwrap())
+            .expect("model traffic plans");
+        let via_manifest =
+            TrafficPlan::from_manifest(&frozen, &GatewayPlan::from_manifest(&frozen).unwrap())
+                .expect("manifest traffic plans");
+
+        assert_eq!(via_model.profiles.len(), via_manifest.profiles.len());
+        for (a, b) in via_model.profiles.iter().zip(via_manifest.profiles.iter()) {
+            assert_eq!(a.id, b.id);
+            // The resolved endpoints carry the interface and address traffic is actually
+            // generated against — the whole point of the comparison.
+            assert_eq!(a.source, b.source, "source endpoint drifted");
+            assert_eq!(a.target, b.target, "target endpoint drifted");
+            assert_eq!(a.bandwidth_mbps, b.bandwidth_mbps);
+            assert_eq!(a.payload_bytes, b.payload_bytes);
+        }
         std::fs::remove_dir_all(&tmp).ok();
     }
 
