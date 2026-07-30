@@ -140,8 +140,25 @@ baseline the migration is being checked against.
         `<zone-vxid>:<node-vxid>` whose zone half lowering synthesized, so no author could write
         it correctly. The model resolves to a device id once, at build time. Also removed a dead
         `&ExperimentManifest` parameter from `endpoint_for` that had never been read.
-  - [ ] `FiveGPlan` from the model — the H2 path; needs `s_nssai` carried through the model
-        (already typed, not yet exercised by a fixture)
+  - [x] `FiveGPlan` from the model (2026-07-30) — both paths delegate to one allocator. Every
+        address is derived positionally from the slice list (UE subnets, SMF/UPF, TUN devices,
+        SUPIs), and a drifted SUPI surfaces as a registration timeout with nothing pointing at
+        the cause, so two allocators were two chances to fail silently. **Weaker evidence than
+        the other three**: exp-010 needs a provisioning-capable host, so this compares the two
+        planners on a fixture rather than against a recorded result.
+
+**5b is complete.** All four planners have a model path with an equivalence test. Next: 5c (the
+§6.1 → model adapter, which is what lets the frozen experiments run through the model), then the
+§6.0 schema change that finishes 5a.
+
+- [x] **Model invariants** (2026-07-30) — `Experiment::check`. The model introduced id spaces
+      §6.0 did not have (zones, devices, functions as distinct kinds), and new namespaces mean
+      new collisions and new dangling references. Two checks are specific to what changed: a
+      zone/device id collision (§6.0 derives a zone id from `position` and a device id from the
+      component key, so a component named after its own region answers to one name as two
+      things), and **a channel endpoint must be a function, not a device** — the distinction the
+      model exists to make, enforced rather than documented. Device ids stay unique across the
+      whole experiment because parts and traffic profiles address them flatly.
 
 - [ ] **Positional endpoint numbering is fragile** — `vz0`/`vzp0` are assigned in traversal
       order, and campaign scripts address those names directly, so adding a device (model path:
