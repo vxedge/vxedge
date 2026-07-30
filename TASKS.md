@@ -131,9 +131,17 @@ baseline the migration is being checked against.
         `network.defaults.bandwidth`: exp-001's 500 mbit bottleneck would have planned at the
         1000 mbit default, changing every number while still validating and running. A
         slice-attached device with no `backend` is now refused rather than guessed.
-  - [ ] `zones::plan` from the model
-  - [ ] `TrafficPlan` from the model
-  - [ ] `FiveGPlan` from the model
+  - [x] `zones::plan` from the model (2026-07-30) — `zone_id` now means the *region* a device
+        sits in rather than a per-device wrapper, so `zone up --vxid front-left` brings up
+        everything in that region. Bundle path comes from the function's part, gated on the
+        backend rather than an image-kind guess. Equivalence asserted on endpoint, peer, kind,
+        vlan, backend and `runtime_name()` — the netns name the runtime actually uses.
+  - [x] `TrafficPlan` from the model (2026-07-30) — §6.1's worst spelling: an endpoint is
+        `<zone-vxid>:<node-vxid>` whose zone half lowering synthesized, so no author could write
+        it correctly. The model resolves to a device id once, at build time. Also removed a dead
+        `&ExperimentManifest` parameter from `endpoint_for` that had never been read.
+  - [ ] `FiveGPlan` from the model — the H2 path; needs `s_nssai` carried through the model
+        (already typed, not yet exercised by a fixture)
 
 - [ ] **Positional endpoint numbering is fragile** — `vz0`/`vzp0` are assigned in traversal
       order, and campaign scripts address those names directly, so adding a device (model path:
