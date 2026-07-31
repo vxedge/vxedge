@@ -92,10 +92,18 @@ because result archives are keyed to manifest SHA256.
       `vxedge_core::lower::lower_path_to_yaml`. **The `experiment lower` CLI verb is deleted.**
       The reproducibility checksum now covers the *lowered* manifest, which is correct: results
       are keyed to what actually ran, and lowering is pure.
-- [ ] **(4) `.vxp` `requires` preflight** — `gpu: none|tier2` checked at `up`, refused with the
-      requirement stated rather than failing partway through provisioning. This is the mechanism
-      that lets GPU-dependent experiments be authored, validated and committed while inert, so
-      the unresolved GPU decision blocks nothing else.
+- [x] **(4) `.vxp` `requires` preflight** (2026-07-31) — `gpu: none|tier2` checked at
+      `experiment up`, **daemon-side** (the host that matters is the one provisioning; a
+      CLI-side check asks the wrong machine the moment `--endpoint` points elsewhere), before
+      anything is provisioned. exp-011 can now be authored, validated and committed while
+      inert, so the unresolved GPU decision blocks nothing else.
+
+      The probe checks what Tier 2 actually requires — compute capability **and** VRAM — not
+      merely that a GPU exists. Found live: this development host has a GT 1030, so a presence
+      check *passed* and would have let a Tier 2 experiment start and fail deep inside CARLA.
+      Pascal at 2 GB fails on both counts, and compute capability is the binding half, since
+      DeepStream/TensorRT need tensor cores and more VRAM within a pre-Turing generation does
+      not help. A multi-GPU host qualifies on its most capable card.
 ### Decided 2026-07-30 (supersedes "demote §6.1") — reject §6.1 and model natively
 
 The demote-not-delete compromise is withdrawn by owner decision: §6.1 is to be **rejected**, not

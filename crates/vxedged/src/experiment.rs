@@ -233,6 +233,12 @@ impl Handles {
 #[tonic::async_trait]
 impl ExperimentService for ExperimentSvc {
     async fn up(&self, req: Request<ExperimentUpRequest>) -> Result<Response<Job>, Status> {
+        // Host requirements first: refusing here costs nothing, and refusing halfway through
+        // provisioning strands a partly-built topology on a host that was never going to run it.
+        if let Some(mref) = req.get_ref().manifest.as_ref() {
+            let dir = crate::services::resolve_manifest_dir(mref).await;
+            crate::services::preflight_requires(dir.as_deref())?;
+        }
         let yaml = resolve_once(req.get_ref().manifest.as_ref()).await?;
         let model = vxedge_core::model::load_yaml(&yaml)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;

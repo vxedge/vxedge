@@ -72,6 +72,37 @@ pub(crate) async fn resolve_manifest_yaml(mref: &ManifestRef) -> Result<String, 
     resolve_manifest(Some(mref)).await.map(|(yaml, _, _)| yaml)
 }
 
+/// The workspace directory a `ManifestRef` names, if it names one. An inline manifest has no
+/// directory and therefore no `.vxp`.
+pub(crate) async fn resolve_manifest_dir(mref: &ManifestRef) -> Option<PathBuf> {
+    resolve_manifest(Some(mref))
+        .await
+        .ok()
+        .and_then(|(_, _, d)| d)
+}
+
+/// Refuse a workspace this host cannot run, **before** anything is provisioned.
+///
+/// Daemon-side on purpose: the host that matters is the one doing the provisioning, and a
+/// CLI-side check asks the wrong machine the moment `--endpoint` points elsewhere. An inline
+/// manifest carries no `.vxp`, so there is nothing to check and nothing is claimed.
+pub(crate) fn preflight_requires(dir: Option<&std::path::Path>) -> Result<(), Status> {
+    let Some(dir) = dir else { return Ok(()) };
+    let Ok(found) = vxedge_core::discover(dir) else {
+        // No `.vxp` is not an error here: `up` accepts a bare directory of documents, and
+        // `experiment` verbs already report a missing descriptor with their own message.
+        return Ok(());
+    };
+    found
+        .package
+        .requires
+        .check(
+            &found.package.id,
+            &vxedge_core::package::HostCapabilities::probe(),
+        )
+        .map_err(|e| Status::failed_precondition(e.to_string()))
+}
+
 async fn resolve_manifest(
     mref: Option<&ManifestRef>,
 ) -> Result<(String, String, Option<PathBuf>), Status> {
