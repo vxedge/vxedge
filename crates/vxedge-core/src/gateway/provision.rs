@@ -497,6 +497,115 @@ pub fn teardown_fiveg_uplink(sh: &Shell, bridge: &str) -> Result<(), NetOpsError
     sh.run_tolerate_missing("ip", &["link", "del", &format!("{bridge}.{vid}")])
 }
 
+/// One data-plane implementation: how a [`GatewayPlan`] is rendered onto a host, removed, and
+/// read back.
+///
+/// The plan is the contract. Everything above this seam — slice ids, VLAN ids, HTB class
+/// minors, interface names ([`crate::gateway::ifnames`]) — is decided in planning, so two
+/// implementations of this trait provision *the same topology* by different mechanisms. That is
+/// the property the phase-2 OVS variant needs: a campaign must be able to swap the data plane
+/// without any experiment changing, or the comparison measures two topologies rather than two
+/// mechanisms.
+///
+/// What an implementation owes:
+///
+/// - **Idempotence, both ways.** `apply` on a live topology is a no-op; `teardown` on an absent
+///   one likewise. Both are re-run constantly — `vxedge up` after a `zone down` is the normal
+///   path, not an edge case.
+/// - **`observe` never mutates**, and reports what is *there*, not what was asked for. It is the
+///   reconciler's read side and the honest half of `status`.
+/// - **No naming decisions.** Names come from the plan. An implementation that derives an
+///   interface name has forked a rule that must have exactly one owner.
+///
+/// **Known limit**: the 5G attachment helpers (`apply_fiveg_uplink`, `apply_fiveg_ue_routes`,
+/// `apply_fiveg_slice_qos`, `teardown_fiveg_uplink`) are still bridge-specific free functions
+/// below this seam. They join the trait when a second implementation needs them — inventing
+/// their shape now, with no OVS 5G path to check it against, would be guessing at an interface
+/// rather than extracting one.
+pub trait DataPlane {
+    /// The mechanism's name, as it would be written in a manifest or a results caveat.
+    fn name(&self) -> &'static str;
+
+    /// Bridge and trunk uplink. Everything else attaches to what this creates.
+    fn apply_links(&self, sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError>;
+
+    /// Per-slice VLANs on the trunk and the HTB queue tree on the uplink — the shared
+    /// bottleneck where slice contention is actually measured.
+    fn apply_slices(&self, sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError>;
+
+    /// One access port per device attachment, veth or tap per the plan.
+    fn apply_endpoints(&self, sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError>;
+
+    fn teardown(&self, sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError>;
+
+    fn observe(&self, sh: &Shell, plan: &GatewayPlan) -> Result<GatewayObservation, NetOpsError>;
+
+    /// The three stages in dependency order.
+    ///
+    /// They are separate trait methods rather than one opaque `apply` because the daemon
+    /// reports progress between them, and a seam that forces a caller to reach underneath it to
+    /// keep a feature is not a seam. The order is part of the contract, not a caller's choice.
+    fn apply(&self, sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
+        self.apply_links(sh, plan)?;
+        self.apply_slices(sh, plan)?;
+        self.apply_endpoints(sh, plan)?;
+        Ok(())
+    }
+}
+
+/// The Linux kernel bridge + VLAN filtering + tc HTB data plane — vxgateway's backend since
+/// phase 1, and the one every recorded number was measured on.
+pub struct KernelBridge;
+
+impl DataPlane for KernelBridge {
+    fn name(&self) -> &'static str {
+        "kernel-bridge"
+    }
+
+    fn apply_links(&self, sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
+        apply_links(sh, plan)
+    }
+
+    fn apply_slices(&self, sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
+        apply_slices(sh, plan)
+    }
+
+    fn apply_endpoints(&self, sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
+        apply_endpoints(sh, plan)
+    }
+
+    fn teardown(&self, sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
+        teardown(sh, plan)
+    }
+
+    fn observe(&self, sh: &Shell, plan: &GatewayPlan) -> Result<GatewayObservation, NetOpsError> {
+        observe(sh, plan)
+    }
+}
+
+/// The active data plane.
+///
+/// One implementation today, so this takes no argument: a selector with one option is a knob
+/// nobody can turn, and guessing whether it belongs on the manifest, the daemon or the plan is
+/// the kind of decision that is cheap once a second mechanism exists and expensive to unpick if
+/// guessed early. The OVS variant brings its selector with it.
+pub fn data_plane() -> &'static dyn DataPlane {
+    &KernelBridge
+}
+
+#[cfg(test)]
+mod seam_tests {
+    use super::*;
+
+    /// The seam must not have changed what provisioning does — it dispatches to the same
+    /// functions the netns integration test already exercises. This pins the wiring; the live
+    /// behaviour is that test's job.
+    #[test]
+    fn the_active_data_plane_is_the_kernel_bridge() {
+        assert_eq!(data_plane().name(), "kernel-bridge");
+    }
+}
+
 /// Full apply, in dependency order.
 pub fn apply(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
     apply_links(sh, plan)?;

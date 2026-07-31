@@ -12,4 +12,7 @@ pub mod provision;
 
 pub use netops::{NetOpsError, Shell};
 pub use plan::{GatewayPlan, PlanError};
-pub use provision::{GatewayObservation, SliceObservation, apply, observe, teardown};
+pub use provision::{
+    DataPlane, GatewayObservation, KernelBridge, SliceObservation, apply, data_plane, observe,
+    teardown,
+};

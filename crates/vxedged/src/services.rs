@@ -224,29 +224,38 @@ impl GatewaySvc {
                         let sh = shell.clone();
                         let pl = plan.clone();
                         blocking(move || {
-                            gateway::provision::apply_links(&sh, &pl).map_err(|e| e.to_string())
+                            gateway::data_plane()
+                                .apply_links(&sh, &pl)
+                                .map_err(|e| e.to_string())
                         })
                         .await?;
                         p.update(65, "applying slice VLANs + HTB queue tree");
                         let sh = shell.clone();
                         let pl = plan.clone();
                         blocking(move || {
-                            gateway::provision::apply_slices(&sh, &pl).map_err(|e| e.to_string())
+                            gateway::data_plane()
+                                .apply_slices(&sh, &pl)
+                                .map_err(|e| e.to_string())
                         })
                         .await?;
                         p.update(80, "attaching zone endpoints");
                         let sh = shell.clone();
                         let pl = plan.clone();
                         blocking(move || {
-                            gateway::provision::apply_endpoints(&sh, &pl).map_err(|e| e.to_string())
+                            gateway::data_plane()
+                                .apply_endpoints(&sh, &pl)
+                                .map_err(|e| e.to_string())
                         })
                         .await?;
                         p.update(90, "verifying observed state");
                         let sh = shell.clone();
                         let pl = plan.clone();
-                        let obs =
-                            blocking(move || gateway::observe(&sh, &pl).map_err(|e| e.to_string()))
-                                .await?;
+                        let obs = blocking(move || {
+                            gateway::data_plane()
+                                .observe(&sh, &pl)
+                                .map_err(|e| e.to_string())
+                        })
+                        .await?;
                         if !obs.fully_up() {
                             return Err(format!(
                                 "provisioning incomplete: bridge={} uplink={} endpoints={}/{}",
@@ -387,8 +396,12 @@ impl GatewaySvc {
                         p.update(60, "removing endpoints, uplink, bridge");
                         let sh = shell.clone();
                         let pl = plan.clone();
-                        blocking(move || gateway::teardown(&sh, &pl).map_err(|e| e.to_string()))
-                            .await?;
+                        blocking(move || {
+                            gateway::data_plane()
+                                .teardown(&sh, &pl)
+                                .map_err(|e| e.to_string())
+                        })
+                        .await?;
                         *state.lock().await = EdgeState::default();
                         Ok("vxgateway down — all gateway objects removed".to_string())
                     }
@@ -443,10 +456,12 @@ impl GatewayService for GatewaySvc {
             Some(plan) => {
                 let snssai_count = plan.snssai_slice_ids.len();
                 let shell = self.shell.clone();
-                let obs = tokio::task::spawn_blocking(move || gateway::observe(&shell, &plan))
-                    .await
-                    .map_err(|e| Status::internal(format!("observe task panicked: {e}")))?
-                    .map_err(|e| Status::internal(e.to_string()))?;
+                let obs = tokio::task::spawn_blocking(move || {
+                    gateway::data_plane().observe(&shell, &plan)
+                })
+                .await
+                .map_err(|e| Status::internal(format!("observe task panicked: {e}")))?
+                .map_err(|e| Status::internal(e.to_string()))?;
                 let slices: Vec<SliceStatus> = obs
                     .slices
                     .iter()

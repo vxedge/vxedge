@@ -860,6 +860,13 @@ exp-001 measurements).
 - [ ] mTLS + OIDC auth path; viewer/operator/admin roles
 - [ ] Harness `impairments` rendering: tc netem per link (rate cap, latency/jitter, loss —
       100/1000BASE-T1 emulation); manifest struct extension
+- [ ] **The seam is in** (2026-07-31): `DataPlane` — `apply_links`/`apply_slices`/
+      `apply_endpoints`/`teardown`/`observe`, with `KernelBridge` as the first implementation
+      and `data_plane()` the single selection point. The three apply stages are separate trait
+      methods because the daemon reports progress between them, and a seam a caller must reach
+      under to keep a feature is not a seam. Known limit, stated in the trait doc: the 5G
+      attachment helpers are still bridge-specific free functions and join the trait when a
+      second implementation needs them.
 - [ ] OVS data-plane variant: same GatewayPlan rendered via ovs-vsctl/OVSDB (kernel bridge
       remains the default backend)
 - [ ] Release binaries for vxedge/vxedged via cargo-dist (digest-recorded, §13)
