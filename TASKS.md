@@ -247,6 +247,31 @@ migrate without them, and those two are the last experiments before §6.1 can be
       Keep the bare-string form: it is right whenever no address is needed, and every existing
       workspace uses it.
 
+- [ ] **Where addresses belong — decided shape.** An address is a property of an *attachment*
+      (device × link), not of a device: a device on two slices has two of them, which is why §6.1
+      put `ip` on the iface rather than the node. So it goes on the link endpoint's object form.
+
+      But a *fixed* address is deployment policy, not vehicle structure — exp-001 declares none at
+      all and lets the campaign assign them, while exp-002 needs them because its three arms share
+      one vlan. So the split follows the one already in the workspace:
+
+      - `main.yaml` (the **test**) owns addressing policy: `network.slices[].subnet: 10.101.0.0/24`.
+      - `vehicle.yaml` (the **structure**) optionally pins a host address per attachment, when an
+        attachment must be reachable at a known address.
+
+      A vehicle with no pinned addresses stays reusable across experiments and slice subnets,
+      which is the property that makes "one vehicle, many baselines" real. Pinning everything in
+      the vehicle would quietly tie it to one experiment's addressing.
+
+- [ ] **`PartKind` is derived from the device backend, so a mismatch cannot be detected.**
+      A part *knows* what it is — a `zone/linux/stack/...` bundle is a bundle, a container part is
+      a container — and the device says how to run it. Deriving one from the other means a
+      baseline pointing a `libvirt` arm at a container image is unrepresentable rather than
+      rejected. Take the kind from the part (its vxparts class/layer, or an explicit field on the
+      baseline entry) and **validate it against the backend**, so a mismatch is an error with
+      both halves named. Matters most for H3, where the same function runs on three backends and
+      therefore needs three different parts.
+
 - [ ] **§6.0 needs a way to state device traversal order.** Devices live in a map, so traversal
       is sorted id, and endpoint names are positional. exp-002 declares `cont, microvm, libvirt`
       and sorts to `cont, libvirt, microvm` — `vzp1`/`vzp2` swap, and `run-exp-002.sh`, which
