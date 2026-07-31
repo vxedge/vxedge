@@ -41,7 +41,7 @@ use crate::jobs::{JobEngine, is_terminal, now_ms};
 /// RPC, with a `Status::internal("stored manifest no longer models")` arm for a failure that
 /// could only mean the daemon had corrupted its own state. Holding the value makes the active
 /// experiment a thing the daemon *knows* rather than a string it re-derives, and it is the
-/// precondition for typing the passthrough blocks.
+/// what let the experiment's `services`, `telemetry` and `results` blocks become typed fields.
 pub struct ActiveExperiment {
     pub model: vxedge_core::model::Experiment,
     /// The workspace this was built from. Bundles and relative part refs resolve against it, so
@@ -927,7 +927,7 @@ impl SvcSvc {
         let model = parse_to_model(&yaml)
             .map_err(|e| Status::invalid_argument(format!("workspace invalid: {e}")))?;
         let def = vxedge_core::services::ServiceDef::find(&model, service_type)
-            .map_err(|e| Status::invalid_argument(e.to_string()))?
+            .cloned()
             .ok_or_else(|| {
                 Status::not_found(format!(
                     "no `{service_type}` service declared under `services` in this experiment"

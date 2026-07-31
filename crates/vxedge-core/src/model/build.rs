@@ -59,6 +59,8 @@ pub enum ModelError {
          sensor, actuator or switch"
     )]
     UnknownRole { device: String, role: String },
+    #[error("the experiment's `{block}:` block is malformed: {detail}")]
+    MalformedBlock { block: &'static str, detail: String },
     #[error("`{field}` is {value}, which does not fit a {ty} (max {max})")]
     OutOfRange {
         field: String,
@@ -608,12 +610,34 @@ pub fn build(ws: &Workspace) -> Result<Experiment, ModelError> {
         })
         .unwrap_or_default();
 
-    let mut passthrough = BTreeMap::new();
-    for key in ["services", "telemetry", "results"] {
-        if let Some(v) = raw.get(key) {
-            passthrough.insert(key.to_string(), v.clone());
+    // Typed at build time, so a malformed block is one error against the document the author
+    // wrote rather than a surprise at `svc up`. These were the last untyped blocks in the model.
+    let services: BTreeMap<String, crate::services::ServiceDef> = match raw.get("services") {
+        Some(v) => {
+            serde_yaml_ng::from_value(v.clone()).map_err(|e| ModelError::MalformedBlock {
+                block: "services",
+                detail: e.to_string(),
+            })?
         }
-    }
+        None => BTreeMap::new(),
+    };
+    let telemetry = match raw.get("telemetry").and_then(|t| t.get("prometheus")) {
+        Some(p) => Telemetry {
+            scrape_targets: string_list(p, "scrape_targets"),
+            optional_scrape_targets: string_list(p, "optional_scrape_targets"),
+        },
+        None => Telemetry::default(),
+    };
+    let results = match raw.get("results") {
+        Some(r) => Results {
+            artifact_dir: r
+                .get("artifact_dir")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned),
+            upload: r.get("upload").and_then(|v| v.as_bool()).unwrap_or(false),
+        },
+        None => Results::default(),
+    };
 
     Ok(Experiment {
         id: exp.id.clone(),
@@ -626,8 +650,22 @@ pub fn build(ws: &Workspace) -> Result<Experiment, ModelError> {
         entities,
         traffic,
         method,
-        passthrough,
+        services,
+        telemetry,
+        results,
     })
+}
+
+fn string_list(spec: &Value, key: &str) -> Vec<String> {
+    spec.get(key)
+        .and_then(|v| v.as_sequence())
+        .map(|seq| {
+            seq.iter()
+                .filter_map(|v| v.as_str())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -905,6 +943,52 @@ parts: [{ ref: 'local/vxprobe:host-process', target_ids: fn-vm }]
             m.entities[0].functions["fn-vm"].part.as_ref().unwrap().kind,
             PartKind::Bundle
         );
+    }
+
+    /// The three blocks that used to be untyped `passthrough`. Typing them moved the error
+    /// from "at `svc up`, once per service" to "at build, once per workspace" — which is the
+    /// whole reason to type them.
+    #[test]
+    fn services_telemetry_and_results_are_typed_at_build_time() {
+        let ws = r#"
+kind: experiment
+id: e
+vehicles: [veh]
+network: { slices: [{ id: adas, mode: vlan, vlan: 101 }] }
+services:
+  ota:
+    id: ota-01
+    type: ota
+    image: { url: 'local/vxota:host-process', kind: container }
+    config: { artifacts: /tmp/store, listen: 127.0.0.1:9900 }
+telemetry:
+  prometheus:
+    scrape_targets: ["127.0.0.1:9801"]
+    optional_scrape_targets: ["127.0.0.1:9902"]
+results:
+  artifact_dir: results/e
+  upload: false
+---
+kind: vehicle
+id: veh
+devices: {}
+"#;
+        let m = load_yaml(ws).expect("valid workspace");
+        assert_eq!(m.services.len(), 1);
+        assert_eq!(m.services["ota"].id, "ota-01");
+        assert_eq!(m.telemetry.scrape_targets, vec!["127.0.0.1:9801"]);
+        assert_eq!(m.telemetry.optional_scrape_targets, vec!["127.0.0.1:9902"]);
+        assert_eq!(m.results.artifact_dir.as_deref(), Some("results/e"));
+        assert!(!m.results.upload);
+
+        // A malformed service is now a build error naming the block, not a surprise later.
+        let bad = ws.replace("    type: ota", "    type: nonsense");
+        match load_yaml(&bad) {
+            Err(crate::model::LoadError::Model(ModelError::MalformedBlock { block, .. })) => {
+                assert_eq!(block, "services")
+            }
+            other => panic!("expected MalformedBlock, got {other:?}"),
+        }
     }
 
     /// Every scaffolded template must satisfy every model invariant. If the generator can emit

@@ -197,8 +197,7 @@ impl Handles {
         p: &Progress,
     ) -> Result<String, String> {
         // Keyed by service *type* because that is what SvcService dispatches on.
-        let types = vxedge_core::services::ServiceDef::declared_types(model)
-            .map_err(|e| format!("services: {e}"))?;
+        let types = vxedge_core::services::ServiceDef::declared_types(model);
         if types.is_empty() {
             return Ok("no services declared".into());
         }

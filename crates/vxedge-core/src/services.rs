@@ -11,17 +11,15 @@
 //! meant finding it again per service.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 /// One entry of an experiment's `services:` block: what to run, and how it is packaged.
 ///
 /// Lives here rather than in a schema module because this is the only thing that reads it. The
-/// domain model carries `services` as untyped `passthrough` — a service is a runtime descriptor
-/// rather than part of the vehicle under test, so typing it in the model would put a
-/// deployment concern in the system model. [`ServiceDef::find`] is the one place raw YAML
-/// becomes this type.
+/// domain model owns the `services:` block — a service is a runtime descriptor rather than part
+/// of the vehicle under test, so it sits on the experiment beside `traffic` and `telemetry`,
+/// not on any entity. The type lives here because this module is what runs one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceDef {
@@ -67,40 +65,24 @@ pub enum ImageKind {
 impl ServiceDef {
     /// The service of `service_type` this experiment declares, if any.
     ///
-    /// Reads the model's `passthrough["services"]`, which is the experiment document's own
-    /// block verbatim. A malformed entry is an error rather than a miss: a typo'd `type:` that
-    /// silently meant "no such service" would surface as "you declared no ota service" while
-    /// one is sitting in the file.
-    /// Every service type this experiment declares, in declaration order — what
-    /// `experiment up` fans out over.
-    pub fn declared_types(
-        exp: &crate::model::Experiment,
-    ) -> Result<Vec<String>, ServiceBackendError> {
-        Ok(Self::all(exp)?
-            .into_iter()
+    /// Every service type this experiment declares — what `experiment up` fans out over.
+    pub fn declared_types(exp: &crate::model::Experiment) -> Vec<String> {
+        exp.services
+            .values()
             .map(|d| d.service_type.as_str().to_string())
-            .collect())
+            .collect()
     }
 
-    fn all(exp: &crate::model::Experiment) -> Result<Vec<Self>, ServiceBackendError> {
-        let Some(raw) = exp.passthrough.get("services") else {
-            return Ok(Vec::new());
-        };
-        let defs: BTreeMap<String, ServiceDef> =
-            serde_yaml_ng::from_value(raw.clone()).map_err(|e| ServiceBackendError::BadConfig {
-                svc: "services".to_string(),
-                detail: e.to_string(),
-            })?;
-        Ok(defs.into_values().collect())
-    }
-
-    pub fn find(
-        exp: &crate::model::Experiment,
-        service_type: &str,
-    ) -> Result<Option<Self>, ServiceBackendError> {
-        Ok(Self::all(exp)?
-            .into_iter()
-            .find(|d| d.service_type.as_str() == service_type))
+    /// The service of `service_type` this experiment declares, if any.
+    ///
+    /// No parsing: the model typed `services:` at build time, so a malformed block was already
+    /// reported against the document the author wrote. This used to deserialize raw YAML on
+    /// every call, which meant a typo'd `type:` surfaced at `svc up` — once per service — with
+    /// the file long out of sight.
+    pub fn find<'a>(exp: &'a crate::model::Experiment, service_type: &str) -> Option<&'a Self> {
+        exp.services
+            .values()
+            .find(|d| d.service_type.as_str() == service_type)
     }
 }
 

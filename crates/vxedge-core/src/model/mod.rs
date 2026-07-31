@@ -347,10 +347,34 @@ pub struct Experiment {
     pub uplink_bandwidth_bps: Option<u64>,
     pub traffic: Vec<TrafficProfile>,
     pub method: Method,
-    /// Everything §6.0 carries that the model does not yet interpret — telemetry, results,
-    /// services. Kept as raw YAML rather than dropped, so the daemon can still act on it while
-    /// the model grows to cover it. Each block that graduates to a typed field leaves here.
-    pub passthrough: BTreeMap<String, serde_yaml_ng::Value>,
+    /// Services the experiment runs alongside the vehicle (OTA, telemetry). Typed and validated
+    /// at build time rather than re-parsed per use: `ServiceDef::find` used to deserialize the
+    /// raw block on every call, so a malformed `services:` surfaced at `svc up` rather than at
+    /// validate, once per service instead of once per workspace.
+    pub services: BTreeMap<String, crate::services::ServiceDef>,
+    pub telemetry: Telemetry,
+    pub results: Results,
+}
+
+/// What to collect while the experiment runs.
+///
+/// Scrape targets live here and nowhere else. `vxtelemetry` reads them from the workspace for
+/// the same reason: a second copy in `services.telemetry.config` would be a second place to
+/// edit that can silently disagree with the first.
+#[derive(Debug, Clone, Default)]
+pub struct Telemetry {
+    pub scrape_targets: Vec<String>,
+    /// Targets that are legitimately absent under some arms — a burst driver's exporter that
+    /// only exists while that arm is active. A failed scrape here never counts against
+    /// completeness (`ARCHITECTURE.md` §6); exp-003's baseline arm is why the distinction
+    /// exists.
+    pub optional_scrape_targets: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Results {
+    pub artifact_dir: Option<String>,
+    pub upload: bool,
 }
 
 #[derive(Debug, Clone, Default)]
