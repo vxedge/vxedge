@@ -445,7 +445,14 @@ exp-001 measurements).
 - [ ] WireGuard `ota`/telemetry slice transport (§7) — v1's `config.listen` must be an
       address zone nodes can already reach (typically the gateway's own bridge address)
       since there's no encrypted overlay yet
-- [ ] `telemetry` service type in the generic process backend (today: CLI-driven only)
+- [x] `telemetry` service type in the generic process backend (2026-07-31) — landed with the
+      `ServiceBackend` seam: a backend translates a `ServiceDef` into a command line, and the
+      supervision every service shares (idempotent up, pidfile, child reaping, graceful-then-
+      forceful down) stays in one place. Telemetry spawns `vxtelemetry ingest --workspace <ws>`
+      and reads its scrape targets from the workspace rather than restating them in
+      `services.telemetry.config`, which would be a second place to edit. `--vxtelemetry-bin`
+      joins `--vxota-bin` on vxedged, both behind a `ServiceBinaries` struct so the next service
+      type adds a field rather than a parameter to every caller.
 
 ## 4. Phase 2
 

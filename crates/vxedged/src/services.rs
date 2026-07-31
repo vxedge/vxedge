@@ -868,9 +868,10 @@ pub struct SvcSvc {
     pub engine: JobEngine,
     pub audit: Arc<Audit>,
     pub runtime_dir: PathBuf,
-    /// Path to the `vxota` binary the process backend spawns (v1 co-locates
-    /// the service with vxedged — see ARCHITECTURE.md §8).
-    pub vxota_bin: String,
+    /// Binaries the process backend spawns (v1 co-locates every service with vxedged — see
+    /// ARCHITECTURE.md §8). A struct rather than one path per service, so a new service type
+    /// adds a field instead of a parameter to every caller.
+    pub bins: vxedge_core::services::ServiceBinaries,
 }
 
 impl SvcSvc {
@@ -878,13 +879,13 @@ impl SvcSvc {
         &self,
         service_type: &str,
         experiment: Option<&ManifestRef>,
-    ) -> Result<(vxedge_core::services::ServiceDef, String), Status> {
+    ) -> Result<(vxedge_core::services::ServiceDef, String, PathBuf), Status> {
         if service_type.is_empty() {
             return Err(Status::invalid_argument(
                 "service_type is required (\"ota\" or \"telemetry\")",
             ));
         }
-        let (yaml, sha256, _dir) = resolve_manifest(experiment).await?;
+        let (yaml, sha256, dir) = resolve_manifest(experiment).await?;
         let model = parse_to_model(&yaml)
             .map_err(|e| Status::invalid_argument(format!("workspace invalid: {e}")))?;
         let def = vxedge_core::services::ServiceDef::find(&model, service_type)
@@ -894,7 +895,12 @@ impl SvcSvc {
                     "no `{service_type}` service declared under `services` in this experiment"
                 ))
             })?;
-        Ok((def, sha256))
+        // The workspace dir travels with the def: a telemetry service reads its scrape targets
+        // from the workspace rather than from its own config, so the backend needs to know
+        // which one is active. An inline manifest has no directory; the runtime dir stands in,
+        // and telemetry will fail honestly there rather than scrape a workspace that is not on
+        // this host.
+        Ok((def, sha256, dir.unwrap_or_else(|| self.runtime_dir.clone())))
     }
 }
 
@@ -902,14 +908,14 @@ impl SvcSvc {
 impl SvcService for SvcSvc {
     async fn up(&self, req: Request<SvcUpRequest>) -> Result<Response<Job>, Status> {
         let req = req.into_inner();
-        let (def, sha256) = self
+        let (def, sha256, workspace_dir) = self
             .service_def(&req.service_type, req.experiment.as_ref())
             .await?;
         self.audit.record(
             "SvcService.Up",
             serde_json::json!({ "service_type": req.service_type, "manifest_sha256": sha256 }),
         );
-        let vxota_bin = self.vxota_bin.clone();
+        let bins = self.bins.clone();
         let runtime_dir = self.runtime_dir.clone();
         let service_type = req.service_type.clone();
         let job = self
@@ -917,7 +923,7 @@ impl SvcService for SvcSvc {
             .submit("svc.up", move |p| async move {
                 p.update(30, &format!("starting {service_type} service"));
                 let msg = blocking(move || {
-                    vxedge_core::services::svc_up(&def, &vxota_bin, &runtime_dir)
+                    vxedge_core::services::svc_up(&def, &bins, &workspace_dir, &runtime_dir)
                         .map_err(|e| e.to_string())
                 })
                 .await?;

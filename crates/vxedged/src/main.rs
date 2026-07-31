@@ -45,6 +45,11 @@ struct Args {
     #[arg(long, default_value = "vxota", env = "VXEDGE_VXOTA_BIN")]
     vxota_bin: String,
 
+    /// Path to the `vxtelemetry` binary the service backend spawns for `telemetry` services.
+    /// Same co-location caveat as `--vxota-bin`.
+    #[arg(long, default_value = "vxtelemetry", env = "VXEDGE_VXTELEMETRY_BIN")]
+    vxtelemetry_bin: String,
+
     /// Path to the `vxprobe` binary `TrafficService` spawns for round-trip
     /// probe profiles (`traffic_profiles.<id>.pps`). Default assumes it's
     /// on PATH.
@@ -132,7 +137,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         engine: engine.clone(),
         audit: audit.clone(),
         runtime_dir: args.runtime_dir.clone(),
-        vxota_bin: args.vxota_bin.clone(),
+        bins: vxedge_core::services::ServiceBinaries {
+            vxota: args.vxota_bin.clone(),
+            vxtelemetry: args.vxtelemetry_bin.clone(),
+        },
     });
 
     Server::builder()
