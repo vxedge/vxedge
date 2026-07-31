@@ -303,7 +303,13 @@ Two more defects surfaced while migrating, both fixed:
 
 None block the critical path; all are consistency debts this session created or exposed.
 
-- [ ] **Two different answers to "which workspace was this".** The daemon hashes the
+- [x] **Two different answers to "which workspace was this"** — settled 2026-08-01, one rule in
+      `ARCHITECTURE.md` §13: every file the experiment is made of, path and bytes, sorted,
+      excluding `results/`. Implemented in `Workspace::content_sha256` and independently in
+      `vxtelemetry`, both pinned to the same test vector. The daemon uses it for audit records;
+      the archive records it as `workspace_sha256`. Original text below.
+
+      **Two different answers to "which workspace was this".** The daemon hashes the
       *concatenated* `*.yaml` text it read (`services::resolve_manifest`); `vxtelemetry` hashes
       each file's name and bytes, `.vxp` included (`workspace_view::content_sha256`). So an
       audit record's `manifest_sha256` and its archive's `workspace_sha256` disagree for the
