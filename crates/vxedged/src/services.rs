@@ -24,6 +24,7 @@ use vxedge_api::v1::{
     ZoneApplyRequest, ZoneDownRequest, ZoneListRequest, ZoneListResponse, ZoneRemoveRequest,
     ZoneUpRequest,
 };
+use vxedge_core::Workspace;
 use vxedge_core::fiveg::{self, FiveGLifecycleConfig, FiveGPlan};
 use vxedge_core::gateway::{self, GatewayPlan, Shell};
 use vxedge_core::traffic::{self, TrafficPlan};
@@ -128,7 +129,16 @@ async fn resolve_manifest(
             ));
         }
     };
-    let sha256 = hex::encode(sha2::Sha256::digest(yaml.as_bytes()));
+    // The workspace identity rule (`ARCHITECTURE.md` §13), not a hash of the concatenated
+    // documents: a sandbox's local parts, assets and scripts are part of what ran, and an
+    // identity that ignored them would call two different experiments the same. An inline
+    // manifest has no directory, so it falls back to hashing what it was actually given.
+    let sha256 = match &dir {
+        Some(root) => Workspace::content_sha256(root).map_err(|e| {
+            Status::invalid_argument(format!("workspace `{}`: {e}", root.display()))
+        })?,
+        None => hex::encode(sha2::Sha256::digest(yaml.as_bytes())),
+    };
     if !mref.sha256.is_empty() && mref.sha256 != sha256 {
         return Err(Status::failed_precondition(format!(
             "manifest checksum mismatch: expected {}, got {sha256}",
