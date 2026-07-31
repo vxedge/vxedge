@@ -27,9 +27,9 @@
 //!
 //! A shortened stem keeps a readable head and a hash of the **whole** id, so it stays a pure
 //! function of that id alone. The mapping is never left implicit: `GatewayPlan` carries the
-//! device id on every endpoint, `NodePlan` joins on it, and both are printed by `plan-diff` and
-//! the job log, so "which interface is this arm" is always answerable without recomputing a hash
-//! by hand.
+//! device id on every endpoint, `NodePlan` joins on it, and `vxedge zone list` prints each
+//! device's `port=` and `peer=` — so "which interface is this arm" is always answerable without
+//! recomputing a hash by hand.
 
 /// `IFNAMSIZ` is 16 bytes *including* the NUL terminator.
 pub const IFNAME_MAX: usize = 15;

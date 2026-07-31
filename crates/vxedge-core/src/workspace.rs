@@ -39,9 +39,9 @@ pub enum WorkspaceError {
     Invalid(Vec<WorkspaceValidationError>),
     #[error(
         "`{}` is a §6.{} manifest (it declares `{key}:` and no `kind:`), which stopped being a \
-         provisioning input on 2026-07-31. Point this at the experiment's §6.0 workspace \
-         directory instead — `vxedge manifest validate` still checks the old shape if you need \
-         it for a renderer.",
+         provisioning input on 2026-07-31 and was deleted. Point this at the experiment's §6.0 \
+         workspace directory instead; if this file is a frozen manifest kept as provenance, \
+         read it at the `v0.1.0` tag, where the schema it was written to still exists.",
         .path.display(),
         if .key == "vehicle" { "2" } else { "1" }
     )]
