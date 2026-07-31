@@ -261,9 +261,22 @@ enum ExperimentCmd {
     /// Load and cross-check the workspace here (local — no daemon, no network).
     Validate,
     /// Bring the workspace here up.
-    Up,
+    Up {
+        /// Restrict to specific stages, repeatable (default: all, in dependency order).
+        ///
+        /// A campaign frequently wants a subset. exp-001 measures on the host-side veth peers
+        /// and never starts its zones; exp-002's isolation contract is one packaging arm at a
+        /// time, so it takes `--stage gateway` and then brings each arm up with
+        /// `vxedge zone up --vxid <device>`.
+        #[arg(long = "stage", value_enum)]
+        stages: Vec<StageArg>,
+    },
     /// Tear the workspace here down.
-    Down,
+    Down {
+        /// Restrict to specific stages, repeatable (default: all, in reverse order).
+        #[arg(long = "stage", value_enum)]
+        stages: Vec<StageArg>,
+    },
     /// Show status for the workspace here.
     Status,
 }
@@ -281,6 +294,23 @@ impl From<TemplateArg> for vxedge_core::Template {
         match value {
             TemplateArg::Minimal => vxedge_core::Template::Minimal,
             TemplateArg::Slicing => vxedge_core::Template::Slicing,
+        }
+    }
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum StageArg {
+    Gateway,
+    Zones,
+    Services,
+}
+
+impl StageArg {
+    fn as_proto(self) -> i32 {
+        match self {
+            StageArg::Gateway => vxedge_api::v1::ExperimentStage::Gateway as i32,
+            StageArg::Zones => vxedge_api::v1::ExperimentStage::Zones as i32,
+            StageArg::Services => vxedge_api::v1::ExperimentStage::Services as i32,
         }
     }
 }
@@ -640,7 +670,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // The daemon receives the workspace *directory* and lowers it itself. The CLI
             // never learns that §6.1 exists — which is the point of §6.0 being the only
             // authored schema.
-            ExperimentCmd::Up | ExperimentCmd::Down | ExperimentCmd::Status => {
+            ExperimentCmd::Up { .. } | ExperimentCmd::Down { .. } | ExperimentCmd::Status => {
                 let found = vxedge_core::discover(&here()?)?;
                 let workspace = found.root.to_string_lossy().to_string();
                 let channel = connect(&cli.endpoint).await?;
@@ -659,19 +689,27 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             println!("  {} [{}] {}", c.vxid, c.state, c.detail);
                         }
                     }
-                    ExperimentCmd::Up => {
+                    ExperimentCmd::Up { stages } => {
                         let job = exp
                             .up(ExperimentUpRequest {
                                 manifest: manifest_ref(&Some(workspace)),
+                                stages: stages.iter().map(|s| s.as_proto()).collect(),
                             })
                             .await?
                             .into_inner();
                         watch_job(channel, job, cli.json).await?;
                     }
                     _ => {
+                        let stages = match cmd {
+                            ExperimentCmd::Down { stages } => {
+                                stages.iter().map(|s| s.as_proto()).collect()
+                            }
+                            _ => Vec::new(),
+                        };
                         let job = exp
                             .down(ExperimentDownRequest {
                                 manifest: manifest_ref(&Some(workspace)),
+                                stages,
                             })
                             .await?
                             .into_inner();

@@ -35,10 +35,10 @@ use vxedge_api::v1::gateway_service_server::GatewayService;
 use vxedge_api::v1::svc_service_server::SvcService;
 use vxedge_api::v1::zone_service_server::ZoneService;
 use vxedge_api::v1::{
-    ExperimentDownRequest, ExperimentStatus, ExperimentStatusRequest, ExperimentUpRequest,
-    GatewayDownRequest, GatewayStatusRequest, GatewayUpRequest, Job, JobState, ManifestRef,
-    ResourceKind, ResourceState, ResourceStatus, SvcDownRequest, SvcUpRequest, VxidRef,
-    ZoneDownRequest, ZoneListRequest, ZoneUpRequest, manifest_ref::Source,
+    ExperimentDownRequest, ExperimentStage, ExperimentStatus, ExperimentStatusRequest,
+    ExperimentUpRequest, GatewayDownRequest, GatewayStatusRequest, GatewayUpRequest, Job, JobState,
+    ManifestRef, ResourceKind, ResourceState, ResourceStatus, SvcDownRequest, SvcUpRequest,
+    VxidRef, ZoneDownRequest, ZoneListRequest, ZoneUpRequest, manifest_ref::Source,
 };
 
 use crate::audit::Audit;
@@ -230,6 +230,12 @@ impl Handles {
     }
 }
 
+/// Which stages a request asked for. Empty means all of them, which is what every caller that
+/// predates staging sends — so the default stays "the whole experiment".
+fn wants(stages: &[i32], stage: ExperimentStage) -> bool {
+    stages.is_empty() || stages.contains(&(stage as i32))
+}
+
 #[tonic::async_trait]
 impl ExperimentService for ExperimentSvc {
     async fn up(&self, req: Request<ExperimentUpRequest>) -> Result<Response<Job>, Status> {
@@ -248,18 +254,28 @@ impl ExperimentService for ExperimentSvc {
         );
         let id = model.id.clone();
         let svc = self.handles.clone();
+        let stages = req.get_ref().stages.clone();
         let job = self
             .handles
             .engine
             .submit("experiment.up", move |p| async move {
-                svc.stage_gateway(&yaml, true, &p).await?;
-                let zones = svc.stage_zones(true, &p).await?;
-                let services = svc.stage_services(&model, &yaml, true, &p).await?;
+                let mut done: Vec<String> = Vec::new();
+                if wants(&stages, ExperimentStage::Gateway) {
+                    svc.stage_gateway(&yaml, true, &p).await?;
+                    done.push("gateway".to_string());
+                }
+                if wants(&stages, ExperimentStage::Zones) {
+                    done.push(svc.stage_zones(true, &p).await?);
+                }
+                if wants(&stages, ExperimentStage::Services) {
+                    done.push(svc.stage_services(&model, &yaml, true, &p).await?);
+                }
                 // Said explicitly, because an engineer expecting `up` to have started the load
                 // would otherwise sit waiting for numbers that are not coming.
                 Ok(format!(
-                    "experiment `{id}` up — gateway, {zones}, {services}. \
-                     Traffic is not started by `up`: run `vxedge traffic up`."
+                    "experiment `{id}` up — {}. \
+                     Traffic is not started by `up`: run `vxedge traffic up`.",
+                    done.join(", ")
                 ))
             })
             .await;
@@ -276,6 +292,7 @@ impl ExperimentService for ExperimentSvc {
         );
         let id = model.id.clone();
         let svc = self.handles.clone();
+        let stages = req.get_ref().stages.clone();
         let job = self
             .handles
             .engine
@@ -284,13 +301,19 @@ impl ExperimentService for ExperimentSvc {
                 // strands whatever came after it. Collect failures, tear the rest down anyway,
                 // and report everything that went wrong.
                 let mut failures: Vec<String> = Vec::new();
-                if let Err(e) = svc.stage_services(&model, &yaml, false, &p).await {
+                if wants(&stages, ExperimentStage::Services)
+                    && let Err(e) = svc.stage_services(&model, &yaml, false, &p).await
+                {
                     failures.push(e);
                 }
-                if let Err(e) = svc.stage_zones(false, &p).await {
+                if wants(&stages, ExperimentStage::Zones)
+                    && let Err(e) = svc.stage_zones(false, &p).await
+                {
                     failures.push(e);
                 }
-                if let Err(e) = svc.stage_gateway(&yaml, false, &p).await {
+                if wants(&stages, ExperimentStage::Gateway)
+                    && let Err(e) = svc.stage_gateway(&yaml, false, &p).await
+                {
                     failures.push(e);
                 }
                 if failures.is_empty() {

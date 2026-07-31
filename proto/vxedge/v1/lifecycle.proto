@@ -188,12 +188,29 @@ service VehicleService {
 // Experiment & Traffic
 // ---------------------------------------------------------------------------
 
+// One stage of bringing an experiment up. Named because a campaign frequently wants a
+// *subset*: exp-001 measures on the host-side veth peers and deliberately never starts its
+// zones, and exp-002's isolation contract is exactly one packaging arm running at a time, so
+// an all-or-nothing `up` would start all three and reintroduce the concurrent-guest CPU
+// contention that invalidated exp-002b's first campaign.
+enum ExperimentStage {
+  EXPERIMENT_STAGE_UNSPECIFIED = 0;
+  EXPERIMENT_STAGE_GATEWAY = 1;
+  EXPERIMENT_STAGE_ZONES = 2;
+  EXPERIMENT_STAGE_SERVICES = 3;
+}
+
 message ExperimentUpRequest {
   ManifestRef manifest = 1;
+  // Restrict to specific stages (empty = all, in dependency order). Individual devices are
+  // still addressed with ZoneService.Up, which is how a campaign runs one arm at a time.
+  repeated ExperimentStage stages = 2;
 }
 
 message ExperimentDownRequest {
   ManifestRef manifest = 1;
+  // Restrict to specific stages (empty = all, in reverse dependency order).
+  repeated ExperimentStage stages = 2;
 }
 
 message ExperimentStatusRequest {
