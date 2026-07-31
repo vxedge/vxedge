@@ -1302,6 +1302,64 @@ parts:
         fs::remove_dir_all(&root).ok();
     }
 
+    /// The sandbox layout, locked in. A workspace owns `parts/`, `assets/`, `tools/`,
+    /// `scripts/` and `results/`, and none of them are workspace *documents* — a `part.yaml`
+    /// inside `parts/` describes a loadable, not an experiment, and absorbing it would make a
+    /// sandbox invalid the moment it carried its own parts.
+    #[test]
+    fn sandbox_subdirectories_are_content_not_documents() {
+        let root = workspace(
+            "sandbox",
+            &[
+                ("main.yaml", GOOD_EXPERIMENT),
+                ("car1.yaml", GOOD_VEHICLE),
+                ("parts.yaml", GOOD_BASELINE),
+            ],
+        );
+        for (dir, name, body) in [
+            (
+                "parts",
+                "part.yaml",
+                "kind: experiment
+id: a-loadable
+",
+            ),
+            (
+                "assets",
+                "scenario.yaml",
+                "kind: vehicle
+id: not-a-vehicle
+",
+            ),
+            (
+                "tools",
+                "config.yaml",
+                "kind: baseline
+id: not-a-baseline
+",
+            ),
+            (
+                "scripts",
+                "helper.yaml",
+                "kind: experiment
+id: stray
+",
+            ),
+        ] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+            fs::write(root.join(dir).join(name), body).unwrap();
+        }
+        let ws = Workspace::load(&root).unwrap();
+        assert_eq!(
+            ws.experiments.len(),
+            1,
+            "a subdirectory joined the workspace"
+        );
+        assert_eq!(ws.vehicles.len(), 1);
+        assert_eq!(ws.validate(), vec![], "{:?}", ws.validate());
+        fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn results_directory_is_not_absorbed_into_the_workspace() {
         // Non-recursive load: a results archive containing YAML must not join the experiment.

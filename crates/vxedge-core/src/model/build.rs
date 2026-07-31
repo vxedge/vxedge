@@ -717,7 +717,11 @@ mod tests {
         let e = &m.entities[0];
         let f = e.functions.get("adas").expect("declared function");
         assert_eq!(f.deployed_on, "zonefl");
-        assert!(f.part.as_ref().unwrap().reference.contains("probe-bundle"));
+        let part = f.part.as_ref().expect("the baseline targets this function");
+        assert!(part.reference.contains("probe"), "{}", part.reference);
+        // The template states the kind, and it agrees with the device's container backend —
+        // a bundle-named part on a container device is the pairing the scaffold used to teach.
+        assert_eq!(part.kind, PartKind::Container);
         assert_eq!(e.host_of("adas").unwrap().id, "zonefl");
         std::fs::remove_dir_all(&tmp).ok();
     }

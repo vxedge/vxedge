@@ -87,6 +87,9 @@ impl std::str::FromStr for Template {
 pub struct WorkspaceFile {
     pub path: PathBuf,
     pub contents: String,
+    /// Written with the owner-execute bit. `scripts/run.sh` is the only such file today; a
+    /// campaign script that arrives non-executable is a papercut every recipient hits.
+    pub executable: bool,
 }
 
 /// A planned workspace. Pure data: building one performs no I/O and touches no filesystem.
@@ -133,29 +136,62 @@ impl WorkspacePlan {
             WorkspaceFile {
                 path: PathBuf::from(format!("{id}.vxp")),
                 contents: vxp(id, template),
+                executable: false,
             },
             WorkspaceFile {
                 path: PathBuf::from("main.yaml"),
                 contents: main_yaml(id, template),
+                executable: false,
             },
             // `vehicle.yaml`, not `vehicle.yaml`: the name is purely pedagogical (documents route
             // by `kind`, never by path) and `car1` teaches nothing about what the file is for.
             WorkspaceFile {
                 path: PathBuf::from("vehicle.yaml"),
                 contents: vehicle_yaml(template),
+                executable: false,
             },
             WorkspaceFile {
                 path: PathBuf::from("parts.yaml"),
                 contents: parts_yaml(template),
+                executable: false,
             },
             WorkspaceFile {
                 path: PathBuf::from("README.md"),
                 contents: readme(id, template),
+                executable: false,
+            },
+            // The campaign itself. An experiment that cannot be run without knowing which
+            // shared script to invoke is not shareable; this one resolves its own workspace
+            // from its own location, so the sandbox works wherever it is unzipped.
+            WorkspaceFile {
+                path: PathBuf::from("scripts/run.sh"),
+                contents: run_sh(id),
+                executable: true,
+            },
+            // The rest of the sandbox. Directories rather than files, because what goes in them
+            // is the experiment's own: a local loadable, a scenario asset, an analysis tool.
+            // Each carries a README rather than a bare .gitkeep — an empty directory with no
+            // explanation is a directory people put the wrong thing in.
+            WorkspaceFile {
+                path: PathBuf::from("parts/README.md"),
+                contents: parts_dir_readme(),
+                executable: false,
+            },
+            WorkspaceFile {
+                path: PathBuf::from("assets/README.md"),
+                contents: assets_dir_readme(),
+                executable: false,
+            },
+            WorkspaceFile {
+                path: PathBuf::from("tools/README.md"),
+                contents: tools_dir_readme(),
+                executable: false,
             },
             // Keeps the results directory in place before the first run, and in git.
             WorkspaceFile {
                 path: PathBuf::from("results/.gitkeep"),
                 contents: String::new(),
+                executable: false,
             },
         ];
 
@@ -193,10 +229,127 @@ impl WorkspacePlan {
                 path: target.clone(),
                 source,
             })?;
+            #[cfg(unix)]
+            if file.executable {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).map_err(
+                    |source| ScaffoldError::Io {
+                        path: target.clone(),
+                        source,
+                    },
+                )?;
+            }
         }
 
         Ok(root)
     }
+}
+
+/// The campaign runner every sandbox ships with.
+///
+/// A working skeleton, not a placeholder: it resolves its own workspace from its own location
+/// (so the sandbox runs wherever it is unzipped), refuses politely without the privileges
+/// provisioning needs, and drives `vxedge experiment up|down` rather than re-implementing the
+/// daemon's sequence in bash. The knobs at the top are *method* — repetitions, warmup, window —
+/// which is the half of a campaign that genuinely belongs to the experiment.
+fn run_sh(id: &str) -> String {
+    format!(
+        r#"#!/usr/bin/env bash
+# {id} — campaign runner.
+#
+# Self-contained: this script resolves the workspace from its own location, so the experiment
+# runs wherever it is unpacked. Provisioning is `vxedge experiment up`; what stays here is the
+# method — how many repetitions, how long to warm up, how long to measure.
+#
+#   sudo -E env "PATH=$PATH" ./scripts/run.sh [--quick]
+set -euo pipefail
+
+WS="$(cd "$(dirname "${{BASH_SOURCE[0]}}")/.." && pwd)"
+VXEDGE="${{VXEDGE:-vxedge}}"
+
+QUICK=0
+for arg in "$@"; do case "$arg" in
+  --quick) QUICK=1 ;;
+  *) echo "error: unknown argument '$arg' (supported: --quick)" >&2; exit 1 ;;
+esac; done
+
+# --- method -----------------------------------------------------------------
+# --quick is pipeline validation only. Its sample counts are below tail-percentile
+# support, so its numbers must never be reported as results.
+if [[ $QUICK -eq 1 ]]; then
+  REPS=1; WARMUP_S=3; WINDOW_S=12
+else
+  REPS=5; WARMUP_S=10; WINDOW_S=60
+fi
+
+if [[ $(id -u) -ne 0 ]]; then
+  echo "error: provisioning needs CAP_NET_ADMIN — sudo -E env \"PATH=\$PATH\" $0" >&2
+  exit 1
+fi
+command -v "$VXEDGE" >/dev/null || {{ echo "error: vxedge not on PATH (set VXEDGE=/path/to/vxedge)" >&2; exit 1; }}
+
+RESULTS="$WS/results/$( [[ $QUICK -eq 1 ]] && echo quick || date +%Y-%m-%d )"
+mkdir -p "$RESULTS"
+
+cleanup() {{ "$VXEDGE" --chdir "$WS" experiment down >/dev/null 2>&1 || true; }}
+trap cleanup EXIT
+
+for rep in $(seq 1 "$REPS"); do
+  echo "== rep$rep: experiment up"
+  "$VXEDGE" --chdir "$WS" experiment up
+
+  echo "   warmup ${{WARMUP_S}}s"
+  sleep "$WARMUP_S"
+
+  echo "   measuring ${{WINDOW_S}}s"
+  "$VXEDGE" --chdir "$WS" traffic up
+  sleep "$WINDOW_S"
+  "$VXEDGE" --chdir "$WS" traffic down
+
+  # Collection: point vxtelemetry at this workspace; the archive carries the workspace itself,
+  # so a result is re-runnable from what is inside it.
+  if command -v vxtelemetry >/dev/null; then
+    vxtelemetry collect --workspace "$WS" --ingest-dir "$WS/results/.ingest" \
+      --out "$RESULTS/rep$rep.zip"
+  fi
+
+  "$VXEDGE" --chdir "$WS" experiment down
+done
+
+echo "== done: $RESULTS"
+"#
+    )
+}
+
+fn parts_dir_readme() -> String {
+    "# parts/ — this experiment's own loadables\n\n\
+     Local parts live here: a guest bundle, a container context, a config layer this experiment\n\
+     needs and nothing else does. `parts.yaml` references them by relative path\n\
+     (`./parts/my-bundle`), which is a *local* ref and needs no digest — it is content-hashed\n\
+     into the results archive instead.\n\n\
+     Keeping them inside the sandbox is what makes the experiment shareable: a workspace whose\n\
+     parts live three directories up is not something anyone can unzip and run.\n\n\
+     A part that outgrows one experiment belongs in `vxparts`, published and digest-pinned.\n\
+     That is a promotion, not a move: swap the relative ref for the published one.\n"
+        .to_string()
+}
+
+fn assets_dir_readme() -> String {
+    "# assets/ — inputs that are not software\n\n\
+     Scenario files, recorded traces, sensor captures, a CARLA map — anything the experiment\n\
+     reads that is not a loadable and not a manifest.\n\n\
+     Large binaries do not belong in git. Keep the small ones here; for the rest, keep a\n\
+     fetch script in `tools/` and the checksum here, so what ran is still identifiable.\n"
+        .to_string()
+}
+
+fn tools_dir_readme() -> String {
+    "# tools/ — analysis and helpers for this experiment\n\n\
+     The notebook or script that turns this experiment's archives into its table, plus anything\n\
+     else specific to it. Shared analysis belongs in the repo's own notebooks; what lives here\n\
+     is what only this experiment needs.\n\n\
+     `scripts/run.sh` runs the campaign; `tools/` is for everything after it.\n"
+        .to_string()
 }
 
 fn vxp(id: &str, template: Template) -> String {
@@ -344,13 +497,21 @@ fn parts_yaml(template: Template) -> String {
          # A published ref is pinned by digest; a local ref needs none — it is content-hashed\n\
          # into the results archive instead. So a local run is reproducible for you, and\n\
          # publishing is what makes it reproducible for anyone else.\n\
+         #\n\
+         # `kind:` says what a loadable *is*, and it is checked against the device's `backend:`\n\
+         # — a container backend boots a container image, libvirt and qemu-microvm boot a guest\n\
+         # bundle. State it wherever the ref does not: a published vxparts ref names the kind of\n\
+         # node a part loads onto, not how it is packaged.\n\
          parts:\n\
-         \x20 - ref: ghcr.io/vxedge/parts/zone/linux/stack/probe-bundle:0.1.0\n\
+         \x20 - ref: ghcr.io/vxedge/parts/agent/linux/app/probe:0.1.0\n\
          \x20   digest: sha256:33c9c8d8625bd5c6d1f4d3d0c561fdaa930e057fcd1fb24fb3badb402f25429d\n\
+         \x20   kind: container            # these devices run `backend: container`\n\
          \x20   target_ids: {targets}     # one declaration, however many nodes share the part\n\n\
-         \x20 - ref: ./images/hpc-reflector\n\
+         \x20 - ref: ./parts/hpc-reflector\n\
+         \x20   kind: container\n\
          \x20   target_ids: percept\n\n\
-         \x20 - ref: ./images/gw-tcu\n\
+         \x20 - ref: ./parts/gw-tcu\n\
+         \x20   kind: container\n\
          \x20   target_ids: tcu\n"
     )
 }
@@ -358,36 +519,44 @@ fn parts_yaml(template: Template) -> String {
 fn readme(id: &str, template: Template) -> String {
     format!(
         "# {id}\n\n\
-         Generated by `vxedge experiment new --template {t}`.\n\n\
-         Run it from **inside this directory**:\n\n\
+         Generated by `vxedge experiment new --template {t}`. This folder is a **sandbox**: it\n\
+         owns everything the experiment needs, so it can be zipped, sent, unzipped and run.\n\n\
          ```bash\n\
-         vxedge experiment up      # gateway + zones; does NOT start traffic\n\
-         vxedge traffic up         # the load, separately, because it is time-bounded\n\
-         vxedge experiment down\n\
+         sudo -E env \"PATH=$PATH\" ./scripts/run.sh --quick   # pipeline validation\n\
+         sudo -E env \"PATH=$PATH\" ./scripts/run.sh           # the campaign\n\
          ```\n\n\
-         ## Files\n\n\
-         | File | `kind` | What it owns |\n\
+         ## Layout\n\n\
+         | Path | `kind` | What it owns |\n\
          |---|---|---|\n\
          | `{id}.vxp` | — | identity, version, entry point, host requirements |\n\
          | `main.yaml` | `experiment` | the test: slices, traffic, method, telemetry |\n\
-         | `vehicle.yaml` | `vehicle` | the system under test: zones, devices, functions, links, channels |\n\
-         | `parts.yaml` | `baseline` | which software, by ref + digest |\n\n\
-         Every file declares its `kind` and `id`. Nothing references anything by path, so you\n\
-         can rename these files freely. Add a file, it joins the experiment; delete one you do\n\
-         not need. There is no `road` file here because this template uses synthetic traffic\n\
-         and has no world to model.\n\n\
+         | `vehicle.yaml` | `vehicle` | the system under test: zones, devices, functions, links |\n\
+         | `parts.yaml` | `baseline` | which software runs on which function |\n\
+         | `scripts/run.sh` | — | the campaign: repetitions, warmup, measurement window |\n\
+         | `parts/` | — | this experiment's own loadables |\n\
+         | `assets/` | — | scenario files, traces, maps |\n\
+         | `tools/` | — | analysis specific to this experiment |\n\
+         | `results/` | — | archives, one per run |\n\n\
+         Every YAML file declares its `kind` and `id`, and nothing references anything by path,\n\
+         so you can rename them freely — or collapse them into one `---`-separated file. Add a\n\
+         file and it joins the experiment; delete one you do not need.\n\n\
          ## What to change first\n\n\
          1. **The load** — `traffic_profiles` in `main.yaml`.\n\
          2. **The isolation mechanism** — `network.slices[].mode`. Switching `vlan` to\n\
-            `s-nssai` is the whole difference between H1 and H2, over an unchanged vehicle.\n\
+         `s-nssai` is the whole difference between H1 and H2, over an unchanged vehicle.\n\
          3. **The vehicle** — `devices`, `functions` and `links` in `vehicle.yaml`.\n\
-            Device ids (`zonefl`, `hpc1`, `gw1`) name hardware; function ids (`adas`, `percept`)\n            name software, and are what `parts.yaml` targets.\n\
-         4. **The software** — `parts.yaml`. `target_ids` takes one id or a list.\n\n\
+         Device ids name hardware; function ids name software, and are what `parts.yaml`\n\
+         targets.\n\
+         4. **The software** — `parts.yaml`. `target_ids` takes one id or a list.\n\
+         5. **The method** — the knobs at the top of `scripts/run.sh`.\n\n\
          ## Sharing it\n\n\
-         `vxedge experiment publish` refuses while any local ref (`./images/...`) is still\n\
-         unpublished: a workspace handed to someone else with a path from your disk in it is\n\
-         broken for them by construction. Publish those parts first, and the references are\n\
-         rewritten to digests in place.\n",
+         Zip the folder. Everything the experiment needs is inside it, which is the point of\n\
+         the layout — a workspace whose parts live three directories up is not something anyone\n\
+         can unpack and run.\n\n\
+         `vxedge experiment publish` refuses while any local ref (`./parts/...`) is still\n\
+         unpublished, for the same reason in reverse: a workspace handed to someone else with a\n\
+         path from your disk in it is broken for them by construction. Publish those parts\n\
+         first, and the references are rewritten to digests in place.\n",
         t = template.as_str()
     )
 }
