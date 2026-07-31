@@ -2,14 +2,14 @@
 //! into concrete, slice-mode-aware endpoints. Pure data — no privileges, no
 //! I/O — mirroring `GatewayPlan`/`FiveGPlan`.
 //!
-//! Resolves each profile's `source`/`target` (a `<zone-vxid>:<node-vxid>`
-//! reference, or the symbolic `internet`) against the manifest's own
-//! zone/node/slice declarations, and — for `mode: vlan` endpoints only —
-//! against the *already-computed* `GatewayPlan.endpoints`, never
-//! re-deriving peer-interface naming independently. `zone-backend-contract`
-//! is explicit that `NodePlan`/`GatewayPlan` endpoints are joined by
-//! identical traversal order, asserted, not assumed — this module reuses
-//! that join instead of re-deriving a second, potentially-diverging one.
+//! Resolves each profile's `source`/`target` (a device id, or a symbolic
+//! endpoint like `internet`) against the model's devices, links and slices,
+//! and — for `mode: vlan` endpoints only — against the *already-computed*
+//! `GatewayPlan.endpoints`, never re-deriving peer-interface naming
+//! independently. Interface names come from the device id
+//! (`gateway::ifnames`), so re-deriving them here would be a second
+//! implementation of one rule; this module looks up the endpoint the
+//! gateway plan already named.
 //! `mode: s-nssai` endpoints don't appear in `GatewayPlan.endpoints` at all
 //! (built only for VLAN-bound ifaces), so they're resolved from the raw
 //! manifest slice/node declaration alone; their real transport address
@@ -21,15 +21,7 @@ use crate::model::SliceMode;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TrafficPlanError {
-    #[error(
-        "traffic_profiles.{profile}.{field} `{reference}` is not `<zone-vxid>:<node-vxid>` or `internet`"
-    )]
-    InvalidReference {
-        profile: String,
-        field: &'static str,
-        reference: String,
-    },
-    #[error("traffic_profiles.{profile}.{field} references unknown zone/node `{reference}`")]
+    #[error("traffic_profiles.{profile}.{field} references unknown device `{reference}`")]
     UnknownNode {
         profile: String,
         field: &'static str,
@@ -159,12 +151,11 @@ struct RealRef<'a> {
 }
 
 impl TrafficPlan {
-    /// Plan from the domain model (task 5b).
+    /// Plan from the domain model.
     ///
-    /// The model already resolved each endpoint to [`crate::model::TrafficEndpoint`] at build
-    /// time, so this does not re-parse `zone:node` strings. That is the point of the port: §6.1
-    /// spells an endpoint `<zone-vxid>:<node-vxid>`, a form whose zone half lowering had to
-    /// synthesize and an author could never write. In the model an endpoint is just a device id.
+    /// The model resolved each endpoint to [`crate::model::TrafficEndpoint`] at build time, so
+    /// this parses no strings: an endpoint is a device id or a symbolic destination, and which
+    /// it is was decided once, against the devices the vehicle declares.
     pub fn from_model(
         exp: &crate::model::Experiment,
         gateway_plan: &GatewayPlan,

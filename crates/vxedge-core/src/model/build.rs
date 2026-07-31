@@ -1,17 +1,15 @@
 //! Build the domain model from a loaded §6.0 workspace.
 //!
-//! **Transitional shape.** §6.0's YAML still says `composition: {zones, compute, gateway}` —
-//! components grouped by what they are, with software attached straight to them. The model says
-//! zone/device/function. So this builder maps the former onto the latter, synthesizing one
-//! [`Function`] per device from the part targeting it.
+//! §6.0 declares `zones`, `devices` and `functions` natively, so this reads them rather than
+//! deriving one from another — an earlier version had to synthesize a function per device
+//! because the schema could not say what a function was, and closing that gap is what made
+//! `channels` and per-function part targeting expressible.
 //!
-//! That synthesis is deliberate and temporary. It means every planner can move onto the model
-//! *now*, against workspaces that already exist, before the schema grows `zones:`/`devices:`/
-//! `functions:` blocks of its own. When it does, only this file changes — which is the point of
-//! having the model be a separate type rather than the parsed YAML.
-//!
-//! The reverse direction (§6.1 → model) is the adapter that keeps the frozen experiments
-//! runnable; it lands with task 5c.
+//! What this file still *does* decide is everything the YAML leaves implicit: which part a
+//! function boots and whether the device can run it ([`part_kind`]), how a slice's QoS defaults,
+//! and how narrowing from YAML's `u64` is range-checked. Those are model concerns rather than
+//! schema ones, which is why the model is a separate type from the parsed document — each can
+//! change for its own reasons.
 
 use super::*;
 use crate::workspace::{PartEntry, VehicleDoc, Workspace};

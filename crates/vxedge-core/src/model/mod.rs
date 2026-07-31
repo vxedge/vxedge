@@ -7,9 +7,10 @@
 //!
 //! # The ontology, and what it fixes
 //!
-//! §6.0's `composition: {zones, compute, gateway}` groups devices by what they are, and calls one
-//! group "zones" — but **a zone is a place, not a device**. That is the same conflation §6.0 was
-//! created to fix in `ZoneRole`, surviving one level down. Here they are separate:
+//! Both retired schemas grouped devices by what they *are* and called one group "zones" —
+//! §6.1 through a `ZoneRole` enum, §6.0's first draft through a `composition:` block — but
+//! **a zone is a place, not a device**. The same conflation, one level apart. Here the two are
+//! separate, and the schema follows:
 //!
 //! - [`Zone`] — a *region* of the entity. Front-left, cabin, nacelle-2, an ATA zone. A named
 //!   region rather than an enum, which is what lets a non-road entity have zones at all.
