@@ -33,16 +33,33 @@ use crate::audit::Audit;
 use crate::events::EventBus;
 use crate::jobs::{JobEngine, is_terminal, now_ms};
 
+/// The experiment a successful `gateway up` registered: the built model, where it came from,
+/// and the plans derived from it. Consumed by zone verbs, cleared by `gateway down`.
+///
+/// The **model** is held, not the YAML it was built from. It used to be the document, so every
+/// zone verb re-parsed it — the same workspace built, validated and invariant-checked once per
+/// RPC, with a `Status::internal("stored manifest no longer models")` arm for a failure that
+/// could only mean the daemon had corrupted its own state. Holding the value makes the active
+/// experiment a thing the daemon *knows* rather than a string it re-derives, and it is the
+/// precondition for typing the passthrough blocks.
+pub struct ActiveExperiment {
+    pub model: vxedge_core::model::Experiment,
+    /// The workspace this was built from. Bundles and relative part refs resolve against it, so
+    /// it travels with the model rather than being recomputed per verb.
+    pub dir: PathBuf,
+    /// Checksum of the source documents, for audit records and results provenance.
+    pub sha256: String,
+}
+
 /// Daemon-wide view of the active experiment: set by a successful
 /// `gateway up`, consumed by zone verbs, cleared by `gateway down`.
 #[derive(Default)]
 pub struct EdgeState {
     pub gateway: Option<GatewayPlan>,
-    pub manifest_yaml: Option<String>,
-    pub manifest_dir: Option<PathBuf>,
-    /// Set alongside `gateway` whenever the manifest's `network.slices`
+    pub active: Option<ActiveExperiment>,
+    /// Set alongside `gateway` whenever the experiment's `network.slices`
     /// include any `mode: s-nssai` — the fiveg CN/RAN pods' desired state,
-    /// for `down`/`status` to act on without re-parsing the manifest.
+    /// for `down`/`status` to act on without re-planning.
     pub fiveg: Option<FiveGPlan>,
 }
 
@@ -145,10 +162,6 @@ fn parse_to_model(yaml: &str) -> Result<vxedge_core::model::Experiment, String> 
     vxedge_core::model::load_yaml(yaml).map_err(|e| e.to_string())
 }
 
-fn parse_and_plan(yaml: &str) -> Result<GatewayPlan, String> {
-    GatewayPlan::from_model(&parse_to_model(yaml)?).map_err(|e| e.to_string())
-}
-
 /// Re-parses `yaml` to compile its `mode: s-nssai` slices, if any. Only
 /// called when `GatewayPlan.snssai_slice_ids` is non-empty, so a real error
 /// here (bad `s_nssai` block, duplicate SST/SD, ...) is a genuine manifest
@@ -211,8 +224,11 @@ impl GatewaySvc {
         let job = self
             .engine
             .submit(kind, move |p| async move {
-                p.update(10, "parsing manifest");
-                let plan = parse_and_plan(&yaml)?;
+                p.update(10, "parsing workspace");
+                // Built once, here, and kept: every verb downstream reads the model rather
+                // than re-deriving it from the document.
+                let model = parse_to_model(&yaml)?;
+                let plan = GatewayPlan::from_model(&model).map_err(|e| e.to_string())?;
                 p.update(30, &format!("plan: {}", plan.summary()));
                 match verb {
                     Verb::Apply => Ok(format!(
@@ -357,8 +373,11 @@ impl GatewaySvc {
                         let summary = plan.summary();
                         let mut st = state.lock().await;
                         st.gateway = Some(plan);
-                        st.manifest_yaml = Some(yaml.clone());
-                        st.manifest_dir = manifest_dir.clone();
+                        st.active = Some(ActiveExperiment {
+                            model: model.clone(),
+                            dir: manifest_dir.clone().unwrap_or_else(|| PathBuf::from(".")),
+                            sha256: sha256.clone(),
+                        });
                         st.fiveg = five_g_plan;
                         Ok(format!("vxgateway up — {summary}"))
                     }
@@ -674,8 +693,8 @@ impl ZoneSvc {
     /// Node plans for the active experiment, optionally filtered to one zone.
     async fn plans_for(&self, zone_vxid: Option<&str>) -> Result<Vec<NodePlan>, Status> {
         let st = self.state.lock().await;
-        let (yaml, gateway) = match (&st.manifest_yaml, &st.gateway) {
-            (Some(y), Some(g)) => (y.clone(), g.clone()),
+        let (model, dir, gateway) = match (&st.active, &st.gateway) {
+            (Some(a), Some(g)) => (a.model.clone(), a.dir.clone(), g.clone()),
             _ => {
                 return Err(Status::failed_precondition(
                     "no active experiment: zone verbs act on the topology the gateway registered, so \
@@ -683,13 +702,7 @@ impl ZoneSvc {
                 ));
             }
         };
-        let dir = st
-            .manifest_dir
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("."));
         drop(st);
-        let model = parse_to_model(&yaml)
-            .map_err(|e| Status::internal(format!("stored manifest no longer models: {e}")))?;
         let plans = zones::plan_nodes_from_model(&model, &gateway, &dir)
             .map_err(|e| Status::internal(e.to_string()))?;
         // A zone is a *region*, so `--vxid front-left` brings up everything in it. A single
@@ -723,9 +736,19 @@ impl ZoneSvc {
         up: bool,
     ) -> Result<Response<Job>, Status> {
         let plans = self.plans_for(Some(&vxid)).await?;
+        // The workspace checksum rides along: an audit line saying a zone came up is only
+        // provenance if it says which topology it came up in.
+        let workspace = self
+            .state
+            .lock()
+            .await
+            .active
+            .as_ref()
+            .map(|a| a.sha256.clone())
+            .unwrap_or_default();
         self.audit.record(
             rpc,
-            serde_json::json!({ "zone": vxid, "nodes": plans.len() }),
+            serde_json::json!({ "zone": vxid, "nodes": plans.len(), "workspace_sha256": workspace }),
         );
         let shell = self.shell.clone();
         let runtime_dir = self.runtime_dir.clone();
