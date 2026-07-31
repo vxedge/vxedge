@@ -14,6 +14,10 @@
 //! Ordering contract: `gateway up` before `zone up`; `zone down` before
 //! `gateway down`. Deleting a container netns destroys its veth pair, so
 //! re-running `vxedge up` (idempotent) restores endpoints after `zone down`.
+//!
+//! All three are selected through one [`ZoneBackend`] seam, and [`backend_for`] is the only
+//! place a backend kind is matched. Adding a fourth is an impl and one arm — see the trait's
+//! doc for what an implementation owes.
 
 use std::path::Path;
 
@@ -321,29 +325,130 @@ fn libvirt_status(sh: &Shell, np: &NodePlan) -> NodeState {
 }
 
 // ---------------------------------------------------------------------------
+// the seam
+// ---------------------------------------------------------------------------
+
+/// One packaging backend: how a node is started, stopped and observed.
+///
+/// The contract every implementation owes is stated once, in the
+/// `zone-backend-contract` skill, and is not restated here — two statements of one contract
+/// drift. The parts that bind an implementor:
+///
+/// - **Attachment is identical across backends.** The gateway has already created this node's
+///   port (`NodePlan.endpoint`/`peer`); a backend consumes it and never names or renames an
+///   interface itself. Interface names come from the device id (`gateway::ifnames`), so a
+///   backend deriving one would be a second implementation of a rule that must have exactly one.
+/// - **`up` and `down` are idempotent and converge.** Running `up` on a live node is a no-op,
+///   not an error; `down` on an absent one likewise. Every idempotency bug this project has
+///   found lived on a re-run path nobody exercised manually, which is why this is a contract
+///   rather than a convention.
+/// - **`status` never mutates.** It is called by `zone list` and by the reconciler, including
+///   against nodes this process did not start.
+/// - **Failures are actionable.** Wrap an implementation's own error in [`ZoneBackendError`]
+///   with the node named — a caller matching on a libvirt error would be matching on the
+///   implementation this seam exists to hide.
+///
+/// A backend takes a [`NodePlan`]; it does not compute one. Anything a backend would need to
+/// *decide* belongs in `zones::plan`, where it is pure, testable and diffable.
+pub trait ZoneBackend {
+    /// The `backend:` value that selects this implementation. Used in errors and logs, so it
+    /// matches the manifest spelling exactly.
+    fn name(&self) -> &'static str;
+
+    fn up(&self, sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneBackendError>;
+
+    fn down(&self, sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneBackendError>;
+
+    fn status(&self, sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> NodeState;
+}
+
+struct ContainerBackend;
+struct QemuMicrovmBackend;
+struct LibvirtBackend;
+
+impl ZoneBackend for ContainerBackend {
+    fn name(&self) -> &'static str {
+        "container"
+    }
+    fn up(&self, sh: &Shell, np: &NodePlan, _runtime_dir: &Path) -> Result<(), ZoneBackendError> {
+        container_up(sh, np)
+    }
+    fn down(&self, sh: &Shell, np: &NodePlan, _runtime_dir: &Path) -> Result<(), ZoneBackendError> {
+        container_down(sh, np)
+    }
+    fn status(&self, sh: &Shell, np: &NodePlan, _runtime_dir: &Path) -> NodeState {
+        container_status(sh, np)
+    }
+}
+
+impl ZoneBackend for QemuMicrovmBackend {
+    fn name(&self) -> &'static str {
+        "qemu-microvm"
+    }
+    fn up(&self, sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneBackendError> {
+        microvm_up(sh, np, runtime_dir)
+    }
+    fn down(&self, _sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneBackendError> {
+        microvm_down(np, runtime_dir)
+    }
+    fn status(&self, _sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> NodeState {
+        microvm_status(np, runtime_dir)
+    }
+}
+
+impl ZoneBackend for LibvirtBackend {
+    fn name(&self) -> &'static str {
+        "libvirt"
+    }
+    fn up(&self, sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneBackendError> {
+        libvirt_up(sh, np, runtime_dir)
+    }
+    fn down(&self, sh: &Shell, np: &NodePlan, _runtime_dir: &Path) -> Result<(), ZoneBackendError> {
+        libvirt_down(sh, np)
+    }
+    fn status(&self, sh: &Shell, np: &NodePlan, _runtime_dir: &Path) -> NodeState {
+        libvirt_status(sh, np)
+    }
+}
+
+/// **The only place a backend kind is matched.** Everything downstream holds a
+/// `&dyn ZoneBackend`, so adding a fourth backend is one impl and one arm here — it used to be
+/// three matches in three functions with nothing saying they had to agree.
+pub fn backend_for(kind: Backend) -> &'static dyn ZoneBackend {
+    match kind {
+        Backend::Container => &ContainerBackend,
+        Backend::QemuMicrovm => &QemuMicrovmBackend,
+        Backend::Libvirt => &LibvirtBackend,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // dispatch
 // ---------------------------------------------------------------------------
 
 pub fn node_up(sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneBackendError> {
-    match np.backend {
-        Backend::Container => container_up(sh, np),
-        Backend::QemuMicrovm => microvm_up(sh, np, runtime_dir),
-        Backend::Libvirt => libvirt_up(sh, np, runtime_dir),
-    }
+    backend_for(np.backend).up(sh, np, runtime_dir)
 }
 
 pub fn node_down(sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneBackendError> {
-    match np.backend {
-        Backend::Container => container_down(sh, np),
-        Backend::QemuMicrovm => microvm_down(np, runtime_dir),
-        Backend::Libvirt => libvirt_down(sh, np),
-    }
+    backend_for(np.backend).down(sh, np, runtime_dir)
 }
 
 pub fn node_status(sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> NodeState {
-    match np.backend {
-        Backend::Container => container_status(sh, np),
-        Backend::QemuMicrovm => microvm_status(np, runtime_dir),
-        Backend::Libvirt => libvirt_status(sh, np),
+    backend_for(np.backend).status(sh, np, runtime_dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The one match that remains has to be right — a mis-wired arm would run a node under the
+    /// wrong isolation mechanism, which is precisely the H3 variable, and every plan and every
+    /// interface name would still look correct.
+    #[test]
+    fn every_backend_kind_selects_the_implementation_it_names() {
+        assert_eq!(backend_for(Backend::Container).name(), "container");
+        assert_eq!(backend_for(Backend::QemuMicrovm).name(), "qemu-microvm");
+        assert_eq!(backend_for(Backend::Libvirt).name(), "libvirt");
     }
 }
