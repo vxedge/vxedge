@@ -35,6 +35,24 @@ pub enum ModelError {
     #[error("component `{component}` has no part — nothing to run on it")]
     NoPart { component: String },
     #[error(
+        "`{component}`: part `{part}` is a {kind}, but the device it deploys onto runs the \
+         `{backend}` backend. A container backend boots a container image; libvirt and \
+         qemu-microvm boot a guest bundle. Point this target at the right part, or correct the \
+         device's `backend`."
+    )]
+    PartKindMismatch {
+        component: String,
+        part: String,
+        kind: &'static str,
+        backend: &'static str,
+    },
+    #[error("`{component}`: part `{part}` declares `kind: {kind}` — expected container or bundle")]
+    UnknownPartKind {
+        component: String,
+        part: String,
+        kind: String,
+    },
+    #[error(
         "device `{device}` declares backend `{backend}`, which is not container, qemu-microvm or libvirt"
     )]
     UnknownBackend { device: String, backend: String },
@@ -153,21 +171,103 @@ fn sole_part(
             }
         }
     };
+    let kind = part_kind(component, chosen, backend)?;
     Ok(Part {
         reference: chosen.reference.clone(),
-        // The backend is the authority on how the image is consumed — deriving it from the
-        // reference is the guess that produced an unbootable manifest during the exp-001
-        // migration.
-        kind: match backend {
-            Some(Backend::Container) | None => PartKind::Container,
-            Some(_) => PartKind::Bundle,
-        },
+        kind,
         digest: chosen.digest.clone(),
         local: chosen.is_local(),
     })
 }
 
-fn endpoint(raw: &str) -> Endpoint {
+/// What a part *is*, and whether the device can run it.
+///
+/// Three sources, in order: the baseline's explicit `kind:`, then the reference itself, then
+/// the device's backend. The last is a fallback rather than the rule — deriving the kind from
+/// the backend is what made a mismatch *unrepresentable*: a baseline pointing a `libvirt` arm at
+/// a container image simply became a bundle, and the run failed at boot with nothing naming the
+/// cause. Wherever the part says what it is, it is checked against the backend instead.
+fn part_kind(
+    component: &str,
+    entry: &PartEntry,
+    backend: Option<Backend>,
+) -> Result<PartKind, ModelError> {
+    let declared = match entry.kind.as_deref() {
+        None => None,
+        Some("container") => Some(PartKind::Container),
+        Some("bundle") => Some(PartKind::Bundle),
+        Some(other) => {
+            return Err(ModelError::UnknownPartKind {
+                component: component.to_string(),
+                part: entry.reference.clone(),
+                kind: other.to_string(),
+            });
+        }
+    };
+    let known = declared.or_else(|| kind_from_reference(&entry.reference));
+    let Some(kind) = known else {
+        // A bare path says nothing about itself, so the backend decides — the one case where
+        // guessing is the only option, and the one the `kind:` field exists to remove.
+        return Ok(match backend {
+            Some(Backend::Container) | None => PartKind::Container,
+            Some(_) => PartKind::Bundle,
+        });
+    };
+    let runnable = matches!(
+        (kind, backend),
+        (_, None)
+            | (PartKind::Container, Some(Backend::Container))
+            | (
+                PartKind::Bundle,
+                Some(Backend::Libvirt | Backend::QemuMicrovm)
+            )
+    );
+    if !runnable {
+        return Err(ModelError::PartKindMismatch {
+            component: component.to_string(),
+            part: entry.reference.clone(),
+            kind: match kind {
+                PartKind::Container => "container",
+                PartKind::Bundle => "bundle",
+            },
+            backend: match backend {
+                Some(Backend::Container) => "container",
+                Some(Backend::QemuMicrovm) => "qemu-microvm",
+                Some(Backend::Libvirt) => "libvirt",
+                None => "none",
+            },
+        });
+    }
+    Ok(kind)
+}
+
+/// What a reference says about itself — deliberately little.
+///
+/// Only the `local/…` namespace is conclusive: it names a host process or a locally-built
+/// container image, never a guest bundle directory, and pointing a VM backend at one is exactly
+/// the mistake the exp-001 migration hit (it planned as a VM with no bundle to boot).
+///
+/// A published vxparts ref is **not** used, though it looks like it should be: its class says
+/// what kind of *node* the part loads onto (`zone` = virtual ECU), not how the part is
+/// packaged, and a zone guest is legitimately a container under the netns backend. Reading
+/// packaging out of the class would reject correct workspaces, which is worse than the gap.
+/// That is what `kind:` on the baseline entry is for.
+fn kind_from_reference(reference: &str) -> Option<PartKind> {
+    reference
+        .starts_with("local/")
+        .then_some(PartKind::Container)
+}
+
+fn link_endpoint(doc: &crate::workspace::EndpointDoc) -> Endpoint {
+    Endpoint {
+        node: doc.node().to_string(),
+        port: doc.port().map(str::to_owned),
+        ip_cidr: doc.ip().map(str::to_owned),
+    }
+}
+
+/// A channel endpoint names a *function*, and carries no address — see [`Endpoint::ip_cidr`].
+fn channel_endpoint(raw: &str) -> Endpoint {
     match raw.split_once(':') {
         Some((n, p)) => Endpoint {
             node: n.to_string(),
@@ -286,7 +386,15 @@ fn build_entity(ws: &Workspace, doc: &VehicleDoc) -> Result<Entity, ModelError> 
             Function {
                 id: id.clone(),
                 deployed_on: f.deployed_on.clone(),
-                part: sole_part(ws, id, backend).ok(),
+                // "No part at all" is tolerated here and reported by the workspace validator
+                // against the file the author wrote (`ComponentWithoutPart`). Any *other*
+                // failure is a real defect in the part they did declare, and swallowing it
+                // turned a kind mismatch into a function that silently ran nothing.
+                part: match sole_part(ws, id, backend) {
+                    Ok(part) => Some(part),
+                    Err(ModelError::NoPart { .. }) => None,
+                    Err(e) => return Err(e),
+                },
                 asil: f.asil.as_deref().and_then(asil_of),
             },
         );
@@ -302,7 +410,6 @@ fn build_entity(ws: &Workspace, doc: &VehicleDoc) -> Result<Entity, ModelError> 
             Some(other) => EntityClass::Other(other.to_string()),
         },
         subtype: doc.subtype.clone(),
-        device_order: devices.keys().cloned().collect(),
         zones,
         devices,
         functions,
@@ -311,7 +418,7 @@ fn build_entity(ws: &Workspace, doc: &VehicleDoc) -> Result<Entity, ModelError> 
             .iter()
             .map(|l| Link {
                 id: l.id.clone(),
-                endpoints: l.endpoints.iter().map(|e| endpoint(e)).collect(),
+                endpoints: l.endpoints.iter().map(link_endpoint).collect(),
                 kind: link_kind(l.slice.as_ref()),
                 slice: l.slice.clone(),
                 harness: None,
@@ -322,8 +429,8 @@ fn build_entity(ws: &Workspace, doc: &VehicleDoc) -> Result<Entity, ModelError> 
             .iter()
             .map(|c| Channel {
                 id: c.id.clone(),
-                from: endpoint(&c.from),
-                to: c.to.iter().map(|e| endpoint(e)).collect(),
+                from: channel_endpoint(&c.from),
+                to: c.to.iter().map(|e| channel_endpoint(e)).collect(),
                 protocol: Protocol::Udp,
                 qos: None,
                 carried_by: c.carried_by.clone(),
@@ -392,6 +499,51 @@ fn traffic_endpoint(raw: &str, devices: &BTreeMap<String, Device>) -> TrafficEnd
         TrafficEndpoint::Internet
     } else {
         TrafficEndpoint::Simulator(raw.to_string())
+    }
+}
+
+/// Everything that can go wrong between "some YAML" and "a checked model".
+///
+/// One type because callers act the same way on all three — report and stop — and because the
+/// daemon, the CLI and every test want the same one-call entry point rather than a three-step
+/// dance each reimplements slightly differently.
+#[derive(Debug, thiserror::Error)]
+pub enum LoadError {
+    #[error(transparent)]
+    Workspace(#[from] crate::workspace::WorkspaceError),
+    #[error(transparent)]
+    Model(#[from] ModelError),
+    #[error(
+        "model invariants violated:\n{}",
+        .0.iter().map(|e| format!("  - {e}")).collect::<Vec<_>>().join("\n")
+    )]
+    Invariants(Vec<InvariantError>),
+}
+
+/// Workspace directory → checked model. The single entry point for provisioning.
+pub fn load_dir(root: &std::path::Path) -> Result<Experiment, LoadError> {
+    checked(build(&Workspace::load_validated(root)?)?)
+}
+
+/// Workspace YAML text → checked model, for callers with no directory to point at: an inline
+/// manifest over vxAPI, and every test fixture in this crate.
+pub fn load_yaml(text: &str) -> Result<Experiment, LoadError> {
+    let ws = Workspace::from_yaml(text)?;
+    let errors = ws.validate();
+    if !errors.is_empty() {
+        return Err(LoadError::Workspace(
+            crate::workspace::WorkspaceError::Invalid(errors),
+        ));
+    }
+    checked(build(&ws)?)
+}
+
+fn checked(exp: Experiment) -> Result<Experiment, LoadError> {
+    let violations = exp.check();
+    if violations.is_empty() {
+        Ok(exp)
+    } else {
+        Err(LoadError::Invariants(violations))
     }
 }
 
@@ -646,7 +798,13 @@ parts:
             .iter()
             .map(|e| (e.name.as_str(), e.peer.as_str(), e.vlan))
             .collect();
-        assert_eq!(eps, vec![("vz0", "vzp0", 101), ("vz1", "vzp1", 103)]);
+        assert_eq!(
+            eps,
+            vec![
+                ("vz-node-a", "vzp-node-a", 101),
+                ("vz-node-b", "vzp-node-b", 103)
+            ]
+        );
 
         let nodes = plan_nodes_from_model(&model, &gw, &tmp).unwrap();
         assert_eq!(
@@ -659,6 +817,96 @@ parts:
         assert_eq!(traffic.profiles.len(), 1);
         assert_eq!(traffic.profiles[0].id, "load");
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The whole point of the object endpoint form: a pinned address has to survive from the
+    /// vehicle all the way to the zone backend that configures it. exp-002's three arms share one
+    /// VLAN and are told apart by address alone, so an address dropped anywhere on this path is
+    /// three arms answering at nothing.
+    #[test]
+    fn a_pinned_address_reaches_the_node_plan() {
+        use crate::gateway::GatewayPlan;
+        use crate::zones::plan::plan_nodes_from_model;
+
+        let (tmp, _) = h1_fixture("addressed");
+        let veh = std::fs::read_to_string(tmp.join("veh.yaml")).unwrap().replace(
+            "  - { id: la, endpoints: [node-a:eth0], slice: adas }",
+            "  - { id: la, endpoints: [{ node: node-a, port: eth0, ip: 10.101.0.11/24 }], slice: adas }",
+        );
+        std::fs::write(tmp.join("veh.yaml"), veh).unwrap();
+
+        let ws = Workspace::load_validated(&tmp).expect("still validates");
+        let model = build(&ws).unwrap();
+        let gw = GatewayPlan::from_model(&model).unwrap();
+        let nodes = plan_nodes_from_model(&model, &gw, &tmp).unwrap();
+        let node_a = nodes.iter().find(|n| n.node_id == "node-a").unwrap();
+        assert_eq!(node_a.ip_cidr.as_deref(), Some("10.101.0.11/24"));
+        // …and an unaddressed attachment stays unaddressed, so a vehicle that pins nothing keeps
+        // working across experiments with different subnets.
+        let node_b = nodes.iter().find(|n| n.node_id == "node-b").unwrap();
+        assert_eq!(node_b.ip_cidr, None);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// H3 runs one function on three backends from three parts, so a baseline pointing a VM arm
+    /// at a container image is the mistake most worth catching — and it used to be
+    /// unrepresentable rather than rejected, because the kind was *derived* from the backend.
+    #[test]
+    fn a_part_the_backend_cannot_run_is_refused_with_both_halves_named() {
+        // `local/…` names a host process, never a bootable bundle, so libvirt cannot run it.
+        let ws = "
+kind: experiment
+id: e
+vehicles: [veh]
+baseline: bl
+network: { slices: [{ id: adas, mode: vlan, vlan: 101 }] }
+---
+kind: vehicle
+id: veh
+devices: { vm1: { role: ecu, backend: libvirt } }
+functions: { fn-vm: { deployed_on: vm1 } }
+links: [{ id: l, endpoints: [vm1:eth0], slice: adas }]
+---
+kind: baseline
+id: bl
+parts: [{ ref: 'local/vxprobe:host-process', target_ids: fn-vm }]
+";
+        match load_yaml(ws) {
+            Err(crate::model::LoadError::Model(ModelError::PartKindMismatch {
+                kind,
+                backend,
+                ..
+            })) => {
+                assert_eq!(kind, "container");
+                assert_eq!(backend, "libvirt");
+            }
+            other => panic!("expected PartKindMismatch, got {other:?}"),
+        }
+
+        // An explicit `kind:` is authoritative where the reference is silent — and is checked
+        // the same way, so a path ref can be wrong out loud too.
+        let bad_explicit = ws.replace(
+            "parts: [{ ref: 'local/vxprobe:host-process', target_ids: fn-vm }]",
+            "parts: [{ ref: ./image, kind: container, target_ids: fn-vm }]",
+        );
+        assert!(matches!(
+            load_yaml(&bad_explicit),
+            Err(crate::model::LoadError::Model(
+                ModelError::PartKindMismatch { .. }
+            ))
+        ));
+
+        // …and the same path ref declared a bundle is accepted, which is what makes the field
+        // worth having rather than merely restrictive.
+        let good_explicit = ws.replace(
+            "parts: [{ ref: 'local/vxprobe:host-process', target_ids: fn-vm }]",
+            "parts: [{ ref: ./bundle, kind: bundle, target_ids: fn-vm }]",
+        );
+        let m = load_yaml(&good_explicit).expect("a bundle on a VM backend is fine");
+        assert_eq!(
+            m.entities[0].functions["fn-vm"].part.as_ref().unwrap().kind,
+            PartKind::Bundle
+        );
     }
 
     /// Every scaffolded template must satisfy every model invariant. If the generator can emit

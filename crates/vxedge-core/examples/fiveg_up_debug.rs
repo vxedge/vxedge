@@ -5,8 +5,7 @@
 //!
 //! Usage: cargo run -p vxedge-core --example fiveg_up_debug -- <manifest.yaml> <runtime-dir> <pod-name>
 
-use std::{env, fs, process::ExitCode};
-use vxedge_core::ExperimentManifest;
+use std::{env, fs, path::Path, process::ExitCode};
 use vxedge_core::fiveg::{FiveGLifecycleConfig, FiveGPlan, fiveg_up};
 
 fn main() -> ExitCode {
@@ -18,9 +17,8 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let yaml = fs::read_to_string(manifest_path).expect("read manifest");
-    let manifest = ExperimentManifest::from_yaml(&yaml).expect("parse manifest");
-    let plan = FiveGPlan::from_model(&manifest.to_model().expect("adapts")).expect("plan");
+    let model = load_workspace(manifest_path).expect("load workspace");
+    let plan = FiveGPlan::from_model(&model).expect("plan");
     let cfg = FiveGLifecycleConfig {
         pod_name: pod_name.clone(),
         ran_pod_name: format!("{pod_name}-ran"),
@@ -37,5 +35,17 @@ fn main() -> ExitCode {
             eprintln!("error: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// A §6.0 workspace, given as a directory or as a single file of `---`-separated documents.
+fn load_workspace(
+    path: &str,
+) -> Result<vxedge_core::model::Experiment, vxedge_core::model::LoadError> {
+    let path = Path::new(path);
+    if path.is_dir() {
+        vxedge_core::model::load_dir(path)
+    } else {
+        vxedge_core::model::load_yaml(&fs::read_to_string(path).expect("read workspace"))
     }
 }

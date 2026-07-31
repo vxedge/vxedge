@@ -708,77 +708,35 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         },
         Command::Manifest { cmd } => match cmd {
             ManifestCmd::Validate { manifest } => {
-                let yaml = std::fs::read_to_string(manifest)
-                    .map_err(|e| format!("cannot read manifest `{manifest}`: {e}"))?;
-                // Vehicle manifests (§6.2) and experiment manifests (§6.1)
-                // are distinguished by their required top-level key — sniff
-                // it instead of asking the caller to declare the kind, so
-                // `vxedge manifest validate` stays a single command for
-                // both (M2's `vxmodel render` needs to validate rendered
-                // vehicle manifests too).
-                let is_vehicle = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&yaml)
-                    .ok()
-                    .and_then(|v| v.get("vehicle").is_some().then_some(()))
-                    .is_some();
-                if is_vehicle {
-                    match vxedge_core::VehicleManifest::from_yaml(&yaml) {
-                        Ok(m) => {
-                            if cli.json {
-                                println!(
-                                    "{}",
-                                    serde_json::json!({
-                                        "manifest": manifest, "valid": true, "kind": "vehicle",
-                                        "vehicle_id": m.vehicle.id,
-                                        "zones": m.zones.len(), "compute": m.compute.len(),
-                                        "services": m.services.len(),
-                                    })
-                                );
-                            } else {
-                                println!(
-                                    "OK: {manifest} — vehicle `{}`, {} zone(s), {} compute node(s), {} service(s)",
-                                    m.vehicle.id,
-                                    m.zones.len(),
-                                    m.compute.len(),
-                                    m.services.len()
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            if cli.json {
-                                println!(
-                                    "{}",
-                                    serde_json::json!({
-                                        "manifest": manifest, "valid": false, "error": e.to_string(),
-                                    })
-                                );
-                            } else {
-                                eprintln!("INVALID: {manifest}\n{e}");
-                            }
-                            std::process::exit(1);
-                        }
-                    }
-                    return Ok(());
-                }
-                match vxedge_core::ExperimentManifest::from_yaml(&yaml) {
-                    Ok(m) => {
+                // A §6.0 workspace: a directory, or one file of `---`-separated documents.
+                // It is the only schema there is — §6.1 experiment manifests and §6.2 vehicle
+                // manifests were retired on 2026-07-31 and their structs deleted, once
+                // `vxmodel render` (track M) began emitting workspaces too.
+                let path = std::path::Path::new(manifest);
+                let result = if path.is_dir() {
+                    validate_workspace_dir(path)
+                } else {
+                    let yaml = std::fs::read_to_string(path)
+                        .map_err(|e| format!("cannot read `{manifest}`: {e}"))?;
+                    validate_workspace_yaml(&yaml)
+                };
+                let kind = "workspace";
+                match result {
+                    Ok((summary, human)) => {
                         if cli.json {
-                            println!(
-                                "{}",
-                                serde_json::json!({
-                                    "manifest": manifest, "valid": true, "kind": "experiment",
-                                    "experiment_id": m.experiment.id,
-                                    "zones": m.zones.len(), "compute": m.compute.len(),
-                                    "services": m.services.len(),
-                                })
-                            );
+                            let mut obj = serde_json::json!({
+                                "manifest": manifest, "valid": true, "kind": kind,
+                            });
+                            if let (Some(o), Some(extra)) =
+                                (obj.as_object_mut(), summary.as_object())
+                            {
+                                for (k, v) in extra {
+                                    o.insert(k.clone(), v.clone());
+                                }
+                            }
+                            println!("{}", serde_json::to_string_pretty(&obj)?);
                         } else {
-                            println!(
-                                "OK: {manifest} — experiment `{}`, {} zone(s), {} compute node(s), {} service(s)",
-                                m.experiment.id,
-                                m.zones.len(),
-                                m.compute.len(),
-                                m.services.len()
-                            );
+                            println!("OK: {manifest} — {kind}: {human}");
                         }
                     }
                     Err(e) => {
@@ -786,7 +744,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             println!(
                                 "{}",
                                 serde_json::json!({
-                                    "manifest": manifest, "valid": false, "error": e.to_string(),
+                                    "manifest": manifest, "valid": false, "kind": kind,
+                                    "error": e,
                                 })
                             );
                         } else {
@@ -801,6 +760,53 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     Ok(())
 }
+
+/// A §6.0 workspace directory: every cross-file join, then every model invariant.
+fn validate_workspace_dir(root: &std::path::Path) -> Result<Summary, String> {
+    let ws = vxedge_core::Workspace::load(root).map_err(|e| e.to_string())?;
+    finish_workspace(ws, || vxedge_core::model::load_dir(root))
+}
+
+/// The same checks over a workspace held in one file of `---`-separated documents.
+fn validate_workspace_yaml(yaml: &str) -> Result<Summary, String> {
+    let ws = vxedge_core::Workspace::from_yaml(yaml).map_err(|e| e.to_string())?;
+    finish_workspace(ws, || vxedge_core::model::load_yaml(yaml))
+}
+
+/// Validating is not "does it parse": a workspace that passes its cross-file joins can still
+/// violate a model invariant, and `up` would be the one to find out. Both run here, so the
+/// local check is the same check provisioning runs.
+fn finish_workspace(
+    ws: vxedge_core::Workspace,
+    model: impl FnOnce() -> Result<vxedge_core::model::Experiment, vxedge_core::model::LoadError>,
+) -> Result<Summary, String> {
+    let errors = ws.validate();
+    if !errors.is_empty() {
+        return Err(errors
+            .iter()
+            .map(|e| format!("  - {e}"))
+            .collect::<Vec<_>>()
+            .join("\n"));
+    }
+    let model = model().map_err(|e| e.to_string())?;
+    let devices: usize = model.entities.iter().map(|e| e.devices.len()).sum();
+    let (vehicles, slices) = (model.entities.len(), model.slices.len());
+    Ok((
+        serde_json::json!({
+            "experiment_id": model.id,
+            "vehicles": vehicles,
+            "devices": devices,
+            "slices": slices,
+        }),
+        format!(
+            "experiment `{}`, {vehicles} vehicle(s), {devices} device(s), {slices} slice(s)",
+            model.id
+        ),
+    ))
+}
+
+/// A machine-readable summary and the sentence a human reads.
+type Summary = (serde_json::Value, String);
 
 #[derive(serde::Serialize)]
 struct JsonSliceStatus {

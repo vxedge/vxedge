@@ -5,6 +5,7 @@
 //! H1 minimum (TASKS §2): bridge/VLAN/HTB. WireGuard/VXLAN/FRR/nftables trail
 //! within phase 1. Backend is the kernel bridge (not OVS) — see AGENTS.md.
 
+pub mod ifnames;
 pub mod netops;
 pub mod plan;
 pub mod provision;

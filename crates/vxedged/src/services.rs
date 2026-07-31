@@ -24,7 +24,6 @@ use vxedge_api::v1::{
     ZoneApplyRequest, ZoneDownRequest, ZoneListRequest, ZoneListResponse, ZoneRemoveRequest,
     ZoneUpRequest,
 };
-use vxedge_core::ExperimentManifest;
 use vxedge_core::fiveg::{self, FiveGLifecycleConfig, FiveGPlan};
 use vxedge_core::gateway::{self, GatewayPlan, Shell};
 use vxedge_core::traffic::{self, TrafficPlan};
@@ -64,7 +63,7 @@ async fn resolve_manifest(
     })?;
     let (yaml, dir) = match &mref.source {
         Some(Source::Path(path)) if PathBuf::from(path).is_dir() => {
-            (lower_workspace(path).await?, Some(PathBuf::from(path)))
+            (read_workspace(path).await?, Some(PathBuf::from(path)))
         }
         Some(Source::Path(path)) => {
             let yaml = tokio::fs::read_to_string(path).await.map_err(|e| {
@@ -91,22 +90,44 @@ async fn resolve_manifest(
     Ok((yaml, sha256, dir))
 }
 
-/// A `ManifestRef.path` pointing at a **directory** is a §6.0 workspace: load it, validate it,
-/// and lower it to the §6.1 manifest the provisioning layer consumes.
+/// A `ManifestRef.path` pointing at a **directory** is a §6.0 workspace: read its documents
+/// into one `---`-separated string.
 ///
-/// This lives daemon-side on purpose. Lowering is a manifest transformation, so putting it in
-/// the CLI would make every frontend reimplement it — and §6.0 is the only schema an OEM
-/// engineer authors, so no frontend should need to know the older one exists at all.
+/// The daemon used to *lower* a workspace into a §6.1 manifest here, because the provisioning
+/// layer consumed §6.1. It consumes the domain model now, and a workspace is several documents
+/// that `Workspace::from_yaml` reads directly, so the transformation — and the whole second
+/// schema it targeted — is gone. Concatenating rather than passing the directory keeps the one
+/// property lowering was carrying: `ExperimentSvc` resolves once and hands the *same document*
+/// to every sub-RPC, so `up` cannot fan out to a topology that changed underneath it.
 ///
-/// The reproducibility checksum therefore covers the **lowered** manifest, which is the right
-/// thing: results are keyed to what actually ran. Lowering is pure, so the same workspace
-/// always produces the same hash.
-async fn lower_workspace(dir: &str) -> Result<String, Status> {
+/// The reproducibility checksum therefore covers exactly the documents that were read.
+async fn read_workspace(dir: &str) -> Result<String, Status> {
     let root = PathBuf::from(dir);
-    // std::fs, so it must not run on the async runtime.
     tokio::task::spawn_blocking(move || {
-        vxedge_core::lower::lower_path_to_yaml(&root)
-            .map_err(|e| Status::invalid_argument(format!("workspace `{}`: {e}", root.display())))
+        let bad =
+            |e: String| Status::invalid_argument(format!("workspace `{}`: {e}", root.display()));
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(&root)
+            .map_err(|e| bad(e.to_string()))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("yaml"))
+            .collect();
+        // Sorted, so the same workspace always produces the same document and the same hash.
+        paths.sort();
+        if paths.is_empty() {
+            return Err(bad("no `*.yaml` documents here".to_string()));
+        }
+        let mut out = String::new();
+        for path in paths {
+            let text = std::fs::read_to_string(&path).map_err(|e| bad(e.to_string()))?;
+            if !out.is_empty() {
+                out.push_str("---\n");
+            }
+            out.push_str(&text);
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        Ok(out)
     })
     .await
     .map_err(|e| Status::internal(format!("workspace task panicked: {e}")))?
@@ -118,23 +139,10 @@ mod hex {
     }
 }
 
-/// YAML → domain model. The single entry point for §6.1 text.
-///
-/// §6.1 is an input *format*, not a planner input: every planner takes the model, so a manifest
-/// reaches provisioning through exactly one adapter. That is what keeps there from being two
-/// planning paths that can disagree.
+/// Workspace documents → checked domain model. The daemon's single entry point for manifest
+/// text, whether it arrived as a directory (concatenated by [`read_workspace`]) or inline.
 fn parse_to_model(yaml: &str) -> Result<vxedge_core::model::Experiment, String> {
-    let manifest = ExperimentManifest::from_yaml(yaml).map_err(|e| e.to_string())?;
-    let model = manifest.to_model().map_err(|e| e.to_string())?;
-    let violations = model.check();
-    if !violations.is_empty() {
-        return Err(violations
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join("; "));
-    }
-    Ok(model)
+    vxedge_core::model::load_yaml(yaml).map_err(|e| e.to_string())
 }
 
 fn parse_and_plan(yaml: &str) -> Result<GatewayPlan, String> {
@@ -669,13 +677,23 @@ impl ZoneSvc {
             .map_err(|e| Status::internal(format!("stored manifest no longer models: {e}")))?;
         let plans = zones::plan_nodes_from_model(&model, &gateway, &dir)
             .map_err(|e| Status::internal(e.to_string()))?;
+        // A zone is a *region*, so `--vxid front-left` brings up everything in it. A single
+        // device is addressable by its own id as well, and that is not a convenience: exp-002's
+        // isolation contract is exactly one arm up at a time, and its three arms are three
+        // packaging backends of one region — under region-only selection they could only be
+        // started together, which is the concurrent-guest CPU contention that invalidated
+        // exp-002b's first campaign. The model forbids a zone and a device sharing an id
+        // (`InvariantError::ZoneDeviceCollision`), so accepting either is unambiguous.
         let filtered: Vec<NodePlan> = match zone_vxid {
-            Some(z) => plans.into_iter().filter(|p| p.zone_id == z).collect(),
+            Some(z) => plans
+                .into_iter()
+                .filter(|p| p.zone_id == z || p.node_id == z)
+                .collect(),
             None => plans,
         };
         if filtered.is_empty() {
             return Err(Status::not_found(format!(
-                "no nodes for zone `{}` in the active experiment",
+                "no zone or device `{}` in the active experiment",
                 zone_vxid.unwrap_or("<all>")
             )));
         }
@@ -807,9 +825,14 @@ impl ZoneService for ZoneSvc {
                         } else {
                             ResourceState::Down as i32
                         },
+                        // `peer` is here because interface names are derived from the device id
+                        // and shortened to fit IFNAMSIZ, so `vz-node-a-c06a` is not something an
+                        // operator reconstructs by eye. This listing is the answer to "which
+                        // interface is this device", and for a container-backed node the useful
+                        // half is the peer — that is the end campaign scripts address.
                         detail: format!(
-                            "zone={} backend={:?} port={} vlan={}",
-                            np.zone_id, np.backend, np.endpoint, np.vlan
+                            "zone={} backend={:?} port={} peer={} vlan={}",
+                            np.zone_id, np.backend, np.endpoint, np.peer, np.vlan
                         ),
                         since_unix_ms: now_ms(),
                     }
@@ -841,13 +864,6 @@ impl ZoneService for ZoneSvc {
 // SvcService (ota, telemetry — §8)
 // ---------------------------------------------------------------------------
 
-fn service_type_str(t: vxedge_core::manifest::ServiceType) -> &'static str {
-    match t {
-        vxedge_core::manifest::ServiceType::Ota => "ota",
-        vxedge_core::manifest::ServiceType::Telemetry => "telemetry",
-    }
-}
-
 pub struct SvcSvc {
     pub engine: JobEngine,
     pub audit: Arc<Audit>,
@@ -862,23 +878,20 @@ impl SvcSvc {
         &self,
         service_type: &str,
         experiment: Option<&ManifestRef>,
-    ) -> Result<(vxedge_core::manifest::ServiceDef, String), Status> {
+    ) -> Result<(vxedge_core::services::ServiceDef, String), Status> {
         if service_type.is_empty() {
             return Err(Status::invalid_argument(
                 "service_type is required (\"ota\" or \"telemetry\")",
             ));
         }
         let (yaml, sha256, _dir) = resolve_manifest(experiment).await?;
-        let manifest = ExperimentManifest::from_yaml(&yaml)
-            .map_err(|e| Status::invalid_argument(format!("manifest invalid: {e}")))?;
-        let def = manifest
-            .services
-            .values()
-            .find(|s| service_type_str(s.service_type) == service_type)
-            .cloned()
+        let model = parse_to_model(&yaml)
+            .map_err(|e| Status::invalid_argument(format!("workspace invalid: {e}")))?;
+        let def = vxedge_core::services::ServiceDef::find(&model, service_type)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?
             .ok_or_else(|| {
                 Status::not_found(format!(
-                    "no `{service_type}` service declared under `services` in this manifest"
+                    "no `{service_type}` service declared under `services` in this experiment"
                 ))
             })?;
         Ok((def, sha256))

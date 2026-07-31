@@ -37,6 +37,15 @@ pub enum WorkspaceError {
         .0.iter().map(|e| format!("  - {e}")).collect::<Vec<_>>().join("\n")
     )]
     Invalid(Vec<WorkspaceValidationError>),
+    #[error(
+        "`{}` is a §6.{} manifest (it declares `{key}:` and no `kind:`), which stopped being a \
+         provisioning input on 2026-07-31. Point this at the experiment's §6.0 workspace \
+         directory instead — `vxedge manifest validate` still checks the old shape if you need \
+         it for a renderer.",
+        .path.display(),
+        if .key == "vehicle" { "2" } else { "1" }
+    )]
+    LegacyManifest { path: PathBuf, key: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -130,6 +139,16 @@ pub enum WorkspaceValidationError {
         baseline: String,
         part: String,
         digest: String,
+    },
+    #[error(
+        "vehicle `{vehicle}`: link `{link}` endpoint `{endpoint}` has `ip: {ip}` — expected an \
+         address with a prefix length, e.g. `10.101.0.11/24`"
+    )]
+    MalformedAddress {
+        vehicle: String,
+        link: String,
+        endpoint: String,
+        ip: String,
     },
     #[error(
         "experiment `{experiment}`: traffic profile `{profile}` has `{field}: {endpoint}`, which \
@@ -303,9 +322,113 @@ impl VehicleDoc {
 pub struct LinkDoc {
     pub id: String,
     #[serde(default)]
-    pub endpoints: Vec<String>,
+    pub endpoints: Vec<EndpointDoc>,
     #[serde(default)]
     pub slice: Option<String>,
+}
+
+/// One end of a link, in either of two forms:
+///
+/// ```yaml
+/// endpoints: [gw1:eth0, zonefl:eth0]                        # bare: no address needed
+/// endpoints: [{ node: node-cont-01, port: eth0, ip: 10.101.0.11/24 }]
+/// ```
+///
+/// The bare form is kept because it is the right one whenever nothing has to be reachable at a
+/// known address, which is most attachments — exp-001 declares no address at all and lets the
+/// campaign assign them. The object form exists for the case that has no other expression:
+/// exp-002's three arms share one VLAN and are told apart *only* by address, so the probe
+/// reaches each arm by its `10.101.0.1{1,2,3}`.
+///
+/// An address is a property of the **attachment**, not of the device — a device on two slices
+/// has two — so it lives on the endpoint rather than on `devices:`. And it lives in the
+/// *vehicle* rather than the experiment because it describes a structural fact ("this ECU
+/// answers here"), which is what keeps one vehicle usable by many baselines.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum EndpointDoc {
+    /// `component` or `component:port`.
+    Bare(String),
+    Attached(AttachedEndpoint),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AttachedEndpoint {
+    pub node: String,
+    #[serde(default)]
+    pub port: Option<String>,
+    /// Host address in CIDR form (`10.101.0.11/24`), configured on this attachment by the zone
+    /// backend. Validated for shape at load time — an address that only fails at `ip addr add`
+    /// fails halfway through provisioning, with half a topology up.
+    #[serde(default)]
+    pub ip: Option<String>,
+}
+
+impl EndpointDoc {
+    /// The component id this end names.
+    pub fn node(&self) -> &str {
+        match self {
+            EndpointDoc::Bare(s) => component_of(s),
+            EndpointDoc::Attached(a) => &a.node,
+        }
+    }
+
+    /// The port, when declared.
+    pub fn port(&self) -> Option<&str> {
+        match self {
+            EndpointDoc::Bare(s) => s.split_once(':').map(|(_, p)| p),
+            EndpointDoc::Attached(a) => a.port.as_deref(),
+        }
+    }
+
+    pub fn ip(&self) -> Option<&str> {
+        match self {
+            EndpointDoc::Bare(_) => None,
+            EndpointDoc::Attached(a) => a.ip.as_deref(),
+        }
+    }
+
+    /// `component:port`, the spelling §6.1 lowering and error messages both want.
+    pub fn qualified(&self) -> String {
+        match self.port() {
+            Some(p) => format!("{}:{p}", self.node()),
+            None => self.node().to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for EndpointDoc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.qualified())
+    }
+}
+
+/// Hand-written rather than `#[serde(untagged)]` on the way in: untagged reports every failure
+/// as "data did not match any variant", so a typo'd key inside the object form would be
+/// diagnosed as a malformed *string*. Dispatching on the YAML node type first means the object
+/// form's own error survives — `unknown field `adress`, expected one of node, port, ip`.
+impl<'de> Deserialize<'de> for EndpointDoc {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = EndpointDoc;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("`component:port`, or { node, port, ip }")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<EndpointDoc, E> {
+                Ok(EndpointDoc::Bare(v.to_string()))
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                m: M,
+            ) -> Result<EndpointDoc, M::Error> {
+                AttachedEndpoint::deserialize(serde::de::value::MapAccessDeserializer::new(m))
+                    .map(EndpointDoc::Attached)
+            }
+        }
+        d.deserialize_any(V)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -333,6 +456,15 @@ pub struct PartEntry {
     pub digest: Option<String>,
     #[serde(default)]
     pub target_ids: Option<OneOrMany>,
+    /// `container` | `bundle` — what this loadable *is*, when the reference does not say.
+    ///
+    /// A part knows its own kind: a `zone/linux/stack/…` vxparts ref is a bootable bundle, a
+    /// `local/vxprobe:host-process` is not. Only a bare path is genuinely ambiguous, and that
+    /// is what this field is for. Stating it is what lets a baseline pointing a `libvirt` arm
+    /// at a container image be *rejected* rather than merely unrepresentable — the check H3
+    /// needs most, since it runs one function on three backends from three parts.
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 impl PartEntry {
@@ -411,34 +543,79 @@ impl Workspace {
                 path: path.clone(),
                 source,
             })?;
-            let header: Header =
-                serde_yaml_ng::from_str(&text).map_err(|source| WorkspaceError::Parse {
-                    path: path.clone(),
-                    source,
-                })?;
-            let parse_err = |source| WorkspaceError::Parse {
-                path: path.clone(),
-                source,
-            };
-            match header.kind {
-                Kind::Experiment => {
-                    ws.experiments
-                        .push(serde_yaml_ng::from_str(&text).map_err(parse_err)?);
-                    ws.experiments_raw
-                        .push(serde_yaml_ng::from_str(&text).map_err(parse_err)?);
-                }
-                Kind::Vehicle => ws
-                    .vehicles
-                    .push(serde_yaml_ng::from_str(&text).map_err(parse_err)?),
-                Kind::Baseline => ws
-                    .baselines
-                    .push(serde_yaml_ng::from_str(&text).map_err(parse_err)?),
-                Kind::Road => ws.roads.push(header.id),
-                Kind::Component => ws.components.push(header.id),
-            }
+            ws.absorb(&text, &path)?;
         }
 
         Ok(ws)
+    }
+
+    /// Read a workspace from YAML text rather than from a directory.
+    ///
+    /// One file can hold the whole workspace as `---`-separated documents. That works because
+    /// every reference is by id and never by path, so the file boundary carries no meaning —
+    /// the loader simply never reached it before. Separate files stay the scaffold's default
+    /// because they teach the model, but an engineer who wants one file, or a caller with no
+    /// directory to point at (an inline manifest over vxAPI), now has one.
+    pub fn from_yaml(text: &str) -> Result<Self, WorkspaceError> {
+        let mut ws = Workspace::default();
+        ws.absorb(text, Path::new("<inline>"))?;
+        Ok(ws)
+    }
+
+    /// Route every YAML document in `text` by its `kind`.
+    ///
+    /// Multi-document on purpose — see [`Workspace::from_yaml`]. A file holding one document is
+    /// the same case with one iteration, so there is a single path here rather than two that
+    /// can drift.
+    fn absorb(&mut self, text: &str, path: &Path) -> Result<(), WorkspaceError> {
+        use serde::Deserialize;
+
+        let parse_err = |source| WorkspaceError::Parse {
+            path: path.to_path_buf(),
+            source,
+        };
+        for document in serde_yaml_ng::Deserializer::from_str(text) {
+            let value = serde_yaml_ng::Value::deserialize(document).map_err(parse_err)?;
+            // An empty document (a trailing `---`, or a file of only comments) is not an error;
+            // it simply declares nothing.
+            if value.is_null() {
+                continue;
+            }
+            // A §6.1/§6.2 manifest reaches here whenever something still points at the old
+            // file — a campaign script, a stale note. "missing field `kind`" is true and
+            // useless; say what the document is and where to go instead.
+            if value.get("kind").is_none() {
+                for key in ["experiment", "vehicle"] {
+                    if value.get(key).is_some() {
+                        return Err(WorkspaceError::LegacyManifest {
+                            path: path.to_path_buf(),
+                            key: key.to_string(),
+                        });
+                    }
+                }
+            }
+            let header: Header = serde_yaml_ng::from_value(value.clone()).map_err(parse_err)?;
+            fn doc<T: serde::de::DeserializeOwned>(
+                value: serde_yaml_ng::Value,
+                path: &Path,
+            ) -> Result<T, WorkspaceError> {
+                serde_yaml_ng::from_value(value).map_err(|source| WorkspaceError::Parse {
+                    path: path.to_path_buf(),
+                    source,
+                })
+            }
+            match header.kind {
+                Kind::Experiment => {
+                    self.experiments.push(doc(value.clone(), path)?);
+                    self.experiments_raw.push(value);
+                }
+                Kind::Vehicle => self.vehicles.push(doc(value, path)?),
+                Kind::Baseline => self.baselines.push(doc(value, path)?),
+                Kind::Road => self.roads.push(header.id),
+                Kind::Component => self.components.push(header.id),
+            }
+        }
+        Ok(())
     }
 
     /// Every cross-file check, returning all problems rather than the first.
@@ -545,13 +722,23 @@ impl Workspace {
 
             for l in &v.links {
                 for ep in &l.endpoints {
-                    let c = component_of(ep);
+                    let c = ep.node();
                     if !own.contains(c) {
                         errors.push(E::UnknownLinkEndpoint {
                             vehicle: v.id.clone(),
                             link: l.id.clone(),
-                            endpoint: ep.clone(),
+                            endpoint: ep.to_string(),
                             component: c.to_string(),
+                        });
+                    }
+                    if let Some(ip) = ep.ip()
+                        && !is_cidr(ip)
+                    {
+                        errors.push(E::MalformedAddress {
+                            vehicle: v.id.clone(),
+                            link: l.id.clone(),
+                            endpoint: ep.to_string(),
+                            ip: ip.to_string(),
                         });
                     }
                 }
@@ -609,8 +796,7 @@ impl Workspace {
                     loop {
                         let before = reachable.len();
                         for l in v.links.iter().filter(|l| ch.carried_by.contains(&l.id)) {
-                            let comps: Vec<&str> =
-                                l.endpoints.iter().map(|e| component_of(e)).collect();
+                            let comps: Vec<&str> = l.endpoints.iter().map(|e| e.node()).collect();
                             if comps.iter().any(|c| reachable.contains(c)) {
                                 for c in comps {
                                     reachable.insert(c);
@@ -727,6 +913,23 @@ impl Workspace {
         } else {
             Err(WorkspaceError::Invalid(errors))
         }
+    }
+}
+
+/// `10.101.0.11/24` or `fd00::1/64`. The prefix length is required: a bare address leaves the
+/// zone backend guessing at the mask, and guessing produced an attachment that came up on the
+/// wrong subnet once already.
+fn is_cidr(raw: &str) -> bool {
+    let Some((addr, prefix)) = raw.split_once('/') else {
+        return false;
+    };
+    let Ok(prefix) = prefix.parse::<u8>() else {
+        return false;
+    };
+    match addr.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(_)) => prefix <= 32,
+        Ok(std::net::IpAddr::V6(_)) => prefix <= 128,
+        Err(_) => false,
     }
 }
 
@@ -976,6 +1179,73 @@ parts:
         fs::remove_dir_all(&root).ok();
     }
 
+    /// exp-002's shape: three arms on one VLAN, told apart only by address. The bare form stays
+    /// valid alongside it — most attachments need no fixed address, and every existing workspace
+    /// uses it.
+    #[test]
+    fn a_link_endpoint_can_carry_an_address_without_the_bare_form_going_away() {
+        let vehicle = GOOD_VEHICLE.replace(
+            "  - { id: trunk-fl, endpoints: [gw1:eth0, zonefl:eth0], slice: adas }",
+            "  - id: trunk-fl\n    endpoints:\n      - gw1:eth0\n      - { node: zonefl, port: eth0, ip: 10.101.0.11/24 }\n    slice: adas",
+        );
+        let root = workspace(
+            "addressed",
+            &[
+                ("main.yaml", GOOD_EXPERIMENT),
+                ("car1.yaml", &vehicle),
+                ("parts.yaml", GOOD_BASELINE),
+            ],
+        );
+        let ws = Workspace::load(&root).expect("parses");
+        assert_eq!(ws.validate(), vec![]);
+        let eps = &ws.vehicles[0].links[0].endpoints;
+        assert_eq!(eps[0].node(), "gw1");
+        assert_eq!(eps[0].ip(), None, "the bare form carries no address");
+        assert_eq!(eps[1].node(), "zonefl");
+        assert_eq!(eps[1].port(), Some("eth0"));
+        assert_eq!(eps[1].ip(), Some("10.101.0.11/24"));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// An address that only fails at `ip addr add` fails halfway through provisioning, with half
+    /// a topology up. It is a shape error, so it is caught where shape errors are caught.
+    #[test]
+    fn an_address_without_a_prefix_length_is_caught() {
+        let vehicle = GOOD_VEHICLE.replace(
+            "endpoints: [gw1:eth0, zonefl:eth0]",
+            "endpoints: [gw1:eth0, { node: zonefl, ip: 10.101.0.11 }]",
+        );
+        let root = workspace(
+            "badaddr",
+            &[
+                ("main.yaml", GOOD_EXPERIMENT),
+                ("car1.yaml", &vehicle),
+                ("parts.yaml", GOOD_BASELINE),
+            ],
+        );
+        let errs = Workspace::load(&root).unwrap().validate();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, WorkspaceValidationError::MalformedAddress { ip, .. } if ip == "10.101.0.11")),
+            "{errs:?}"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The reason the endpoint form is deserialized by hand: `#[serde(untagged)]` reports every
+    /// failure as "data did not match any variant", so a misspelled key would be diagnosed as a
+    /// malformed *string* and send the author looking at the wrong thing.
+    #[test]
+    fn a_misspelled_key_in_the_object_form_names_the_key() {
+        let err = serde_yaml_ng::from_str::<LinkDoc>(
+            "id: l\nendpoints: [{ node: zonefl, adress: 10.101.0.11/24 }]\n",
+        )
+        .expect_err("unknown field is rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("adress"), "{msg}");
+        assert!(msg.contains("node"), "{msg}");
+    }
+
     #[test]
     fn target_ids_accepts_a_scalar_or_a_list() {
         let one: PartEntry = serde_yaml_ng::from_str("ref: ./x\ntarget_ids: fn-hpc1").unwrap();
@@ -983,6 +1253,53 @@ parts:
             serde_yaml_ng::from_str("ref: ./x\ntarget_ids: [fn-a, fn-b]").unwrap();
         assert_eq!(one.target_ids.unwrap().as_slice(), vec!["fn-hpc1"]);
         assert_eq!(many.target_ids.unwrap().as_slice(), vec!["fn-a", "fn-b"]);
+    }
+
+    /// Every reference is by id and never by path, so the file boundary carries no meaning —
+    /// a workspace collapsed into one `---`-separated file has to load, and validate, exactly
+    /// as the folder does.
+    #[test]
+    fn a_whole_workspace_can_live_in_one_file() {
+        let one_file = format!("{GOOD_EXPERIMENT}---{GOOD_VEHICLE}---{GOOD_BASELINE}");
+        let inline = Workspace::from_yaml(&one_file).expect("parses");
+        assert_eq!(inline.validate(), vec![], "{:?}", inline.validate());
+
+        let root = workspace(
+            "onefile",
+            &[
+                ("main.yaml", GOOD_EXPERIMENT),
+                ("car1.yaml", GOOD_VEHICLE),
+                ("parts.yaml", GOOD_BASELINE),
+            ],
+        );
+        let folder = Workspace::load(&root).unwrap();
+        // The same workspace either way: same documents, same ids, same verdict.
+        assert_eq!(inline.experiments.len(), folder.experiments.len());
+        assert_eq!(inline.vehicles[0].id, folder.vehicles[0].id);
+        assert_eq!(
+            inline.baselines[0].parts.len(),
+            folder.baselines[0].parts.len()
+        );
+        assert_eq!(inline.experiments_raw, folder.experiments_raw);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A directory whose files each hold several documents is the same case — nothing about the
+    /// two forms may be exclusive.
+    #[test]
+    fn documents_can_be_grouped_across_files_however_the_author_likes() {
+        let root = workspace(
+            "grouped",
+            &[
+                (
+                    "everything.yaml",
+                    &format!("{GOOD_EXPERIMENT}---{GOOD_VEHICLE}"),
+                ),
+                ("parts.yaml", GOOD_BASELINE),
+            ],
+        );
+        assert_eq!(Workspace::load(&root).unwrap().validate(), vec![]);
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

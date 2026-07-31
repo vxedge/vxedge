@@ -938,18 +938,23 @@ pub fn fiveg_status(cfg: &FiveGLifecycleConfig) -> Result<FiveGStatus, FiveGLife
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::ExperimentManifest;
 
     fn plan_two_slices() -> FiveGPlan {
         let yaml = r#"
-experiment: { id: t, name: t, duration_s: 1, results_prefix: r }
+kind: experiment
+id: t
+vehicles: [veh]
 network:
   slices:
     - { id: adas, mode: s-nssai, s_nssai: { sst: 1, sd: '000001' } }
     - { id: infotainment, mode: s-nssai, s_nssai: { sst: 2 } }
+---
+kind: vehicle
+id: veh
+devices: {}
 "#;
-        let m = ExperimentManifest::from_yaml(yaml).expect("test manifest parses");
-        FiveGPlan::from_model(&m.to_model().expect("adapts")).expect("plans")
+        let m = crate::model::load_yaml(yaml).expect("valid test workspace");
+        FiveGPlan::from_model(&m).expect("plans")
     }
 
     #[test]

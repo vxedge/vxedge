@@ -19,7 +19,6 @@
 //!   cd ../.. && sudo -v && \
 //!     cargo test -p vxedge-core --test fiveg_podman -- --ignored --nocapture
 
-use vxedge_core::ExperimentManifest;
 use vxedge_core::fiveg::{
     FiveGLifecycleConfig, FiveGPlan, SliceSession, fiveg_down, fiveg_status, fiveg_up, pod_exists,
     pod_pid, ue_down, ue_pod_name, ue_probe_up, ue_up,
@@ -27,12 +26,18 @@ use vxedge_core::fiveg::{
 
 const PROBE_PORT: u16 = 9800;
 
-const MANIFEST: &str = r#"
-experiment: { id: fiveg-podman-test, name: fiveg lifecycle integration }
+const WORKSPACE: &str = r#"
+kind: experiment
+id: fiveg-podman-test
+vehicles: [veh]
 network:
   slices:
     - { id: adas, mode: s-nssai, s_nssai: { sst: 1, sd: '000001' } }
     - { id: infotainment, mode: s-nssai, s_nssai: { sst: 2, sd: '000002' } }
+---
+kind: vehicle
+id: veh
+devices: {}
 "#;
 
 /// Removes both test pods, plus any UE pods brought up, even if an
@@ -53,8 +58,8 @@ impl Drop for PodGuard {
 #[test]
 #[ignore = "needs root + podman + the vx5g-core/vx5g-ran images (see module docs)"]
 fn fiveg_up_brings_cn_and_ran_pods_up_idempotently_then_tears_down() {
-    let manifest = ExperimentManifest::from_yaml(MANIFEST).expect("manifest parses");
-    let plan = FiveGPlan::from_model(&manifest.to_model().expect("adapts")).expect("plans");
+    let model = vxedge_core::model::load_yaml(WORKSPACE).expect("workspace loads");
+    let plan = FiveGPlan::from_model(&model).expect("plans");
     let runtime_dir = tempfile::tempdir().expect("tempdir");
     let cfg = FiveGLifecycleConfig {
         pod_name: "vx5g-cargo-test".to_string(),

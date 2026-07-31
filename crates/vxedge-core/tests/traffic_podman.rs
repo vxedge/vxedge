@@ -32,53 +32,46 @@
 //!     VXTRAFFIC_BIN=../vxagents/target/release/vxtraffic \
 //!     cargo test -p vxedge-core --test traffic_podman -- --ignored --nocapture
 
-use vxedge_core::ExperimentManifest;
 use vxedge_core::fiveg::{self, FiveGLifecycleConfig, FiveGPlan};
 use vxedge_core::gateway::{self, GatewayPlan, Shell};
 use vxedge_core::traffic::{TrafficPlan, profile_down, profile_up};
 
 const PROBE_PORT: u16 = 9800;
 
-const MANIFEST: &str = r#"
-experiment: { id: traffic-podman-test, name: TrafficService live integration }
+const WORKSPACE: &str = r#"
+kind: experiment
+id: traffic-podman-test
+vehicles: [veh]
 network:
   defaults: { bandwidth: 500000000 }
   slices:
     - { id: adas, mode: vlan, vlan: 101, qos: { min_rate_mbps: 100, max_rate_mbps: 200, priority: 1 } }
     - { id: infotainment, mode: vlan, vlan: 103, qos: { min_rate_mbps: 0, max_rate_mbps: 400, priority: 5 } }
     - { id: h2slice, mode: s-nssai, s_nssai: { sst: 3, sd: '000003' } }
-zones:
-  - id: vxzone-fl-01
-    role: front-left
-    nodes:
-      - id: node-adas-01
-        type: ecu
-        image: { url: x, kind: container }
-        backend: container
-        network: [{ iface: eth0, vlan: 101, slice: adas }]
-      - id: node-info-01
-        type: infotainment
-        image: { url: x, kind: container }
-        backend: container
-        network: [{ iface: eth0, vlan: 103, slice: infotainment }]
-      - id: node-h2-01
-        type: ecu
-        image: { url: x, kind: container }
-        backend: container
-        network: [{ iface: eth0, slice: h2slice }]
 traffic_profiles:
   adas-probe:
-    source: vxzone-fl-01:node-adas-01
+    source: node-adas-01
     target: internet
     pps: 200
   infotainment-load:
-    source: vxzone-fl-01:node-info-01
+    source: node-info-01
     target: internet
     bandwidth_mbps: 100
   h2-probe:
     source: internet
-    target: vxzone-fl-01:node-h2-01
+    target: node-h2-01
     pps: 200
+---
+kind: vehicle
+id: veh
+devices:
+  node-adas-01: { role: ecu, backend: container }
+  node-info-01: { role: ecu, backend: container }
+  node-h2-01:   { role: ecu, backend: container }
+links:
+  - { id: l-adas,  endpoints: [node-adas-01:eth0], slice: adas }
+  - { id: l-infot, endpoints: [node-info-01:eth0], slice: infotainment }
+  - { id: l-h2,    endpoints: [node-h2-01:eth0],   slice: h2slice }
 "#;
 
 fn vxprobe_bin() -> String {
@@ -117,14 +110,10 @@ impl Drop for Guard {
 #[test]
 #[ignore = "needs root + podman + vx5g-core/vx5g-ran images + built vxprobe/vxtraffic (see module docs)"]
 fn traffic_service_runs_vlan_and_snssai_profiles_simultaneously_through_the_real_bridge() {
-    let manifest = ExperimentManifest::from_yaml(MANIFEST).expect("manifest parses");
-    let gateway_plan =
-        GatewayPlan::from_model(&manifest.to_model().expect("adapts")).expect("gateway plan");
-    let five_g_plan =
-        FiveGPlan::from_model(&manifest.to_model().expect("adapts")).expect("fiveg plan");
-    let traffic_plan =
-        TrafficPlan::from_model(&manifest.to_model().expect("adapts"), &gateway_plan)
-            .expect("traffic plan");
+    let model = vxedge_core::model::load_yaml(WORKSPACE).expect("workspace loads");
+    let gateway_plan = GatewayPlan::from_model(&model).expect("gateway plan");
+    let five_g_plan = FiveGPlan::from_model(&model).expect("fiveg plan");
+    let traffic_plan = TrafficPlan::from_model(&model, &gateway_plan).expect("traffic plan");
     assert_eq!(traffic_plan.profiles.len(), 3);
 
     let sh = Shell::default();

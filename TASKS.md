@@ -227,65 +227,86 @@ baseline the migration is being checked against.
       Sequencing note: do this **before** migrating exp-002/002b/003/010, so they are migrated
       once rather than twice — the same argument that pairs exp-002's schema and vxparts cutovers.
 
-### Blocking exp-002/002b (found 2026-07-31 by attempting the migration)
+### Blocking exp-002/002b — **closed 2026-07-31**
 
-Both are §6.0 expressiveness gaps. They are the next code to write — exp-002 and exp-002b cannot
-migrate without them, and those two are the last experiments before §6.1 can be deleted.
+All three were §6.0 expressiveness gaps found by attempting the migration. exp-002 and exp-002b
+are migrated (`vxperiments/experiments/exp-002-ws`, `exp-002b-ws`), both plan-identical to the
+manifests they replace.
 
-- [ ] **Link endpoints need an object form carrying a node address.** exp-002's three arms are
-      distinguished by IP (`10.101.0.11/.12/.13` on one shared vlan) — that is how the probe
-      reaches each arm separately. §6.1 has `network[].ip`; §6.0's endpoints are bare strings with
-      nowhere to put one. `model::Endpoint.ip_cidr` already exists and is populated only by the
-      §6.1 adapter, so this is schema + builder, not model.
+- [x] **Link endpoints take an object form carrying a node address** — `{ node, port, ip }`
+      alongside the bare `node:port` string, which stays right whenever no fixed address is
+      needed. exp-002's three arms share one VLAN and are told apart only by address.
+      Deserialized by hand rather than with `#[serde(untagged)]`, so a misspelled key inside the
+      object is reported as a misspelled key rather than as a malformed string. Addresses are
+      CIDR-checked at load time.
+- [x] **Where addresses belong** — on the link endpoint (the attachment), in the *vehicle*.
+      A vehicle that pins none stays reusable across experiments and slice subnets. Slice
+      `subnet:` as an experiment-side addressing policy is **not** implemented: no experiment
+      needs auto-assignment yet, and an allocator would reintroduce order-dependence.
+- [x] **`PartKind` is taken from the part, not derived from the backend** — explicit
+      `kind: container | bundle` on the baseline entry, else the reference where it is
+      conclusive (`local/…` is never a bundle), else the backend as a last resort. A stated kind
+      is validated against the device's backend, so an H3 arm pointed at the wrong packaging is
+      rejected with both halves named. A published vxparts ref is deliberately not read for
+      this: its class says what kind of *node* the part loads onto, not how it is packaged.
+- [x] **Device traversal order is no longer expressible, because nothing derives from it** —
+      interface names come from the device id (`gateway::ifnames`, `ARCHITECTURE.md` §6.0.5).
+      `Entity::device_order` and its invariant are deleted; the gateway and zone plans join by
+      interface name rather than by index. Campaign scripts were updated once, deliberately.
 
-      ```yaml
-      links:
-        - id: arm-cont
-          endpoints: [{ node: node-cont-01, port: eth0, ip: 10.101.0.11/24 }]
-          slice: adas
-      ```
-      Keep the bare-string form: it is right whenever no address is needed, and every existing
-      workspace uses it.
+Two more defects surfaced while migrating, both fixed:
 
-- [ ] **Where addresses belong — decided shape.** An address is a property of an *attachment*
-      (device × link), not of a device: a device on two slices has two of them, which is why §6.1
-      put `ip` on the iface rather than the node. So it goes on the link endpoint's object form.
+- [x] **A VM's guest bundle was unreachable in §6.0** — the zone planner looked up a device's
+      software by *function id equals device id*, true in §6.1 and false here, so every libvirt
+      and qemu-microvm arm planned as a VM with no bundle to boot. Resolves through
+      `deployed_on` now, with `AmbiguousBundle` when a device hosts two bootable parts.
+- [x] **`zone up --vxid` could not select one arm** — a zone is a region, and exp-002's three
+      arms share `front-left`, so region-only selection could start only all three at once: the
+      concurrent-guest CPU contention that invalidated exp-002b's first campaign. It accepts a
+      device id as well; the model already forbids a zone and a device sharing an id.
 
-      But a *fixed* address is deployment policy, not vehicle structure — exp-001 declares none at
-      all and lets the campaign assign them, while exp-002 needs them because its three arms share
-      one vlan. So the split follows the one already in the workspace:
+### §6.1 removal — **mostly done 2026-07-31**
 
-      - `main.yaml` (the **test**) owns addressing policy: `network.slices[].subnet: 10.101.0.0/24`.
-      - `vehicle.yaml` (the **structure**) optionally pins a host address per attachment, when an
-        attachment must be reachable at a known address.
+- [x] `lower.rs` deleted (its only consumer, `vxtelemetry`, reads workspaces now).
+- [x] `model/adapt.rs` deleted; `plan-diff` deleted with it.
+- [x] The daemon holds workspace documents, not a lowered §6.1 manifest; `parse_to_model` is
+      `model::load_yaml`. `experiment up` fans out over what `ZoneService` can actually plan
+      rather than over §6.1 `zones[]`, one device at a time.
+- [x] `ServiceDef`/`ServiceType`/`Image`/`ImageKind` moved to `vxedge-core::services`, which is
+      their only consumer; they read the model's `passthrough["services"]`.
+- [x] `NodePlan.backend` and traffic's `SliceMode` now use the model's own enums.
+- [x] `vxedge manifest validate` validates a §6.0 workspace (directory or single file) and
+      still checks §6.1/§6.2 shapes, sniffed by what the document declares.
+- [x] **`manifest.rs` deleted** (2026-07-31) — `ExperimentManifest`, `VehicleManifest` and the
+      shared §6.1 composition types, ~876 lines. Unblocked by migrating `vxmodel render` to emit
+      §6.0 workspaces first, so no repo was ever left with a red gate: vxmodels' CI now asserts
+      `kind == "workspace"` and workspace counts. `gateway::plan::resolved_backend` went with
+      it — it resolved a §6.1 `image.kind` into a backend, which §6.0 states outright.
+      `vxedge manifest validate` accepts §6.0 and nothing else.
 
-      A vehicle with no pinned addresses stays reusable across experiments and slice subnets,
-      which is the property that makes "one vehicle, many baselines" real. Pinning everything in
-      the vehicle would quietly tie it to one experiment's addressing.
+### Open, found while deleting §6.1 (2026-07-31)
 
-- [ ] **`PartKind` is derived from the device backend, so a mismatch cannot be detected.**
-      A part *knows* what it is — a `zone/linux/stack/...` bundle is a bundle, a container part is
-      a container — and the device says how to run it. Deriving one from the other means a
-      baseline pointing a `libvirt` arm at a container image is unrepresentable rather than
-      rejected. Take the kind from the part (its vxparts class/layer, or an explicit field on the
-      baseline entry) and **validate it against the backend**, so a mismatch is an error with
-      both halves named. Matters most for H3, where the same function runs on three backends and
-      therefore needs three different parts.
+None block the critical path; all are consistency debts this session created or exposed.
 
-- [ ] **§6.0 needs a way to state device traversal order.** Devices live in a map, so traversal
-      is sorted id, and endpoint names are positional. exp-002 declares `cont, microvm, libvirt`
-      and sorts to `cont, libvirt, microvm` — `vzp1`/`vzp2` swap, and `run-exp-002.sh`, which
-      addresses them by name, would measure libvirt while reporting microvm. Passing every test.
-
-      The §6.1 adapter already preserves declaration order through `device_order`; §6.0 has no
-      way to say one. Renaming arms so sorted order coincides is not a fix — it makes correctness
-      depend on id spelling and re-breaks on the next experiment.
-
-      This is the same fragility as the positional-numbering item below, approached from the
-      other side. **Worth considering fixing them together**: if an endpoint's name derived from
-      its device id rather than its position, order would stop being load-bearing at all and both
-      items would close. That change breaks every campaign script once, deliberately — which is
-      cheaper now, while only three workspaces exist, than after all of them are migrated.
+- [ ] **Two different answers to "which workspace was this".** The daemon hashes the
+      *concatenated* `*.yaml` text it read (`services::resolve_manifest`); `vxtelemetry` hashes
+      each file's name and bytes, `.vxp` included (`workspace_view::content_sha256`). So an
+      audit record's `manifest_sha256` and its archive's `workspace_sha256` disagree for the
+      same run, and neither is wrong — they are just two rules. Pick one, state it in
+      `ARCHITECTURE.md` §13, and make both sides cite it. The daemon's omission of the `.vxp`
+      also means an inline workspace carries no `requires`, which task 4's preflight will need.
+- [ ] **The `slicing` scaffold template pairs a bundle-named part with container devices** —
+      `ghcr.io/vxedge/parts/zone/linux/stack/probe-bundle` on `backend: container`. It validates
+      (a published ref says nothing conclusive about packaging, deliberately — see
+      `model::build::kind_from_reference`), but the template is the first thing anyone reads,
+      and it teaches a pairing that would be wrong if the part were what its name suggests.
+      Either give the template a container-class part or declare `kind:` on the entry.
+- [x] **`vxedge manifest validate` accepts only §6.0** (2026-07-31) — the old shapes went with
+      `manifest.rs`, so "workspaces only" is enforced by there being nothing else to accept.
+      Its multi-document sniffing had to be fixed at the same time: it read the file with
+      `from_str`, which fails outright on a `---`-separated document set, so every rendered
+      workspace was silently routed into the §6.1 branch and rejected. It reads the first
+      document now.
 
 ### Open, found by dogfooding (2026-07-30)
 
@@ -293,19 +314,16 @@ Tracked here so they are not rediscovered. None block the critical path.
 
 - [x] `experiment new <dir> --id <experiment-id>`; `.vxp` named for the id (2026-07-30)
 - [x] `car1.yaml` → `vehicle.yaml` (2026-07-30)
-- [ ] **Multi-document YAML in `Workspace::load`** — one file per document today, so an engineer
-      who wants everything in one file cannot have it. Because every reference is by id and never
-      by path, `---`-separated documents would collapse a workspace to one file with **no other
-      change**. The design already allows it; the loader does not reach it. Separate files stay
-      the scaffold default because they teach the model.
+- [x] **Multi-document YAML in `Workspace::load`** (2026-07-31) — `---`-separated documents,
+      so a whole workspace can live in one file, and `Workspace::from_yaml` gives callers with
+      no directory (an inline manifest over vxAPI) the same loader. Separate files stay the
+      scaffold default because they teach the model.
 - [ ] **Re-derive `exp-001-ws` through `experiment new`** — it was hand-built before the scaffold
       was used for migrations. It validates and plan-diffs clean, so it is correct, but it was
       never shown to be something the tool can produce, which is the point of dogfooding.
-- [ ] **Positional endpoint numbering** — `vz0`/`vz1` are assigned in traversal order and
-      campaign scripts address them by name, so adding a device renumbers the rest and a campaign
-      silently measures the wrong interface. Pre-existing in both schema paths. The fix (derive
-      the name from the device id) breaks every campaign script, so it wants doing once,
-      deliberately.
+- [x] **Positional endpoint numbering** (2026-07-31) — names derive from the device id, so
+      adding or reordering a device cannot move one. Every campaign script was updated once, as
+      planned. `ARCHITECTURE.md` §6.0.5 is the contract.
 - [ ] **H2/`s-nssai` verification is the thinnest evidence in the port** — `FiveGPlan` and
       exp-010 are checked against fixtures, not a recorded result. Migrating exp-010 is what
       improves it.

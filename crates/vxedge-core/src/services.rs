@@ -4,10 +4,99 @@
 //! zone backend tracks its guest — not yet scheduled onto a `vxcompute` node,
 //! since that backend doesn't exist yet (§8, §10).
 
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::manifest::{ServiceDef, ServiceType};
+/// One entry of an experiment's `services:` block: what to run, and how it is packaged.
+///
+/// Lives here rather than in a schema module because this is the only thing that reads it. The
+/// domain model carries `services` as untyped `passthrough` — a service is a runtime descriptor
+/// rather than part of the vehicle under test, so typing it in the model would put a
+/// deployment concern in the system model. [`ServiceDef::find`] is the one place raw YAML
+/// becomes this type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceDef {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub service_type: ServiceType,
+    pub image: Image,
+    #[serde(default)]
+    pub config: Option<serde_yaml_ng::Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceType {
+    Ota,
+    Telemetry,
+}
+
+impl ServiceType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ServiceType::Ota => "ota",
+            ServiceType::Telemetry => "telemetry",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Image {
+    pub url: String,
+    pub kind: ImageKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageKind {
+    Vm,
+    Container,
+    Rtimage,
+}
+
+impl ServiceDef {
+    /// The service of `service_type` this experiment declares, if any.
+    ///
+    /// Reads the model's `passthrough["services"]`, which is the experiment document's own
+    /// block verbatim. A malformed entry is an error rather than a miss: a typo'd `type:` that
+    /// silently meant "no such service" would surface as "you declared no ota service" while
+    /// one is sitting in the file.
+    /// Every service type this experiment declares, in declaration order — what
+    /// `experiment up` fans out over.
+    pub fn declared_types(
+        exp: &crate::model::Experiment,
+    ) -> Result<Vec<String>, ServiceBackendError> {
+        Ok(Self::all(exp)?
+            .into_iter()
+            .map(|d| d.service_type.as_str().to_string())
+            .collect())
+    }
+
+    fn all(exp: &crate::model::Experiment) -> Result<Vec<Self>, ServiceBackendError> {
+        let Some(raw) = exp.passthrough.get("services") else {
+            return Ok(Vec::new());
+        };
+        let defs: BTreeMap<String, ServiceDef> =
+            serde_yaml_ng::from_value(raw.clone()).map_err(|e| ServiceBackendError::BadConfig {
+                svc: "services".to_string(),
+                detail: e.to_string(),
+            })?;
+        Ok(defs.into_values().collect())
+    }
+
+    pub fn find(
+        exp: &crate::model::Experiment,
+        service_type: &str,
+    ) -> Result<Option<Self>, ServiceBackendError> {
+        Ok(Self::all(exp)?
+            .into_iter()
+            .find(|d| d.service_type.as_str() == service_type))
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceBackendError {
@@ -165,7 +254,6 @@ pub fn svc_down(service_type: &str, runtime_dir: &Path) -> Result<String, Servic
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{Image, ImageKind};
 
     fn ota_def(config_yaml: &str) -> ServiceDef {
         ServiceDef {

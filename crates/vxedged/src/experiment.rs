@@ -38,7 +38,7 @@ use vxedge_api::v1::{
     ExperimentDownRequest, ExperimentStatus, ExperimentStatusRequest, ExperimentUpRequest,
     GatewayDownRequest, GatewayStatusRequest, GatewayUpRequest, Job, JobState, ManifestRef,
     ResourceKind, ResourceState, ResourceStatus, SvcDownRequest, SvcUpRequest, VxidRef,
-    ZoneDownRequest, ZoneUpRequest, manifest_ref::Source,
+    ZoneDownRequest, ZoneListRequest, ZoneUpRequest, manifest_ref::Source,
 };
 
 use crate::audit::Audit;
@@ -141,29 +141,38 @@ impl Handles {
             .map_err(|e| format!("gateway: {e}"))
     }
 
-    async fn stage_zones(
-        &self,
-        manifest: &vxedge_core::ExperimentManifest,
-        up: bool,
-        p: &Progress,
-    ) -> Result<String, String> {
-        let total = manifest.zones.len();
+    /// Bring every provisioned device up or down, one RPC each.
+    ///
+    /// The list comes from `ZoneService` rather than from the workspace, because what it can
+    /// plan *is* what has to be staged: a device with no VLAN attachment has no bridge port and
+    /// no node plan, and asking for it by name would fail the stage on a device that was never
+    /// meant to be provisioned. Addressing devices individually rather than by region also
+    /// keeps `up` from starting several guests concurrently in one call — the concurrency that
+    /// invalidated exp-002b's first campaign.
+    async fn stage_zones(&self, up: bool, p: &Progress) -> Result<String, String> {
+        let listed = match self.zones.list(Request::new(ZoneListRequest {})).await {
+            Ok(r) => r.into_inner().zones,
+            // No active experiment, or nothing plannable in it: both mean there is nothing to
+            // stage, which is not a failure.
+            Err(_) => return Ok("no zones declared".into()),
+        };
+        let total = listed.len();
         if total == 0 {
             return Ok("no zones declared".into());
         }
-        for (i, zone) in manifest.zones.iter().enumerate() {
+        for (i, node) in listed.iter().enumerate() {
             p.update(
                 40 + (i as u32 * 30) / total as u32,
                 &format!(
                     "zone {}/{}: {} ({})",
                     i + 1,
                     total,
-                    zone.id,
+                    node.vxid,
                     if up { "up" } else { "down" }
                 ),
             );
             let r#ref = Some(VxidRef {
-                vxid: zone.id.clone(),
+                vxid: node.vxid.clone(),
             });
             let job = if up {
                 self.zones.up(Request::new(ZoneUpRequest { r#ref })).await
@@ -172,24 +181,24 @@ impl Handles {
                     .down(Request::new(ZoneDownRequest { r#ref }))
                     .await
             }
-            .map_err(|e| format!("zone `{}`: {}", zone.id, e.message()))?;
+            .map_err(|e| format!("zone `{}`: {}", node.vxid, e.message()))?;
             await_job(&self.engine, job.into_inner())
                 .await
-                .map_err(|e| format!("zone `{}`: {e}", zone.id))?;
+                .map_err(|e| format!("zone `{}`: {e}", node.vxid))?;
         }
         Ok(format!("{total} zone(s)"))
     }
 
     async fn stage_services(
         &self,
-        manifest: &vxedge_core::ExperimentManifest,
+        model: &vxedge_core::model::Experiment,
         yaml: &str,
         up: bool,
         p: &Progress,
     ) -> Result<String, String> {
-        // Keyed by service *type* because that is what SvcService dispatches on; the manifest's
-        // own key is the type in every schema-valid document.
-        let types: Vec<String> = manifest.services.keys().cloned().collect();
+        // Keyed by service *type* because that is what SvcService dispatches on.
+        let types = vxedge_core::services::ServiceDef::declared_types(model)
+            .map_err(|e| format!("services: {e}"))?;
         if types.is_empty() {
             return Ok("no services declared".into());
         }
@@ -226,21 +235,21 @@ impl Handles {
 impl ExperimentService for ExperimentSvc {
     async fn up(&self, req: Request<ExperimentUpRequest>) -> Result<Response<Job>, Status> {
         let yaml = resolve_once(req.get_ref().manifest.as_ref()).await?;
-        let manifest = vxedge_core::ExperimentManifest::from_yaml(&yaml)
+        let model = vxedge_core::model::load_yaml(&yaml)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
         self.audit.record(
             "ExperimentService.Up",
-            serde_json::json!({ "experiment": manifest.experiment.id }),
+            serde_json::json!({ "experiment": model.id }),
         );
-        let id = manifest.experiment.id.clone();
+        let id = model.id.clone();
         let svc = self.handles.clone();
         let job = self
             .handles
             .engine
             .submit("experiment.up", move |p| async move {
                 svc.stage_gateway(&yaml, true, &p).await?;
-                let zones = svc.stage_zones(&manifest, true, &p).await?;
-                let services = svc.stage_services(&manifest, &yaml, true, &p).await?;
+                let zones = svc.stage_zones(true, &p).await?;
+                let services = svc.stage_services(&model, &yaml, true, &p).await?;
                 // Said explicitly, because an engineer expecting `up` to have started the load
                 // would otherwise sit waiting for numbers that are not coming.
                 Ok(format!(
@@ -254,13 +263,13 @@ impl ExperimentService for ExperimentSvc {
 
     async fn down(&self, req: Request<ExperimentDownRequest>) -> Result<Response<Job>, Status> {
         let yaml = resolve_once(req.get_ref().manifest.as_ref()).await?;
-        let manifest = vxedge_core::ExperimentManifest::from_yaml(&yaml)
+        let model = vxedge_core::model::load_yaml(&yaml)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
         self.audit.record(
             "ExperimentService.Down",
-            serde_json::json!({ "experiment": manifest.experiment.id }),
+            serde_json::json!({ "experiment": model.id }),
         );
-        let id = manifest.experiment.id.clone();
+        let id = model.id.clone();
         let svc = self.handles.clone();
         let job = self
             .handles
@@ -270,10 +279,10 @@ impl ExperimentService for ExperimentSvc {
                 // strands whatever came after it. Collect failures, tear the rest down anyway,
                 // and report everything that went wrong.
                 let mut failures: Vec<String> = Vec::new();
-                if let Err(e) = svc.stage_services(&manifest, &yaml, false, &p).await {
+                if let Err(e) = svc.stage_services(&model, &yaml, false, &p).await {
                     failures.push(e);
                 }
-                if let Err(e) = svc.stage_zones(&manifest, false, &p).await {
+                if let Err(e) = svc.stage_zones(false, &p).await {
                     failures.push(e);
                 }
                 if let Err(e) = svc.stage_gateway(&yaml, false, &p).await {
@@ -298,7 +307,7 @@ impl ExperimentService for ExperimentSvc {
         req: Request<ExperimentStatusRequest>,
     ) -> Result<Response<ExperimentStatus>, Status> {
         let yaml = resolve_once(req.get_ref().manifest.as_ref()).await?;
-        let manifest = vxedge_core::ExperimentManifest::from_yaml(&yaml)
+        let model = vxedge_core::model::load_yaml(&yaml)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
         let gw = self
@@ -333,7 +342,7 @@ impl ExperimentService for ExperimentSvc {
                 .all(|r| r.state == ResourceState::Up as i32);
         Ok(Response::new(ExperimentStatus {
             status: Some(ResourceStatus {
-                vxid: manifest.experiment.id.clone(),
+                vxid: model.id.clone(),
                 kind: ResourceKind::Experiment as i32,
                 state: if all_up {
                     ResourceState::Up as i32

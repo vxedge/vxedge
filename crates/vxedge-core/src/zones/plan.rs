@@ -1,11 +1,12 @@
 //! NodePlan: desired state for one node interface, joined 1:1 with the
-//! gateway plan's endpoints (same deterministic traversal order — that
-//! invariant is asserted, not assumed).
+//! gateway plan's endpoints **by interface name** — which is derived from the
+//! device id (`gateway::ifnames`), so the join is on identity rather than on
+//! two traversals happening to agree.
 
 use std::path::{Path, PathBuf};
 
 use crate::gateway::plan::{EndpointKind, GatewayPlan};
-use crate::manifest::Backend;
+use crate::model::Backend;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ZonePlanError {
@@ -14,8 +15,23 @@ pub enum ZonePlanError {
          plans must come from the same manifest"
     )]
     EndpointMismatch { gateway: usize, zones: usize },
+    #[error(
+        "device `{device}` attaches to slice `{slice}` as `{iface}`, which the gateway plan does \
+         not contain — the two plans came from different models"
+    )]
+    NoSuchEndpoint {
+        device: String,
+        slice: String,
+        iface: String,
+    },
     #[error("node `{0}`: backend `{1:?}` requires an image bundle path (kind vm/rtimage)")]
     MissingBundle(String, Backend),
+    #[error(
+        "device `{device}` hosts {count} functions carrying a bootable bundle, and a VM boots \
+         one. Deploy the others on their own devices, or publish them as a single `stack`-layer \
+         part."
+    )]
+    AmbiguousBundle { device: String, count: usize },
     #[error(
         "device `{0}` declares no `backend`, so there is no way to know whether it attaches by \
          veth or by tap. Add `backend: container|qemu-microvm|libvirt`."
@@ -56,11 +72,13 @@ impl NodePlan {
     }
 }
 
-/// Join model devices with the gateway plan's endpoints (task 5b).
+/// Join model devices with the gateway plan's endpoints.
 ///
-/// Traversal must match [`GatewayPlan::from_model`]'s exactly — sorted device id, then the links
-/// touching it — because the two plans are joined 1:1 by index. That invariant is asserted here
-/// rather than assumed, the same way the §6.1 path does it.
+/// The join is **by interface name**, which both sides derive from the device id
+/// ([`crate::gateway::ifnames`]). It used to be by index, on the assumption that two traversals
+/// of the same model visit attachments in the same order — true, but an assumption that had to
+/// be re-established by hand every time either loop changed, and one whose failure mode was a
+/// device provisioned onto another device's interface.
 ///
 /// `zone_id` becomes the **region** the device sits in, not a per-device wrapper. That is the
 /// model's whole point, and it gives `vxedge zone up --vxid front-left` a real meaning: bring up
@@ -72,9 +90,8 @@ pub fn plan_nodes_from_model(
     workspace_dir: &Path,
 ) -> Result<Vec<NodePlan>, ZonePlanError> {
     let mut plans = Vec::new();
-    let mut idx = 0usize;
     for entity in &exp.entities {
-        for device in entity.devices_in_order() {
+        for device in entity.devices.values() {
             for (link, endpoint) in entity.links_for(&device.id) {
                 // Join only what `GatewayPlan::from_model` produced an endpoint for: a slice
                 // with a vlan. An `s-nssai` attachment is slice-bound but has no vlan and no
@@ -89,13 +106,15 @@ pub fn plan_nodes_from_model(
                 if !is_vlan_attached {
                     continue;
                 }
-                let Some(ep) = gateway.endpoints.get(idx) else {
-                    return Err(ZonePlanError::EndpointMismatch {
-                        gateway: gateway.endpoints.len(),
-                        zones: idx + 1,
+                let iface =
+                    crate::gateway::ifnames::access_port(&device.id, endpoint.port.as_deref());
+                let Some(ep) = gateway.endpoints.iter().find(|e| e.name == iface) else {
+                    return Err(ZonePlanError::NoSuchEndpoint {
+                        device: device.id.clone(),
+                        slice: link.slice.clone().unwrap_or_default(),
+                        iface,
                     });
                 };
-                debug_assert_eq!(ep.node, device.id, "traversal order invariant");
 
                 // A VM-ish backend boots a bundle directory; a container has no image to
                 // resolve. The backend is the authority here — deriving it from the part
@@ -117,19 +136,27 @@ pub fn plan_nodes_from_model(
                 // saying so is the check §6.1 made through `image.kind` — losing it let a
                 // libvirt node pointed at a container image plan cleanly and fail at boot.
                 let bundle = match backend {
-                    Backend::Libvirt | Backend::QemuMicrovm => entity
-                        .functions
-                        .get(&device.id)
-                        .and_then(|f| f.part.as_ref())
-                        .filter(|part| part.kind == crate::model::PartKind::Bundle)
-                        .map(|part| {
+                    Backend::Libvirt | Backend::QemuMicrovm => {
+                        let bundles: Vec<&crate::model::Part> = entity
+                            .functions_on(&device.id)
+                            .filter_map(|f| f.part.as_ref())
+                            .filter(|part| part.kind == crate::model::PartKind::Bundle)
+                            .collect();
+                        if bundles.len() > 1 {
+                            return Err(ZonePlanError::AmbiguousBundle {
+                                device: device.id.clone(),
+                                count: bundles.len(),
+                            });
+                        }
+                        bundles.first().map(|part| {
                             let p = Path::new(&part.reference);
                             if p.is_absolute() {
                                 p.to_path_buf()
                             } else {
                                 workspace_dir.join(p)
                             }
-                        }),
+                        })
+                    }
                     Backend::Container => None,
                 };
                 if bundle.is_none() && matches!(backend, Backend::Libvirt | Backend::QemuMicrovm) {
@@ -149,14 +176,15 @@ pub fn plan_nodes_from_model(
                     bundle,
                     pinned_cpus: device.pinned_cpus.clone(),
                 });
-                idx += 1;
             }
         }
     }
-    if idx != gateway.endpoints.len() {
+    // Every gateway endpoint must have found a node: an endpoint with nothing to attach would
+    // leave a bridge port dangling, shaped and counted but connected to nothing.
+    if plans.len() != gateway.endpoints.len() {
         return Err(ZonePlanError::EndpointMismatch {
             gateway: gateway.endpoints.len(),
-            zones: idx,
+            zones: plans.len(),
         });
     }
     Ok(plans)
@@ -165,62 +193,101 @@ pub fn plan_nodes_from_model(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::ExperimentManifest;
 
-    const YAML: &str = r#"
-experiment: { id: exp-z, name: z }
+    const WS: &str = r#"
+kind: experiment
+id: exp-z
+vehicles: [veh]
+baseline: bl
 network:
   slices:
     - { id: adas, mode: vlan, vlan: 101, qos: { min_rate_mbps: 100, max_rate_mbps: 200, priority: 1 } }
-zones:
-  - id: vxzone-fl-01
-    role: front-left
-    nodes:
-      - id: node-a
-        type: ecu
-        image: { url: images/linux-probe/bundle, kind: rtimage }
-        backend: qemu-microvm
-        network: [{ iface: eth0, vlan: 101, slice: adas, ip: 10.101.0.2/24 }]
-      - id: node-b
-        type: ecu
-        image: { url: whatever, kind: container }
-        backend: container
-        network: [{ iface: eth0, vlan: 101, slice: adas, ip: 10.101.0.3/24 }]
+---
+kind: vehicle
+id: veh
+zones: { front-left: {} }
+devices:
+  node-a: { role: ecu, zone: front-left, backend: qemu-microvm }
+  node-b: { role: ecu, zone: front-left, backend: container }
+functions:
+  fn-a: { deployed_on: node-a }
+  fn-b: { deployed_on: node-b }
+links:
+  - { id: la, endpoints: [{ node: node-a, port: eth0, ip: 10.101.0.2/24 }], slice: adas }
+  - { id: lb, endpoints: [{ node: node-b, port: eth0, ip: 10.101.0.3/24 }], slice: adas }
+---
+kind: baseline
+id: bl
+parts:
+  - { ref: ./images/linux-probe/bundle, kind: bundle, target_ids: fn-a }
+  - { ref: 'local/vxprobe:host-process', target_ids: fn-b }
 "#;
+
+    fn plans(ws: &str) -> Vec<NodePlan> {
+        let model = crate::model::load_yaml(ws).expect("valid test workspace");
+        let gw = GatewayPlan::from_model(&model).unwrap();
+        plan_nodes_from_model(&model, &gw, Path::new("/manifests")).unwrap()
+    }
 
     #[test]
     fn joins_nodes_with_gateway_endpoints() {
-        let m = ExperimentManifest::from_yaml(YAML).unwrap();
-        let gw = GatewayPlan::from_model(&m.to_model().expect("adapts")).unwrap();
-        let plans =
-            plan_nodes_from_model(&m.to_model().expect("adapts"), &gw, Path::new("/manifests"))
-                .unwrap();
+        let plans = plans(WS);
         assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].node_id, "node-a");
         assert_eq!(plans[0].backend, Backend::QemuMicrovm);
         assert_eq!(plans[0].kind, EndpointKind::Tap);
-        assert_eq!(plans[0].endpoint, "vz0");
+        assert_eq!(plans[0].endpoint, "vz-node-a");
         assert_eq!(
             plans[0].bundle.as_deref(),
-            Some(Path::new("/manifests/images/linux-probe/bundle"))
+            Some(Path::new("/manifests/./images/linux-probe/bundle"))
         );
         assert_eq!(plans[0].ip_cidr.as_deref(), Some("10.101.0.2/24"));
         assert_eq!(plans[1].backend, Backend::Container);
         assert_eq!(plans[1].kind, EndpointKind::Veth);
-        assert_eq!(plans[1].peer, "vzp1");
+        assert_eq!(plans[1].peer, "vzp-node-b");
         assert_eq!(plans[1].runtime_name(), "vx-node-b");
     }
 
+    /// A VM with nothing deployed on it has no bundle to boot. Reported as such rather than
+    /// booted empty — `MissingBundle` is what a mis-wired H3 arm looks like from here.
     #[test]
-    fn vm_backend_without_bundle_is_rejected() {
-        let bad = YAML.replace(
-            "image: { url: whatever, kind: container }\n        backend: container",
-            "image: { url: whatever, kind: container }\n        backend: qemu-microvm",
-        );
-        let m = ExperimentManifest::from_yaml(&bad).unwrap();
-        let gw = GatewayPlan::from_model(&m.to_model().expect("adapts")).unwrap();
+    fn a_vm_backend_with_nothing_to_boot_is_rejected() {
+        let ws = WS
+            .replace("  fn-b: { deployed_on: node-b }\n", "")
+            .replace(
+                "  - { ref: 'local/vxprobe:host-process', target_ids: fn-b }\n",
+                "",
+            )
+            .replace(
+                "  node-b: { role: ecu, zone: front-left, backend: container }",
+                "  node-b: { role: ecu, zone: front-left, backend: qemu-microvm }",
+            );
+        let model = crate::model::load_yaml(&ws).expect("valid test workspace");
+        let gw = GatewayPlan::from_model(&model).unwrap();
         assert!(matches!(
-            plan_nodes_from_model(&m.to_model().expect("adapts"), &gw, Path::new("/x")),
+            plan_nodes_from_model(&model, &gw, Path::new("/x")),
             Err(ZonePlanError::MissingBundle(id, _)) if id == "node-b"
+        ));
+    }
+
+    /// Two bootable parts on one device is not a plan a hypervisor can execute, and choosing
+    /// one silently would boot half the arm.
+    #[test]
+    fn a_device_hosting_two_bundles_is_refused() {
+        let ws = WS
+            .replace(
+                "  fn-b: { deployed_on: node-b }",
+                "  fn-b: { deployed_on: node-b }\n  fn-a2: { deployed_on: node-a }",
+            )
+            .replace(
+                "  - { ref: 'local/vxprobe:host-process', target_ids: fn-b }",
+                "  - { ref: 'local/vxprobe:host-process', target_ids: fn-b }\n  - { ref: ./other, kind: bundle, target_ids: fn-a2 }",
+            );
+        let model = crate::model::load_yaml(&ws).expect("valid test workspace");
+        let gw = GatewayPlan::from_model(&model).unwrap();
+        assert!(matches!(
+            plan_nodes_from_model(&model, &gw, Path::new("/x")),
+            Err(ZonePlanError::AmbiguousBundle { device, count: 2 }) if device == "node-a"
         ));
     }
 }

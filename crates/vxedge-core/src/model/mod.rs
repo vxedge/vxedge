@@ -1,9 +1,9 @@
 //! The vxedge domain model — the in-code single source of truth the planners consume.
 //!
-//! This replaces `ExperimentManifest` (§6.1) as the planners' input. §6.1 is being rejected, not
-//! demoted: it has no interaction layer, so a workspace's messaging topology can be modelled and
-//! validated but never executed, and no amount of lowering fixes a concept the target schema
-//! does not have.
+//! It replaced the §6.1 experiment manifest as the planners' input, and §6.1 was rejected
+//! rather than demoted (deleted 2026-07-31): it had no interaction layer, so a workspace's
+//! messaging topology could be modelled and validated but never executed, and no amount of
+//! lowering fixes a concept the target schema does not have.
 //!
 //! # The ontology, and what it fixes
 //!
@@ -46,11 +46,9 @@
 
 use std::collections::BTreeMap;
 
-pub mod adapt;
 pub mod build;
 
-pub use adapt::AdaptError;
-pub use build::{ModelError, build};
+pub use build::{LoadError, ModelError, build, load_dir, load_yaml};
 
 /// A software-defined mobility entity. A car today; the class axis is what keeps an eVTOL,
 /// vessel or aircraft expressible without re-deriving the model.
@@ -63,20 +61,17 @@ pub struct Entity {
     /// place to edit that can silently disagree.
     pub subtype: Option<String>,
     pub zones: BTreeMap<String, Zone>,
-    pub devices: BTreeMap<String, Device>,
-    /// Device ids in **traversal order**, which is load-bearing rather than cosmetic: gateway
-    /// endpoints are numbered positionally (`vz0`, `vz1`, …) and campaign scripts address those
-    /// names directly.
+    /// Devices, keyed by id. Map order is the only order there is, and nothing is derived from
+    /// it: interface names come from the device id ([`crate::gateway::ifnames`]), and the
+    /// gateway and zone plans join on that name rather than on position.
     ///
-    /// Explicit because the two schemas order differently and neither is wrong. §6.0 stores
-    /// components in a map, so declaration order is already lost and sorted id is the only
-    /// deterministic choice; §6.1 declares zones and nodes as sequences, so declaration order is
-    /// what its existing plans were built from. Sorting a §6.1 manifest would renumber
-    /// endpoints: exp-002 declares `cont, microvm, libvirt` and sorts to `cont, libvirt,
-    /// microvm`, so its H3 arms would have attached to each other's interfaces and the campaign
-    /// would have measured libvirt while reporting microvm. Ordering therefore travels with the
-    /// model rather than being re-derived.
-    pub device_order: Vec<String>,
+    /// That was not always true. Endpoints used to be numbered positionally (`vz0`, `vz1`, …),
+    /// which made declaration order load-bearing and the two schemas irreconcilable: exp-002
+    /// declares its arms `cont, microvm, libvirt` and sorts to `cont, libvirt, microvm`, so the
+    /// H3 arms swapped interfaces between the two paths and the campaign would have measured
+    /// libvirt while reporting microvm. An explicit `device_order` carried through the model to
+    /// contain that; deriving names from ids removed the need for it entirely.
+    pub devices: BTreeMap<String, Device>,
     pub functions: BTreeMap<String, Function>,
     pub links: Vec<Link>,
     pub channels: Vec<Channel>,
@@ -118,7 +113,7 @@ pub struct Device {
     /// experimental variable, and it belongs on the device rather than on the part precisely so
     /// an arm can vary it while holding the software identical.
     pub backend: Option<Backend>,
-    /// Signal bindings for sensors and actuators (`ARCHITECTURE.md` §6.2): a VSS path, and a
+    /// Signal bindings for sensors and actuators (`ARCHITECTURE.md` §6.0.1): a VSS path, and a
     /// DBC for CAN-attached devices.
     pub signals: Vec<SignalBinding>,
     /// CPUs this device's runtime is pinned to. A determinism control, not an allocation —
@@ -258,9 +253,14 @@ pub struct Endpoint {
     pub node: String,
     pub port: Option<String>,
     /// Address (CIDR) the zone backend configures on this attachment. Only meaningful on a
-    /// link; a channel endpoint leaves it unset. §6.0's `endpoints: [a:eth0, b:eth0]` string
-    /// form cannot express it yet — the §6.1 adapter populates it, and the schema change that
-    /// finishes 5a gives authors an object form that can.
+    /// link; a channel endpoint leaves it unset.
+    ///
+    /// It belongs to the *attachment* rather than to the device, which is why it sits here: a
+    /// device on two slices has two addresses, and §6.1 put `ip` on the iface for the same
+    /// reason. §6.0 spells it in the object endpoint form
+    /// (`{ node: n, port: eth0, ip: 10.101.0.11/24 }`); the bare `n:eth0` string stays right
+    /// whenever no fixed address is needed, which is most of the time — a pinned address is
+    /// deployment policy, and a vehicle that pins none stays reusable across experiments.
     pub ip_cidr: Option<String>,
 }
 
@@ -379,14 +379,6 @@ pub enum TrafficEndpoint {
 }
 
 impl Entity {
-    /// Devices in traversal order — see [`Entity::device_order`] for why this is not simply
-    /// map order.
-    pub fn devices_in_order(&self) -> impl Iterator<Item = &Device> {
-        self.device_order
-            .iter()
-            .filter_map(move |id| self.devices.get(id))
-    }
-
     pub fn device(&self, id: &str) -> Option<&Device> {
         self.devices.get(id)
     }
@@ -402,6 +394,18 @@ impl Entity {
                 .filter(move |e| e.node == device)
                 .map(move |e| (l, e))
         })
+    }
+
+    /// The functions deployed on `device`, in id order.
+    ///
+    /// The inverse of [`Entity::host_of`], and not the same as "the function whose id is the
+    /// device id": §6.1 named them alike, §6.0 does not, and looking one up by the other's id
+    /// silently found nothing — a libvirt arm whose guest bundle hangs off its function then
+    /// planned as a VM with no bundle to boot.
+    pub fn functions_on<'a>(&'a self, device: &'a str) -> impl Iterator<Item = &'a Function> {
+        self.functions
+            .values()
+            .filter(move |f| f.deployed_on == device)
     }
 
     /// Which device a function runs on.
@@ -477,16 +481,6 @@ pub enum InvariantError {
     UnknownTrafficDevice { profile: String, device: String },
     #[error("link `{link}` binds slice `{slice}`, which the experiment does not define")]
     UndefinedSlice { link: String, slice: String },
-    #[error(
-        "entity `{entity}`: `device_order` lists {listed} device(s) but the entity declares \
-         {declared} — traversal order decides positional endpoint names, so a device missing \
-         from it would never be provisioned and a duplicate would be provisioned twice"
-    )]
-    DeviceOrderMismatch {
-        entity: String,
-        listed: usize,
-        declared: usize,
-    },
 }
 
 impl Experiment {
@@ -513,15 +507,6 @@ impl Experiment {
         let mut device_owner: BTreeMap<&str, &str> = BTreeMap::new();
 
         for entity in &self.entities {
-            let ordered: std::collections::BTreeSet<&str> =
-                entity.device_order.iter().map(String::as_str).collect();
-            if ordered.len() != entity.devices.len() || entity.device_order.len() != ordered.len() {
-                errors.push(E::DeviceOrderMismatch {
-                    entity: entity.id.clone(),
-                    listed: entity.device_order.len(),
-                    declared: entity.devices.len(),
-                });
-            }
             for (id, device) in &self.devices_of(entity) {
                 if device_owner.insert(id, entity.id.as_str()).is_some() {
                     errors.push(E::DuplicateDevice {

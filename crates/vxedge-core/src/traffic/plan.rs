@@ -17,7 +17,7 @@
 //! discovers it live — this plan only records *which slice*.
 
 use crate::gateway::GatewayPlan;
-use crate::manifest::SliceMode;
+use crate::model::SliceMode;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TrafficPlanError {
@@ -212,10 +212,7 @@ impl TrafficPlan {
                     Ok(Some(RealRef {
                         node_id: &device.id,
                         slice_id: &slice.id,
-                        mode: match slice.mode {
-                            crate::model::SliceMode::Vlan => SliceMode::Vlan,
-                            crate::model::SliceMode::SNssai => SliceMode::Snssai,
-                        },
+                        mode: slice.mode,
                     }))
                 };
 
@@ -338,7 +335,7 @@ fn endpoint_for(
                 addr: vlan_endpoint_addr(ep.vlan, false)?,
             })
         }
-        SliceMode::Snssai => Ok(ProfileEndpoint::SnssaiUe {
+        SliceMode::SNssai => Ok(ProfileEndpoint::SnssaiUe {
             slice_id: real.slice_id.to_string(),
         }),
     }
@@ -374,7 +371,7 @@ fn far_side_for(
                 addr: vlan_endpoint_addr(ep.vlan, true)?,
             })
         }
-        SliceMode::Snssai => Ok(ProfileEndpoint::SnssaiFarSide),
+        SliceMode::SNssai => Ok(ProfileEndpoint::SnssaiFarSide),
     }
 }
 
@@ -382,46 +379,38 @@ fn far_side_for(
 mod tests {
     use super::*;
     use crate::gateway::GatewayPlan;
-    use crate::manifest::ExperimentManifest;
 
-    /// §6.1 text → model. Test fixtures stay in §6.1 while it is still an accepted input
-    /// format; they reach the planners the same single way production code does.
-    fn manifest(yaml: &str) -> crate::model::Experiment {
-        ExperimentManifest::from_yaml(yaml)
-            .expect("valid test manifest")
-            .to_model()
-            .expect("adapts to the model")
+    /// §6.0 workspace text → checked model, the one way anything reaches a planner.
+    fn model(yaml: &str) -> crate::model::Experiment {
+        crate::model::load_yaml(yaml).expect("valid test workspace")
     }
 
     const BASE: &str = r#"
-experiment: { id: exp-t, name: t }
+kind: experiment
+id: exp-t
+vehicles: [veh]
 network:
   slices:
     - { id: adas, mode: vlan, vlan: 101, qos: { min_rate_mbps: 100, max_rate_mbps: 200, priority: 1 } }
     - { id: infotainment, mode: s-nssai, s_nssai: { sst: 2 } }
-zones:
-  - id: vxzone-fl-01
-    role: front-left
-    nodes:
-      - id: node-adas-01
-        type: ecu
-        image: { url: x, kind: container }
-        backend: container
-        network: [{ iface: eth0, vlan: 101, slice: adas }]
-      - id: node-info-01
-        type: infotainment
-        image: { url: x, kind: container }
-        backend: container
-        network: [{ iface: eth0, slice: infotainment }]
 traffic_profiles:
   adas-probe:
-    source: vxzone-fl-01:node-adas-01
+    source: node-adas-01
     target: internet
     pps: 1000
   infotainment-load:
-    source: vxzone-fl-01:node-info-01
+    source: node-info-01
     target: internet
     bandwidth_mbps: 400
+---
+kind: vehicle
+id: veh
+devices:
+  node-adas-01: { role: ecu, backend: container }
+  node-info-01: { role: ecu, backend: container }
+links:
+  - { id: l-adas,  endpoints: [node-adas-01:eth0], slice: adas }
+  - { id: l-infot, endpoints: [node-info-01:eth0], slice: infotainment }
 "#;
 
     /// Mutable access to one profile by id — the model stores traffic as a list, not a map.
@@ -436,7 +425,7 @@ traffic_profiles:
     }
 
     fn plans(yaml: &str) -> (crate::model::Experiment, GatewayPlan) {
-        let m = manifest(yaml);
+        let m = model(yaml);
         let gw = GatewayPlan::from_model(&m).expect("gateway plans");
         (m, gw)
     }
@@ -453,7 +442,7 @@ traffic_profiles:
         assert_eq!(
             p.source,
             ProfileEndpoint::VlanNodePeer {
-                peer_iface: "vzp0".to_string(),
+                peer_iface: "vzp-node-a-cd63".to_string(),
                 vlan: 101,
                 addr: "10.101.0.2".to_string(),
             }
@@ -496,29 +485,26 @@ traffic_profiles:
         // slot to land on. H1's own methodology never needs this (every
         // profile pairs one real node with the symbolic `internet`).
         let yaml = r#"
-experiment: { id: exp-t, name: t }
+kind: experiment
+id: exp-t
+vehicles: [veh]
 network:
   slices:
     - { id: adas, mode: vlan, vlan: 101 }
-zones:
-  - id: vxzone-fl-01
-    role: front-left
-    nodes:
-      - id: node-a
-        type: ecu
-        image: { url: x, kind: container }
-        backend: container
-        network: [{ iface: eth0, vlan: 101, slice: adas }]
-      - id: node-b
-        type: ecu
-        image: { url: x, kind: container }
-        backend: container
-        network: [{ iface: eth0, vlan: 101, slice: adas }]
 traffic_profiles:
   node-to-node:
-    source: vxzone-fl-01:node-a
-    target: vxzone-fl-01:node-b
+    source: node-a
+    target: node-b
     pps: 500
+---
+kind: vehicle
+id: veh
+devices:
+  node-a: { role: ecu, backend: container }
+  node-b: { role: ecu, backend: container }
+links:
+  - { id: la, endpoints: [node-a:eth0], slice: adas }
+  - { id: lb, endpoints: [node-b:eth0], slice: adas }
 "#;
         let (m, gw) = plans(yaml);
         let err = TrafficPlan::from_model(&m, &gw).unwrap_err();
@@ -533,30 +519,27 @@ traffic_profiles:
         // Different vlans embed distinct addresses, so no collision — this
         // is a legitimate, supported "both real" case.
         let yaml = r#"
-experiment: { id: exp-t, name: t }
+kind: experiment
+id: exp-t
+vehicles: [veh]
 network:
   slices:
     - { id: adas, mode: vlan, vlan: 101 }
     - { id: infotainment, mode: vlan, vlan: 103 }
-zones:
-  - id: vxzone-fl-01
-    role: front-left
-    nodes:
-      - id: node-a
-        type: ecu
-        image: { url: x, kind: container }
-        backend: container
-        network: [{ iface: eth0, vlan: 101, slice: adas }]
-      - id: node-b
-        type: ecu
-        image: { url: x, kind: container }
-        backend: container
-        network: [{ iface: eth0, vlan: 103, slice: infotainment }]
 traffic_profiles:
   cross-slice:
-    source: vxzone-fl-01:node-a
-    target: vxzone-fl-01:node-b
+    source: node-a
+    target: node-b
     pps: 500
+---
+kind: vehicle
+id: veh
+devices:
+  node-a: { role: ecu, backend: container }
+  node-b: { role: ecu, backend: container }
+links:
+  - { id: la, endpoints: [node-a:eth0], slice: adas }
+  - { id: lb, endpoints: [node-b:eth0], slice: infotainment }
 "#;
         let (m, gw) = plans(yaml);
         let plan = TrafficPlan::from_model(&m, &gw).expect("traffic plans");
@@ -564,7 +547,7 @@ traffic_profiles:
         assert_eq!(
             p.source,
             ProfileEndpoint::VlanNodePeer {
-                peer_iface: "vzp0".to_string(),
+                peer_iface: "vzp-node-a".to_string(),
                 vlan: 101,
                 addr: "10.101.0.2".to_string(),
             }
@@ -572,7 +555,7 @@ traffic_profiles:
         assert_eq!(
             p.target,
             ProfileEndpoint::VlanNodePeer {
-                peer_iface: "vzp1".to_string(),
+                peer_iface: "vzp-node-b".to_string(),
                 vlan: 103,
                 addr: "10.103.0.2".to_string(),
             }
@@ -609,25 +592,27 @@ traffic_profiles:
 
     #[test]
     fn rejects_node_with_no_slice_bound_interface() {
+        // `node-a` has a link, but it binds no slice — so nothing tells the planner which
+        // vlan to address it on.
         let yaml = r#"
-experiment: { id: exp-t, name: t }
+kind: experiment
+id: exp-t
+vehicles: [veh]
 network:
   slices:
     - { id: adas, mode: vlan, vlan: 101 }
-zones:
-  - id: vxzone-fl-01
-    role: front-left
-    nodes:
-      - id: node-a
-        type: ecu
-        image: { url: x, kind: container }
-        backend: container
-        network: [{ iface: eth0 }]
 traffic_profiles:
   bad:
-    source: vxzone-fl-01:node-a
+    source: node-a
     target: internet
     pps: 100
+---
+kind: vehicle
+id: veh
+devices:
+  node-a: { role: ecu, backend: container }
+links:
+  - { id: la, endpoints: [node-a:eth0] }
 "#;
         let (m, gw) = plans(yaml);
         let err = TrafficPlan::from_model(&m, &gw).unwrap_err();
@@ -637,24 +622,24 @@ traffic_profiles:
     #[test]
     fn rejects_vlan_too_large_for_addressing() {
         let yaml = r#"
-experiment: { id: exp-t, name: t }
+kind: experiment
+id: exp-t
+vehicles: [veh]
 network:
   slices:
     - { id: adas, mode: vlan, vlan: 300 }
-zones:
-  - id: vxzone-fl-01
-    role: front-left
-    nodes:
-      - id: node-a
-        type: ecu
-        image: { url: x, kind: container }
-        backend: container
-        network: [{ iface: eth0, vlan: 300, slice: adas }]
 traffic_profiles:
   probe:
-    source: vxzone-fl-01:node-a
+    source: node-a
     target: internet
     pps: 100
+---
+kind: vehicle
+id: veh
+devices:
+  node-a: { role: ecu, backend: container }
+links:
+  - { id: la, endpoints: [node-a:eth0], slice: adas }
 "#;
         let (m, gw) = plans(yaml);
         let err = TrafficPlan::from_model(&m, &gw).unwrap_err();

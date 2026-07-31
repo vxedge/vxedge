@@ -380,7 +380,6 @@ pub fn profile_down(runtime_dir: &Path, profile_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::ExperimentManifest;
 
     fn snssai_profile(id: &str, pps: Option<u64>, bandwidth_mbps: Option<u64>) -> ResolvedProfile {
         ResolvedProfile {
@@ -470,16 +469,22 @@ mod tests {
 
         // A plan with no sessions at all -- the lookup for "adas" fails the
         // same way a missing plan does.
-        let manifest = ExperimentManifest::from_yaml(
+        let model = crate::model::load_yaml(
             r#"
-experiment: { id: t, name: t }
+kind: experiment
+id: t
+vehicles: [veh]
 network:
   slices:
     - { id: infotainment, mode: s-nssai, s_nssai: { sst: 2 } }
+---
+kind: vehicle
+id: veh
+devices: {}
 "#,
         )
         .unwrap();
-        let plan = FiveGPlan::from_model(&manifest.to_model().expect("adapts"));
+        let plan = FiveGPlan::from_model(&model);
         // "adas" isn't declared, so this manifest actually has a session
         // for "infotainment" only -- confirms the lookup misses cleanly.
         let plan = plan.unwrap_or_else(|e| panic!("expected a plan: {e:?}"));

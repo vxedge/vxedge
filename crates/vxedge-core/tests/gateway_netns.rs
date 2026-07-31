@@ -8,32 +8,39 @@
 
 #![cfg(target_os = "linux")]
 
-use vxedge_core::ExperimentManifest;
 use vxedge_core::gateway::{GatewayPlan, Shell, apply, observe, teardown};
 use vxedge_core::zones::backend::NodeState;
 use vxedge_core::zones::{node_down, node_status, node_up, plan_nodes_from_model};
 
-const MANIFEST: &str = r#"
-experiment: { id: exp-netns, name: netns integration }
+const WORKSPACE: &str = r#"
+kind: experiment
+id: exp-netns
+vehicles: [veh]
+baseline: bl
 network:
   defaults: { bandwidth: 500000000 }
   slices:
     - { id: adas, mode: vlan, vlan: 101, qos: { min_rate_mbps: 100, max_rate_mbps: 200, priority: 1 } }
     - { id: infotainment, mode: vlan, vlan: 103, qos: { min_rate_mbps: 0, max_rate_mbps: 400, priority: 5 } }
-zones:
-  - id: vxzone-fl-01
-    role: front-left
-    nodes:
-      - id: node-ecu-01
-        type: ecu
-        image: { url: /nonexistent/bundle, kind: rtimage }
-        backend: qemu-microvm
-        network: [{ iface: eth0, vlan: 101, slice: adas }]
-      - id: node-info-01
-        type: infotainment
-        image: { url: x, kind: container }
-        backend: container
-        network: [{ iface: eth0, vlan: 103, slice: infotainment, ip: 10.103.0.2/24 }]
+---
+kind: vehicle
+id: veh
+zones: { front-left: {} }
+devices:
+  node-ecu-01:  { role: ecu, zone: front-left, backend: qemu-microvm }
+  node-info-01: { role: ecu, zone: front-left, backend: container }
+functions:
+  fn-ecu:  { deployed_on: node-ecu-01 }
+  fn-info: { deployed_on: node-info-01 }
+links:
+  - { id: l-adas,  endpoints: [node-ecu-01:eth0], slice: adas }
+  - { id: l-infot, endpoints: [{ node: node-info-01, port: eth0, ip: 10.103.0.2/24 }], slice: infotainment }
+---
+kind: baseline
+id: bl
+parts:
+  - { ref: /nonexistent/bundle, kind: bundle, target_ids: fn-ecu }
+  - { ref: 'local/probe:host-process', target_ids: fn-info }
 "#;
 
 /// Deletes the test netns even if assertions panic.
@@ -66,8 +73,8 @@ fn gateway_and_container_zone_cycle_in_netns() {
         escalate: false,
     };
 
-    let manifest = ExperimentManifest::from_yaml(MANIFEST).unwrap();
-    let plan = GatewayPlan::from_model(&manifest.to_model().expect("adapts")).unwrap();
+    let model = vxedge_core::model::load_yaml(WORKSPACE).expect("workspace loads");
+    let plan = GatewayPlan::from_model(&model).unwrap();
 
     // --- gateway: apply, observe, idempotency -------------------------------
     apply(&sh, &plan).unwrap();
@@ -89,12 +96,7 @@ fn gateway_and_container_zone_cycle_in_netns() {
     // --- container zone backend ---------------------------------------------
     let runtime = std::env::temp_dir().join(format!("vxzones-test-{}", std::process::id()));
     std::fs::create_dir_all(&runtime).unwrap();
-    let nodes = plan_nodes_from_model(
-        &manifest.to_model().expect("adapts"),
-        &plan,
-        std::path::Path::new("/"),
-    )
-    .unwrap();
+    let nodes = plan_nodes_from_model(&model, &plan, std::path::Path::new("/")).unwrap();
     let container = nodes
         .iter()
         .find(|n| n.node_id == "node-info-01")

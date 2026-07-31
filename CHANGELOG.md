@@ -6,6 +6,86 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING: host interface names derive from the device id, not from position.** `vz0`/`vzp0`
+  become `vz-<stem>`/`vzp-<stem>`, where the stem is the sanitised device id, shortened to a
+  readable head plus a hash of the whole id when it exceeds the kernel's 15-byte `IFNAMSIZ`
+  limit (`node-cont-01` → `vz-node-c-32cc`). Campaign scripts address these names directly, so
+  this breaks them once, deliberately — see `ARCHITECTURE.md` §6.0.5 for the contract.
+
+  Positional names made traversal order load-bearing: adding a device renumbered the rest, and
+  two views of the same topology could number it differently. exp-002 declares its arms
+  `cont, microvm, libvirt` and sorts to `cont, libvirt, microvm`, so its H3 arms swapped
+  interfaces between the two schema paths — the campaign would have measured libvirt and
+  reported microvm, passing every test on the way. A name now depends on its own device and
+  nothing else; two ids that collapse to one name are refused with both named. `Entity::
+  device_order` is deleted, and the gateway and zone plans join by interface name rather than
+  by index.
+
+- **BREAKING: §6.1 experiment manifests and §6.2 vehicle manifests are deleted.** `vxedge up`,
+  `vxedge experiment up`, the daemon and `vxedge manifest validate` all read §6.0 workspaces and
+  nothing else. Pointing any of them at a retired manifest reports what the document is and
+  where to go instead. `vxmodel render` (vxmodels) moved to workspaces first, so no CI gate was
+  ever left red.
+
+- `vxedge manifest validate` takes a §6.0 workspace — a directory, or one file of
+  `---`-separated documents — and runs every cross-file check *and* every model invariant, the
+  same checks `up` runs.
+
+- `vxedge zone up|down --vxid` accepts a **device id** as well as a zone id. A zone is a region,
+  and exp-002's three packaging arms share one; region-only selection could start only all
+  three at once, which is the concurrent-guest CPU contention that invalidated exp-002b's first
+  campaign.
+
+- `vxedge zone list` reports each device's `port=` and `peer=`, so the device → interface
+  mapping is answerable without recomputing a shortened name by hand.
+
+### Added
+
+- **Link endpoints take an object form**: `{ node, port, ip }` alongside the bare `node:port`
+  string, pinning a host address on an attachment. exp-002's three arms share one VLAN and are
+  told apart only by address, and §6.0 had nowhere to put one. Addresses are CIDR-checked at
+  load time. The form is deserialized by hand rather than with `#[serde(untagged)]`, so a
+  misspelled key inside the object is reported as a misspelled key.
+
+- **A baseline part can state its `kind`** (`container` | `bundle`), validated against the
+  device's backend. A part knows what it is and the device knows how it is run; deriving one
+  from the other made a mismatch unrepresentable rather than rejected — the check H3 needs
+  most, since it runs one function on three backends from three parts.
+
+- **A workspace can be one file.** `---`-separated documents load exactly as a folder does, and
+  `Workspace::from_yaml` gives callers with no directory — an inline manifest over vxAPI — the
+  same loader. Every reference is by id, so the file boundary never carried meaning.
+
+- `model::load_dir` / `model::load_yaml`: workspace → validated → checked model in one call, and
+  the daemon's single entry point for manifest text.
+
+### Removed
+
+- `vxedge-core::manifest` in full — `ExperimentManifest`, `VehicleManifest` and the §6.1
+  composition types they shared (~876 lines) — plus `gateway::plan::resolved_backend`, which
+  existed to turn a §6.1 `image.kind` into a backend that §6.0 states outright.
+- `vxedge-core::lower` (§6.0 → §6.1 lowering), `model::adapt` (§6.1 → model), and the
+  `plan-diff` example. Lowering existed only so the daemon could hand `vxtelemetry` a §6.1 file;
+  `vxtelemetry` reads workspaces now. `plan-diff` compared the two planning paths, and there is
+  one.
+
+### Fixed
+
+- **A VM's guest bundle was unreachable in a §6.0 workspace.** The zone planner looked a
+  device's software up by *function id equals device id* — true in §6.1, false here — so every
+  libvirt and qemu-microvm arm planned as a VM with no bundle to boot. It resolves through
+  `deployed_on` now, and a device hosting two bootable parts is refused rather than half-booted.
+
+- A part error other than "no part at all" was swallowed while building the model, so a kind
+  mismatch silently produced a function that ran nothing.
+
+- `manifest validate` read a file with `serde_yaml_ng::from_str`, which fails outright on a
+  `---`-separated document set — so a workspace held in one file fell through the sniffer into
+  the §6.1 branch and was rejected. It reads the first document now.
+
+
 ### Added
 
 - **`ExperimentService` is implemented in `vxedged`** — `vxedge experiment up` provisions the

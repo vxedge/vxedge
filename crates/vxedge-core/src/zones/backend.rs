@@ -19,7 +19,7 @@ use std::path::Path;
 
 use super::plan::NodePlan;
 use crate::gateway::netops::{NetOpsError, Shell};
-use crate::manifest::Backend;
+use crate::model::Backend;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ZoneBackendError {
