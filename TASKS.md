@@ -92,6 +92,13 @@ because result archives are keyed to manifest SHA256.
       `vxedge_core::lower::lower_path_to_yaml`. **The `experiment lower` CLI verb is deleted.**
       The reproducibility checksum now covers the *lowered* manifest, which is correct: results
       are keyed to what actually ran, and lowering is pure.
+- [x] **Staged `experiment up|down`** (2026-08-01) — `ExperimentStage` GATEWAY/ZONES/SERVICES,
+      repeated on both requests, empty meaning all. Additive to `vxedge.v1`, so every existing
+      caller keeps its behaviour. Found by moving the campaign runners onto `experiment up`:
+      all-or-nothing could serve neither exp-001 (measures on the host-side veth peers, so
+      staging its zones changes the measurement path) nor exp-002 (isolation contract is one
+      packaging arm at a time). Individual devices are still addressed with `zone up --vxid`,
+      which is the right primitive for an arm.
 - [x] **(4) `.vxp` `requires` preflight** (2026-07-31) — `gpu: none|tier2` checked at
       `experiment up`, **daemon-side** (the host that matters is the one provisioning; a
       CLI-side check asks the wrong machine the moment `--endpoint` points elsewhere), before
