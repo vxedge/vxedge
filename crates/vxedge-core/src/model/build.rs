@@ -1111,6 +1111,66 @@ devices: {}
         std::fs::remove_dir_all(&tmp).ok();
     }
 
+    /// A switch slice-attached directly would plan and provision cleanly — `GatewayPlan` only
+    /// asks for `backend`, never `role` — and boot as an ordinary access port, silently
+    /// misrepresenting a forwarding element as an endpoint. This is the check that exp-014's own
+    /// authoring found itself needing by hand (impairments on the endpoints instead of a real
+    /// intermediate device); it belongs in the model, not left to every author to rediscover.
+    #[test]
+    fn a_switch_slice_attached_directly_is_refused() {
+        let ws = r#"
+kind: experiment
+id: e
+vehicles: [veh]
+network: { slices: [{ id: adas, mode: vlan, vlan: 101 }] }
+---
+kind: vehicle
+id: veh
+devices:
+  sw1: { role: switch, backend: container }
+links:
+  - { id: l1, endpoints: [sw1:eth0], slice: adas }
+"#;
+        match load_yaml(ws) {
+            Err(LoadError::Invariants(errors)) => assert!(
+                errors.iter().any(
+                    |e| matches!(e, crate::model::InvariantError::SwitchIsNotAnEndpoint {
+                        device, link, slice, ..
+                    } if device == "sw1" && link == "l1" && slice == "adas")
+                ),
+                "{errors:?}"
+            ),
+            other => panic!("expected Invariants(SwitchIsNotAnEndpoint), got {other:?}"),
+        }
+    }
+
+    /// `role: sensor`/`actuator` must stay silent here even when slice-attached: §9 gives them
+    /// two legitimate transports under one role (perception sensors and the ADAS actuation loop
+    /// ride real slice traffic; body sensors/actuators ride `type: can` instead), so which one
+    /// applies is a property of the link an author chose, not something the model should guess
+    /// at and refuse. Regression guard for the mistake narrowing `SwitchIsNotAnEndpoint` fixed:
+    /// an earlier draft of this check refused every sensor/actuator on a slice, which broke the
+    /// exact live-verified fixtures the impairments feature already shipped.
+    #[test]
+    fn slice_attached_sensors_and_actuators_are_not_refused() {
+        let ws = r#"
+kind: experiment
+id: e
+vehicles: [veh]
+network: { slices: [{ id: adas, mode: vlan, vlan: 101 }] }
+---
+kind: vehicle
+id: veh
+devices:
+  cam1: { role: sensor, backend: container }
+  brk1: { role: actuator, backend: container }
+links:
+  - { id: l1, endpoints: [cam1:eth0], slice: adas }
+  - { id: l2, endpoints: [brk1:eth0], slice: adas }
+"#;
+        load_yaml(ws).expect("sensor/actuator roles are valid slice-attached endpoints");
+    }
+
     /// Channels connect functions, not devices. That is the distinction the model exists to
     /// make, so pointing one at a device has to be an error rather than a silent near-miss.
     #[test]

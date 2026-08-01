@@ -562,6 +562,20 @@ pub enum InvariantError {
          netem onto, so the impairment would be dropped without a word"
     )]
     ImpairmentWithoutSlice { link: String },
+    #[error(
+        "entity `{entity}`: device `{device}` (role: switch) attaches to slice `{slice}` via \
+         link `{link}`, but a switch is a forwarding element between devices, not an endpoint — \
+         this reconciler only provisions one flat bridge, with no backend that forwards through \
+         an intermediate device. Model the segment's cost on the endpoints' own `impairments` \
+         instead (as exp-014's daisy-chain arm does), or drop the switch device until a real \
+         multi-hop backend exists."
+    )]
+    SwitchIsNotAnEndpoint {
+        entity: String,
+        device: String,
+        link: String,
+        slice: String,
+    },
 }
 
 impl Experiment {
@@ -653,6 +667,29 @@ impl Experiment {
                 // the one impairment mistake that fails silently.
                 if l.impairments.is_some_and(|i| !i.is_empty()) && l.slice.is_none() {
                     errors.push(E::ImpairmentWithoutSlice { link: l.id.clone() });
+                }
+                // `role: sensor`/`actuator` are deliberately silent here: §9 gives them two
+                // legitimate transports under one role — perception sensors and the ADAS
+                // actuation loop ride real slice traffic (this exact link), body sensors/
+                // actuators ride `type: can` instead — so which one applies is a property of
+                // the *link*, not the role, and the model must not guess. `switch` has no such
+                // ambiguity: nothing in §9's transport model ever slice-attaches one directly,
+                // because a switch is an intermediate forwarding element and this reconciler
+                // provisions one flat bridge with no backend that forwards through a device.
+                if let Some(slice) = &l.slice {
+                    for ep in &l.endpoints {
+                        let Some(device) = entity.devices.get(&ep.node) else {
+                            continue; // already reported as UnknownLinkEndpoint
+                        };
+                        if device.role == DeviceRole::Switch {
+                            errors.push(E::SwitchIsNotAnEndpoint {
+                                entity: entity.id.clone(),
+                                device: device.id.clone(),
+                                link: l.id.clone(),
+                                slice: slice.clone(),
+                            });
+                        }
+                    }
                 }
             }
 
