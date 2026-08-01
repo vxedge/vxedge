@@ -210,7 +210,120 @@ pub fn apply_endpoints(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError
         if ep.kind == super::plan::EndpointKind::Veth && sh.link_exists(&ep.peer) {
             sh.run("ip", &["link", "set", &ep.peer, "up"])?;
         }
+        if let Some(imp) = &ep.impairment {
+            apply_impairment(sh, &ep.name, imp)?;
+        }
     }
+    Ok(())
+}
+
+/// The netem arguments for one impairment, as an argument vector.
+///
+/// Built as tokens rather than a command string — every value here came out of a validated
+/// manifest, but a provisioning layer that formats shell text is one manifest away from being a
+/// command-injection surface, and this codebase does not have one.
+///
+/// `delay` is emitted with its jitter as a second positional argument, which is netem's syntax;
+/// jitter alone is unrepresentable, and is refused in the validator rather than silently dropped
+/// here.
+fn netem_args(params: &crate::model::Impairment) -> Vec<String> {
+    let mut args = vec!["netem".to_string()];
+    if let Some(delay_us) = params.delay_us {
+        args.push("delay".to_string());
+        args.push(format!("{delay_us}us"));
+        if let Some(jitter_us) = params.jitter_us {
+            args.push(format!("{jitter_us}us"));
+        }
+    }
+    if let Some(ppm) = params.loss_ppm {
+        args.push("loss".to_string());
+        // Back to the percentage tc speaks, from the ppm the plan compares on. Four decimals is
+        // the scale's full resolution, so this round-trips whatever the author wrote.
+        args.push(format!("{}.{:04}%", ppm / 10_000, ppm % 10_000));
+    }
+    if let Some(rate_mbps) = params.rate_mbps {
+        args.push("rate".to_string());
+        args.push(format!("{rate_mbps}mbit"));
+    }
+    args
+}
+
+/// Render one link's impairment onto its elected access port, in both directions.
+///
+/// # Why an IFB, and not simply two qdiscs
+///
+/// A qdisc shapes egress only. On the access port that is bridge→device, which is half a wire.
+/// The other half — device→bridge — *ingresses* here, and the port's own root qdisc never sees
+/// it. It cannot be shaped from the far end either: for a container that end has already moved
+/// into the device's namespace, and for a VM it belongs to the hypervisor, so reaching it would
+/// couple gateway provisioning to both zone backends.
+///
+/// Redirecting ingress onto an IFB turns it into egress on a device this module owns, where the
+/// same netem applies. Everything stays on the host, and veth and tap attachments are treated
+/// identically.
+///
+/// # Idempotence
+///
+/// The two netem qdiscs use `replace`, which converges. The ingress filter cannot: `tc filter
+/// add` appends, so re-running would stack redirects and impair inbound traffic once per
+/// `up`, and there is no version-portable way to replace an unhandled `u32` filter in place.
+/// Reading the existing filter back instead is what this file already avoids for `tc` —
+/// `observe`'s own comment records `tc -j class show` emitting non-JSON on shipped iproute2
+/// versions. So the ingress qdisc is deleted and rebuilt, which takes its filters with it and
+/// lands on exactly one redirect every time. That is convergent rather than untouched: a re-apply
+/// leaves a sub-millisecond window where inbound traffic crosses unimpaired. `up` is a
+/// provisioning operation and traffic is started separately (`vxedge traffic up`), so no
+/// measurement is running when it happens.
+fn apply_impairment(
+    sh: &Shell,
+    access_port: &str,
+    imp: &super::plan::EndpointImpairment,
+) -> Result<(), NetOpsError> {
+    let netem = netem_args(&imp.params);
+    let netem: Vec<&str> = netem.iter().map(String::as_str).collect();
+
+    // Egress: bridge → device.
+    let mut egress = vec!["qdisc", "replace", "dev", access_port, "root"];
+    egress.extend_from_slice(&netem);
+    sh.run("tc", &egress)?;
+
+    // Ingress: device → bridge, by way of the IFB.
+    if !sh.link_exists(&imp.ifb) {
+        sh.run("ip", &["link", "add", &imp.ifb, "type", "ifb"])?;
+    }
+    sh.run("ip", &["link", "set", &imp.ifb, "up"])?;
+    let mut ifb_egress = vec!["qdisc", "replace", "dev", imp.ifb.as_str(), "root"];
+    ifb_egress.extend_from_slice(&netem);
+    sh.run("tc", &ifb_egress)?;
+
+    sh.run_tolerate_missing("tc", &["qdisc", "del", "dev", access_port, "ingress"])?;
+    sh.run("tc", &["qdisc", "add", "dev", access_port, "ingress"])?;
+    sh.run(
+        "tc",
+        &[
+            "filter",
+            "add",
+            "dev",
+            access_port,
+            "parent",
+            "ffff:",
+            "protocol",
+            "all",
+            "prio",
+            "1",
+            "u32",
+            "match",
+            "u32",
+            "0",
+            "0",
+            "action",
+            "mirred",
+            "egress",
+            "redirect",
+            "dev",
+            &imp.ifb,
+        ],
+    )?;
     Ok(())
 }
 
@@ -596,6 +709,7 @@ pub fn data_plane() -> &'static dyn DataPlane {
 #[cfg(test)]
 mod seam_tests {
     use super::*;
+    use crate::model::Impairment;
 
     /// The seam must not have changed what provisioning does — it dispatches to the same
     /// functions the netns integration test already exercises. This pins the wiring; the live
@@ -603,6 +717,63 @@ mod seam_tests {
     #[test]
     fn the_active_data_plane_is_the_kernel_bridge() {
         assert_eq!(data_plane().name(), "kernel-bridge");
+    }
+
+    /// The exact tokens handed to `tc`. Worth pinning as a unit test because the netns test can
+    /// only report that netem installed, not that it installed the numbers the manifest asked
+    /// for — a units slip (`250` read as milliseconds rather than microseconds) would pass every
+    /// live check and misstate every result by a factor of a thousand.
+    #[test]
+    fn netem_renders_the_declared_units() {
+        assert_eq!(
+            netem_args(&Impairment {
+                rate_mbps: Some(100),
+                delay_us: Some(250),
+                jitter_us: Some(40),
+                loss_ppm: Some(100),
+            }),
+            [
+                "netem", "delay", "250us", "40us", "loss", "0.0100%", "rate", "100mbit"
+            ]
+        );
+    }
+
+    /// Absent fields are absent from the command, not defaulted: netem's own defaults are "do
+    /// nothing", and a rate cap nobody asked for would silently bound every measurement.
+    #[test]
+    fn an_unset_field_contributes_no_argument() {
+        assert_eq!(
+            netem_args(&Impairment {
+                rate_mbps: Some(1000),
+                ..Default::default()
+            }),
+            ["netem", "rate", "1000mbit"]
+        );
+        assert_eq!(
+            netem_args(&Impairment {
+                delay_us: Some(5),
+                ..Default::default()
+            }),
+            ["netem", "delay", "5us"]
+        );
+    }
+
+    /// The ppm scale's endpoints, in the percentages `tc` is given. Loss is the one value that
+    /// changes representation between the manifest and the plan, so both ends of its range are
+    /// checked rather than assumed.
+    #[test]
+    fn loss_round_trips_across_the_ppm_scale() {
+        let rendered = |ppm| {
+            netem_args(&Impairment {
+                loss_ppm: Some(ppm),
+                ..Default::default()
+            })[2]
+                .clone()
+        };
+        assert_eq!(rendered(1), "0.0001%");
+        assert_eq!(rendered(100), "0.0100%");
+        assert_eq!(rendered(10_000), "1.0000%");
+        assert_eq!(rendered(1_000_000), "100.0000%");
     }
 }
 
@@ -618,6 +789,13 @@ pub fn apply(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
 /// deleting the bridge detaches remaining ports. Tolerates absence.
 pub fn teardown(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
     for ep in &plan.endpoints {
+        // The IFB is a link of its own, so deleting the access port does not take it — only its
+        // own qdiscs and the ingress redirect pointing at it. Left behind, it would survive
+        // `down` and be silently reused by the next `up`, which is how a stale netem outlives
+        // the manifest that asked for it.
+        if let Some(imp) = &ep.impairment {
+            sh.run_tolerate_missing("ip", &["link", "del", &imp.ifb])?;
+        }
         sh.run_tolerate_missing("ip", &["link", "del", &ep.name])?;
     }
     sh.run_tolerate_missing("ip", &["link", "del", &plan.uplink])?;
@@ -641,6 +819,25 @@ impl SliceObservation {
     }
 }
 
+/// One link's impairment, as it is actually installed.
+#[derive(Debug, Clone)]
+pub struct ImpairmentObservation {
+    pub link: String,
+    pub access_port: String,
+    /// netem is the root qdisc on the access port — the bridge→device direction.
+    pub egress_present: bool,
+    /// The IFB exists and carries its own netem — the device→bridge direction.
+    pub ingress_present: bool,
+}
+
+impl ImpairmentObservation {
+    /// Both directions, because one of them alone is an asymmetric wire nobody asked for and
+    /// nothing in the results would reveal.
+    pub fn healthy(&self) -> bool {
+        self.egress_present && self.ingress_present
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct GatewayObservation {
     pub bridge_present: bool,
@@ -648,6 +845,7 @@ pub struct GatewayObservation {
     pub slices: Vec<SliceObservation>,
     pub endpoints_present: usize,
     pub endpoints_expected: usize,
+    pub impairments: Vec<ImpairmentObservation>,
 }
 
 impl GatewayObservation {
@@ -656,6 +854,10 @@ impl GatewayObservation {
             && self.uplink_present
             && self.endpoints_present == self.endpoints_expected
             && self.slices.iter().all(|s| s.healthy())
+            // An impairment that failed to install turns a 100BASE-T1 run into a clean-wire run
+            // that still produces a full set of plausible numbers. `Up` verifies observed against
+            // planned and fails when they differ, and this squarely counts as a difference.
+            && self.impairments.iter().all(|i| i.healthy())
     }
 }
 
@@ -715,11 +917,37 @@ pub fn observe(sh: &Shell, plan: &GatewayPlan) -> Result<GatewayObservation, Net
         .filter(|ep| sh.link_exists(&ep.name))
         .count();
 
+    let mut impairments = Vec::new();
+    for ep in &plan.endpoints {
+        let Some(imp) = &ep.impairment else { continue };
+        // Text, not `-j`: this file's own note on `tc -j class show` emitting non-JSON on
+        // shipped iproute2 versions applies to qdiscs too, and `htb_root_present` above already
+        // reads qdiscs this way. What is checked is that netem is *there*, not that its
+        // parameters match — a full parameter diff belongs with the converging reconciler.
+        let egress_present = sh.link_exists(&ep.name)
+            && sh
+                .run("tc", &["qdisc", "show", "dev", &ep.name])?
+                .lines()
+                .any(|l| l.starts_with("qdisc netem "));
+        let ingress_present = sh.link_exists(&imp.ifb)
+            && sh
+                .run("tc", &["qdisc", "show", "dev", &imp.ifb])?
+                .lines()
+                .any(|l| l.starts_with("qdisc netem "));
+        impairments.push(ImpairmentObservation {
+            link: imp.link.clone(),
+            access_port: ep.name.clone(),
+            egress_present,
+            ingress_present,
+        });
+    }
+
     Ok(GatewayObservation {
         bridge_present,
         uplink_present,
         slices,
         endpoints_present,
         endpoints_expected: plan.endpoints.len(),
+        impairments,
     })
 }

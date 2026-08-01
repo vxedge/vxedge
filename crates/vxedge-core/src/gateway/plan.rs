@@ -32,6 +32,12 @@ pub enum PlanError {
          attachment (`fiveg::FIVEG_UPLINK_VLAN`) — pick a different VLAN id"
     )]
     VlanCollidesWithFiveGUplink(String, u16),
+    #[error(
+        "link `{link}` declares `impairments` but has no attachment this gateway provisions, so \
+         there is no access port to render netem onto. A link earns one by binding a `slice:` \
+         and attaching a device that declares a `backend:`."
+    )]
+    ImpairmentNotRenderable { link: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +74,20 @@ pub struct EndpointPlan {
     pub node: String,
     pub vlan: u16,
     pub slice: Option<String>,
+    /// The harness impairment this access port renders, when it is the one its link elected to
+    /// carry it. See [`GatewayPlan::from_model`] for why exactly one endpoint per link does.
+    pub impairment: Option<EndpointImpairment>,
+}
+
+/// A link's impairment, resolved onto the single access port that will render it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointImpairment {
+    /// The link this came from. Carried so `status` and any results caveat can say *which*
+    /// harness segment a netem represents, rather than only which interface it sits on.
+    pub link: String,
+    /// The IFB device carrying the ingress direction ([`crate::gateway::ifnames::ingress_ifb`]).
+    pub ifb: String,
+    pub params: crate::model::Impairment,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,6 +169,68 @@ fn plan_slices(slices: &[SliceInput]) -> Result<(Vec<SlicePlan>, Vec<String>), P
     Ok((vlan_slices, snssai))
 }
 
+/// Elect, per impaired link, the one access port that renders its netem.
+///
+/// # Why one port and not every port
+///
+/// A qdisc shapes what leaves an interface, so the obvious reading — impair every attachment of
+/// the link — impairs each traversal *twice* whenever both ends are devices on this bridge. A
+/// packet from `gw1` to `zonefl` leaves `gw1`, is impaired inbound at `vz-gw1`, crosses the
+/// bridge, and is impaired again outbound at `vz-zonefl`: 500 µs of delay on a 250 µs wire, with
+/// nothing anywhere reporting a problem. Halving the values to compensate would then be wrong
+/// for the single-attachment links every frozen experiment actually declares.
+///
+/// So exactly one port carries it, impairing **both directions** there
+/// ([`crate::gateway::provision`] renders the ingress half through an IFB). Each traversal pays
+/// the declared cost once, in either direction, whether the link has one device attachment or
+/// two.
+///
+/// The port is elected by lowest interface name, which is a pure function of the attachment
+/// ([`crate::gateway::ifnames`]) — the same property that keeps traversal order out of every
+/// other name here. Which end holds the netem is not observable in the measurement, so the rule
+/// only has to be stable, and this one cannot be moved by editing an unrelated part of the file.
+///
+/// # No collision check, and why none is needed
+///
+/// Two links cannot elect the same port. Each entry of `endpoints` is produced by exactly one
+/// attachment of exactly one link, so distinct link ids select disjoint index sets. The case
+/// that looks like it might collide — one device attached to two links on the same port — is
+/// already refused upstream as [`PlanError::EndpointNameCollision`], because those two
+/// attachments derive one interface name.
+fn assign_impairments(
+    exp: &crate::model::Experiment,
+    endpoints: &mut [EndpointPlan],
+    endpoint_link: &[String],
+) -> Result<(), PlanError> {
+    for link in exp.entities.iter().flat_map(|e| e.links.iter()) {
+        let Some(params) = link.impairments.filter(|i| !i.is_empty()) else {
+            continue;
+        };
+        let carrier = endpoint_link
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| *id == &link.id)
+            .map(|(i, _)| i)
+            .min_by(|a, b| endpoints[*a].name.cmp(&endpoints[*b].name));
+        // A link with impairments and no provisioned attachment renders nothing. The workspace
+        // validator catches the common cause (no `slice:`) against the authored file; this
+        // catches every cause, including a device the planner skipped, and refuses rather than
+        // dropping the block.
+        let Some(carrier) = carrier else {
+            return Err(PlanError::ImpairmentNotRenderable {
+                link: link.id.clone(),
+            });
+        };
+        let ep = &mut endpoints[carrier];
+        ep.impairment = Some(EndpointImpairment {
+            link: link.id.clone(),
+            ifb: super::ifnames::ingress_ifb(&ep.name),
+            params,
+        });
+    }
+    Ok(())
+}
+
 impl GatewayPlan {
     /// Plan from the domain model — the only planning path there is.
     ///
@@ -183,6 +265,9 @@ impl GatewayPlan {
         };
 
         let mut endpoints: Vec<EndpointPlan> = Vec::new();
+        // Link id per entry of `endpoints`, same index. Parallel to the vector rather than a
+        // field on it because it is scaffolding for one pass, not part of the plan.
+        let mut endpoint_link: Vec<String> = Vec::new();
         // What each name was derived from, so a collision names both halves rather than
         // reporting that some interface exists twice.
         let mut claimed: std::collections::BTreeMap<String, String> =
@@ -224,10 +309,16 @@ impl GatewayPlan {
                         node: device.id.clone(),
                         vlan,
                         slice: Some(slice.clone()),
+                        impairment: None,
                     });
+                    // Recorded for the impairment pass below, which needs to know which
+                    // endpoints a given link produced — the loop above is keyed by device.
+                    endpoint_link.push(link.id.clone());
                 }
             }
         }
+
+        assign_impairments(exp, &mut endpoints, &endpoint_link)?;
 
         Ok(Self {
             bridge: "vxbr0".into(),
@@ -264,8 +355,22 @@ impl GatewayPlan {
                 self.snssai_slice_ids.join(", ")
             )
         };
+        // Impairments are named in the summary rather than left to `status`: they change what
+        // every number in the run means, so "which harness am I measuring" has to be answerable
+        // from the plan the operator approved.
+        let impaired: Vec<&str> = self
+            .endpoints
+            .iter()
+            .filter_map(|e| e.impairment.as_ref())
+            .map(|i| i.link.as_str())
+            .collect();
+        let harness = if impaired.is_empty() {
+            String::new()
+        } else {
+            format!("; impaired link(s): [{}]", impaired.join(", "))
+        };
         format!(
-            "bridge {} + uplink {} @ {} mbit; slices: [{slices}]{snssai}; {} endpoint(s)",
+            "bridge {} + uplink {} @ {} mbit; slices: [{slices}]{snssai}; {} endpoint(s){harness}",
             self.bridge,
             self.uplink,
             self.root_rate_mbps,
@@ -457,6 +562,202 @@ links:
             matches!(&err, PlanError::EndpointNameCollision { name, .. } if name == "vz-node-a"),
             "{err}"
         );
+    }
+
+    /// A vehicle whose two links carry different harness characteristics — a 100BASE-T1 sensor
+    /// run and a 1000BASE-T1 backbone segment, which is the comparison §7 says the model exists
+    /// to make iterable.
+    const IMPAIRED: &str = r#"
+kind: experiment
+id: exp-imp
+vehicles: [veh]
+network:
+  slices:
+    - { id: adas, mode: vlan, vlan: 101 }
+    - { id: infotainment, mode: vlan, vlan: 103 }
+---
+kind: vehicle
+id: veh
+devices:
+  node-sensor-01: { role: sensor, backend: container }
+  node-hpc-01:    { role: hpc, backend: container }
+links:
+  - id: seg-t1
+    endpoints: [node-sensor-01:eth0]
+    slice: adas
+    impairments: { rate_mbps: 100, delay_us: 250, jitter_us: 40, loss_pct: 0.01 }
+  - id: seg-backbone
+    endpoints: [node-hpc-01:eth0]
+    slice: infotainment
+    impairments: { rate_mbps: 1000 }
+"#;
+
+    #[test]
+    fn an_impaired_link_lands_on_its_access_port_with_its_ifb() {
+        let plan = GatewayPlan::from_model(&model(IMPAIRED)).unwrap();
+        let sensor = plan
+            .endpoints
+            .iter()
+            .find(|e| e.node == "node-sensor-01")
+            .unwrap();
+        let imp = sensor.impairment.as_ref().expect("seg-t1 is impaired");
+        assert_eq!(imp.link, "seg-t1");
+        assert_eq!(imp.ifb, "vxi-node-s-c9ce");
+        assert_eq!(sensor.name, "vz-node-s-c9ce");
+        assert_eq!(imp.params.rate_mbps, Some(100));
+        assert_eq!(imp.params.delay_us, Some(250));
+        assert_eq!(imp.params.jitter_us, Some(40));
+        // 0.01% is 100 ppm — the conversion the model does once, checked where it is used.
+        assert_eq!(imp.params.loss_ppm, Some(100));
+
+        let hpc = plan
+            .endpoints
+            .iter()
+            .find(|e| e.node == "node-hpc-01")
+            .unwrap();
+        let imp = hpc.impairment.as_ref().expect("seg-backbone is impaired");
+        assert_eq!(imp.params.rate_mbps, Some(1000));
+        assert_eq!(imp.params.delay_us, None);
+
+        assert_eq!(plan, GatewayPlan::from_model(&model(IMPAIRED)).unwrap());
+    }
+
+    /// The regression the one-port rule exists to prevent, and the reason it is not "impair every
+    /// attachment": a link between two devices on this bridge would be crossed through *two*
+    /// impaired ports, so a 250 µs wire would measure 500 µs with nothing reporting a problem.
+    #[test]
+    fn a_link_between_two_devices_impairs_one_port_not_both() {
+        let ws = r#"
+kind: experiment
+id: e
+vehicles: [veh]
+network: { slices: [{ id: adas, mode: vlan, vlan: 101 }] }
+---
+kind: vehicle
+id: veh
+devices:
+  gw1:    { role: gateway, backend: container }
+  zonefl: { role: zone-controller, backend: container }
+links:
+  - id: trunk-fl
+    endpoints: [gw1:eth0, zonefl:eth0]
+    slice: adas
+    impairments: { delay_us: 250 }
+"#;
+        let plan = GatewayPlan::from_model(&model(ws)).unwrap();
+        assert_eq!(plan.endpoints.len(), 2, "both attachments still get a port");
+        let impaired: Vec<&str> = plan
+            .endpoints
+            .iter()
+            .filter(|e| e.impairment.is_some())
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(
+            impaired,
+            vec!["vz-gw1"],
+            "exactly one port carries the netem"
+        );
+    }
+
+    /// Election is by lowest interface name, so it cannot be moved by reordering the endpoint
+    /// list — the same property `ifnames` gives every other name here.
+    #[test]
+    fn the_carrier_port_does_not_depend_on_endpoint_order() {
+        let one = r#"
+kind: experiment
+id: e
+vehicles: [veh]
+network: { slices: [{ id: adas, mode: vlan, vlan: 101 }] }
+---
+kind: vehicle
+id: veh
+devices:
+  aaa: { role: ecu, backend: container }
+  zzz: { role: ecu, backend: container }
+links:
+  - { id: l, endpoints: [ENDPOINTS], slice: adas, impairments: { delay_us: 250 } }
+"#;
+        let carrier = |eps: &str| {
+            let plan = GatewayPlan::from_model(&model(&one.replace("ENDPOINTS", eps))).unwrap();
+            plan.endpoints
+                .iter()
+                .find(|e| e.impairment.is_some())
+                .map(|e| e.name.clone())
+                .unwrap()
+        };
+        assert_eq!(carrier("aaa:eth0, zzz:eth0"), "vz-aaa");
+        assert_eq!(carrier("zzz:eth0, aaa:eth0"), "vz-aaa");
+    }
+
+    /// Two links impairing one port would leave only one netem installed and the run would
+    /// quietly carry characteristics nobody declared. It cannot arise — one device attached to
+    /// two links on the same port is already refused where two attachments derive one interface
+    /// name, which is why `assign_impairments` carries no collision check of its own. Pinned
+    /// here so that reasoning has a test holding it up rather than a comment asserting it.
+    #[test]
+    fn one_port_impaired_by_two_links_is_already_refused_upstream() {
+        let ws = r#"
+kind: experiment
+id: e
+vehicles: [veh]
+network: { slices: [{ id: adas, mode: vlan, vlan: 101 }] }
+---
+kind: vehicle
+id: veh
+devices:
+  node-a: { role: ecu, backend: container }
+links:
+  - { id: l1, endpoints: [node-a:eth0], slice: adas, impairments: { delay_us: 250 } }
+  - { id: l2, endpoints: [node-a:eth0], slice: adas, impairments: { delay_us: 900 } }
+"#;
+        let err = GatewayPlan::from_model(&model(ws)).unwrap_err();
+        assert!(
+            matches!(&err, PlanError::EndpointNameCollision { name, .. } if name == "vz-node-a"),
+            "{err}"
+        );
+    }
+
+    /// Impairments on an s-nssai link are refused rather than dropped.
+    ///
+    /// This is the case the planner's backstop is really for, and it is a plausible thing to
+    /// write: the link looks provisionable, binds a defined slice and attaches a real device. But
+    /// an s-nssai slice carries no VLAN, so this reconciler plans no access port for it — fiveg
+    /// owns that lifecycle — and there is nowhere to put the netem. Silently, the workspace would
+    /// have declared a 100BASE-T1 segment and measured a clean one.
+    #[test]
+    fn an_impairment_on_an_snssai_link_is_refused_rather_than_dropped() {
+        let ws = r#"
+kind: experiment
+id: e
+vehicles: [veh]
+network:
+  slices:
+    - { id: adas, mode: vlan, vlan: 101 }
+    - { id: adas5g, mode: s-nssai, s_nssai: { sst: 1, sd: '000001' } }
+---
+kind: vehicle
+id: veh
+devices:
+  node-a: { role: ecu, backend: container }
+  node-b: { role: ecu, backend: container }
+links:
+  - { id: l1, endpoints: [node-a:eth0], slice: adas }
+  - { id: l2, endpoints: [node-b:eth0], slice: adas5g, impairments: { delay_us: 250 } }
+"#;
+        let err = GatewayPlan::from_model(&model(ws)).unwrap_err();
+        assert!(
+            matches!(&err, PlanError::ImpairmentNotRenderable { link } if link == "l2"),
+            "{err}"
+        );
+    }
+
+    /// Regression guard, matching the s-nssai one above: the frozen experiments declare no
+    /// impairments, and adding the feature must leave their plans byte for byte unchanged.
+    #[test]
+    fn an_unimpaired_workspace_plans_no_impairments() {
+        let plan = GatewayPlan::from_model(&model(BASE)).unwrap();
+        assert!(plan.endpoints.iter().all(|e| e.impairment.is_none()));
+        assert!(!plan.summary().contains("impaired"));
     }
 
     #[test]

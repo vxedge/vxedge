@@ -68,6 +68,10 @@ pub enum ModelError {
         ty: &'static str,
         max: u64,
     },
+    #[error(
+        "link `{link}`: `impairments.loss_pct` is {loss} — expected a percentage between 0 and 100"
+    )]
+    LossOutOfRange { link: String, loss: f64 },
 }
 
 /// Range-checked narrowing from YAML's `u64`.
@@ -291,6 +295,49 @@ fn link_kind(slice: Option<&String>) -> LinkKind {
     }
 }
 
+/// The author's `impairments:` block as the planner needs it.
+///
+/// The only real conversion is loss: authors write a percentage because that is how a datasheet
+/// states it, and the model carries parts per million because a desired-state type is compared
+/// against itself on every re-apply and a float makes that comparison a question about rounding.
+/// The rounding therefore happens exactly here, once — 0.0001% (one packet in a million) is the
+/// finest distinction the scale keeps, which is already finer than any campaign in this program
+/// has the sample size to measure.
+fn impairment_of(
+    link: &str,
+    doc: &crate::workspace::ImpairmentDoc,
+) -> Result<Impairment, ModelError> {
+    let loss_ppm = match doc.loss_pct {
+        None => None,
+        // Written to reject NaN rather than to let it fall through an accepting comparison.
+        Some(p) if (0.0..=100.0).contains(&p) => Some((p * PPM_PER_PERCENT).round() as u32),
+        Some(p) => {
+            return Err(ModelError::LossOutOfRange {
+                link: link.to_string(),
+                loss: p,
+            });
+        }
+    };
+    Ok(Impairment {
+        rate_mbps: doc.rate_mbps,
+        delay_us: doc.delay_us,
+        jitter_us: doc.jitter_us,
+        loss_ppm,
+    })
+}
+
+/// The author's `harness:` block, unchanged. A straight field copy rather than a fallible
+/// conversion: unlike [`impairment_of`]'s loss percentage, nothing here changes representation
+/// between the document and the model, so there is no rounding decision that has to happen
+/// exactly once and nothing for this layer to reject that `check_harness` has not already.
+fn harness_of(doc: &crate::workspace::HarnessDoc) -> Harness {
+    Harness {
+        medium: doc.medium.clone(),
+        length_m: doc.length_m,
+        weight_g: doc.weight_g,
+    }
+}
+
 fn role_of(device: &str, raw: &str) -> Result<DeviceRole, ModelError> {
     Ok(match raw {
         "zone-controller" => DeviceRole::ZoneController,
@@ -416,14 +463,21 @@ fn build_entity(ws: &Workspace, doc: &VehicleDoc) -> Result<Entity, ModelError> 
         links: doc
             .links
             .iter()
-            .map(|l| Link {
-                id: l.id.clone(),
-                endpoints: l.endpoints.iter().map(link_endpoint).collect(),
-                kind: link_kind(l.slice.as_ref()),
-                slice: l.slice.clone(),
-                harness: None,
+            .map(|l| {
+                Ok(Link {
+                    id: l.id.clone(),
+                    endpoints: l.endpoints.iter().map(link_endpoint).collect(),
+                    kind: link_kind(l.slice.as_ref()),
+                    slice: l.slice.clone(),
+                    harness: l.harness.as_ref().map(harness_of),
+                    impairments: l
+                        .impairments
+                        .as_ref()
+                        .map(|i| impairment_of(&l.id, i))
+                        .transpose()?,
+                })
             })
-            .collect(),
+            .collect::<Result<_, ModelError>>()?,
         channels: doc
             .channels
             .iter()
@@ -1124,5 +1178,34 @@ devices: {}
             other => panic!("expected UnknownBackend, got {other:?}"),
         }
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The declarative harness block reaches the model unchanged — the property
+    /// [`crate::gateway::plan`]'s tests take for granted about `harness: None` on every other
+    /// fixture, checked here for the one link that sets it.
+    #[test]
+    fn a_harness_block_reaches_the_model() {
+        let ws = r#"
+kind: experiment
+id: e
+vehicles: [veh]
+network: { slices: [{ id: adas, mode: vlan, vlan: 101 }] }
+---
+kind: vehicle
+id: veh
+devices:
+  node-sensor-01: { role: sensor, backend: container }
+links:
+  - id: seg-t1
+    endpoints: [node-sensor-01:eth0]
+    slice: adas
+    harness: { medium: 100BASE-T1, length_m: 2.4, weight_g: 85.0 }
+"#;
+        let m = load_yaml(ws).expect("valid workspace");
+        let link = &m.entities[0].links[0];
+        let h = link.harness.as_ref().expect("harness present");
+        assert_eq!(h.medium.as_deref(), Some("100BASE-T1"));
+        assert_eq!(h.length_m, Some(2.4));
+        assert_eq!(h.weight_g, Some(85.0));
     }
 }

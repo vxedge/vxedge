@@ -223,6 +223,40 @@ pub struct Link {
     /// The network slice this link's traffic belongs to, when it crosses vxgateway.
     pub slice: Option<String>,
     pub harness: Option<Harness>,
+    /// PHY characteristics to emulate on this segment. `None` is an unimpaired virtual wire.
+    pub impairments: Option<Impairment>,
+}
+
+/// What crossing a harness segment costs a packet — the emulated half of [`Harness`], which
+/// describes the same wire declaratively.
+///
+/// Rendered as tc netem on the segment's access port (`gateway::provision`). Every value is
+/// **per traversal, per direction**: `delay_us` is one-way, so a round trip pays it twice.
+///
+/// Loss is carried in parts per million rather than as the author's percentage so the whole plan
+/// stays exactly comparable — a desired-state type is diffed against itself on every re-apply,
+/// and a float in it would make "same plan?" a question about rounding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Impairment {
+    pub rate_mbps: Option<u32>,
+    pub delay_us: Option<u32>,
+    /// Delay variation. Meaningless without `delay_us`, and rejected there rather than here.
+    pub jitter_us: Option<u32>,
+    /// Loss in parts per million: 10 000 ppm is 1%.
+    pub loss_ppm: Option<u32>,
+}
+
+/// Parts per million in one percent — the scale [`Impairment::loss_ppm`] is expressed on.
+pub const PPM_PER_PERCENT: f64 = 10_000.0;
+
+impl Impairment {
+    /// True when nothing is actually impaired, so a caller can skip the netem entirely.
+    pub fn is_empty(&self) -> bool {
+        self.rate_mbps.is_none()
+            && self.delay_us.is_none()
+            && self.jitter_us.is_none()
+            && self.loss_ppm.is_none()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -506,6 +540,11 @@ pub enum InvariantError {
     UnknownTrafficDevice { profile: String, device: String },
     #[error("link `{link}` binds slice `{slice}`, which the experiment does not define")]
     UndefinedSlice { link: String, slice: String },
+    #[error(
+        "link `{link}` carries impairments but binds no slice — it has no access port to render \
+         netem onto, so the impairment would be dropped without a word"
+    )]
+    ImpairmentWithoutSlice { link: String },
 }
 
 impl Experiment {
@@ -590,6 +629,13 @@ impl Experiment {
                         link: l.id.clone(),
                         slice: slice.clone(),
                     });
+                }
+                // Re-checked here and not only in the workspace validator, for the same reason
+                // `UndefinedSlice` is: a model reaching a planner by any other route — a future
+                // adapter, an alternative frontend, a test fixture — must not be able to skip
+                // the one impairment mistake that fails silently.
+                if l.impairments.is_some_and(|i| !i.is_empty()) && l.slice.is_none() {
+                    errors.push(E::ImpairmentWithoutSlice { link: l.id.clone() });
                 }
             }
 

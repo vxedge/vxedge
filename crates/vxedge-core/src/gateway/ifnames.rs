@@ -38,6 +38,9 @@ pub const IFNAME_MAX: usize = 15;
 const ACCESS_PREFIX: &str = "vz-";
 /// Veth peer, the end that moves into the device's namespace.
 const PEER_PREFIX: &str = "vzp-";
+/// Ingress-impairment IFB, the device the access port's *inbound* traffic is redirected onto.
+/// Four bytes like [`PEER_PREFIX`], so it costs the stem budget nothing extra.
+const IFB_PREFIX: &str = "vxi-";
 
 /// Longest stem that fits under *both* prefixes. The peer prefix is the longer one, so it sets
 /// the budget for the pair — a stem that fitted only the access port would produce a veth whose
@@ -121,6 +124,26 @@ pub fn veth_peer(device: &str, port: Option<&str>) -> String {
     format!("{PEER_PREFIX}{}", stem(device, port))
 }
 
+/// The IFB device carrying an access port's *ingress* impairment.
+///
+/// A qdisc only shapes egress, so an access port's own netem impairs bridge→device and nothing
+/// else. The device→bridge direction is redirected onto this IFB, where a second, identical
+/// netem gives the segment the same characteristics both ways — which is what a length of
+/// 100BASE-T1 actually has.
+///
+/// Taken from the access port rather than re-derived from `(device, port)` on purpose: the two
+/// names must share a stem exactly, and reading it off the name the planner already committed to
+/// makes that structural instead of a rule two call sites have to keep agreeing on. A name that
+/// did not come from [`access_port`] keeps its own text and would overrun `IFNAMSIZ`, which the
+/// kernel refuses loudly — but no such name reaches here: the plan carries only what
+/// [`access_port`] produced.
+pub fn ingress_ifb(access_port: &str) -> String {
+    let stem = access_port
+        .strip_prefix(ACCESS_PREFIX)
+        .unwrap_or(access_port);
+    format!("{IFB_PREFIX}{stem}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,8 +184,10 @@ mod tests {
         ] {
             let name = access_port(id, Some("eth0"));
             let peer = veth_peer(id, Some("eth0"));
+            let ifb = ingress_ifb(&name);
             assert!(name.len() <= IFNAME_MAX, "{name} is {} bytes", name.len());
             assert!(peer.len() <= IFNAME_MAX, "{peer} is {} bytes", peer.len());
+            assert!(ifb.len() <= IFNAME_MAX, "{ifb} is {} bytes", ifb.len());
             assert_eq!(name, access_port(id, Some("eth0")), "not deterministic");
         }
         // Pinned, because these are the names campaign scripts and results metadata carry: a
@@ -194,6 +219,21 @@ mod tests {
         assert_eq!(access_port("gw1", None), "vz-gw1");
         assert_eq!(access_port("gw1", Some("eth1")), "vz-gw1-eth1");
         assert_ne!(access_port("gw1", Some("eth1")), access_port("gw1", None));
+    }
+
+    /// An attachment's three names are distinct but share a stem, so `vz-`/`vzp-`/`vxi-` read as
+    /// one set. Distinctness is not cosmetic: the IFB is created as a real link, and a name
+    /// clashing with the port it serves would delete that port on teardown.
+    #[test]
+    fn the_ingress_ifb_shares_the_stem_but_not_the_name() {
+        for id in ["node-a", "node-adas-probe-01"] {
+            let port = access_port(id, Some("eth0"));
+            let peer = veth_peer(id, Some("eth0"));
+            let ifb = ingress_ifb(&port);
+            assert_eq!(ifb, format!("vxi-{}", stem(id, Some("eth0"))));
+            assert_ne!(ifb, port);
+            assert_ne!(ifb, peer);
+        }
     }
 
     #[test]

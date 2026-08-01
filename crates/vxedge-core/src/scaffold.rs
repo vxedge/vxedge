@@ -470,6 +470,18 @@ fn vehicle_yaml(template: Template) -> String {
          \x20 percept: {{ deployed_on: hpc1 }}\n\
          \x20 tcu:     {{ deployed_on: gw1 }}\n\n\
          # Transport: how bytes move. This is the wiring harness (ARCHITECTURE.md §7).\n\
+         #\n\
+         # A slice-bound link may add an `impairments:` block to emulate the PHY it stands for,\n\
+         # which is what makes harness topology an experimental variable rather than a drawing:\n\
+         #\n\
+         #   impairments: {{ rate_mbps: 100, delay_us: 250, jitter_us: 40, loss_pct: 0.01 }}\n\
+         #\n\
+         # Every value is per traversal, one direction, so a round trip pays the delay twice.\n\
+         # Left off below on purpose: an unimpaired link is a clean virtual wire, and that is the\n\
+         # right baseline to measure against before you start varying the harness.\n\
+         #\n\
+         # Any link — impaired or not — may also carry a `harness:` block (medium, length_m,\n\
+         # weight_g): the declarative record a zonal-vs-domain harness-reduction study reports on.\n\
          links:\n\
          \x20 - {{ id: trunk-fl,  endpoints: [gw1:eth0, zonefl:eth0], slice: adas }}\n\
          {extra_link}\

@@ -562,11 +562,33 @@ impl GatewayService for GatewaySvc {
                         ),
                     })
                     .collect();
+                // Impairments change what every latency number in the run means, so `status`
+                // names them rather than leaving the operator to infer a healthy gateway is an
+                // unimpaired one. A half-installed impairment already makes `fully_up` false;
+                // without this, the degraded line would not say which one.
+                let harness = if obs.impairments.is_empty() {
+                    String::new()
+                } else {
+                    let broken: Vec<&str> = obs
+                        .impairments
+                        .iter()
+                        .filter(|i| !i.healthy())
+                        .map(|i| i.link.as_str())
+                        .collect();
+                    if broken.is_empty() {
+                        format!(", {} impaired link(s)", obs.impairments.len())
+                    } else {
+                        format!(
+                            ", impairment not installed on link(s): [{}]",
+                            broken.join(", ")
+                        )
+                    }
+                };
                 if obs.fully_up() {
                     (
                         ResourceState::Up,
                         format!(
-                            "up: {} vlan slice(s), {snssai_count} s-nssai slice(s), {}/{} endpoint(s)",
+                            "up: {} vlan slice(s), {snssai_count} s-nssai slice(s), {}/{} endpoint(s){harness}",
                             slices.len(),
                             obs.endpoints_present,
                             obs.endpoints_expected
@@ -577,7 +599,7 @@ impl GatewayService for GatewaySvc {
                     (
                         ResourceState::Degraded,
                         format!(
-                            "degraded: bridge={} uplink={} endpoints={}/{} ({snssai_count} s-nssai slice(s) declared)",
+                            "degraded: bridge={} uplink={} endpoints={}/{} ({snssai_count} s-nssai slice(s) declared){harness}",
                             obs.bridge_present,
                             obs.uplink_present,
                             obs.endpoints_present,

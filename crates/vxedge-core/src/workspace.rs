@@ -161,6 +161,49 @@ pub enum WorkspaceValidationError {
         field: &'static str,
         endpoint: String,
     },
+    #[error(
+        "vehicle `{vehicle}`: link `{link}` has an `impairments:` block with nothing in it — set \
+         at least one of `rate_mbps`, `delay_us`, `jitter_us`, `loss_pct`, or drop the block"
+    )]
+    ImpairmentEmpty { vehicle: String, link: String },
+    #[error(
+        "vehicle `{vehicle}`: link `{link}` sets `impairments.jitter_us` without \
+         `impairments.delay_us` — jitter is variation *of* a delay, so there is nothing for it \
+         to vary. Add a `delay_us`, or drop the jitter."
+    )]
+    ImpairmentJitterWithoutDelay { vehicle: String, link: String },
+    #[error(
+        "vehicle `{vehicle}`: link `{link}` sets `impairments.{field}: {value}` — expected \
+         {expected}"
+    )]
+    ImpairmentOutOfRange {
+        vehicle: String,
+        link: String,
+        field: &'static str,
+        value: String,
+        expected: &'static str,
+    },
+    #[error(
+        "vehicle `{vehicle}`: link `{link}` declares `impairments:` but binds no `slice:` — a \
+         link that does not cross vxgateway has no access port to install netem on, so the \
+         impairment would be silently ignored. Bind the link to a slice, or drop the block."
+    )]
+    ImpairmentWithoutSlice { vehicle: String, link: String },
+    #[error(
+        "vehicle `{vehicle}`: link `{link}` has a `harness:` block with nothing in it — set at \
+         least one of `medium`, `length_m`, `weight_g`, or drop the block"
+    )]
+    HarnessEmpty { vehicle: String, link: String },
+    #[error(
+        "vehicle `{vehicle}`: link `{link}` sets `harness.{field}: {value}` — a harness segment \
+         cannot have a negative {field}"
+    )]
+    HarnessNegative {
+        vehicle: String,
+        link: String,
+        field: &'static str,
+        value: String,
+    },
 }
 
 /// Traffic endpoints that name no component. `internet` is the host-side reflector on the far
@@ -325,6 +368,97 @@ pub struct LinkDoc {
     pub endpoints: Vec<EndpointDoc>,
     #[serde(default)]
     pub slice: Option<String>,
+    /// PHY characteristics to emulate on this segment (`ARCHITECTURE.md` §7, "Harness
+    /// modeling"). Absent means an unimpaired virtual wire, which is what every frozen
+    /// experiment declares and therefore what they keep measuring.
+    #[serde(default)]
+    pub impairments: Option<ImpairmentDoc>,
+    /// The physical harness segment this link stands for — the declarative half of harness
+    /// modeling, alongside [`ImpairmentDoc`]'s emulated half. §7 states the claim this exists to
+    /// back: zonal E/E is justified by harness reduction, so a model that cannot say how much
+    /// wire a topology needs cannot express the architecture's own headline benefit. Carried and
+    /// reported, never rendered onto the kernel — nothing about a length in meters or a weight
+    /// in grams is a `tc` argument.
+    #[serde(default)]
+    pub harness: Option<HarnessDoc>,
+}
+
+/// A harness segment's physical properties, as an author states them.
+///
+/// Every field is descriptive rather than executable: this feeds a harness-weight/length report
+/// (a zonal-versus-domain study's dependent variable), not the reconciler. [`ImpairmentDoc`] on
+/// the same link is the half that *does* reach the kernel, for the segment's timing behaviour.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessDoc {
+    /// `100BASE-T1`, `1000BASE-T1`, `CAN-FD`, … Free-form, matching [`crate::model::Harness`]'s
+    /// own comment: the taxonomy of automotive harness media is larger than this workspace needs
+    /// to enumerate, and a closed enum here would reject a real medium the day someone names one.
+    #[serde(default)]
+    pub medium: Option<String>,
+    #[serde(default)]
+    pub length_m: Option<f64>,
+    #[serde(default)]
+    pub weight_g: Option<f64>,
+}
+
+impl HarnessDoc {
+    pub fn is_empty(&self) -> bool {
+        self.medium.is_none() && self.length_m.is_none() && self.weight_g.is_none()
+    }
+}
+
+/// What a harness segment does to the packets crossing it: the manifest's expression of
+/// 100BASE-T1 versus 1000BASE-T1 versus a clean virtual wire.
+///
+/// This is the field that makes harness topology an experimental *variable* rather than a
+/// drawing — §7's claim that star-versus-daisy-chain is iterable in minutes needs the segments
+/// to differ in something a measurement can see.
+///
+/// # Semantics, stated because the alternatives are all defensible
+///
+/// Every value describes **one traversal of the segment, in one direction**. `delay_us: 250` is
+/// a one-way delay, so a round trip over the link accrues 500 µs; `loss_pct` is the chance a
+/// packet crossing in either direction is dropped. Both directions are impaired identically,
+/// because a length of twisted pair does not know which way the electrons are going.
+///
+/// # The jitter caveat
+///
+/// `jitter_us` is netem's, and netem applies jitter per packet independently — so a packet drawn
+/// a short delay **can overtake** one drawn a long delay. That reordering is real, not an
+/// artifact to correct for, but it is not what a BASE-T1 segment does either, and an experiment
+/// measuring a reordering-sensitive protocol has to account for it. Delay and loss carry no such
+/// caveat.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ImpairmentDoc {
+    /// Segment rate cap in mbit/s — 100 for 100BASE-T1, 1000 for 1000BASE-T1.
+    ///
+    /// Distinct from a slice's `qos.max_rate_mbps`, and they compose: the slice's HTB tree caps
+    /// what a *slice* may draw from the shared uplink, this caps what one *wire* can carry. A
+    /// zonal-versus-domain comparison varies this while holding the slice QoS fixed.
+    #[serde(default)]
+    pub rate_mbps: Option<u32>,
+    /// One-way propagation + PHY delay, microseconds.
+    #[serde(default)]
+    pub delay_us: Option<u32>,
+    /// Delay variation, microseconds. Requires `delay_us` — netem has nothing to vary otherwise.
+    #[serde(default)]
+    pub jitter_us: Option<u32>,
+    /// Packet loss, percent (`0.01` is one in ten thousand).
+    #[serde(default)]
+    pub loss_pct: Option<f64>,
+}
+
+impl ImpairmentDoc {
+    /// True when the block was written but says nothing — worth reporting, since the author
+    /// plainly meant to impair something.
+    pub fn is_empty(&self) -> bool {
+        self.rate_mbps.is_none()
+            && self.delay_us.is_none()
+            && self.jitter_us.is_none()
+            && self.loss_pct.is_none()
+    }
 }
 
 /// One end of a link, in either of two forms:
@@ -752,6 +886,17 @@ impl Workspace {
                         slice: slice.clone(),
                     });
                 }
+
+                if let Some(imp) = &l.impairments {
+                    check_impairments(&v.id, &l.id, imp, l.slice.is_some(), &mut errors);
+                }
+                // Unlike impairments, harness carries no slice-binding rule: it feeds a
+                // length/weight report rather than the reconciler, so it is meaningful on any
+                // link, slice-bound or not — a direct point-to-point harness segment has a
+                // length whether or not it happens to cross vxgateway.
+                if let Some(h) = &l.harness {
+                    check_harness(&v.id, &l.id, h, &mut errors);
+                }
             }
 
             let own_functions: BTreeSet<&str> = v.functions.keys().map(String::as_str).collect();
@@ -971,6 +1116,97 @@ fn is_cidr(raw: &str) -> bool {
     }
 }
 
+/// Everything wrong with one `impairments:` block, reported against the file the author wrote.
+///
+/// Three of the four checks are things `tc` would reject anyway, caught here so the message
+/// names a manifest field instead of a netem argument. The fourth — an impairment on a link that
+/// binds no slice — is the one `tc` would never complain about, because nothing would ever be
+/// asked of it: no slice means no access port, and the block would sit in the file looking
+/// effective. That is the failure this function exists for.
+fn check_impairments(
+    vehicle: &str,
+    link: &str,
+    imp: &ImpairmentDoc,
+    has_slice: bool,
+    errors: &mut Vec<WorkspaceValidationError>,
+) {
+    use WorkspaceValidationError as E;
+    if imp.is_empty() {
+        errors.push(E::ImpairmentEmpty {
+            vehicle: vehicle.to_string(),
+            link: link.to_string(),
+        });
+        return;
+    }
+    if !has_slice {
+        errors.push(E::ImpairmentWithoutSlice {
+            vehicle: vehicle.to_string(),
+            link: link.to_string(),
+        });
+    }
+    if imp.jitter_us.is_some() && imp.delay_us.is_none() {
+        errors.push(E::ImpairmentJitterWithoutDelay {
+            vehicle: vehicle.to_string(),
+            link: link.to_string(),
+        });
+    }
+    if imp.rate_mbps == Some(0) {
+        errors.push(E::ImpairmentOutOfRange {
+            vehicle: vehicle.to_string(),
+            link: link.to_string(),
+            field: "rate_mbps",
+            value: "0".to_string(),
+            expected: "at least 1 — a segment that carries nothing is a disconnected link, not \
+                       an impaired one",
+        });
+    }
+    // NaN fails every comparison, so the range test is written to reject it rather than to
+    // accept it by falling through.
+    if let Some(loss) = imp.loss_pct
+        && !(0.0..=100.0).contains(&loss)
+    {
+        errors.push(E::ImpairmentOutOfRange {
+            vehicle: vehicle.to_string(),
+            link: link.to_string(),
+            field: "loss_pct",
+            value: loss.to_string(),
+            expected: "a percentage between 0 and 100",
+        });
+    }
+}
+
+/// Everything wrong with one `harness:` block. Simpler than [`check_impairments`]: nothing here
+/// composes with anything else in the file, so there is no cross-field rule to enforce, only
+/// "did the author write something" and "is a physical quantity actually physical."
+fn check_harness(
+    vehicle: &str,
+    link: &str,
+    h: &HarnessDoc,
+    errors: &mut Vec<WorkspaceValidationError>,
+) {
+    use WorkspaceValidationError as E;
+    if h.is_empty() {
+        errors.push(E::HarnessEmpty {
+            vehicle: vehicle.to_string(),
+            link: link.to_string(),
+        });
+        return;
+    }
+    for (field, value) in [("length_m", h.length_m), ("weight_g", h.weight_g)] {
+        // Spelled as `nan() || < 0.0` rather than `!(v >= 0.0)`: both reject NaN identically, but
+        // clippy reads a negated partial-order comparison as a sign the two operands might not
+        // be comparable at all, which is not the concern here.
+        if value.is_some_and(|v| v.is_nan() || v < 0.0) {
+            errors.push(E::HarnessNegative {
+                vehicle: vehicle.to_string(),
+                link: link.to_string(),
+                field,
+                value: value.unwrap().to_string(),
+            });
+        }
+    }
+}
+
 /// Every file under `dir`, relative to `base`, skipping `results/` — see
 /// [`Workspace::content_sha256`] for why outputs are excluded.
 fn collect_files(
@@ -1119,6 +1355,195 @@ parts:
         assert!(
             errs.iter()
                 .any(|e| matches!(e, WorkspaceValidationError::UndefinedSlice { slice, .. } if slice == "adas")),
+            "{errs:?}"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Addressing and impairment are orthogonal — a pinned attachment address (the object
+    /// endpoint form exp-002 uses to tell its three arms apart on one VLAN) and a harness
+    /// impairment (an L2 property of the wire itself) compose freely on the same link, because a
+    /// real PHY segment doesn't know or care what is addressed on top of it. No new field is
+    /// needed to combine them; this pins that the two independent parts of the schema actually
+    /// do combine rather than merely both existing.
+    #[test]
+    fn a_pinned_address_and_an_impairment_compose_on_one_link() {
+        let vehicle = GOOD_VEHICLE.replace(
+            "- { id: trunk-fl, endpoints: [gw1:eth0, zonefl:eth0], slice: adas }",
+            "- id: trunk-fl\n    endpoints:\n      - gw1:eth0\n      - { node: zonefl, port: eth0, ip: 10.101.0.11/24 }\n    slice: adas\n    impairments: { rate_mbps: 100, delay_us: 250 }",
+        );
+        let root = workspace(
+            "imp-and-ip",
+            &[
+                ("main.yaml", GOOD_EXPERIMENT),
+                ("car1.yaml", &vehicle),
+                ("parts.yaml", GOOD_BASELINE),
+            ],
+        );
+        assert_eq!(Workspace::load(&root).unwrap().validate(), vec![]);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A well-formed impairment adds no findings — the block is usable, not merely parseable.
+    #[test]
+    fn a_well_formed_impairment_validates() {
+        let vehicle = GOOD_VEHICLE.replace(
+            "- { id: trunk-fl, endpoints: [gw1:eth0, zonefl:eth0], slice: adas }",
+            "- { id: trunk-fl, endpoints: [gw1:eth0, zonefl:eth0], slice: adas, \
+             impairments: { rate_mbps: 100, delay_us: 250, jitter_us: 40, loss_pct: 0.01 } }",
+        );
+        let root = workspace(
+            "imp-ok",
+            &[
+                ("main.yaml", GOOD_EXPERIMENT),
+                ("car1.yaml", &vehicle),
+                ("parts.yaml", GOOD_BASELINE),
+            ],
+        );
+        assert_eq!(Workspace::load(&root).unwrap().validate(), vec![]);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The impairment mistake that fails *silently*: `trunk-hpc` binds no slice, so it never
+    /// reaches vxgateway and its netem would never be installed — with nothing at any later
+    /// stage to say so. Every other check here is something `tc` would also reject; this one is
+    /// the reason the validator looks at impairments at all.
+    #[test]
+    fn an_impairment_on_a_link_that_binds_no_slice_is_caught() {
+        let vehicle = GOOD_VEHICLE.replace(
+            "- { id: trunk-hpc, endpoints: [gw1:eth2, hpc1:eth0] }",
+            "- { id: trunk-hpc, endpoints: [gw1:eth2, hpc1:eth0], impairments: { delay_us: 250 } }",
+        );
+        let root = workspace(
+            "imp-noslice",
+            &[
+                ("main.yaml", GOOD_EXPERIMENT),
+                ("car1.yaml", &vehicle),
+                ("parts.yaml", GOOD_BASELINE),
+            ],
+        );
+        let errs = Workspace::load(&root).unwrap().validate();
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                WorkspaceValidationError::ImpairmentWithoutSlice { link, .. } if link == "trunk-hpc"
+            )),
+            "{errs:?}"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Malformed blocks, reported together rather than one per run — the same all-at-once
+    /// contract every other check here holds to, and what an author editing a file needs.
+    #[test]
+    fn malformed_impairments_are_all_reported_at_once() {
+        use WorkspaceValidationError as E;
+        let vehicle = GOOD_VEHICLE
+            .replace(
+                "- { id: trunk-fl, endpoints: [gw1:eth0, zonefl:eth0], slice: adas }",
+                "- { id: trunk-fl, endpoints: [gw1:eth0, zonefl:eth0], slice: adas, \
+                 impairments: { jitter_us: 40, rate_mbps: 0, loss_pct: 150.0 } }",
+            )
+            .replace(
+                "- { id: trunk-hpc, endpoints: [gw1:eth2, hpc1:eth0] }",
+                "- { id: trunk-hpc, endpoints: [gw1:eth2, hpc1:eth0], slice: adas, \
+                 impairments: {} }",
+            );
+        let root = workspace(
+            "imp-bad",
+            &[
+                ("main.yaml", GOOD_EXPERIMENT),
+                ("car1.yaml", &vehicle),
+                ("parts.yaml", GOOD_BASELINE),
+            ],
+        );
+        let errs = Workspace::load(&root).unwrap().validate();
+        assert!(
+            errs.iter().any(
+                |e| matches!(e, E::ImpairmentJitterWithoutDelay { link, .. } if link == "trunk-fl")
+            ),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter().any(
+                |e| matches!(e, E::ImpairmentOutOfRange { field: "rate_mbps", link, .. } if link == "trunk-fl")
+            ),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter().any(
+                |e| matches!(e, E::ImpairmentOutOfRange { field: "loss_pct", link, .. } if link == "trunk-fl")
+            ),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, E::ImpairmentEmpty { link, .. } if link == "trunk-hpc")),
+            "{errs:?}"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The declarative half of harness modeling: length/weight/medium, carried for a
+    /// zonal-versus-domain report, independent of whether the link is impaired or even
+    /// slice-bound.
+    #[test]
+    fn a_harness_block_validates_and_composes_with_impairments() {
+        let vehicle = GOOD_VEHICLE
+            .replace(
+                "- { id: trunk-fl, endpoints: [gw1:eth0, zonefl:eth0], slice: adas }",
+                "- { id: trunk-fl, endpoints: [gw1:eth0, zonefl:eth0], slice: adas, \
+                 impairments: { rate_mbps: 100, delay_us: 250 }, \
+                 harness: { medium: 100BASE-T1, length_m: 2.4, weight_g: 85.0 } }",
+            )
+            .replace(
+                "- { id: trunk-hpc, endpoints: [gw1:eth2, hpc1:eth0] }",
+                "- { id: trunk-hpc, endpoints: [gw1:eth2, hpc1:eth0], \
+                 harness: { length_m: 5.0 } }",
+            );
+        let root = workspace(
+            "harness-ok",
+            &[
+                ("main.yaml", GOOD_EXPERIMENT),
+                ("car1.yaml", &vehicle),
+                ("parts.yaml", GOOD_BASELINE),
+            ],
+        );
+        assert_eq!(Workspace::load(&root).unwrap().validate(), vec![]);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn an_empty_or_negative_harness_block_is_caught() {
+        use WorkspaceValidationError as E;
+        let vehicle = GOOD_VEHICLE
+            .replace(
+                "- { id: trunk-fl, endpoints: [gw1:eth0, zonefl:eth0], slice: adas }",
+                "- { id: trunk-fl, endpoints: [gw1:eth0, zonefl:eth0], slice: adas, \
+                 harness: { length_m: -1.0 } }",
+            )
+            .replace(
+                "- { id: trunk-hpc, endpoints: [gw1:eth2, hpc1:eth0] }",
+                "- { id: trunk-hpc, endpoints: [gw1:eth2, hpc1:eth0], harness: {} }",
+            );
+        let root = workspace(
+            "harness-bad",
+            &[
+                ("main.yaml", GOOD_EXPERIMENT),
+                ("car1.yaml", &vehicle),
+                ("parts.yaml", GOOD_BASELINE),
+            ],
+        );
+        let errs = Workspace::load(&root).unwrap().validate();
+        assert!(
+            errs.iter().any(
+                |e| matches!(e, E::HarnessNegative { field: "length_m", link, .. } if link == "trunk-fl")
+            ),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, E::HarnessEmpty { link, .. } if link == "trunk-hpc")),
             "{errs:?}"
         );
         fs::remove_dir_all(&root).ok();
