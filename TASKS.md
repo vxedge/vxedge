@@ -879,8 +879,49 @@ exp-001 measurements).
 - [ ] TrafficService: synthetic generator (pps/bandwidth/payload per profile)
 - [ ] TS SDK (connect-es) generation + tonic-web enablement; minimal web dashboard repo/dir
 - [ ] mTLS + OIDC auth path; viewer/operator/admin roles
-- [ ] Harness `impairments` rendering: tc netem per link (rate cap, latency/jitter, loss —
-      100/1000BASE-T1 emulation); manifest struct extension
+- [x] Harness `impairments` rendering: tc netem per link (rate cap, latency/jitter, loss —
+      100/1000BASE-T1 emulation) — **delivered 2026-08-01**. `links[].impairments` in the §6.0
+      schema (`rate_mbps`/`delay_us`/`jitter_us`/`loss_pct`); the model carries loss as parts
+      per million so a desired-state plan compares exactly against itself on re-apply, the same
+      reason interface names are a pure function of the attachment rather than of traversal
+      order.
+      **The design decision**: exactly one of a link's access ports renders the netem, not
+      every attachment. A two-device link's traffic already crosses two ports on this bridge —
+      impairing both would double every traversal (a 250 µs wire measuring 500 µs, with nothing
+      reporting it), and halving values to compensate would then be wrong for the
+      single-attachment links every frozen experiment declares. The carrier is elected by
+      lowest interface name (`gateway::ifnames`), so — like every other name in that module —
+      it is a pure function of the attachment and cannot move by reordering endpoints.
+      **The mechanism**: `tc qdisc replace ... netem` on the elected port is the
+      bridge→device (egress) half. The device→bridge half cannot be shaped there — a qdisc only
+      shapes egress — so it is `mirred`-redirected onto a new IFB device (`vxi-<stem>`,
+      `gateway::ifnames::ingress_ifb`, derived from the access port name it serves) carrying an
+      identical netem. Idempotency needed its own fix: `tc filter add` appends rather than
+      converges, so a naive re-apply would stack a second redirect and silently double inbound
+      impairment while `observe` kept reporting a healthy gateway — the ingress qdisc is deleted
+      and rebuilt on every apply instead, which takes its filters with it and lands on exactly
+      one redirect every time (a sub-millisecond unimpaired window during `up`, never during a
+      measurement, since traffic starts separately via `vxedge traffic up`).
+      **Refused, not silently dropped**: an impairment on a link with no provisioned access
+      port (e.g. an s-nssai slice, which this reconciler doesn't provision at all — fiveg owns
+      that lifecycle) is `PlanError::ImpairmentNotRenderable` rather than a manifest that
+      declares a 100BASE-T1 segment and measures a clean one. The workspace validator adds two
+      author-facing checks with no such runtime backstop possible: `impairments` on a link that
+      binds no `slice:` (the common case — no slice means no access port, and nothing later
+      would ever say why the netem never applied) and `jitter_us` without `delay_us` (nothing
+      for netem to vary).
+      **The declarative half landed alongside it**: `links[].harness` (`medium`, `length_m`,
+      `weight_g`) — carried for a harness-reduction report, not rendered onto anything, since
+      §7's own claim is that zonal E/E is justified by *less* wire and the model needs to be
+      able to say how much. Independent of `impairments` and of slice-binding: a direct
+      point-to-point segment has a length whether or not it crosses vxgateway.
+      **Verified**: an address pinned on an endpoint (the object form exp-002 uses) and an
+      impairment on the same link compose with no interaction, confirmed by a dedicated test —
+      the two are orthogonal by construction (impairments are L2, addressing is L3). 133 tests
+      total (was 123), clippy `-D warnings` and fmt clean. The pre-existing netns integration
+      test gained a second, impairment-specific case (both directions installed, redirect count
+      pinned across a re-apply) but — like the cycle test it sits beside — has not yet run
+      against a real kernel; this is the same standing item the board already tracks for #3/#5/#21.
 - [ ] **The seam is in** (2026-07-31): `DataPlane` — `apply_links`/`apply_slices`/
       `apply_endpoints`/`teardown`/`observe`, with `KernelBridge` as the first implementation
       and `data_plane()` the single selection point. The three apply stages are separate trait
