@@ -929,8 +929,34 @@ exp-001 measurements).
       under to keep a feature is not a seam. Known limit, stated in the trait doc: the 5G
       attachment helpers are still bridge-specific free functions and join the trait when a
       second implementation needs them.
-- [ ] OVS data-plane variant: same GatewayPlan rendered via ovs-vsctl/OVSDB (kernel bridge
-      remains the default backend)
+- [x] OVS data-plane variant: same GatewayPlan rendered via ovs-vsctl/OVSDB (kernel bridge
+      remains the default backend) — **delivered 2026-08-01**. `network.data_plane: ovs`
+      (absent means `kernel-bridge`, so every experiment that predates the field keeps
+      planning and provisioning exactly as before); a manifest field, matching how
+      `network.slices[].mode` already picks a mechanism, not a daemon flag. `GatewayPlan`
+      carries the selection (`data_plane: DataPlaneKind`) so it's part of the provisioning
+      intent rather than threaded separately through every call site.
+      **What's shared and what isn't**: the HTB queue tree (`ensure_htb_root_and_default`,
+      extracted from `apply_slices`) and per-slice class/filter
+      (`apply_slice_htb_class`) don't know which switching fabric the uplink belongs to —
+      a `tc` qdisc is the same kernel object either way — so both backends call the exact
+      same functions. Only bridge creation and VLAN membership differ: the kernel bridge
+      uses `ip link add ... type bridge` + `bridge vlan add`; OVS uses
+      `ovs-vsctl add-br`/`add-port` + `set port ... trunks=[...]`/`tag=...`. Impairments
+      (netem/IFB) needed zero changes — same reasoning, one level down.
+      **A real operational difference surfaced building this, not assumed**: OVS state is
+      not netns-scoped, unlike everything else `gateway_netns.rs` tests — a Linux bridge
+      inside a disposable `ip netns add` vanishes with the namespace, but an OVS bridge
+      lives in the system-wide `ovsdb-server` regardless of which netns created it. Verified
+      empirically before writing the parsing code (a throwaway, fully-cleaned-up bridge/port
+      exercising add/get/set/del) rather than guessing at `ovs-vsctl`'s JSON output shapes
+      against a real system service. `gateway_ovs.rs`'s own test therefore builds a
+      `GatewayPlan` directly with names that can't collide with a real gateway
+      (`vxovstest`/`vxovsup`, never `vxbr0`/`vxup0`) and cleans up explicitly. **Live-verified
+      against a real `ovsdb-server`**: apply, re-apply (idempotent), trunk VLAN confirmed in
+      OVSDB itself (not just the plan), teardown, second teardown — all clean, zero leftover
+      interfaces confirmed by hand afterward. 138 tests total (was 134), clippy `-D warnings`
+      and fmt clean.
 - [ ] Release binaries for vxedge/vxedged via cargo-dist (digest-recorded, §13)
 
 ### Device/node provisioning layer (pulled forward from phase 3, `docs/TASKS.md` 2026-08-01)
