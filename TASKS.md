@@ -316,12 +316,13 @@ None block the critical path; all are consistency debts this session created or 
       same run, and neither is wrong — they are just two rules. Pick one, state it in
       `ARCHITECTURE.md` §13, and make both sides cite it. The daemon's omission of the `.vxp`
       also means an inline workspace carries no `requires`, which task 4's preflight will need.
-- [ ] **The `slicing` scaffold template pairs a bundle-named part with container devices** —
-      `ghcr.io/vxedge/parts/zone/linux/stack/probe-bundle` on `backend: container`. It validates
-      (a published ref says nothing conclusive about packaging, deliberately — see
-      `model::build::kind_from_reference`), but the template is the first thing anyone reads,
-      and it teaches a pairing that would be wrong if the part were what its name suggests.
-      Either give the template a container-class part or declare `kind:` on the entry.
+- [x] **The `slicing` scaffold template pairs a bundle-named part with container devices** —
+      fixed; the template now pairs `backend: container` devices with `kind: container` parts
+      (`ghcr.io/vxedge/parts/agent/linux/app/probe`, not the bundle-named
+      `.../zone/linux/stack/probe-bundle` this bullet originally flagged — confirmed by reading
+      current `scaffold.rs`, 2026-08-01). This bullet was left unchecked after the fix landed —
+      a stale TODO for already-done work, tracked at the top level as `docs/TASKS.md` item
+      #13. Closed here rather than left to be rediscovered by the next reader.
 - [x] **`vxedge manifest validate` accepts only §6.0** (2026-07-31) — the old shapes went with
       `manifest.rs`, so "workspaces only" is enforced by there being nothing else to accept.
       Its multi-document sniffing had to be fixed at the same time: it read the file with
@@ -355,8 +356,16 @@ Tracked here so they are not rediscovered. None block the critical path.
       design (`docs/ARCHITECTURE.md` §7), so it lands after 5b.
 - [ ] **(5f) Delete `ExperimentManifest`/`VehicleManifest` and the adapter** — last, gated on the
       exp-001/002/003 equivalence runs passing and every experiment being migrated.
-- [ ] **(6) Migrate the remaining verbs** (`up`, `zone`, `compute`, `ota`, `telemetry`,
-      `traffic`) off `--manifest` onto workspace resolution.
+- [ ] **(Track D-6) Migrate the remaining verbs** (`up`, `zone`, `compute`, `ota`, `telemetry`,
+      `traffic`) off `--manifest` onto workspace resolution. Confirmed 2026-08-01:
+      `experiment up/down/status` already resolve from the cwd; `ota up/down` and
+      `telemetry up/down` still require an explicit `--experiment <path>` — the
+      confirmed-remaining scope. `zone`/`compute`/`traffic` address the daemon's already-active
+      experiment rather than taking a path at all, and the bare (non-`experiment`) `up`/`down`
+      gateway verb still takes an optional `--manifest` too — neither was re-checked against
+      this item's original intent in this pass, so don't assume either is migrated or exempt.
+      Tracked at the top level as `docs/TASKS.md` item #26 (scoped there to the confirmed
+      ota/telemetry gap specifically).
 - [ ] **(7) `vehicle up` from a §6.0 vehicle document** — the phase-3 gate itself. Needs (2).
 - [ ] Candidate, from Terraform's `init`: `experiment init` pre-pulls every part ref by digest
       into a local cache before `up`, so a run either has everything or fails before it starts.
