@@ -113,6 +113,11 @@ pub struct GatewayPlan {
     /// byte. Bridging an s-nssai slice's fiveg pod into `bridge` as an
     /// access port is `fiveg`'s job, tracked in `vxedge/TASKS.md` §4.
     pub snssai_slice_ids: Vec<String>,
+    /// Which mechanism renders this plan (`gateway::provision::data_plane`'s selector). Carried
+    /// on the plan, not passed alongside it, because the choice is part of the provisioning
+    /// intent itself — the same reason `slices`/`endpoints` live here rather than being derived
+    /// again at each call site.
+    pub data_plane: crate::model::DataPlaneKind,
 }
 
 /// One half of a collision message: which attachment a name was derived from.
@@ -331,6 +336,7 @@ impl GatewayPlan {
             slices,
             endpoints,
             snssai_slice_ids,
+            data_plane: exp.data_plane,
         })
     }
 
@@ -444,8 +450,27 @@ parts:
         assert_eq!(plan.endpoints[0].kind, EndpointKind::Tap);
         // A tap has no peer: the hypervisor opens the access port itself.
         assert_eq!(plan.endpoints[0].peer, "vz-node-ecu-01");
+        // No `network.data_plane` in BASE — every frozen experiment is in exactly this shape,
+        // and this is what keeps them selecting the kernel bridge without ever naming it.
+        assert_eq!(plan.data_plane, crate::model::DataPlaneKind::KernelBridge);
         // Determinism: same workspace, same plan.
         assert_eq!(plan, GatewayPlan::from_model(&model(BASE)).unwrap());
+    }
+
+    #[test]
+    fn data_plane_ovs_reaches_the_plan() {
+        let ws = BASE.replacen(
+            "network:\n  defaults: { bandwidth: 500000000 }",
+            "network:\n  data_plane: ovs\n  defaults: { bandwidth: 500000000 }",
+            1,
+        );
+        let plan = GatewayPlan::from_model(&model(&ws)).unwrap();
+        assert_eq!(plan.data_plane, crate::model::DataPlaneKind::Ovs);
+        // Selecting OVS changes nothing else about the plan — the same slices/endpoints/HTB
+        // rates a campaign would compare across the two mechanisms.
+        let kernel_bridge_plan = GatewayPlan::from_model(&model(BASE)).unwrap();
+        assert_eq!(plan.slices, kernel_bridge_plan.slices);
+        assert_eq!(plan.endpoints, kernel_bridge_plan.endpoints);
     }
 
     #[test]

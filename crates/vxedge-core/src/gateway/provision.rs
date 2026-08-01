@@ -54,20 +54,27 @@ fn htb_root_present(sh: &Shell, dev: &str) -> Result<bool, NetOpsError> {
     Ok(out.lines().any(|l| l.starts_with("qdisc htb 1:")))
 }
 
-/// Phase 2 of apply: per-slice VLANs on the trunk + the HTB queue tree.
-pub fn apply_slices(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
-    let root_rate = format!("{}mbit", plan.root_rate_mbps);
+/// The HTB queue tree's root and default classes — fabric-agnostic (both `KernelBridge` and
+/// `Ovs` shape it identically on the uplink's own kernel qdisc, which exists and behaves the
+/// same regardless of which switching fabric the interface is enslaved to). Shared so the two
+/// backends cannot drift on the one piece of the tree that isn't backend-specific.
+fn ensure_htb_root_and_default(
+    sh: &Shell,
+    dev: &str,
+    root_rate_mbps: u64,
+) -> Result<(), NetOpsError> {
+    let root_rate = format!("{root_rate_mbps}mbit");
     // HTB root qdiscs don't support in-place change (`replace` fails on an
     // existing one), so create only when absent; classes/filters below use
     // replace semantics and converge on every apply.
-    if !htb_root_present(sh, &plan.uplink)? {
+    if !htb_root_present(sh, dev)? {
         sh.run(
             "tc",
             &[
                 "qdisc",
                 "add",
                 "dev",
-                &plan.uplink,
+                dev,
                 "root",
                 "handle",
                 "1:",
@@ -80,16 +87,7 @@ pub fn apply_slices(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
     sh.run(
         "tc",
         &[
-            "class",
-            "replace",
-            "dev",
-            &plan.uplink,
-            "parent",
-            "1:",
-            "classid",
-            "1:1",
-            "htb",
-            "rate",
+            "class", "replace", "dev", dev, "parent", "1:", "classid", "1:1", "htb", "rate",
             &root_rate,
         ],
     )?;
@@ -100,7 +98,7 @@ pub fn apply_slices(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
             "class",
             "replace",
             "dev",
-            &plan.uplink,
+            dev,
             "parent",
             "1:1",
             "classid",
@@ -114,56 +112,76 @@ pub fn apply_slices(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
             "7",
         ],
     )?;
+    Ok(())
+}
 
+/// One slice's HTB class + the flower filter mapping its VLAN tag onto that class — also
+/// fabric-agnostic: `tc flower vlan_id` matches on the 802.1Q tag already present on the wire,
+/// which both backends produce identically (a `KernelBridge` trunk port and an OVS trunk port
+/// emit the same tagged frames), and the class itself lives on the uplink's own qdisc, not on
+/// anything backend-specific.
+fn apply_slice_htb_class(
+    sh: &Shell,
+    dev: &str,
+    slice: &super::plan::SlicePlan,
+    pref_offset: usize,
+) -> Result<(), NetOpsError> {
+    let vid = slice.vlan.to_string();
+    let classid = format!("1:{:x}", slice.class_minor);
+    sh.run(
+        "tc",
+        &[
+            "class",
+            "replace",
+            "dev",
+            dev,
+            "parent",
+            "1:1",
+            "classid",
+            &classid,
+            "htb",
+            "rate",
+            &format!("{}mbit", slice.min_rate_mbps),
+            "ceil",
+            &format!("{}mbit", slice.max_rate_mbps),
+            "prio",
+            &slice.priority.to_string(),
+        ],
+    )?;
+    // Flower `replace` without an explicit handle EEXISTs on an identical filter — which is
+    // already the converged state, so tolerate it. (Changing a vlan→class mapping in place is
+    // reconciler follow-up.)
+    sh.run_tolerate_exists(
+        "tc",
+        &[
+            "filter",
+            "replace",
+            "dev",
+            dev,
+            "parent",
+            "1:",
+            "pref",
+            &(10 + pref_offset).to_string(),
+            "protocol",
+            "802.1q",
+            "flower",
+            "vlan_id",
+            &vid,
+            "classid",
+            &classid,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Phase 2 of apply: per-slice VLANs on the trunk + the HTB queue tree.
+pub fn apply_slices(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
+    ensure_htb_root_and_default(sh, &plan.uplink, plan.root_rate_mbps)?;
     for (i, slice) in plan.slices.iter().enumerate() {
         let vid = slice.vlan.to_string();
         // Trunk carries every slice VLAN tagged.
         sh.run_tolerate_exists("bridge", &["vlan", "add", "dev", &plan.uplink, "vid", &vid])?;
-        let classid = format!("1:{:x}", slice.class_minor);
-        sh.run(
-            "tc",
-            &[
-                "class",
-                "replace",
-                "dev",
-                &plan.uplink,
-                "parent",
-                "1:1",
-                "classid",
-                &classid,
-                "htb",
-                "rate",
-                &format!("{}mbit", slice.min_rate_mbps),
-                "ceil",
-                &format!("{}mbit", slice.max_rate_mbps),
-                "prio",
-                &slice.priority.to_string(),
-            ],
-        )?;
-        // Map the slice's VLAN onto its class (egress on the trunk).
-        // Flower `replace` without an explicit handle EEXISTs on an identical
-        // filter — which is already the converged state, so tolerate it.
-        // (Changing a vlan→class mapping in place is reconciler follow-up.)
-        sh.run_tolerate_exists(
-            "tc",
-            &[
-                "filter",
-                "replace",
-                "dev",
-                &plan.uplink,
-                "parent",
-                "1:",
-                "pref",
-                &(10 + i).to_string(),
-                "protocol",
-                "802.1q",
-                "flower",
-                "vlan_id",
-                &vid,
-                "classid",
-                &classid,
-            ],
-        )?;
+        apply_slice_htb_class(sh, &plan.uplink, slice, i)?;
     }
     Ok(())
 }
@@ -171,21 +189,29 @@ pub fn apply_slices(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
 /// Phase 3 of apply: zone endpoints as access ports (pvid untagged).
 /// Veth for container nodes (peer moves into the node's netns at `zone up`);
 /// tap for VM nodes (libvirt/qemu opens it directly).
+/// Creates an endpoint's own device (veth pair or tap) if it doesn't exist yet — fabric-agnostic,
+/// since a device attachment is the same kernel object whether its access port ends up enslaved
+/// to a Linux bridge or added as an OVS port.
+fn ensure_endpoint_device(sh: &Shell, ep: &super::plan::EndpointPlan) -> Result<(), NetOpsError> {
+    if !sh.link_exists(&ep.name) {
+        match ep.kind {
+            super::plan::EndpointKind::Veth => sh.run(
+                "ip",
+                &[
+                    "link", "add", &ep.name, "type", "veth", "peer", "name", &ep.peer,
+                ],
+            )?,
+            super::plan::EndpointKind::Tap => {
+                sh.run("ip", &["tuntap", "add", "dev", &ep.name, "mode", "tap"])?
+            }
+        };
+    }
+    Ok(())
+}
+
 pub fn apply_endpoints(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
     for ep in &plan.endpoints {
-        if !sh.link_exists(&ep.name) {
-            match ep.kind {
-                super::plan::EndpointKind::Veth => sh.run(
-                    "ip",
-                    &[
-                        "link", "add", &ep.name, "type", "veth", "peer", "name", &ep.peer,
-                    ],
-                )?,
-                super::plan::EndpointKind::Tap => {
-                    sh.run("ip", &["tuntap", "add", "dev", &ep.name, "mode", "tap"])?
-                }
-            };
-        }
+        ensure_endpoint_device(sh, ep)?;
         sh.run("ip", &["link", "set", &ep.name, "master", &plan.bridge])?;
         let vid = ep.vlan.to_string();
         // Access port: node-side traffic is untagged, tagged as the slice
@@ -696,14 +722,258 @@ impl DataPlane for KernelBridge {
     }
 }
 
-/// The active data plane.
-///
-/// One implementation today, so this takes no argument: a selector with one option is a knob
-/// nobody can turn, and guessing whether it belongs on the manifest, the daemon or the plan is
-/// the kind of decision that is cheap once a second mechanism exists and expensive to unpick if
-/// guessed early. The OVS variant brings its selector with it.
-pub fn data_plane() -> &'static dyn DataPlane {
-    &KernelBridge
+// ---------------------------------------------------------------------------
+// OVS/OVSDB data plane
+// ---------------------------------------------------------------------------
+
+/// Bridge + trunk uplink, via `ovs-vsctl` instead of `ip link add ... type bridge`. The veth
+/// pair itself is still plain `ip` — OVS attaches to netdevices, it doesn't create them — and
+/// `--may-exist` is `ovs-vsctl`'s own idempotent-create idiom, the direct parallel to
+/// `link_exists` guards elsewhere in this file.
+fn ovs_apply_links(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
+    sh.run("ovs-vsctl", &["--may-exist", "add-br", &plan.bridge])?;
+    sh.run("ip", &["link", "set", &plan.bridge, "up"])?;
+
+    if !sh.link_exists(&plan.uplink) {
+        sh.run(
+            "ip",
+            &[
+                "link",
+                "add",
+                &plan.uplink,
+                "type",
+                "veth",
+                "peer",
+                "name",
+                &plan.uplink_peer,
+            ],
+        )?;
+    }
+    sh.run(
+        "ovs-vsctl",
+        &["--may-exist", "add-port", &plan.bridge, &plan.uplink],
+    )?;
+    sh.run("ip", &["link", "set", &plan.uplink, "up"])?;
+    sh.run("ip", &["link", "set", &plan.uplink_peer, "up"])?;
+    Ok(())
+}
+
+/// Per-slice VLANs on the trunk (OVS's own `trunks` port column) + the same HTB queue tree the
+/// kernel bridge builds — `ensure_htb_root_and_default`/`apply_slice_htb_class` don't know or
+/// care which switching fabric the uplink is attached to, because they act on the uplink's own
+/// kernel qdisc, which exists either way.
+fn ovs_apply_slices(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
+    ensure_htb_root_and_default(sh, &plan.uplink, plan.root_rate_mbps)?;
+    // A `set`, not an `add`: OVS's trunk list is one column holding the whole set, so the
+    // converged value is assigned outright on every apply — idempotent by construction, unlike
+    // the Linux bridge's per-vid `bridge vlan add`, which needs `tolerate_exists` because it's
+    // additive. An empty plan (no vlan slices — e.g. s-nssai-only) sets `trunks=[]`, correctly
+    // carrying nothing tagged.
+    let trunks = plan
+        .slices
+        .iter()
+        .map(|s| s.vlan.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    sh.run(
+        "ovs-vsctl",
+        &["set", "port", &plan.uplink, &format!("trunks=[{trunks}]")],
+    )?;
+    for (i, slice) in plan.slices.iter().enumerate() {
+        apply_slice_htb_class(sh, &plan.uplink, slice, i)?;
+    }
+    Ok(())
+}
+
+/// One access port per device attachment. `add-port`'s trailing `tag=<vid>` sets the column at
+/// creation, but `--may-exist` skips column assignment on an *existing* port — so `tag` is set
+/// again, unconditionally, as a converging step of its own, the same reason `apply_slices`
+/// above uses `set` rather than trusting `add-port`'s one-shot value to stay correct forever.
+fn ovs_apply_endpoints(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
+    for ep in &plan.endpoints {
+        ensure_endpoint_device(sh, ep)?;
+        sh.run(
+            "ovs-vsctl",
+            &["--may-exist", "add-port", &plan.bridge, &ep.name],
+        )?;
+        sh.run(
+            "ovs-vsctl",
+            &["set", "port", &ep.name, &format!("tag={}", ep.vlan)],
+        )?;
+        sh.run("ip", &["link", "set", &ep.name, "up"])?;
+        // Same idempotency guard as the kernel bridge's own apply_endpoints: a running
+        // container zone has already moved the peer into its own netns, so its absence here is
+        // the converged state, not a failure.
+        if ep.kind == super::plan::EndpointKind::Veth && sh.link_exists(&ep.peer) {
+            sh.run("ip", &["link", "set", &ep.peer, "up"])?;
+        }
+        if let Some(imp) = &ep.impairment {
+            apply_impairment(sh, &ep.name, imp)?;
+        }
+    }
+    Ok(())
+}
+
+/// Removes everything an OVS-backed plan created. `--if-exists` is `ovs-vsctl`'s own
+/// tolerate-missing idiom (confirmed idempotent on a second call against an already-removed
+/// port/bridge), so unlike [`teardown`] this needs no `run_tolerate_missing` wrapper around the
+/// `ovs-vsctl` calls themselves — only around the underlying `ip link del`, which still errors
+/// on an absent device the normal way.
+fn ovs_teardown(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
+    for ep in &plan.endpoints {
+        if let Some(imp) = &ep.impairment {
+            sh.run_tolerate_missing("ip", &["link", "del", &imp.ifb])?;
+        }
+        sh.run(
+            "ovs-vsctl",
+            &["--if-exists", "del-port", &plan.bridge, &ep.name],
+        )?;
+        sh.run_tolerate_missing("ip", &["link", "del", &ep.name])?;
+    }
+    sh.run(
+        "ovs-vsctl",
+        &["--if-exists", "del-port", &plan.bridge, &plan.uplink],
+    )?;
+    sh.run_tolerate_missing("ip", &["link", "del", &plan.uplink])?;
+    sh.run("ovs-vsctl", &["--if-exists", "del-br", &plan.bridge])?;
+    Ok(())
+}
+
+/// Observe OVS state against the plan — the same shape [`observe`] reports, read through
+/// `ovs-vsctl` instead of `ip`/`bridge`. `br-exists` exits 2 for an absent bridge (checked here
+/// the same way `link_exists` checks `ip -j link show`'s exit code, not its output). The trunk
+/// list happens to already be valid JSON in OVSDB's own text notation (`[101, 103]`, `[]`), so
+/// [`Shell::json`] parses it directly with no `--format=json` needed — confirmed live rather
+/// than assumed, since guessing wrong here would silently under- or over-report trunk state.
+fn ovs_observe(sh: &Shell, plan: &GatewayPlan) -> Result<GatewayObservation, NetOpsError> {
+    let bridge_present = sh.run("ovs-vsctl", &["br-exists", &plan.bridge]).is_ok();
+    let uplink_present = bridge_present && sh.link_exists(&plan.uplink);
+
+    let class_handles: Vec<String> = if uplink_present {
+        sh.run("tc", &["class", "show", "dev", &plan.uplink])?
+            .lines()
+            .filter(|l| l.starts_with("class "))
+            .filter_map(|l| l.split_whitespace().nth(2))
+            .map(str::to_string)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let trunk_vlans: Vec<u16> = if uplink_present {
+        sh.json("ovs-vsctl", &["get", "port", &plan.uplink, "trunks"])?
+            .as_array()
+            .map(|vs| {
+                vs.iter()
+                    .filter_map(|v| v.as_u64())
+                    .map(|v| v as u16)
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let slices = plan
+        .slices
+        .iter()
+        .map(|s| SliceObservation {
+            id: s.id.clone(),
+            vlan: s.vlan,
+            class_present: class_handles
+                .iter()
+                .any(|h| h == &format!("1:{:x}", s.class_minor)),
+            trunk_vlan_present: trunk_vlans.contains(&s.vlan),
+        })
+        .collect();
+
+    let bridge_ports: Vec<String> = if bridge_present {
+        sh.run("ovs-vsctl", &["list-ports", &plan.bridge])?
+            .lines()
+            .map(str::to_string)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let endpoints_present = plan
+        .endpoints
+        .iter()
+        .filter(|ep| bridge_ports.iter().any(|p| p == &ep.name) && sh.link_exists(&ep.name))
+        .count();
+
+    let mut impairments = Vec::new();
+    for ep in &plan.endpoints {
+        let Some(imp) = &ep.impairment else { continue };
+        let egress_present = sh.link_exists(&ep.name)
+            && sh
+                .run("tc", &["qdisc", "show", "dev", &ep.name])?
+                .lines()
+                .any(|l| l.starts_with("qdisc netem "));
+        let ingress_present = sh.link_exists(&imp.ifb)
+            && sh
+                .run("tc", &["qdisc", "show", "dev", &imp.ifb])?
+                .lines()
+                .any(|l| l.starts_with("qdisc netem "));
+        impairments.push(ImpairmentObservation {
+            link: imp.link.clone(),
+            access_port: ep.name.clone(),
+            egress_present,
+            ingress_present,
+        });
+    }
+
+    Ok(GatewayObservation {
+        bridge_present,
+        uplink_present,
+        slices,
+        endpoints_present,
+        endpoints_expected: plan.endpoints.len(),
+        impairments,
+    })
+}
+
+/// The OVS/OVSDB data plane — a second implementation behind the same [`GatewayPlan`], selected
+/// by `network.data_plane: ovs`. The kernel bridge remains the default and the one every frozen
+/// H1/H3/H4 number was measured on; this exists so a campaign can compare mechanisms without
+/// the experiment itself changing (`network-provisioning-patterns` skill). Reuses the tc-based
+/// HTB tree, per-slice class/filter and impairment/netem code unchanged — none of it depends on
+/// which switching fabric the interface underneath it belongs to.
+pub struct Ovs;
+
+impl DataPlane for Ovs {
+    fn name(&self) -> &'static str {
+        "ovs"
+    }
+
+    fn apply_links(&self, sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
+        ovs_apply_links(sh, plan)
+    }
+
+    fn apply_slices(&self, sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
+        ovs_apply_slices(sh, plan)
+    }
+
+    fn apply_endpoints(&self, sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
+        ovs_apply_endpoints(sh, plan)
+    }
+
+    fn teardown(&self, sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
+        ovs_teardown(sh, plan)
+    }
+
+    fn observe(&self, sh: &Shell, plan: &GatewayPlan) -> Result<GatewayObservation, NetOpsError> {
+        ovs_observe(sh, plan)
+    }
+}
+
+/// The data plane a plan selects (`GatewayPlan::data_plane`, from `network.data_plane` — absent
+/// means [`crate::model::DataPlaneKind::KernelBridge`], so every experiment that predates this
+/// field keeps selecting the exact mechanism it always has).
+pub fn data_plane(kind: crate::model::DataPlaneKind) -> &'static dyn DataPlane {
+    match kind {
+        crate::model::DataPlaneKind::KernelBridge => &KernelBridge,
+        crate::model::DataPlaneKind::Ovs => &Ovs,
+    }
 }
 
 #[cfg(test)]
@@ -715,8 +985,16 @@ mod seam_tests {
     /// functions the netns integration test already exercises. This pins the wiring; the live
     /// behaviour is that test's job.
     #[test]
-    fn the_active_data_plane_is_the_kernel_bridge() {
-        assert_eq!(data_plane().name(), "kernel-bridge");
+    fn kernel_bridge_is_the_default_selection() {
+        assert_eq!(
+            data_plane(crate::model::DataPlaneKind::KernelBridge).name(),
+            "kernel-bridge"
+        );
+    }
+
+    #[test]
+    fn ovs_is_reachable_through_the_same_selector() {
+        assert_eq!(data_plane(crate::model::DataPlaneKind::Ovs).name(), "ovs");
     }
 
     /// The exact tokens handed to `tc`. Worth pinning as a unit test because the netns test can

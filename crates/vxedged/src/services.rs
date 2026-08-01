@@ -282,7 +282,7 @@ impl GatewaySvc {
                         let sh = shell.clone();
                         let pl = plan.clone();
                         blocking(move || {
-                            gateway::data_plane()
+                            gateway::data_plane(pl.data_plane)
                                 .apply_links(&sh, &pl)
                                 .map_err(|e| e.to_string())
                         })
@@ -291,7 +291,7 @@ impl GatewaySvc {
                         let sh = shell.clone();
                         let pl = plan.clone();
                         blocking(move || {
-                            gateway::data_plane()
+                            gateway::data_plane(pl.data_plane)
                                 .apply_slices(&sh, &pl)
                                 .map_err(|e| e.to_string())
                         })
@@ -300,7 +300,7 @@ impl GatewaySvc {
                         let sh = shell.clone();
                         let pl = plan.clone();
                         blocking(move || {
-                            gateway::data_plane()
+                            gateway::data_plane(pl.data_plane)
                                 .apply_endpoints(&sh, &pl)
                                 .map_err(|e| e.to_string())
                         })
@@ -309,7 +309,7 @@ impl GatewaySvc {
                         let sh = shell.clone();
                         let pl = plan.clone();
                         let obs = blocking(move || {
-                            gateway::data_plane()
+                            gateway::data_plane(pl.data_plane)
                                 .observe(&sh, &pl)
                                 .map_err(|e| e.to_string())
                         })
@@ -476,7 +476,7 @@ impl GatewaySvc {
                         let sh = shell.clone();
                         let pl = plan.clone();
                         blocking(move || {
-                            gateway::data_plane()
+                            gateway::data_plane(pl.data_plane)
                                 .teardown(&sh, &pl)
                                 .map_err(|e| e.to_string())
                         })
@@ -541,7 +541,7 @@ impl GatewayService for GatewaySvc {
                 let snssai_count = plan.snssai_slice_ids.len();
                 let shell = self.shell.clone();
                 let obs = tokio::task::spawn_blocking(move || {
-                    gateway::data_plane().observe(&shell, &plan)
+                    gateway::data_plane(plan.data_plane).observe(&shell, &plan)
                 })
                 .await
                 .map_err(|e| Status::internal(format!("observe task panicked: {e}")))?

@@ -354,6 +354,19 @@ pub enum SliceMode {
     SNssai,
 }
 
+/// Which mechanism renders a [`crate::gateway::GatewayPlan`] onto the host: `gateway::provision`'s
+/// `KernelBridge` (the default, and the one every frozen H1/H3/H4 number was measured on) or the
+/// OVS variant behind the same plan. A manifest field rather than a daemon flag, matching every
+/// other experimental variable in this model — `network.data_plane`, sitting beside
+/// `network.slices[].mode`, which is exactly the other place a manifest picks which mechanism
+/// implements an otherwise-identical intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DataPlaneKind {
+    #[default]
+    KernelBridge,
+    Ovs,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SNssai {
     pub sst: u8,
@@ -379,6 +392,10 @@ pub struct Experiment {
     /// every number an experiment produces while everything still validated and ran — exp-001
     /// declares 500 mbit and would have planned at the 1000 mbit default.
     pub uplink_bandwidth_bps: Option<u64>,
+    /// Which mechanism renders the gateway plan. Absent in the manifest means
+    /// `DataPlaneKind::KernelBridge`, so every existing experiment (none of which declares this
+    /// field) keeps planning and provisioning byte-for-byte as before.
+    pub data_plane: DataPlaneKind,
     pub traffic: Vec<TrafficProfile>,
     pub method: Method,
     /// Services the experiment runs alongside the vehicle (OTA, telemetry). Typed and validated

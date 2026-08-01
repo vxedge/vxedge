@@ -34,13 +34,34 @@ pure-rtnetlink port as an open, non-blocking phase-1 trailing item
   layer above `netops.rs` — don't let backend-specific detail leak upward into
   `GatewayPlan`/`provision.rs` now, or the port becomes a rewrite instead of a swap.
 
-## Backend choice is also deliberate: kernel bridge, not OVS, for H1
+## Two DataPlane implementations now — kernel bridge is still the default
 
-`gateway/mod.rs`: "Backend is the kernel bridge (not OVS)." The OVS/OVSDB variant is an
-explicit phase-2 item (`docs/TASKS.md`) meant to sit *behind the same `GatewayPlan`* —
-when you build it, it's a second `provision.rs`-shaped implementation, not a
-replacement, since H1's frozen numbers were measured against the kernel-bridge path and
-must stay reproducible against it.
+`gateway/mod.rs`: kernel bridge is the default, OVS (`Ovs`, `network.data_plane: ovs`)
+is the second implementation behind the same `GatewayPlan`, delivered 2026-08-01. H1's
+frozen numbers were measured against the kernel-bridge path and must stay reproducible
+against it — the OVS variant is additive, selected by a manifest field that defaults to
+`kernel-bridge` when absent, so every experiment that predates the field keeps planning
+and provisioning byte-for-byte as before.
+
+What the two backends actually share, and why it's safe to share it: the HTB queue tree
+(`ensure_htb_root_and_default`/`apply_slice_htb_class` in `provision.rs`) and the
+impairment/netem code act on the uplink's or access port's own kernel qdisc, which exists
+identically regardless of which switching fabric the interface is enslaved to — a `tc`
+qdisc doesn't know or care whether its device is a Linux bridge port or an OVS port. Only
+bridge creation and VLAN membership are backend-specific: the kernel bridge uses `ip link
+add ... type bridge` + `bridge vlan add`; OVS uses `ovs-vsctl add-br`/`add-port` +
+`set port ... trunks=[...]`/`tag=...`. If you add a third backend, extract further only
+when it *also* needs to share the tc-based code — don't generalize preemptively.
+
+**OVS state is not namespace-isolated, unlike everything else this skill covers.** A
+Linux bridge created inside a disposable `ip netns add` vanishes with the namespace,
+because kernel bridges are netns-scoped. OVS bridges are not: they live in the
+system-wide `ovsdb-server` regardless of which netns the `ovs-vsctl` command that
+created them ran from. `gateway_ovs.rs`'s own test therefore builds a `GatewayPlan`
+directly with names that can't collide with a real gateway (never `vxbr0`/`vxup0`) and
+cleans up explicitly, rather than relying on namespace teardown — read that test's module
+doc before writing another OVS-touching test, since reusing the netns pattern here would
+silently mutate the real host's OVS config instead of a disposable copy of it.
 
 ## Idempotency is the actual deliverable, not a nice-to-have
 

@@ -72,6 +72,8 @@ pub enum ModelError {
         "link `{link}`: `impairments.loss_pct` is {loss} — expected a percentage between 0 and 100"
     )]
     LossOutOfRange { link: String, loss: f64 },
+    #[error("`network.data_plane` is `{data_plane}` — expected `kernel-bridge` or `ovs`")]
+    UnknownDataPlane { data_plane: String },
 }
 
 /// Range-checked narrowing from YAML's `u64`.
@@ -115,6 +117,21 @@ fn backend_of(device: &str, spec: &Value) -> Result<Option<Backend>, ModelError>
         Some(other) => Err(ModelError::UnknownBackend {
             device: device.to_string(),
             backend: other.to_string(),
+        }),
+    }
+}
+
+fn data_plane_of(raw: &Value) -> Result<DataPlaneKind, ModelError> {
+    match raw
+        .get("network")
+        .and_then(|n| n.get("data_plane"))
+        .and_then(|v| v.as_str())
+    {
+        None => Ok(DataPlaneKind::KernelBridge),
+        Some("kernel-bridge") => Ok(DataPlaneKind::KernelBridge),
+        Some("ovs") => Ok(DataPlaneKind::Ovs),
+        Some(other) => Err(ModelError::UnknownDataPlane {
+            data_plane: other.to_string(),
         }),
     }
 }
@@ -700,6 +717,7 @@ pub fn build(ws: &Workspace) -> Result<Experiment, ModelError> {
             .and_then(|n| n.get("defaults"))
             .and_then(|d| d.get("bandwidth"))
             .and_then(|v| v.as_u64()),
+        data_plane: data_plane_of(&raw)?,
         slices: slices_of(&raw)?,
         entities,
         traffic,
@@ -1178,6 +1196,56 @@ devices: {}
             other => panic!("expected UnknownBackend, got {other:?}"),
         }
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Absent `network.data_plane` means the kernel bridge — every frozen experiment predates
+    /// this field, and this is what keeps them planning identically to before it existed.
+    #[test]
+    fn absent_data_plane_defaults_to_kernel_bridge() {
+        let (tmp, ws) = scaffolded("dpdefault");
+        let m = build(&ws).unwrap();
+        assert_eq!(m.data_plane, DataPlaneKind::KernelBridge);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn network_data_plane_ovs_selects_the_ovs_backend() {
+        let ws = r#"
+kind: experiment
+id: e
+vehicles: [veh]
+network:
+  data_plane: ovs
+  slices: [{ id: adas, mode: vlan, vlan: 101 }]
+---
+kind: vehicle
+id: veh
+devices: {}
+"#;
+        let m = load_yaml(ws).expect("valid workspace");
+        assert_eq!(m.data_plane, DataPlaneKind::Ovs);
+    }
+
+    #[test]
+    fn an_unknown_data_plane_is_refused() {
+        let ws = r#"
+kind: experiment
+id: e
+vehicles: [veh]
+network:
+  data_plane: vpp
+  slices: [{ id: adas, mode: vlan, vlan: 101 }]
+---
+kind: vehicle
+id: veh
+devices: {}
+"#;
+        match load_yaml(ws) {
+            Err(LoadError::Model(ModelError::UnknownDataPlane { data_plane })) => {
+                assert_eq!(data_plane, "vpp")
+            }
+            other => panic!("expected UnknownDataPlane, got {other:?}"),
+        }
     }
 
     /// The declarative harness block reaches the model unchanged — the property
