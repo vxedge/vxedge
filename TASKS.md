@@ -445,7 +445,32 @@ exp-001 measurements).
 - [ ] libvirt: storage pools with SHA256-digest disk images + hugepages (beyond direct
       kernel boot); QMP instead of pidfile for microvm control
 - [ ] container backend: OCI runtime integration (payload currently exec'd by the runner)
-- [ ] `ComputeService` verbs; client-streaming `PushImage` (image store)
+- [x] `ComputeService.Up/Down/List` live — **delivered 2026-08-01**, CLI `compute
+      up/down/list`. The `service-boundaries` skill's own test decided the shape: a
+      second *backend* would need a second implementation, and none exists — an
+      hpc-role device already ran under the exact same container/qemu-microvm/libvirt
+      code as any other, since `plan_nodes_from_model` never filtered by role. So
+      `ComputeService` is not a new backend, it is a second RPC surface over the same
+      `NodePlan`/`zones::node_up`/`node_down`/`node_status`, giving compute nodes their
+      own vocabulary and their own `compute.up`/`compute.down` events without adding a
+      variation point that doesn't exist. `NodePlan` gained a `role: DeviceRole` field
+      (populated straight from the device declaration, never guessed) so
+      `ComputeSvc::plans_for` can filter to `role == Hpc` — the one genuinely new piece
+      of information the split needed. `ZoneSvc` itself is untouched (copied rather than
+      shared, since it is load-bearing for H1/H3/H4 and a shared helper would put a
+      second caller's requirements on code those frozen results depend on).
+      **Deliberately not wired into `ExperimentService`'s zones stage**: that stage
+      already brings up every device regardless of role, so wiring compute in as a
+      second stage would double-provision hpc-role devices without first carving them
+      out of zones — a real, separate decision (`VehicleService`'s planned
+      gateway→zones→compute→signal-plane→services order is where it belongs) left open
+      rather than guessed at. Live-verified against a real daemon: `compute up`/`list`
+      correctly refuse before any experiment is active, and correctly reach the role
+      filter once one is (`ecu1` refused as not compute, `hpc1` accepted) — full
+      provisioning is the same code the netns test already proves, so it was not
+      re-proven under the new name. `Apply`/`Remove`/`PushImage` are `unimplemented`
+      stubs, matching `ZoneService`'s own existing precedent for the same three RPCs.
+      139 tests total (was 138), clippy `-D warnings` and fmt clean.
 
 ## 3b. Service lifecycle (ota, telemetry — §8)
 
@@ -966,7 +991,7 @@ virtual actuators. `ComputeService` and the container backend's OCI integration 
 scoped here (§3); sensor/actuator/virtual-ECU backends move up from phase 3 by owner decision
 — not gated on hardware the way the GPU-dependent phase-3 items are, only on ordering.
 
-- [ ] `ComputeService` verbs; client-streaming `PushImage` (image store) — see §3
+- [x] `ComputeService.Up/Down/List` — **delivered 2026-08-01**, see §3 for the full account
 - [ ] container backend: OCI runtime integration (payload currently exec'd by the runner) — §3
 - [ ] Manifest structs: `io:`, `sensors:`, `actuators:` node blocks (§6.0 — corrected from the
       stale §6.1 reference this item carried before §6.1 was deleted 2026-07-31). The domain
