@@ -16,6 +16,7 @@ use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::Server;
 use tracing::info;
 
+use vxedge_api::v1::compute_service_server::ComputeServiceServer;
 use vxedge_api::v1::event_service_server::EventServiceServer;
 use vxedge_api::v1::experiment_service_server::ExperimentServiceServer;
 use vxedge_api::v1::gateway_service_server::GatewayServiceServer;
@@ -130,6 +131,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         engine: engine.clone(),
         audit: audit.clone(),
         shell: shell.clone(),
+        state: state.clone(),
+        runtime_dir: args.runtime_dir.clone(),
+    });
+    // Not part of `Handles`: `ComputeService` is a standalone RPC surface over the same
+    // `EdgeState`/`NodePlan` machinery `zones` already uses, addressed by role rather than
+    // wired into `experiment up`'s own zones stage — see `ComputeSvc`'s own doc comment for why.
+    let compute = Arc::new(services::ComputeSvc {
+        engine: engine.clone(),
+        audit: audit.clone(),
+        shell: shell.clone(),
         state,
         runtime_dir: args.runtime_dir.clone(),
     });
@@ -146,6 +157,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Server::builder()
         .add_service(GatewayServiceServer::from_arc(gateway.clone()))
         .add_service(ZoneServiceServer::from_arc(zones.clone()))
+        .add_service(ComputeServiceServer::from_arc(compute))
         .add_service(SvcServiceServer::from_arc(svcs.clone()))
         .add_service(ExperimentServiceServer::new(experiment::ExperimentSvc {
             audit: audit.clone(),

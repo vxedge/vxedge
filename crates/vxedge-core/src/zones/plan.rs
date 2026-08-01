@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::gateway::plan::{EndpointKind, GatewayPlan};
-use crate::model::Backend;
+use crate::model::{Backend, DeviceRole};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ZonePlanError {
@@ -43,6 +43,12 @@ pub enum ZonePlanError {
 pub struct NodePlan {
     pub zone_id: String,
     pub node_id: String,
+    /// The device's declared role. `ZoneService` and `ComputeService` share this one plan and
+    /// this one lifecycle (`zones::node_up`/`node_down`/`node_status`) — the two RPC surfaces
+    /// differ only in which role they address, matching the OEM vocabulary split between zone
+    /// controllers/ECUs and central compute, not a difference in how either is actually
+    /// provisioned.
+    pub role: DeviceRole,
     pub backend: Backend,
     /// Bridge access port (tap for VMs; veth host side for containers).
     pub endpoint: String,
@@ -166,6 +172,7 @@ pub fn plan_nodes_from_model(
                 plans.push(NodePlan {
                     zone_id: device.zone.clone().unwrap_or_else(|| device.id.clone()),
                     node_id: device.id.clone(),
+                    role: device.role,
                     backend,
                     endpoint: ep.name.clone(),
                     peer: ep.peer.clone(),
@@ -246,6 +253,24 @@ parts:
         assert_eq!(plans[1].kind, EndpointKind::Veth);
         assert_eq!(plans[1].peer, "vzp-node-b");
         assert_eq!(plans[1].runtime_name(), "vx-node-b");
+        // Both devices in this fixture are `role: ecu` — the role a plan reports is not
+        // guessed or defaulted, it comes straight from the device declaration.
+        assert_eq!(plans[0].role, crate::model::DeviceRole::Ecu);
+        assert_eq!(plans[1].role, crate::model::DeviceRole::Ecu);
+    }
+
+    /// `ComputeService` and `ZoneService` share this one plan; role is what tells a compute
+    /// node apart from a zone-controller/ECU one when a caller needs to filter by it (both
+    /// device kinds join the same gateway plan identically, so nothing else here would).
+    #[test]
+    fn a_mix_of_roles_is_reported_faithfully() {
+        let ws = WS.replace(
+            "  node-a: { role: ecu, zone: front-left, backend: qemu-microvm }",
+            "  node-a: { role: hpc, zone: front-left, backend: qemu-microvm }",
+        );
+        let plans = plans(&ws);
+        assert_eq!(plans[0].role, crate::model::DeviceRole::Hpc);
+        assert_eq!(plans[1].role, crate::model::DeviceRole::Ecu);
     }
 
     /// A VM with nothing deployed on it has no bundle to boot. Reported as such rather than

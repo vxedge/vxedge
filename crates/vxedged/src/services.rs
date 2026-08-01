@@ -1,6 +1,7 @@
-//! vxAPI service implementations. GatewayService and ZoneService are live
-//! end-to-end: gateway Up provisions bridge/VLAN/HTB, zone Up runs nodes
-//! under their packaging backend (container / qemu-microvm / libvirt).
+//! vxAPI service implementations. GatewayService, ZoneService and ComputeService are live
+//! end-to-end: gateway Up provisions bridge/VLAN/HTB, zone/compute Up run nodes under their
+//! packaging backend (container / qemu-microvm / libvirt) — the same lifecycle for both,
+//! addressed by role rather than by a difference in provisioning (see `ComputeSvc`'s own doc).
 
 use sha2::Digest;
 use std::path::PathBuf;
@@ -9,6 +10,7 @@ use std::sync::Arc;
 use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
 use tonic::{Request, Response, Status};
 
+use vxedge_api::v1::compute_service_server::ComputeService;
 use vxedge_api::v1::event_service_server::EventService;
 use vxedge_api::v1::gateway_service_server::GatewayService;
 use vxedge_api::v1::job_service_server::JobService;
@@ -17,12 +19,13 @@ use vxedge_api::v1::svc_service_server::SvcService;
 use vxedge_api::v1::traffic_service_server::TrafficService;
 use vxedge_api::v1::zone_service_server::ZoneService;
 use vxedge_api::v1::{
-    Event, GatewayApplyRequest, GatewayDownRequest, GatewayStatus, GatewayStatusRequest,
-    GatewayUpRequest, GetJobRequest, ImagePushRequest, ImagePushResponse, Job, ManifestRef,
-    ResourceKind, ResourceState, ResourceStatus, SliceStatus, SubscribeRequest, SvcDownRequest,
-    SvcStatusRequest, SvcUpRequest, TrafficDownRequest, TrafficUpRequest, WatchJobRequest,
-    ZoneApplyRequest, ZoneDownRequest, ZoneListRequest, ZoneListResponse, ZoneRemoveRequest,
-    ZoneUpRequest,
+    ComputeApplyRequest, ComputeDownRequest, ComputeListRequest, ComputeListResponse,
+    ComputeRemoveRequest, ComputeUpRequest, Event, GatewayApplyRequest, GatewayDownRequest,
+    GatewayStatus, GatewayStatusRequest, GatewayUpRequest, GetJobRequest, ImagePushRequest,
+    ImagePushResponse, Job, ManifestRef, ResourceKind, ResourceState, ResourceStatus, SliceStatus,
+    SubscribeRequest, SvcDownRequest, SvcStatusRequest, SvcUpRequest, TrafficDownRequest,
+    TrafficUpRequest, WatchJobRequest, ZoneApplyRequest, ZoneDownRequest, ZoneListRequest,
+    ZoneListResponse, ZoneRemoveRequest, ZoneUpRequest,
 };
 use vxedge_core::Workspace;
 use vxedge_core::fiveg::{self, FiveGLifecycleConfig, FiveGPlan};
@@ -993,6 +996,244 @@ impl ZoneService for ZoneSvc {
     ) -> Result<Response<ImagePushResponse>, Status> {
         Err(Status::unimplemented(
             "ZoneService.PushImage: image store lands with the registry work",
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ComputeService — central HPC nodes
+// ---------------------------------------------------------------------------
+
+/// `ComputeService` and `ZoneService` share one lifecycle (`zones::node_up`/`node_down`/
+/// `node_status` over one `NodePlan`) — a compute node is provisioned exactly like a
+/// zone-controller/ECU, because the container/qemu-microvm/libvirt backends never distinguished
+/// them (`plan_nodes_from_model` didn't carry `role` before this service needed to filter on
+/// it). What differs is the RPC surface and vocabulary: `vxedge compute up --vxid hpc1` speaks
+/// to the role an OEM engineer thinks in ("central compute"), the same way `vxedge zone` speaks
+/// to zone-controllers/ECUs, even though both ultimately call the same provisioning code.
+///
+/// Deliberately **not** wired into `ExperimentService`'s `zones` stage: that stage already
+/// brings up every device regardless of role (nothing in it has ever filtered on `role`), so an
+/// hpc-role device in today's five frozen experiments is already provisioned by `zone up`. Adding
+/// a compute stage that also claims hpc-role devices would double-provision them, or require
+/// carving them out of the zones stage first — a real, separate design decision (`VehicleService`
+/// is where `docs/TASKS.md` already plans a real gateway→zones→compute→signal-plane→services
+/// order) deliberately left for when that orchestration exists, not guessed at here. This
+/// service is additive and standalone: it gives compute nodes their own addressable verb without
+/// changing what `experiment up`/`zone up` already do to a single frozen experiment.
+pub struct ComputeSvc {
+    pub engine: JobEngine,
+    pub audit: Arc<Audit>,
+    pub shell: Shell,
+    pub state: SharedState,
+    pub runtime_dir: PathBuf,
+}
+
+impl ComputeSvc {
+    /// Node plans for the active experiment's compute (hpc-role) devices, optionally filtered
+    /// to one. Mirrors `ZoneSvc::plans_for` exactly except for the role filter — kept as its own
+    /// copy rather than shared with `ZoneSvc`, since `ZoneSvc` is load-bearing for H1/H3/H4 and a
+    /// shared helper would put a second caller's requirements on code those frozen results
+    /// depend on.
+    async fn plans_for(&self, vxid: Option<&str>) -> Result<Vec<NodePlan>, Status> {
+        let st = self.state.lock().await;
+        let (model, dir, gateway) = match (&st.active, &st.gateway) {
+            (Some(a), Some(g)) => (a.model.clone(), a.dir.clone(), g.clone()),
+            _ => {
+                return Err(Status::failed_precondition(
+                    "no active experiment: compute verbs act on the topology the gateway \
+                     registered, so bring one up first (`vxedge experiment up` from a workspace \
+                     directory)",
+                ));
+            }
+        };
+        drop(st);
+        let plans = zones::plan_nodes_from_model(&model, &gateway, &dir)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let compute: Vec<NodePlan> = plans
+            .into_iter()
+            .filter(|p| p.role == vxedge_core::model::DeviceRole::Hpc)
+            .filter(|p| vxid.is_none_or(|v| p.node_id == v))
+            .collect();
+        if compute.is_empty() {
+            return Err(Status::not_found(format!(
+                "no compute (hpc-role) device `{}` in the active experiment",
+                vxid.unwrap_or("<all>")
+            )));
+        }
+        Ok(compute)
+    }
+
+    async fn lifecycle(
+        &self,
+        rpc: &'static str,
+        kind: &'static str,
+        vxid: String,
+        up: bool,
+    ) -> Result<Response<Job>, Status> {
+        let plans = self.plans_for(Some(&vxid)).await?;
+        let workspace = self
+            .state
+            .lock()
+            .await
+            .active
+            .as_ref()
+            .map(|a| a.sha256.clone())
+            .unwrap_or_default();
+        self.audit.record(
+            rpc,
+            serde_json::json!({ "compute": vxid, "nodes": plans.len(), "workspace_sha256": workspace }),
+        );
+        let shell = self.shell.clone();
+        let runtime_dir = self.runtime_dir.clone();
+        let events = self.engine.events().clone();
+        let job = self
+            .engine
+            .submit(kind, move |p| async move {
+                let total = plans.len();
+                for (i, np) in plans.iter().enumerate() {
+                    let pct = 10 + (i as u32 * 80) / total as u32;
+                    p.update(
+                        pct,
+                        &format!(
+                            "{} node {}/{}: {} ({:?})",
+                            if up { "starting" } else { "stopping" },
+                            i + 1,
+                            total,
+                            np.node_id,
+                            np.backend
+                        ),
+                    );
+                    let sh = shell.clone();
+                    let rd = runtime_dir.clone();
+                    let node = np.clone();
+                    blocking(move || {
+                        if up {
+                            zones::node_up(&sh, &node, &rd).map_err(|e| e.to_string())
+                        } else {
+                            zones::node_down(&sh, &node, &rd).map_err(|e| e.to_string())
+                        }
+                    })
+                    .await?;
+                    events.emit(
+                        if up {
+                            crate::events::EventKind::ComputeUp
+                        } else {
+                            crate::events::EventKind::ComputeDown
+                        },
+                        &np.node_id,
+                        &format!("{:?} on {} (vlan {})", np.backend, np.endpoint, np.vlan),
+                    );
+                }
+                let sh = shell.clone();
+                let rd = runtime_dir.clone();
+                let verify = plans.clone();
+                let wrong: Vec<String> = blocking(move || {
+                    Ok(verify
+                        .iter()
+                        .filter(|np| {
+                            let s = zones::node_status(&sh, np, &rd);
+                            up != (s == vxedge_core::zones::backend::NodeState::Up)
+                        })
+                        .map(|np| np.node_id.clone())
+                        .collect())
+                })
+                .await?;
+                if !wrong.is_empty() {
+                    return Err(format!(
+                        "verification failed — nodes not {}: {}",
+                        if up { "up" } else { "down" },
+                        wrong.join(", ")
+                    ));
+                }
+                Ok(format!(
+                    "compute `{vxid}` {}: {total} node(s)",
+                    if up { "up" } else { "down" }
+                ))
+            })
+            .await;
+        Ok(Response::new(job))
+    }
+}
+
+#[tonic::async_trait]
+impl ComputeService for ComputeSvc {
+    async fn apply(&self, _: Request<ComputeApplyRequest>) -> Result<Response<Job>, Status> {
+        Err(Status::unimplemented(
+            "ComputeService.Apply: compute nodes register via the experiment manifest for now",
+        ))
+    }
+
+    async fn up(&self, req: Request<ComputeUpRequest>) -> Result<Response<Job>, Status> {
+        let vxid = req
+            .into_inner()
+            .r#ref
+            .map(|r| r.vxid)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| Status::invalid_argument("--vxid <compute node id> is required"))?;
+        self.lifecycle("ComputeService.Up", "compute.up", vxid, true)
+            .await
+    }
+
+    async fn down(&self, req: Request<ComputeDownRequest>) -> Result<Response<Job>, Status> {
+        let vxid = req
+            .into_inner()
+            .r#ref
+            .map(|r| r.vxid)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| Status::invalid_argument("--vxid <compute node id> is required"))?;
+        self.lifecycle("ComputeService.Down", "compute.down", vxid, false)
+            .await
+    }
+
+    async fn list(
+        &self,
+        _: Request<ComputeListRequest>,
+    ) -> Result<Response<ComputeListResponse>, Status> {
+        let plans = self.plans_for(None).await?;
+        let shell = self.shell.clone();
+        let rd = self.runtime_dir.clone();
+        let statuses = tokio::task::spawn_blocking(move || {
+            plans
+                .iter()
+                .map(|np| {
+                    let s = zones::node_status(&shell, np, &rd);
+                    ResourceStatus {
+                        vxid: np.node_id.clone(),
+                        kind: ResourceKind::Compute as i32,
+                        state: if s == vxedge_core::zones::backend::NodeState::Up {
+                            ResourceState::Up as i32
+                        } else {
+                            ResourceState::Down as i32
+                        },
+                        detail: format!(
+                            "backend={:?} port={} peer={} vlan={}",
+                            np.backend, np.endpoint, np.peer, np.vlan
+                        ),
+                        since_unix_ms: now_ms(),
+                    }
+                })
+                .collect()
+        })
+        .await
+        .map_err(|e| Status::internal(format!("status task panicked: {e}")))?;
+        Ok(Response::new(ComputeListResponse { nodes: statuses }))
+    }
+
+    async fn remove(&self, _: Request<ComputeRemoveRequest>) -> Result<Response<Job>, Status> {
+        Err(Status::unimplemented(
+            "ComputeService.Remove: compute nodes are defined by the experiment manifest for now",
+        ))
+    }
+
+    async fn push_image(
+        &self,
+        _: Request<tonic::Streaming<ImagePushRequest>>,
+    ) -> Result<Response<ImagePushResponse>, Status> {
+        Err(Status::unimplemented(
+            "ComputeService.PushImage: image store lands with the registry work — likely the \
+             same store `ZoneService.PushImage` needs, and possibly redundant with vxparts' own \
+             ORAS registry; a design decision for whichever lands first, not assumed here",
         ))
     }
 }

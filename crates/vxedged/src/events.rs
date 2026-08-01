@@ -35,6 +35,14 @@ pub enum EventKind {
     ZoneUp,
     /// A device has been stopped and its runtime state cleaned up.
     ZoneDown,
+    /// A compute (hpc-role) device is running under its backend and attached to its port.
+    /// Distinct from `ZoneUp` so a subscriber can tell "central compute came up" from "an
+    /// ECU came up" without inspecting the device — `ComputeService` and `ZoneService` share
+    /// the same lifecycle underneath, but the event vocabulary follows the RPC surface, which
+    /// follows the role an OEM engineer actually asked about.
+    ComputeUp,
+    /// A compute device has been stopped and its runtime state cleaned up.
+    ComputeDown,
     /// A service process was spawned and pidfile-tracked.
     ServiceUp,
     /// A service process was stopped.
@@ -60,6 +68,8 @@ impl EventKind {
             EventKind::SliceApplied => "gateway.slice-applied",
             EventKind::ZoneUp => "zone.up",
             EventKind::ZoneDown => "zone.down",
+            EventKind::ComputeUp => "compute.up",
+            EventKind::ComputeDown => "compute.down",
             EventKind::ServiceUp => "service.up",
             EventKind::ServiceDown => "service.down",
             EventKind::TrafficStarted => "traffic.started",
@@ -77,6 +87,7 @@ impl EventKind {
                 ResourceKind::Gateway
             }
             EventKind::ZoneUp | EventKind::ZoneDown => ResourceKind::Zone,
+            EventKind::ComputeUp | EventKind::ComputeDown => ResourceKind::Compute,
             EventKind::ServiceUp | EventKind::ServiceDown => ResourceKind::Service,
             EventKind::TrafficStarted | EventKind::TrafficStopped => ResourceKind::Traffic,
         }
@@ -137,6 +148,8 @@ mod tests {
             EventKind::SliceApplied,
             EventKind::ZoneUp,
             EventKind::ZoneDown,
+            EventKind::ComputeUp,
+            EventKind::ComputeDown,
             EventKind::ServiceUp,
             EventKind::ServiceDown,
             EventKind::TrafficStarted,
