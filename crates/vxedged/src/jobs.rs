@@ -7,7 +7,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, watch};
-use vxedge_api::v1::{Job, JobState, ResourceKind};
+use vxedge_api::v1::{Job, JobState};
 
 use crate::events::EventBus;
 
@@ -52,6 +52,16 @@ struct Inner {
 }
 
 impl JobEngine {
+    /// The event bus this engine publishes job transitions on.
+    ///
+    /// Exposed so a service can emit a *domain fact* on the same bus without carrying its own
+    /// handle: every service already holds a `JobEngine`, and a second field for the bus would
+    /// be two ways to reach one thing. Job progress stays private — that belongs to the job's
+    /// watch channel, not to a shared bus.
+    pub fn events(&self) -> &EventBus {
+        &self.inner.events
+    }
+
     pub fn new(events: EventBus) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -85,13 +95,13 @@ impl JobEngine {
 
         let events = self.inner.events.clone();
         let job_kind = kind.to_string();
-        events.emit("job-state", ResourceKind::Unspecified, &id, "pending");
+        events.emit(crate::events::EventKind::JobState, &id, "pending");
         tokio::spawn(async move {
             tx.send_modify(|j| {
                 j.state = JobState::Running as i32;
                 j.updated_unix_ms = now_ms();
             });
-            events.emit("job-state", ResourceKind::Unspecified, &id, "running");
+            events.emit(crate::events::EventKind::JobState, &id, "running");
 
             let result = work(Progress { tx: tx.clone() }).await;
 
@@ -103,7 +113,7 @@ impl JobEngine {
                         j.message = message;
                         j.updated_unix_ms = now_ms();
                     });
-                    events.emit("job-state", ResourceKind::Unspecified, &id, "succeeded");
+                    events.emit(crate::events::EventKind::JobState, &id, "succeeded");
                     tracing::info!(job = %id, kind = %job_kind, "job succeeded");
                 }
                 Err(error) => {
@@ -112,7 +122,7 @@ impl JobEngine {
                         j.error = error.clone();
                         j.updated_unix_ms = now_ms();
                     });
-                    events.emit("job-state", ResourceKind::Unspecified, &id, "failed");
+                    events.emit(crate::events::EventKind::JobState, &id, "failed");
                     tracing::warn!(job = %id, kind = %job_kind, error = %error, "job failed");
                 }
             }

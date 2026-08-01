@@ -120,6 +120,18 @@ enum Command {
         #[command(subcommand)]
         cmd: ManifestCmd,
     },
+    /// Stream what the daemon is doing, live.
+    ///
+    /// Domain facts about resources — `gateway.up`, `gateway.slice-applied`, `zone.up`,
+    /// `service.up`, `traffic.started` — not job progress, which belongs to the job that
+    /// reports it. The stream is lossy by design: a subscriber that falls behind skips rather
+    /// than slowing the daemon down, and it is never a record. For "what happened, in order,
+    /// without loss", read the audit log.
+    Events {
+        /// Only these kinds (repeatable, exact match). Default: everything.
+        #[arg(long = "kind")]
+        kinds: Vec<String>,
+    },
     /// Host preflight per docs/TESTBED-SETUP.md tiers (local — no daemon
     /// connection needed, since its job is to check whether the environment
     /// can even run one).
@@ -794,6 +806,33 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         },
+        Command::Events { kinds } => {
+            let channel = connect(&cli.endpoint).await?;
+            let mut client = vxedge_api::v1::event_service_client::EventServiceClient::new(channel);
+            let mut stream = client
+                .subscribe(vxedge_api::v1::SubscribeRequest {
+                    kinds: kinds.clone(),
+                })
+                .await?
+                .into_inner();
+            while let Some(event) = stream.message().await? {
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "id": event.id, "ts_unix_ms": event.ts_unix_ms,
+                            "kind": event.kind, "resource_vxid": event.resource_vxid,
+                            "detail": event.detail,
+                        })
+                    );
+                } else {
+                    println!(
+                        "{:<22} {:<20} {}",
+                        event.kind, event.resource_vxid, event.detail
+                    );
+                }
+            }
+        }
         Command::Doctor { tier } => doctor::run(*tier, cli.json)?,
     }
     Ok(())

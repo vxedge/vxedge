@@ -262,6 +262,7 @@ impl GatewaySvc {
         let shell = self.shell.clone();
         let state = self.state.clone();
         let runtime_dir = self.runtime_dir.clone();
+        let events = self.engine.events().clone();
         let job = self
             .engine
             .submit(kind, move |p| async move {
@@ -413,13 +414,31 @@ impl GatewaySvc {
 
                         let summary = plan.summary();
                         let mut st = state.lock().await;
-                        st.gateway = Some(plan);
+                        st.gateway = Some(plan.clone());
                         st.active = Some(ActiveExperiment {
                             model: model.clone(),
                             dir: manifest_dir.clone().unwrap_or_else(|| PathBuf::from(".")),
                             sha256: sha256.clone(),
                         });
                         st.fiveg = five_g_plan;
+                        drop(st);
+
+                        // Emitted after the state is durable, never before: a subscriber told of
+                        // a transition that then fails has been told something untrue.
+                        for slice in &plan.slices {
+                            events.emit(
+                                crate::events::EventKind::SliceApplied,
+                                &slice.id,
+                                &format!(
+                                    "vlan {}, {}..{} mbit, prio {}",
+                                    slice.vlan,
+                                    slice.min_rate_mbps,
+                                    slice.max_rate_mbps,
+                                    slice.priority
+                                ),
+                            );
+                        }
+                        events.emit(crate::events::EventKind::GatewayUp, "vxgateway", &summary);
                         Ok(format!("vxgateway up — {summary}"))
                     }
                     Verb::Down => {
@@ -463,6 +482,11 @@ impl GatewaySvc {
                         })
                         .await?;
                         *state.lock().await = EdgeState::default();
+                        events.emit(
+                            crate::events::EventKind::GatewayDown,
+                            "vxgateway",
+                            "bridge, uplink and endpoints removed",
+                        );
                         Ok("vxgateway down — all gateway objects removed".to_string())
                     }
                 }
@@ -793,6 +817,7 @@ impl ZoneSvc {
         );
         let shell = self.shell.clone();
         let runtime_dir = self.runtime_dir.clone();
+        let events = self.engine.events().clone();
         let job = self
             .engine
             .submit(kind, move |p| async move {
@@ -821,6 +846,17 @@ impl ZoneSvc {
                         }
                     })
                     .await?;
+                    // Per device, not per job: a subscriber watching one arm of exp-002 wants
+                    // to know when *that* device came up, and a job-level event cannot say it.
+                    events.emit(
+                        if up {
+                            crate::events::EventKind::ZoneUp
+                        } else {
+                            crate::events::EventKind::ZoneDown
+                        },
+                        &np.node_id,
+                        &format!("{:?} on {} (vlan {})", np.backend, np.endpoint, np.vlan),
+                    );
                 }
                 // Verify observed state matches the verb before claiming success.
                 let sh = shell.clone();
@@ -997,6 +1033,7 @@ impl SvcService for SvcSvc {
         let bins = self.bins.clone();
         let runtime_dir = self.runtime_dir.clone();
         let service_type = req.service_type.clone();
+        let events = self.engine.events().clone();
         let job = self
             .engine
             .submit("svc.up", move |p| async move {
@@ -1006,6 +1043,7 @@ impl SvcService for SvcSvc {
                         .map_err(|e| e.to_string())
                 })
                 .await?;
+                events.emit(crate::events::EventKind::ServiceUp, &service_type, &msg);
                 p.update(100, &msg);
                 Ok(msg)
             })
@@ -1026,6 +1064,8 @@ impl SvcService for SvcSvc {
         );
         let runtime_dir = self.runtime_dir.clone();
         let service_type = req.service_type.clone();
+        let events = self.engine.events().clone();
+        let service_type_for_event = service_type.clone();
         let job = self
             .engine
             .submit("svc.down", move |p| async move {
@@ -1035,6 +1075,11 @@ impl SvcService for SvcSvc {
                         .map_err(|e| e.to_string())
                 })
                 .await?;
+                events.emit(
+                    crate::events::EventKind::ServiceDown,
+                    &service_type_for_event,
+                    &msg,
+                );
                 p.update(100, &msg);
                 Ok(msg)
             })
@@ -1164,6 +1209,7 @@ impl TrafficService for TrafficSvc {
         let runtime_dir = self.runtime_dir.clone();
         let vxprobe_bin = self.vxprobe_bin.clone();
         let vxtraffic_bin = self.vxtraffic_bin.clone();
+        let events = self.engine.events().clone();
         let job = self
             .engine
             .submit("traffic.up", move |p| async move {
@@ -1180,6 +1226,7 @@ impl TrafficService for TrafficSvc {
                     let runtime_dir = runtime_dir.clone();
                     let vxprobe_bin = vxprobe_bin.clone();
                     let vxtraffic_bin = vxtraffic_bin.clone();
+                    let profile_id = profile.id.clone();
                     let msg = blocking(move || {
                         traffic::profile_up(
                             &sh,
@@ -1195,6 +1242,7 @@ impl TrafficService for TrafficSvc {
                         .map_err(|e| e.to_string())
                     })
                     .await?;
+                    events.emit(crate::events::EventKind::TrafficStarted, &profile_id, &msg);
                     messages.push(msg);
                 }
                 p.update(100, "all traffic profiles up");
@@ -1215,6 +1263,7 @@ impl TrafficService for TrafficSvc {
         let selected = select_profiles(traffic_plan, &req.profiles)?;
 
         let runtime_dir = self.runtime_dir.clone();
+        let events = self.engine.events().clone();
         let job = self
             .engine
             .submit("traffic.down", move |p| async move {
@@ -1226,10 +1275,12 @@ impl TrafficService for TrafficSvc {
                         &format!("stopping traffic profile `{}`", profile.id),
                     );
                     let runtime_dir = runtime_dir.clone();
+                    let profile_id = profile.id.clone();
                     let msg = blocking(move || {
                         Ok::<_, String>(traffic::profile_down(&runtime_dir, &profile.id))
                     })
                     .await?;
+                    events.emit(crate::events::EventKind::TrafficStopped, &profile_id, &msg);
                     messages.push(msg);
                 }
                 p.update(100, "all traffic profiles down");
