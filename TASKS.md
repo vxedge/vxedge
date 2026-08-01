@@ -933,6 +933,24 @@ exp-001 measurements).
       remains the default backend)
 - [ ] Release binaries for vxedge/vxedged via cargo-dist (digest-recorded, §13)
 
+### Device/node provisioning layer (pulled forward from phase 3, `docs/TASKS.md` 2026-08-01)
+
+The API and backend surface for containers, VMs, microVMs, virtual ECUs, virtual sensors and
+virtual actuators. `ComputeService` and the container backend's OCI integration were already
+scoped here (§3); sensor/actuator/virtual-ECU backends move up from phase 3 by owner decision
+— not gated on hardware the way the GPU-dependent phase-3 items are, only on ordering.
+
+- [ ] `ComputeService` verbs; client-streaming `PushImage` (image store) — see §3
+- [ ] container backend: OCI runtime integration (payload currently exec'd by the runner) — §3
+- [ ] Manifest structs: `io:`, `sensors:`, `actuators:` node blocks (§6.0 — corrected from the
+      stale §6.1 reference this item carried before §6.1 was deleted 2026-07-31). The domain
+      model already has `DeviceRole::Sensor`/`Actuator` and per-device `SignalBinding`
+      (vss/dbc); what's missing is the authored-schema surface and a provisioning backend
+- [ ] Sensor/actuator virtualization: restbus simulation (DBC-driven `sensors:`/`actuators:` +
+      Kuksa CAN provider), `vxplant` plant-model agent (`vxagents`)
+- [ ] QEMU `io.devices` attach (virtio-gpio/i2c/spi/can) in the libvirt backend
+- [ ] `backend: renode` — Renode zone backend for MCU-class virtual ECUs (register-level I/O)
+
 ## 5. Phase 3
 
 - [ ] VehicleService: ordered composition (gateway→zones→compute→signal plane→services)
@@ -948,6 +966,3 @@ exp-001 measurements).
 - [ ] TSN gateway variant: taprio/cbs qdisc rendering + gPTP time sync (linuxptp)
 - [ ] V2X groundwork: N vehicle manifests per experiment (V2V paths through vxgateway) +
       `type: rsu` node support in zone/gateway provisioning (V2I)
-- [ ] Manifest structs: `io:`, `sensors:`, `actuators:` node blocks (§6.1)
-- [ ] QEMU `io.devices` attach (virtio-gpio/i2c/spi/can) in the libvirt backend
-- [ ] `backend: renode` — Renode zone backend for MCU-class virtual ECUs (register-level I/O)
