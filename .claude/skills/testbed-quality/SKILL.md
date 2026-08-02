@@ -61,8 +61,11 @@ legible in their vocabulary**. Every feature is judged against those four proper
 
 ## 6. Documentation currency (the adoption funnel)
 
-- `docs/STATUS.md` updates ride every progress push; `docs/TESTBED-SETUP.md` is the single
-  host-requirements truth ("anything the testbed needs that it doesn't list is a bug in it");
-  GETTING-STARTED must always work top-to-bottom on a clean machine.
+- `docs/TASKS.md`'s "State snapshot" section carries per-push progress narrative;
+  `docs/STATUS.md` is reference material updated at phase boundaries, not every push
+  (consolidated 2026-08-02 — duplicating the changelog in both files was itself a currency
+  risk). `docs/TESTBED-SETUP.md` is the single host-requirements truth ("anything the testbed
+  needs that it doesn't list is a bug in it"); GETTING-STARTED must always work top-to-bottom
+  on a clean machine.
 - A feature isn't done until its board item is checked and its docs are current — same
   change set, not a follow-up.
