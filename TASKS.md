@@ -1009,7 +1009,21 @@ exp-001 measurements).
       `parses_and_validates_worked_example` in
       `crates/vxedge-core/src/manifest.rs`). Remove the guard when/if this
       item above is actually implemented.
-- [ ] SONiC-VS twin: render slice intent to SONiC config, boot VS qcow2, verify config parity
+- [ ] SONiC-VS twin: render slice intent to SONiC config (**delivered 2026-08-03**), boot VS
+      qcow2 + verify config parity (open). `vxedge_core::sonic` (`plan.rs`/`render.rs`) reduces
+      a `GatewayPlan` to its VLAN slices (`SonicPlan`, s-nssai out of scope — that's `fiveg`'s
+      territory) and renders SONiC's `config_db.json` `VLAN`/`VLAN_MEMBER` tables, deterministic
+      (`BTreeMap`), 5 unit tests including a pinned JSON-output test. Not a `DataPlane`
+      implementation and not wired into `experiment up` — `ARCHITECTURE.md` §7 is explicit the
+      SONiC-VS path is functional but not timing-representative, so this exists purely to prove
+      config portability, never to carry measured traffic. Trunk port name is a caller-supplied
+      parameter, not hardcoded: this codebase has never booted a live SONiC-VS to confirm its
+      virtual port naming. **Remaining**: booting the actual community qcow2 and verifying live
+      parity against the rendered config — needs the real image (not something to guess a
+      download URL for; whoever picks this up sources it) and console/SSH automation for a
+      multi-minute-boot appliance, materially bigger than the renderer above. A privileged test
+      mirroring `gateway_ovs.rs`'s own "second implementation, explicit cleanup" pattern is the
+      natural home once the image is in hand.
 - [x] TrafficService: synthetic generator (pps/bandwidth/payload per profile) — **delivered and
       live-verified end to end**, see the H2 section above (`vxedge-core::traffic`,
       `TrafficPlan` + `traffic::lifecycle`, real `vxprobe`/`vxtraffic` processes). This bullet
