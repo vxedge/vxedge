@@ -1018,12 +1018,23 @@ exp-001 measurements).
       SONiC-VS path is functional but not timing-representative, so this exists purely to prove
       config portability, never to carry measured traffic. Trunk port name is a caller-supplied
       parameter, not hardcoded: this codebase has never booted a live SONiC-VS to confirm its
-      virtual port naming. **Remaining**: booting the actual community qcow2 and verifying live
-      parity against the rendered config — needs the real image (not something to guess a
-      download URL for; whoever picks this up sources it) and console/SSH automation for a
-      multi-minute-boot appliance, materially bigger than the renderer above. A privileged test
-      mirroring `gateway_ovs.rs`'s own "second implementation, explicit cleanup" pattern is the
-      natural home once the image is in hand.
+      virtual port naming. **Sourcing scaffolded 2026-08-03**: `vxparts` is exactly the
+      mechanism this program built for exactly this problem — a
+      `parts/gw/nos/os/sonic-vs` part (`vxparts/TASKS.md`'s own `gw`-class section), `build.sh`
+      a pull-and-republish recipe (`oras pull` the official image, `oras push` it back under
+      `ghcr.io/vxedge/parts/gw/nos/os/sonic-vs`, digest-pinned — the same third-party-artifact
+      re-labeling pattern QNX/AAOS already use), plus a new sibling publish script
+      `publish-vm-disk.sh` for parts that ship as one disk image instead of zone guests'
+      kernel+initrd pair. `vxpn.py lint`/`scan` both pass (`VXES3-GNOS-OBIM`, no collisions).
+      **Blocked on two confirmations, neither guessed**: the official upstream registry ref
+      (`part.yaml`'s `upstream.ref` is a `TODO`), and the actual redistribution licence for a
+      *built* VS image (bundles the Debian base and every packaged component under their own
+      terms, not just SONiC's own Apache-2.0 — `part.yaml`'s `license:` is also a `TODO`).
+      **Still remaining after that**: booting the pushed image and verifying live parity
+      against the rendered config — console/SSH automation for a multi-minute-boot appliance,
+      materially bigger than sourcing the artifact. A privileged test mirroring
+      `gateway_ovs.rs`'s own "second implementation, explicit cleanup" pattern is the natural
+      home once the image is in hand.
 - [x] TrafficService: synthetic generator (pps/bandwidth/payload per profile) — **delivered and
       live-verified end to end**, see the H2 section above (`vxedge-core::traffic`,
       `TrafficPlan` + `traffic::lifecycle`, real `vxprobe`/`vxtraffic` processes). This bullet
