@@ -222,12 +222,13 @@ enum ImageCmd {
 #[derive(Subcommand, Debug)]
 enum SvcCmd {
     Up {
+        /// Workspace to deploy from. Defaults to the current directory, like `experiment up`.
         #[arg(long)]
-        experiment: String,
+        experiment: Option<String>,
     },
     Down {
         #[arg(long)]
-        experiment: String,
+        experiment: Option<String>,
     },
 }
 
@@ -472,6 +473,22 @@ fn here() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
     Ok(std::env::current_dir()?)
 }
 
+/// Resolves a verb's workspace argument: an explicit path wins, otherwise fall back to
+/// discovering the workspace from the working directory — the same rule `experiment` verbs
+/// use, extended to verbs (`ota`) that predate that convention and still take an explicit
+/// override for scripts that address a workspace they are not standing inside.
+fn resolve_experiment_arg(
+    experiment: &Option<String>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    match experiment {
+        Some(path) => Ok(path.clone()),
+        None => {
+            let found = vxedge_core::discover(&here()?)?;
+            Ok(found.root.to_string_lossy().to_string())
+        }
+    }
+}
+
 /// Errors reach the user through `Display`, not `Debug`.
 ///
 /// `fn main() -> Result<_, _>` formats its error with `{:?}`, which for a `thiserror` type
@@ -646,24 +663,26 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         },
         Command::Ota { cmd } => match cmd {
             SvcCmd::Up { experiment } => {
+                let workspace = resolve_experiment_arg(experiment)?;
                 let channel = connect(&cli.endpoint).await?;
                 let mut svc = SvcServiceClient::new(channel.clone());
                 let job = svc
                     .up(SvcUpRequest {
                         service_type: "ota".to_string(),
-                        experiment: manifest_ref(&Some(experiment.clone())),
+                        experiment: manifest_ref(&Some(workspace)),
                     })
                     .await?
                     .into_inner();
                 watch_job(channel, job, cli.json).await?;
             }
             SvcCmd::Down { experiment } => {
+                let workspace = resolve_experiment_arg(experiment)?;
                 let channel = connect(&cli.endpoint).await?;
                 let mut svc = SvcServiceClient::new(channel.clone());
                 let job = svc
                     .down(SvcDownRequest {
                         service_type: "ota".to_string(),
-                        experiment: manifest_ref(&Some(experiment.clone())),
+                        experiment: manifest_ref(&Some(workspace)),
                     })
                     .await?
                     .into_inner();

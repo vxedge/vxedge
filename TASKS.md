@@ -356,16 +356,21 @@ Tracked here so they are not rediscovered. None block the critical path.
       design (`docs/ARCHITECTURE.md` §7), so it lands after 5b.
 - [ ] **(5f) Delete `ExperimentManifest`/`VehicleManifest` and the adapter** — last, gated on the
       exp-001/002/003 equivalence runs passing and every experiment being migrated.
-- [ ] **(Track D-6) Migrate the remaining verbs** (`up`, `zone`, `compute`, `ota`, `telemetry`,
-      `traffic`) off `--manifest` onto workspace resolution. Confirmed 2026-08-01:
-      `experiment up/down/status` already resolve from the cwd; `ota up/down` and
-      `telemetry up/down` still require an explicit `--experiment <path>` — the
-      confirmed-remaining scope. `zone`/`compute`/`traffic` address the daemon's already-active
-      experiment rather than taking a path at all, and the bare (non-`experiment`) `up`/`down`
-      gateway verb still takes an optional `--manifest` too — neither was re-checked against
-      this item's original intent in this pass, so don't assume either is migrated or exempt.
-      Tracked at the top level as `docs/TASKS.md` item #26 (scoped there to the confirmed
-      ota/telemetry gap specifically).
+- [x] **(Track D-6) Migrate `ota`/`telemetry` off `--manifest` onto workspace resolution** —
+      done 2026-08-03 for `ota`: `SvcCmd::Up`/`Down`'s `--experiment` is now `Option<String>`,
+      defaulting through a new `resolve_experiment_arg()` helper to
+      `vxedge_core::discover(&here()?)` (the same call `experiment` verbs make) when omitted;
+      an explicit path still overrides. Live-smoke-tested unprivileged (no CAP_NET_ADMIN
+      needed for `ota`): cwd-resolution from inside a real workspace and the explicit-path
+      override both reach the daemon correctly, and the no-workspace case fails cleanly.
+      `telemetry` turned out to have nothing to migrate — every `telemetry` subcommand hits
+      `scaffold_notice` regardless of args, so there was no live `--experiment`-path behavior
+      to fix; that's the separate, already-tracked "daemon wiring of `TelemetryService.Collect`
+      still open" gap, not reopened here. Whoever wires it should reuse
+      `resolve_experiment_arg()`. `zone`/`compute`/`traffic` still address the daemon
+      differently (vxid or an explicit `--manifest`) and were not re-checked in this pass — 
+      don't assume either is migrated or exempt. Tracked at the top level as `docs/TASKS.md`
+      item #26.
 - [ ] **(7) `vehicle up` from a §6.0 vehicle document** — the phase-3 gate itself. Needs (2).
 - [ ] Candidate, from Terraform's `init`: `experiment init` pre-pulls every part ref by digest
       into a local cache before `up`, so a run either has everything or fails before it starts.
