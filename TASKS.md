@@ -462,11 +462,15 @@ exp-001 measurements).
       pings from the declared address (must succeed) and from a second, spoofed address on the
       same subnet (must be dropped, verified via the drop rule's own kernel packet counter, not
       just "ping failed"). Full workspace build/clippy/fmt clean, all 141 existing unit tests
-      still pass. **Not yet run under sudo on a real kernel** — this environment has no
-      passwordless sudo, so the new privileged test (and a re-run of the other 3) needs a human
-      to execute `sudo -E env "PATH=$PATH" cargo test -p vxedge-core --test gateway_netns --
-      --ignored --test-threads=1` and report back; nothing here is claimed live-verified until
-      that happens.
+      still pass. **Live-verified under sudo on a real kernel, 2026-08-03**: first run caught a
+      real test bug — `Shell::run_host` treats a non-zero exit as `Err` and does not carry
+      stdout on that path (`netops.rs`'s `NetOpsError::Command`), and `ping` exits non-zero on
+      100% loss, so the spoofed-ping assertion was panicking on `.unwrap()` before it ever
+      reached the check it was there to make. Fixed by asserting the call itself errors, which
+      is what `Shell`'s own design actually promises; the drop rule's kernel packet counter
+      (unaffected by the bug) remained the authoritative proof throughout. Re-run after the fix:
+      all 4 privileged gateway tests pass (`gateway_netns.rs`'s 3, unchanged, plus the new one).
+      Item #16's nftables sub-item is closed.
 - [ ] WireGuard link setup; VXLAN inter-host links
 - [ ] FRR config rendering (BGP optional path)
 - [ ] Port NetOps from iproute2 argv exec to pure rtnetlink/netlink (recorded deviation
