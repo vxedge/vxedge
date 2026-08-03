@@ -93,11 +93,10 @@ impl Shell {
     }
 
     /// Like [`Self::run`], but pipes `stdin` to the child instead of leaving its stdin
-    /// unattached. The one consumer today: `wg set <tunnel> private-key -` (WireGuard's own
-    /// convention for "read this argument from standard input") — a generated tunnel private
-    /// key is passed straight from `wg genkey`'s stdout into this, and is never written to
-    /// disk anywhere in this process, matching the "no secrets in manifests or on disk" rule
-    /// the rest of the codebase already follows for daemon state.
+    /// unattached. The one consumer today: `wg set <tunnel> private-key /dev/stdin` — a
+    /// generated tunnel private key is passed straight from `wg genkey`'s stdout into this, and
+    /// is never written to disk anywhere in this process, matching the "no secrets in manifests
+    /// or on disk" rule the rest of the codebase already follows for daemon state.
     pub fn run_with_stdin(
         &self,
         program: &str,

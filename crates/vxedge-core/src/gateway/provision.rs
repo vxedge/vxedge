@@ -438,13 +438,22 @@ fn apply_tunnel(sh: &Shell, t: &super::plan::TunnelPlan) -> Result<(), NetOpsErr
     if !sh.link_exists(&t.name) {
         sh.run("ip", &["link", "add", &t.name, "type", "wireguard"])?;
         // The private key never touches disk: piped straight from `wg genkey`'s stdout into
-        // `wg set`'s stdin (`-` is wg's own convention for "read this from standard input"),
-        // and never stored anywhere by this process — `wg show <name> public-key` (used by
-        // `observe_tunnels`) is the only way to read it back, which is also how an operator
-        // hands this side's identity to the peer, out of band. See `model::Tunnel`'s doc
-        // comment for why the manifest never declares a local key.
+        // `wg set`'s stdin. `/dev/stdin`, not the documented `-` shorthand: found live
+        // 2026-08-03 that Ubuntu noble's `wireguard-tools` 1.0.20210914 rejects `-` for
+        // `private-key` with a literal `fopen: No such file or directory` (it does not special-
+        // case that argument the way the man page describes for some other options) — `wg` has
+        // no trouble opening `/dev/stdin` as a real path, since it resolves to this process's
+        // own piped stdin via `/proc/self/fd/0` either way. Never stored anywhere by this
+        // process — `wg show <name> public-key` (used by `observe_tunnels`) is the only way to
+        // read it back, which is also how an operator hands this side's identity to the peer,
+        // out of band. See `model::Tunnel`'s doc comment for why the manifest never declares a
+        // local key.
         let privkey = sh.run("wg", &["genkey"])?;
-        sh.run_with_stdin("wg", &["set", &t.name, "private-key", "-"], privkey.trim())?;
+        sh.run_with_stdin(
+            "wg",
+            &["set", &t.name, "private-key", "/dev/stdin"],
+            privkey.trim(),
+        )?;
     }
     let listen_port = t.listen_port.to_string();
     let allowed_ips = t.peer_allowed_ips.join(",");
