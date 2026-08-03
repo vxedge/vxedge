@@ -1009,32 +1009,42 @@ exp-001 measurements).
       `parses_and_validates_worked_example` in
       `crates/vxedge-core/src/manifest.rs`). Remove the guard when/if this
       item above is actually implemented.
-- [ ] SONiC-VS twin: render slice intent to SONiC config (**delivered 2026-08-03**), boot VS
-      qcow2 + verify config parity (open). `vxedge_core::sonic` (`plan.rs`/`render.rs`) reduces
-      a `GatewayPlan` to its VLAN slices (`SonicPlan`, s-nssai out of scope — that's `fiveg`'s
-      territory) and renders SONiC's `config_db.json` `VLAN`/`VLAN_MEMBER` tables, deterministic
-      (`BTreeMap`), 5 unit tests including a pinned JSON-output test. Not a `DataPlane`
-      implementation and not wired into `experiment up` — `ARCHITECTURE.md` §7 is explicit the
-      SONiC-VS path is functional but not timing-representative, so this exists purely to prove
-      config portability, never to carry measured traffic. Trunk port name is a caller-supplied
-      parameter, not hardcoded: this codebase has never booted a live SONiC-VS to confirm its
-      virtual port naming. **Sourcing scaffolded 2026-08-03**: `vxparts` is exactly the
-      mechanism this program built for exactly this problem — a
-      `parts/gw/nos/os/sonic-vs` part (`vxparts/TASKS.md`'s own `gw`-class section), `build.sh`
-      a pull-and-republish recipe (`oras pull` the official image, `oras push` it back under
-      `ghcr.io/vxedge/parts/gw/nos/os/sonic-vs`, digest-pinned — the same third-party-artifact
-      re-labeling pattern QNX/AAOS already use), plus a new sibling publish script
+- [ ] SONiC-VS twin: render slice intent to SONiC config (**delivered 2026-08-03**), source +
+      publish the image (**delivered 2026-08-03**), boot + verify live config parity (open).
+      `vxedge_core::sonic` (`plan.rs`/`render.rs`) reduces a `GatewayPlan` to its VLAN slices
+      (`SonicPlan`, s-nssai out of scope — that's `fiveg`'s territory) and renders SONiC's
+      `config_db.json` `VLAN`/`VLAN_MEMBER` tables, deterministic (`BTreeMap`), 5 unit tests
+      including a pinned JSON-output test. Not a `DataPlane` implementation and not wired into
+      `experiment up` — `ARCHITECTURE.md` §7 is explicit the SONiC-VS path is functional but not
+      timing-representative, so this exists purely to prove config portability, never to carry
+      measured traffic. Trunk port name is a caller-supplied parameter, not hardcoded: this
+      codebase has never booted a live SONiC-VS to confirm its virtual port naming.
+      **Image sourced, verified, and published 2026-08-03** via `vxparts` — exactly the
+      mechanism this program built for exactly this problem
+      (`parts/gw/nos/os/sonic-vs`, `vxparts/TASKS.md`'s `gw`-class section). The real upstream
+      mechanism was resolved live, not guessed: SONiC-VS is an Azure Pipelines build output, not
+      published to any OCI/ORAS registry, so `build.sh` fetches over HTTPS via Azure's public
+      build API (a specific pinned build, `202505`/`20260803.4`/commit `ff3c0c9f6`, not
+      "latest") and only the republish half is `oras push`, via a new sibling script
       `publish-vm-disk.sh` for parts that ship as one disk image instead of zone guests'
-      kernel+initrd pair. `vxpn.py lint`/`scan` both pass (`VXES3-GNOS-OBIM`, no collisions).
-      **Blocked on two confirmations, neither guessed**: the official upstream registry ref
-      (`part.yaml`'s `upstream.ref` is a `TODO`), and the actual redistribution licence for a
-      *built* VS image (bundles the Debian base and every packaged component under their own
-      terms, not just SONiC's own Apache-2.0 — `part.yaml`'s `license:` is also a `TODO`).
-      **Still remaining after that**: booting the pushed image and verifying live parity
-      against the rendered config — console/SSH automation for a multi-minute-boot appliance,
-      materially bigger than sourcing the artifact. A privileged test mirroring
-      `gateway_ovs.rs`'s own "second implementation, explicit cleanup" pattern is the natural
-      home once the image is in hand.
+      kernel+initrd pair. Downloaded, gzip-verified, decompressed to a valid QCOW2, **booted
+      under QEMU/KVM, logged in, and ran `show version`** — confirmed the exact pinned build,
+      platform `x86_64-kvm_x86_64-r0`, ASIC `vs`, every expected container present including
+      `docker-orchagent` (SWSS, the component that actually consumes `config_db.json`). Real
+      gotcha found and documented: booting mutates a qcow2 (QEMU opens read-write by default),
+      so the published artifact is a re-decompressed, never-booted copy, confirmed byte-
+      identical to the pre-boot digest. Licence confirmed (not asserted): `sonic-buildimage`'s
+      own tooling is Apache-2.0, a built image also bundles a ~67KB `ThirdPartyLicenses.txt` of
+      third-party terms, recorded honestly rather than as one clean SPDX. **Published**:
+      `ghcr.io/vxedge/parts/gw/nos/os/sonic-vs:202505.1182664`, confirmed via `oras manifest
+      fetch` (digest/size/annotations match `meta.json` exactly, not just a successful push
+      exit code). **Still remaining**: pushing `vxedge_core::sonic`'s rendered `config_db.json`
+      into a running instance (`config load`) and reading it back
+      (`show vlan brief`/`redis-cli`) to confirm it matches what the renderer produced —
+      genuine live config-parity verification, distinct from "the image boots and is usable"
+      (now proven) and materially smaller than the sourcing work just finished, since the image
+      itself is now in hand and boot-proven. A privileged test mirroring `gateway_ovs.rs`'s own
+      "second implementation, explicit cleanup" pattern is the natural home.
 - [x] TrafficService: synthetic generator (pps/bandwidth/payload per profile) — **delivered and
       live-verified end to end**, see the H2 section above (`vxedge-core::traffic`,
       `TrafficPlan` + `traffic::lifecycle`, real `vxprobe`/`vxtraffic` processes). This bullet
