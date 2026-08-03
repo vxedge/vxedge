@@ -441,7 +441,33 @@ exp-001 measurements).
       clear CAP_NET_ADMIN error when unprivileged
 - [x] netns integration test (CI job `netns-integration`, sudo on ubuntu-latest):
       apply → observe → double-apply idempotency → teardown → double-teardown
-- [ ] nftables per-slice firewall; WireGuard link setup; VXLAN inter-host links
+- [x] nftables per-slice firewall — **built 2026-08-03** as anti-spoof ingress filtering, not
+      naive VLAN-to-VLAN blocking (kernel VLAN filtering already makes cross-slice L2 traffic
+      structurally impossible; the real remaining gap is a same-slice endpoint spoofing another
+      node's address). One `netdev`-family table per access port (`vxaf-<port>`, `ingress`
+      hook — fabric-agnostic, no `br_netfilter` dependency, works for both `KernelBridge` and
+      `Ovs`), populated only when the link pins an `ip:` (`EndpointPlan.expected_source`,
+      derived in `plan.rs::from_model` from `attachment.ip_cidr`). Idempotent the same way
+      `apply_impairment`'s `tc filter add` already is: `nft add table/chain` is naturally
+      idempotent, `flush chain` before `add rule` because `add rule` is not.
+      `GatewayObservation.ingress_filters` feeds `fully_up()` (a silently-failed security
+      control is worse than a missing impairment) and both `observe()`/`ovs_observe()`. vxAPI
+      kept in step per the #29 discipline: `GatewayStatus.ingress_filters` +
+      `IngressFilterStatus` (proto additive, `buf lint`/`buf breaking` clean), threaded through
+      `vxedged`'s `status` RPC handler and both CLI output modes (human + `--json`) — an
+      unprivileged wire-round-trip smoke test confirmed `ingress_filters: []` renders correctly
+      in both. Tests: a unit test in `plan.rs` proving `expected_source` is derived only for a
+      pinned link and doesn't leak onto a sibling endpoint; a new privileged test,
+      `ingress_filter_drops_spoofed_source_but_allows_declared_one` in `gateway_netns.rs`,
+      pings from the declared address (must succeed) and from a second, spoofed address on the
+      same subnet (must be dropped, verified via the drop rule's own kernel packet counter, not
+      just "ping failed"). Full workspace build/clippy/fmt clean, all 141 existing unit tests
+      still pass. **Not yet run under sudo on a real kernel** — this environment has no
+      passwordless sudo, so the new privileged test (and a re-run of the other 3) needs a human
+      to execute `sudo -E env "PATH=$PATH" cargo test -p vxedge-core --test gateway_netns --
+      --ignored --test-threads=1` and report back; nothing here is claimed live-verified until
+      that happens.
+- [ ] WireGuard link setup; VXLAN inter-host links
 - [ ] FRR config rendering (BGP optional path)
 - [ ] Port NetOps from iproute2 argv exec to pure rtnetlink/netlink (recorded deviation
       from AGENTS.md; plan/observe layers are unaffected)

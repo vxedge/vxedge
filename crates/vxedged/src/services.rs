@@ -22,10 +22,10 @@ use vxedge_api::v1::{
     ComputeApplyRequest, ComputeDownRequest, ComputeListRequest, ComputeListResponse,
     ComputeRemoveRequest, ComputeUpRequest, Event, GatewayApplyRequest, GatewayDownRequest,
     GatewayStatus, GatewayStatusRequest, GatewayUpRequest, GetJobRequest, ImagePushRequest,
-    ImagePushResponse, ImpairmentStatus, Job, ManifestRef, ResourceKind, ResourceState,
-    ResourceStatus, SliceStatus, SubscribeRequest, SvcDownRequest, SvcStatusRequest, SvcUpRequest,
-    TrafficDownRequest, TrafficUpRequest, WatchJobRequest, ZoneApplyRequest, ZoneDownRequest,
-    ZoneListRequest, ZoneListResponse, ZoneRemoveRequest, ZoneUpRequest,
+    ImagePushResponse, ImpairmentStatus, IngressFilterStatus, Job, ManifestRef, ResourceKind,
+    ResourceState, ResourceStatus, SliceStatus, SubscribeRequest, SvcDownRequest, SvcStatusRequest,
+    SvcUpRequest, TrafficDownRequest, TrafficUpRequest, WatchJobRequest, ZoneApplyRequest,
+    ZoneDownRequest, ZoneListRequest, ZoneListResponse, ZoneRemoveRequest, ZoneUpRequest,
 };
 use vxedge_core::Workspace;
 use vxedge_core::fiveg::{self, FiveGLifecycleConfig, FiveGPlan};
@@ -570,7 +570,7 @@ impl GatewayService for GatewaySvc {
             let st = self.state.lock().await;
             (st.gateway.clone(), st.fiveg.clone())
         };
-        let (state, detail, slices, impairments) = match plan {
+        let (state, detail, slices, impairments, ingress_filters) = match plan {
             Some(plan) => {
                 let snssai_count = plan.snssai_slice_ids.len();
                 let shell = self.shell.clone();
@@ -642,6 +642,25 @@ impl GatewayService for GatewaySvc {
                         )
                     }
                 };
+                // Same reasoning as impairments above, for a security control instead of a
+                // measurement one: a declared anti-spoof filter that silently failed to
+                // install is worse than invisible, and `GatewayObservation::fully_up` already
+                // refuses to converge on it — `status` should say which endpoint, not just
+                // that the gateway overall is degraded.
+                let ingress_filters: Vec<IngressFilterStatus> = obs
+                    .ingress_filters
+                    .iter()
+                    .map(|f| IngressFilterStatus {
+                        node: f.node.clone(),
+                        access_port: f.access_port.clone(),
+                        state: if f.present {
+                            ResourceState::Up as i32
+                        } else {
+                            ResourceState::Down as i32
+                        },
+                        detail: format!("present={}", f.present),
+                    })
+                    .collect();
                 if obs.fully_up() {
                     (
                         ResourceState::Up,
@@ -653,6 +672,7 @@ impl GatewayService for GatewaySvc {
                         ),
                         slices,
                         impairments,
+                        ingress_filters,
                     )
                 } else {
                     (
@@ -666,6 +686,7 @@ impl GatewayService for GatewaySvc {
                         ),
                         slices,
                         impairments,
+                        ingress_filters,
                     )
                 }
             }
@@ -684,11 +705,13 @@ impl GatewayService for GatewaySvc {
                             .to_string(),
                         vec![],
                         vec![],
+                        vec![],
                     )
                 } else {
                     (
                         ResourceState::Down,
                         "no gateway provisioned".to_string(),
+                        vec![],
                         vec![],
                         vec![],
                     )
@@ -748,6 +771,7 @@ impl GatewayService for GatewaySvc {
             }),
             slices,
             impairments,
+            ingress_filters,
         }))
     }
 }

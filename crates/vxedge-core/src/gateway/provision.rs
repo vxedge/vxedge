@@ -239,6 +239,7 @@ pub fn apply_endpoints(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError
         if let Some(imp) = &ep.impairment {
             apply_impairment(sh, &ep.name, imp)?;
         }
+        apply_ingress_filter(sh, ep)?;
     }
     Ok(())
 }
@@ -351,6 +352,72 @@ fn apply_impairment(
         ],
     )?;
     Ok(())
+}
+
+/// The nftables `netdev` table name for one access port's anti-spoof filter. One table per
+/// port, not one shared table for all of them, so tearing down a single endpoint never risks
+/// touching another's rule — the same reasoning `ifnames::ingress_ifb` derives a per-port IFB
+/// name rather than sharing one.
+fn ingress_filter_table(access_port: &str) -> String {
+    format!("vxaf-{access_port}")
+}
+
+/// Per-access-port ingress anti-spoof filter (`docs/TASKS.md` #16, "nftables per VLAN/slice").
+///
+/// **What this is not**: a VLAN-filtering bridge already makes cross-slice traffic structurally
+/// impossible — a frame tagged for one VLAN cannot reach a port that isn't a member of it, with
+/// or without a firewall. Rules blocking "slice A talking to slice B" here would be dead weight,
+/// enforcing something the bridge already guarantees.
+///
+/// **What this is**: nothing stops a compromised device on the *same* slice from spoofing a
+/// neighbor's address to borrow its trust — that gap is real regardless of VLAN isolation, and
+/// it is what this renders. Only fires for endpoints with a pinned `expected_source`
+/// (`model::Endpoint::ip_cidr`); an attachment with no pinned address renders nothing, the same
+/// as an unimpaired link renders no netem.
+///
+/// The `netdev` family's `ingress` hook, not `bridge`, deliberately: it fires on raw packets
+/// arriving at a specific interface before any bridging decision, so it works identically
+/// whether that interface ends up enslaved to a Linux bridge or added as an OVS port — no
+/// `br_netfilter` dependency, and no fabric-specific variant needed (called from both
+/// `apply_endpoints` and `ovs_apply_endpoints`, exactly like `apply_impairment`).
+///
+/// Idempotent by construction rather than by tolerating a specific error: `nft add table/chain`
+/// is already a no-op if either exists (nft's own distinction between `add` and `create`), and
+/// the chain is flushed before its one rule is (re-)added — `nft add rule` itself is not
+/// idempotent (it appends every time, the same lesson `apply_impairment`'s own doc comment
+/// already recorded for `tc filter add`), so re-applying without the flush would stack a second
+/// identical drop rule per `up`.
+fn apply_ingress_filter(sh: &Shell, ep: &super::plan::EndpointPlan) -> Result<(), NetOpsError> {
+    let Some(cidr) = &ep.expected_source else {
+        return Ok(());
+    };
+    let host = cidr.split('/').next().unwrap_or(cidr);
+    let table = ingress_filter_table(&ep.name);
+    sh.run("nft", &["add", "table", "netdev", &table])?;
+    sh.run(
+        "nft",
+        &[
+            "add", "chain", "netdev", &table, "ingress", "{", "type", "filter", "hook", "ingress",
+            "device", &ep.name, "priority", "0", ";", "policy", "accept", ";", "}",
+        ],
+    )?;
+    sh.run("nft", &["flush", "chain", "netdev", &table, "ingress"])?;
+    sh.run(
+        "nft",
+        &[
+            "add", "rule", "netdev", &table, "ingress", "ip", "saddr", "!=", host, "counter",
+            "drop",
+        ],
+    )?;
+    Ok(())
+}
+
+fn teardown_ingress_filter(sh: &Shell, ep: &super::plan::EndpointPlan) -> Result<(), NetOpsError> {
+    if ep.expected_source.is_none() {
+        return Ok(());
+    }
+    let table = ingress_filter_table(&ep.name);
+    sh.run_tolerate_missing("nft", &["delete", "table", "netdev", &table])
 }
 
 /// VLAN membership for the 5G core's uplink port on a `vlan_filtering 1`
@@ -810,6 +877,7 @@ fn ovs_apply_endpoints(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError
         if let Some(imp) = &ep.impairment {
             apply_impairment(sh, &ep.name, imp)?;
         }
+        apply_ingress_filter(sh, ep)?;
     }
     Ok(())
 }
@@ -824,6 +892,7 @@ fn ovs_teardown(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
         if let Some(imp) = &ep.impairment {
             sh.run_tolerate_missing("ip", &["link", "del", &imp.ifb])?;
         }
+        teardown_ingress_filter(sh, ep)?;
         sh.run(
             "ovs-vsctl",
             &["--if-exists", "del-port", &plan.bridge, &ep.name],
@@ -922,6 +991,20 @@ fn ovs_observe(sh: &Shell, plan: &GatewayPlan) -> Result<GatewayObservation, Net
         });
     }
 
+    let mut ingress_filters = Vec::new();
+    for ep in &plan.endpoints {
+        if ep.expected_source.is_none() {
+            continue;
+        }
+        let table = ingress_filter_table(&ep.name);
+        let present = sh.run("nft", &["list", "table", "netdev", &table]).is_ok();
+        ingress_filters.push(IngressFilterObservation {
+            node: ep.node.clone(),
+            access_port: ep.name.clone(),
+            present,
+        });
+    }
+
     Ok(GatewayObservation {
         bridge_present,
         uplink_present,
@@ -929,6 +1012,7 @@ fn ovs_observe(sh: &Shell, plan: &GatewayPlan) -> Result<GatewayObservation, Net
         endpoints_present,
         endpoints_expected: plan.endpoints.len(),
         impairments,
+        ingress_filters,
     })
 }
 
@@ -1074,6 +1158,7 @@ pub fn teardown(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
         if let Some(imp) = &ep.impairment {
             sh.run_tolerate_missing("ip", &["link", "del", &imp.ifb])?;
         }
+        teardown_ingress_filter(sh, ep)?;
         sh.run_tolerate_missing("ip", &["link", "del", &ep.name])?;
     }
     sh.run_tolerate_missing("ip", &["link", "del", &plan.uplink])?;
@@ -1116,6 +1201,16 @@ impl ImpairmentObservation {
     }
 }
 
+/// One endpoint's ingress anti-spoof filter, as it is actually installed (`docs/TASKS.md` #16).
+#[derive(Debug, Clone)]
+pub struct IngressFilterObservation {
+    pub node: String,
+    pub access_port: String,
+    /// The `netdev` table (and therefore its chain and drop rule — a single `nft delete table`
+    /// removes all three) exists on the kernel.
+    pub present: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct GatewayObservation {
     pub bridge_present: bool,
@@ -1124,6 +1219,7 @@ pub struct GatewayObservation {
     pub endpoints_present: usize,
     pub endpoints_expected: usize,
     pub impairments: Vec<ImpairmentObservation>,
+    pub ingress_filters: Vec<IngressFilterObservation>,
 }
 
 impl GatewayObservation {
@@ -1136,6 +1232,10 @@ impl GatewayObservation {
             // that still produces a full set of plausible numbers. `Up` verifies observed against
             // planned and fails when they differ, and this squarely counts as a difference.
             && self.impairments.iter().all(|i| i.healthy())
+            // A declared anti-spoof filter that silently failed to install is worse than a
+            // missing impairment: it's a security control reporting healthy while doing
+            // nothing. Same treatment, for the stronger reason.
+            && self.ingress_filters.iter().all(|f| f.present)
     }
 }
 
@@ -1220,6 +1320,20 @@ pub fn observe(sh: &Shell, plan: &GatewayPlan) -> Result<GatewayObservation, Net
         });
     }
 
+    let mut ingress_filters = Vec::new();
+    for ep in &plan.endpoints {
+        if ep.expected_source.is_none() {
+            continue;
+        }
+        let table = ingress_filter_table(&ep.name);
+        let present = sh.run("nft", &["list", "table", "netdev", &table]).is_ok();
+        ingress_filters.push(IngressFilterObservation {
+            node: ep.node.clone(),
+            access_port: ep.name.clone(),
+            present,
+        });
+    }
+
     Ok(GatewayObservation {
         bridge_present,
         uplink_present,
@@ -1227,5 +1341,6 @@ pub fn observe(sh: &Shell, plan: &GatewayPlan) -> Result<GatewayObservation, Net
         endpoints_present,
         endpoints_expected: plan.endpoints.len(),
         impairments,
+        ingress_filters,
     })
 }

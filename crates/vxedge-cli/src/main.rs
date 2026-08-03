@@ -549,6 +549,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         imp.link, imp.access_port, imp.state, imp.detail
                     );
                 }
+                for f in &status.ingress_filters {
+                    println!(
+                        "  ingress filter {} ({}): state={} {}",
+                        f.node, f.access_port, f.state, f.detail
+                    );
+                }
             } else {
                 println!("gateway: no status reported");
             }
@@ -975,12 +981,21 @@ struct JsonImpairmentStatus {
 }
 
 #[derive(serde::Serialize)]
+struct JsonIngressFilterStatus {
+    node: String,
+    access_port: String,
+    state: i32,
+    detail: String,
+}
+
+#[derive(serde::Serialize)]
 struct JsonStatus {
     vxid: String,
     state: i32,
     detail: String,
     slices: Vec<JsonSliceStatus>,
     impairments: Vec<JsonImpairmentStatus>,
+    ingress_filters: Vec<JsonIngressFilterStatus>,
 }
 
 impl From<&vxedge_api::v1::GatewayStatus> for JsonStatus {
@@ -1007,6 +1022,16 @@ impl From<&vxedge_api::v1::GatewayStatus> for JsonStatus {
                     access_port: imp.access_port.clone(),
                     state: imp.state,
                     detail: imp.detail.clone(),
+                })
+                .collect(),
+            ingress_filters: g
+                .ingress_filters
+                .iter()
+                .map(|f| JsonIngressFilterStatus {
+                    node: f.node.clone(),
+                    access_port: f.access_port.clone(),
+                    state: f.state,
+                    detail: f.detail.clone(),
                 })
                 .collect(),
         }

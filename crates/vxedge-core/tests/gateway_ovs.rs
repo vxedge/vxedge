@@ -50,6 +50,7 @@ fn test_plan() -> GatewayPlan {
                     loss_ppm: None,
                 },
             }),
+            expected_source: None,
         }],
         snssai_slice_ids: vec![],
         data_plane: DataPlaneKind::Ovs,

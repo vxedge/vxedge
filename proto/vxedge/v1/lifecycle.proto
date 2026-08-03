@@ -33,6 +33,10 @@ message GatewayStatus {
   // `--json` client doesn't have to parse prose to tell which link is
   // impaired or whether one direction dropped.
   repeated ImpairmentStatus impairments = 3;
+  // Per-endpoint ingress anti-spoof filters actually observed on the kernel — empty if no
+  // endpoint declares a pinned source address. UP means the filter is installed; DOWN means a
+  // declared filter is missing, which `GatewayService.Up` already refuses to converge on.
+  repeated IngressFilterStatus ingress_filters = 4;
 }
 
 message SliceStatus {
@@ -46,6 +50,14 @@ message ImpairmentStatus {
   string access_port = 2;
   // UP: both netem directions present. DEGRADED: exactly one — an
   // asymmetric wire nobody asked for, always a bug. DOWN: neither.
+  ResourceState state = 3;
+  string detail = 4;
+}
+
+message IngressFilterStatus {
+  string node = 1;
+  string access_port = 2;
+  // UP or DOWN only — a filter is either installed or it isn't, no partial state.
   ResourceState state = 3;
   string detail = 4;
 }

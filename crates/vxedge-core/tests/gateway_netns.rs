@@ -489,3 +489,214 @@ fn zone_traffic_reaches_the_access_port_not_loopback() {
     teardown(&sh, &plan).unwrap();
     let _ = std::fs::remove_dir_all(&runtime);
 }
+
+/// Deliberately its own fixture and device id, for the same reason `IMPAIRED_WORKSPACE` and
+/// `LOCALITY_WORKSPACE` each got their own above: netns names are host-wide and carry no
+/// per-test salt.
+const ANTISPOOF_WORKSPACE: &str = r#"
+kind: experiment
+id: exp-antispoof
+vehicles: [veh]
+network:
+  slices:
+    - { id: adas, mode: vlan, vlan: 101 }
+---
+kind: vehicle
+id: veh
+devices:
+  node-spoof-01: { role: ecu, backend: container }
+links:
+  - { id: l-spoof, endpoints: [{ node: node-spoof-01, port: eth0, ip: 10.113.0.2/24 }], slice: adas }
+"#;
+const ANTISPOOF_DEVICE_ID: &str = "node-spoof-01";
+
+/// Regression/acceptance test for docs/TASKS.md #16's nftables anti-spoof ingress filter: not
+/// just "the table exists" (the unprivileged unit tests already cover plan-building), but that
+/// a real kernel actually drops a packet whose source address doesn't match the endpoint's
+/// declared one, while a packet from the declared address still gets through. VLAN isolation
+/// already makes cross-slice traffic structurally impossible, so the only real gap this closes
+/// is same-slice spoofing — this test's spoofed address (`10.113.0.99`) is deliberately in the
+/// *same* subnet as the declared one, not a different VLAN, to exercise exactly that gap.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN; run under sudo (see module docs)"]
+fn ingress_filter_drops_spoofed_source_but_allows_declared_one() {
+    let ns = format!("vxspoof{}", std::process::id());
+    let created = std::process::Command::new("ip")
+        .args(["netns", "add", &ns])
+        .output()
+        .expect("iproute2 installed");
+    assert!(
+        created.status.success(),
+        "cannot create netns (run as root): {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let _guard = NetnsGuard(ns.clone());
+    let sh = Shell {
+        netns: Some(ns),
+        escalate: false,
+    };
+
+    let model = vxedge_core::model::load_yaml(ANTISPOOF_WORKSPACE).expect("workspace loads");
+    let plan = GatewayPlan::from_model(&model).unwrap();
+    let endpoint = plan
+        .endpoints
+        .iter()
+        .find(|e| e.node == ANTISPOOF_DEVICE_ID)
+        .expect("device's endpoint planned");
+    assert_eq!(
+        endpoint.expected_source.as_deref(),
+        Some("10.113.0.2/24"),
+        "expected_source not derived from the link's declared ip"
+    );
+
+    apply(&sh, &plan).unwrap();
+    let obs = observe(&sh, &plan).unwrap();
+    assert!(obs.fully_up(), "gateway not fully up: {obs:?}");
+    assert_eq!(obs.ingress_filters.len(), 1);
+    assert!(obs.ingress_filters[0].present, "filter not installed");
+
+    let runtime =
+        std::env::temp_dir().join(format!("vxzones-antispoof-test-{}", std::process::id()));
+    std::fs::create_dir_all(&runtime).unwrap();
+    let nodes = plan_nodes_from_model(&model, &plan, std::path::Path::new("/")).unwrap();
+    let container = nodes
+        .iter()
+        .find(|n| n.node_id == ANTISPOOF_DEVICE_ID)
+        .expect("container node planned");
+    node_up(&sh, container, &runtime).unwrap();
+
+    let slice = plan
+        .slices
+        .iter()
+        .find(|s| s.id == endpoint.slice.as_deref().unwrap_or_default())
+        .expect("device's slice planned");
+    let node_cidr = container
+        .ip_cidr
+        .as_deref()
+        .expect("the device has a declared ip_cidr");
+    let (far_side_addr, prefix_len) = sibling_address(node_cidr);
+    let far_side_dev = format!("{}.{}", plan.uplink_peer, slice.vlan);
+    sh.run(
+        "ip",
+        &[
+            "link",
+            "add",
+            "link",
+            &plan.uplink_peer,
+            "name",
+            &far_side_dev,
+            "type",
+            "vlan",
+            "id",
+            &slice.vlan.to_string(),
+        ],
+    )
+    .unwrap();
+    sh.run(
+        "ip",
+        &[
+            "addr",
+            "add",
+            &format!("{far_side_addr}/{prefix_len}"),
+            "dev",
+            &far_side_dev,
+        ],
+    )
+    .unwrap();
+    sh.run("ip", &["link", "set", &far_side_dev, "up"]).unwrap();
+    sh.run("ip", &["link", "set", &plan.uplink_peer, "up"])
+        .unwrap();
+
+    let container_ns = container.runtime_name();
+
+    // Legitimate traffic, from the node's own declared address (its default source for this
+    // subnet) — must not be caught by its own anti-spoof filter.
+    let legit = sh
+        .run_host(
+            "ip",
+            &[
+                "netns",
+                "exec",
+                &container_ns,
+                "ping",
+                "-c",
+                "5",
+                "-W",
+                "1",
+                &far_side_addr,
+            ],
+        )
+        .unwrap();
+    assert!(
+        legit.contains("5 received") || legit.contains("5 packets received"),
+        "legitimate ping (from the declared address) did not get through: {legit}"
+    );
+
+    // Spoofed traffic: a second address on the same interface, same subnet (not a different
+    // VLAN — that's already unreachable regardless of this filter), explicitly not the
+    // declared one.
+    let spoofed_addr = "10.113.0.99";
+    sh.run_host(
+        "ip",
+        &[
+            "netns",
+            "exec",
+            &container_ns,
+            "ip",
+            "addr",
+            "add",
+            &format!("{spoofed_addr}/24"),
+            "dev",
+            "eth0",
+        ],
+    )
+    .unwrap();
+    let spoofed = sh
+        .run_host(
+            "ip",
+            &[
+                "netns",
+                "exec",
+                &container_ns,
+                "ping",
+                "-c",
+                "5",
+                "-W",
+                "1",
+                "-I",
+                spoofed_addr,
+                &far_side_addr,
+            ],
+        )
+        .unwrap();
+    assert!(
+        spoofed.contains("0 received") || spoofed.contains("100% packet loss"),
+        "spoofed ping (from an address other than the declared one) was not dropped: {spoofed}"
+    );
+
+    // Not just "the ping failed" — the drop rule's own counter proves *this* filter is why,
+    // rather than some unrelated routing failure.
+    let table = format!("vxaf-{}", endpoint.name);
+    let nft_out = sh
+        .run("nft", &["list", "table", "netdev", &table])
+        .expect("read the ingress filter table");
+    let dropped_packets: u64 = nft_out
+        .lines()
+        .find(|l| l.contains("drop"))
+        .and_then(|l| l.split_whitespace().skip_while(|w| *w != "packets").nth(1))
+        .and_then(|w| w.parse().ok())
+        .unwrap_or_else(|| panic!("no parseable drop-rule packet counter in: {nft_out}"));
+    assert!(
+        dropped_packets >= 5,
+        "drop rule counter is {dropped_packets}, expected >= 5 spoofed packets: {nft_out}"
+    );
+
+    node_down(&sh, container, &runtime).unwrap();
+    teardown(&sh, &plan).unwrap();
+    let gone = observe(&sh, &plan).unwrap();
+    assert!(
+        gone.ingress_filters.iter().all(|f| !f.present),
+        "ingress filter table survived teardown"
+    );
+    let _ = std::fs::remove_dir_all(&runtime);
+}

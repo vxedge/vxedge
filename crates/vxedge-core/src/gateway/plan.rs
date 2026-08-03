@@ -77,6 +77,14 @@ pub struct EndpointPlan {
     /// The harness impairment this access port renders, when it is the one its link elected to
     /// carry it. See [`GatewayPlan::from_model`] for why exactly one endpoint per link does.
     pub impairment: Option<EndpointImpairment>,
+    /// The link attachment's declared `ip_cidr` (`model::Endpoint::ip_cidr`), when pinned.
+    /// Renders as an ingress anti-spoof filter on this access port (`docs/TASKS.md` #16): a
+    /// VLAN-filtering bridge already makes cross-slice traffic structurally impossible, but
+    /// nothing stops a compromised device on the *same* VLAN from spoofing a neighbor's
+    /// address to borrow its trust — that's the actual gap this closes. `None` when the
+    /// attachment has no pinned address; nothing is rendered for those (most attachments, per
+    /// `model::Endpoint::ip_cidr`'s own doc comment — a pinned address is deployment policy).
+    pub expected_source: Option<String>,
 }
 
 /// A link's impairment, resolved onto the single access port that will render it.
@@ -315,6 +323,7 @@ impl GatewayPlan {
                         vlan,
                         slice: Some(slice.clone()),
                         impairment: None,
+                        expected_source: attachment.ip_cidr.clone(),
                     });
                     // Recorded for the impairment pass below, which needs to know which
                     // endpoints a given link produced — the loop above is keyed by device.
@@ -471,6 +480,35 @@ parts:
         let kernel_bridge_plan = GatewayPlan::from_model(&model(BASE)).unwrap();
         assert_eq!(plan.slices, kernel_bridge_plan.slices);
         assert_eq!(plan.endpoints, kernel_bridge_plan.endpoints);
+    }
+
+    #[test]
+    fn expected_source_is_derived_from_a_pinned_endpoint_ip() {
+        // BASE's endpoints are bare `device:port` form — no IP pinned, so there is no
+        // anti-spoof filter to install (docs/TASKS.md #16's nftables ingress filter). Confirmed
+        // here rather than assumed, since a `None` is easy to get right by accident.
+        let plan = GatewayPlan::from_model(&model(BASE)).unwrap();
+        assert!(plan.endpoints.iter().all(|e| e.expected_source.is_none()));
+
+        let ws = BASE.replacen(
+            "{ id: l-infot, endpoints: [node-info-01:eth0], slice: infotainment }",
+            "{ id: l-infot, endpoints: [{ node: node-info-01, port: eth0, ip: 10.103.0.2/24 }], slice: infotainment }",
+            1,
+        );
+        let plan = GatewayPlan::from_model(&model(&ws)).unwrap();
+        let pinned = plan
+            .endpoints
+            .iter()
+            .find(|e| e.node == "node-info-01")
+            .expect("pinned endpoint planned");
+        assert_eq!(pinned.expected_source.as_deref(), Some("10.103.0.2/24"));
+        // Pinning one link's address must not leak onto its sibling link's endpoint.
+        let unpinned = plan
+            .endpoints
+            .iter()
+            .find(|e| e.node == "node-ecu-01")
+            .expect("unpinned endpoint planned");
+        assert!(unpinned.expected_source.is_none());
     }
 
     #[test]
