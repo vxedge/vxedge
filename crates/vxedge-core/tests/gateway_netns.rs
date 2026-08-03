@@ -806,12 +806,38 @@ fn tunnel_completes_a_real_handshake_between_two_simulated_hosts() {
         .unwrap();
     sh_b.run("ip", &["link", "set", "wanB", "up"]).unwrap();
 
-    let plan_a =
-        GatewayPlan::from_model(&vxedge_core::model::load_yaml(TUNNEL_SITE_A_WORKSPACE).unwrap())
-            .unwrap();
-    let plan_b =
-        GatewayPlan::from_model(&vxedge_core::model::load_yaml(TUNNEL_SITE_B_WORKSPACE).unwrap())
-            .unwrap();
+    // `wg` validates a peer's key strictly (format *and* curve validity, found live: a literal
+    // placeholder string like `PLACEHOLDER_PEER_KEY` fails the whole `wg set` call with "Key is
+    // not the correct length or format" before anything else in that call gets applied). The
+    // fixtures' placeholder therefore has to be a real, if meaningless, WireGuard key — a
+    // throwaway keypair's public half, generated the same way `apply_tunnel` generates a real
+    // one, rather than a hand-encoded literal that risks the same mistake.
+    let toolsh = Shell::default();
+    let placeholder_priv = toolsh.run("wg", &["genkey"]).unwrap();
+    let placeholder_pub = toolsh
+        .run_with_stdin("wg", &["pubkey"], placeholder_priv.trim())
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let plan_a = GatewayPlan::from_model(
+        &vxedge_core::model::load_yaml(&TUNNEL_SITE_A_WORKSPACE.replacen(
+            "PLACEHOLDER_PEER_KEY",
+            &placeholder_pub,
+            1,
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let plan_b = GatewayPlan::from_model(
+        &vxedge_core::model::load_yaml(&TUNNEL_SITE_B_WORKSPACE.replacen(
+            "PLACEHOLDER_PEER_KEY",
+            &placeholder_pub,
+            1,
+        ))
+        .unwrap(),
+    )
+    .unwrap();
 
     // First apply: each side mints its own identity. Still carrying the placeholder peer key —
     // no handshake is possible yet, which is expected: `apply` itself doesn't require one (see
