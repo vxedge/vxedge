@@ -80,7 +80,7 @@ fn children_are_privileged() -> bool {
 
 impl Shell {
     pub fn run(&self, program: &str, args: &[&str]) -> Result<String, NetOpsError> {
-        self.run_inner(program, args, true)
+        self.run_inner(program, args, true, None)
     }
 
     /// Run in the host context, ignoring the netns wrapper. Required for
@@ -89,7 +89,22 @@ impl Shell {
     /// leaves a bind mount that does not propagate (caught in CI: the
     /// subsequent veth move fails with EINVAL on an empty registry file).
     pub fn run_host(&self, program: &str, args: &[&str]) -> Result<String, NetOpsError> {
-        self.run_inner(program, args, false)
+        self.run_inner(program, args, false, None)
+    }
+
+    /// Like [`Self::run`], but pipes `stdin` to the child instead of leaving its stdin
+    /// unattached. The one consumer today: `wg set <tunnel> private-key -` (WireGuard's own
+    /// convention for "read this argument from standard input") — a generated tunnel private
+    /// key is passed straight from `wg genkey`'s stdout into this, and is never written to
+    /// disk anywhere in this process, matching the "no secrets in manifests or on disk" rule
+    /// the rest of the codebase already follows for daemon state.
+    pub fn run_with_stdin(
+        &self,
+        program: &str,
+        args: &[&str],
+        stdin: &str,
+    ) -> Result<String, NetOpsError> {
+        self.run_inner(program, args, true, Some(stdin))
     }
 
     fn run_inner(
@@ -97,6 +112,7 @@ impl Shell {
         program: &str,
         args: &[&str],
         wrapped: bool,
+        stdin: Option<&str>,
     ) -> Result<String, NetOpsError> {
         let mut full_args: Vec<String> = Vec::new();
         let exe = match (&self.netns, wrapped) {
@@ -130,10 +146,38 @@ impl Shell {
             if escalate { "sudo " } else { "" },
             full_args.join(" ")
         );
-        let out = cmd.output().map_err(|source| NetOpsError::Spawn {
-            program: exe.to_string(),
-            source,
-        })?;
+        let out = match stdin {
+            None => cmd.output().map_err(|source| NetOpsError::Spawn {
+                program: exe.to_string(),
+                source,
+            })?,
+            Some(data) => {
+                use std::io::Write;
+                use std::process::Stdio;
+                cmd.stdin(Stdio::piped());
+                cmd.stdout(Stdio::piped());
+                cmd.stderr(Stdio::piped());
+                let mut child = cmd.spawn().map_err(|source| NetOpsError::Spawn {
+                    program: exe.to_string(),
+                    source,
+                })?;
+                child
+                    .stdin
+                    .take()
+                    .expect("stdin piped above")
+                    .write_all(data.as_bytes())
+                    .map_err(|source| NetOpsError::Spawn {
+                        program: exe.to_string(),
+                        source,
+                    })?;
+                child
+                    .wait_with_output()
+                    .map_err(|source| NetOpsError::Spawn {
+                        program: exe.to_string(),
+                        source,
+                    })?
+            }
+        };
         if out.status.success() {
             return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
         }

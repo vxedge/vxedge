@@ -555,6 +555,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         f.node, f.access_port, f.state, f.detail
                     );
                 }
+                for t in &status.tunnels {
+                    println!(
+                        "  tunnel {}: state={} handshake={} public_key={} {}",
+                        t.id, t.state, t.handshake_established, t.public_key, t.detail
+                    );
+                }
             } else {
                 println!("gateway: no status reported");
             }
@@ -989,6 +995,15 @@ struct JsonIngressFilterStatus {
 }
 
 #[derive(serde::Serialize)]
+struct JsonTunnelStatus {
+    id: String,
+    state: i32,
+    public_key: String,
+    handshake_established: bool,
+    detail: String,
+}
+
+#[derive(serde::Serialize)]
 struct JsonStatus {
     vxid: String,
     state: i32,
@@ -996,6 +1011,7 @@ struct JsonStatus {
     slices: Vec<JsonSliceStatus>,
     impairments: Vec<JsonImpairmentStatus>,
     ingress_filters: Vec<JsonIngressFilterStatus>,
+    tunnels: Vec<JsonTunnelStatus>,
 }
 
 impl From<&vxedge_api::v1::GatewayStatus> for JsonStatus {
@@ -1032,6 +1048,17 @@ impl From<&vxedge_api::v1::GatewayStatus> for JsonStatus {
                     access_port: f.access_port.clone(),
                     state: f.state,
                     detail: f.detail.clone(),
+                })
+                .collect(),
+            tunnels: g
+                .tunnels
+                .iter()
+                .map(|t| JsonTunnelStatus {
+                    id: t.id.clone(),
+                    state: t.state,
+                    public_key: t.public_key.clone(),
+                    handshake_established: t.handshake_established,
+                    detail: t.detail.clone(),
                 })
                 .collect(),
         }

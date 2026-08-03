@@ -420,6 +420,122 @@ fn teardown_ingress_filter(sh: &Shell, ep: &super::plan::EndpointPlan) -> Result
     sh.run_tolerate_missing("nft", &["delete", "table", "netdev", &table])
 }
 
+/// One gateway-terminated WireGuard tunnel (`docs/TASKS.md` #16, "WireGuard link setup"),
+/// applied or torn down identically regardless of `network.data_plane`: a WireGuard interface
+/// is a routed L3 endpoint, never enslaved to the bridge/OVS switch itself, so there is nothing
+/// backend-specific here — called once, from the `DataPlane` trait's shared default `apply`,
+/// and from both backends' `teardown`/`observe`.
+///
+/// Idempotency splits in two, deliberately: interface *creation* (and the one-time key
+/// generation that goes with it) happens only when `sh.link_exists` says the tunnel does not
+/// exist yet; peer/listen-port configuration below that point is `wg set`'s own declarative,
+/// safe-to-repeat form, run on every `apply` regardless. Folding key generation into the
+/// declarative half would regenerate this side's identity on every reconcile pass, silently
+/// invalidating whatever the peer already trusts — the same class of bug `apply_impairment`'s
+/// own doc comment warns about for `tc filter add`, just on the "recreates instead of no-ops"
+/// side rather than the "duplicates" side.
+fn apply_tunnel(sh: &Shell, t: &super::plan::TunnelPlan) -> Result<(), NetOpsError> {
+    if !sh.link_exists(&t.name) {
+        sh.run("ip", &["link", "add", &t.name, "type", "wireguard"])?;
+        // The private key never touches disk: piped straight from `wg genkey`'s stdout into
+        // `wg set`'s stdin (`-` is wg's own convention for "read this from standard input"),
+        // and never stored anywhere by this process — `wg show <name> public-key` (used by
+        // `observe_tunnels`) is the only way to read it back, which is also how an operator
+        // hands this side's identity to the peer, out of band. See `model::Tunnel`'s doc
+        // comment for why the manifest never declares a local key.
+        let privkey = sh.run("wg", &["genkey"])?;
+        sh.run_with_stdin("wg", &["set", &t.name, "private-key", "-"], privkey.trim())?;
+    }
+    let listen_port = t.listen_port.to_string();
+    let allowed_ips = t.peer_allowed_ips.join(",");
+    let mut args: Vec<&str> = vec![
+        "set",
+        &t.name,
+        "listen-port",
+        &listen_port,
+        "peer",
+        &t.peer_public_key,
+    ];
+    if !allowed_ips.is_empty() {
+        args.push("allowed-ips");
+        args.push(&allowed_ips);
+    }
+    if let Some(endpoint) = &t.peer_endpoint {
+        args.push("endpoint");
+        args.push(endpoint);
+    }
+    sh.run("wg", &args)?;
+
+    sh.run_tolerate_exists("ip", &["addr", "add", &t.address, "dev", &t.name])?;
+    sh.run("ip", &["link", "set", &t.name, "up"])?;
+    Ok(())
+}
+
+fn apply_tunnels(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
+    for t in &plan.tunnels {
+        apply_tunnel(sh, t)?;
+    }
+    Ok(())
+}
+
+fn teardown_tunnel(sh: &Shell, t: &super::plan::TunnelPlan) -> Result<(), NetOpsError> {
+    sh.run_tolerate_missing("ip", &["link", "del", &t.name])
+}
+
+fn teardown_tunnels(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
+    for t in &plan.tunnels {
+        teardown_tunnel(sh, t)?;
+    }
+    Ok(())
+}
+
+/// One tunnel's observed state (`GatewayObservation.tunnels`).
+#[derive(Debug, Clone)]
+pub struct TunnelObservation {
+    pub id: String,
+    pub name: String,
+    pub present: bool,
+    /// This side's current public key, read live off the kernel — the only place it is ever
+    /// recorded, since `apply_tunnel` never writes it to disk. Empty when the interface is
+    /// absent.
+    pub public_key: String,
+    /// Whether the peer has completed a handshake recently. **Not** a `fully_up` condition:
+    /// WireGuard is connectionless, so a correctly configured but idle tunnel legitimately has
+    /// no handshake yet — this is informational (`status`), the same way an unimpaired link's
+    /// tc counters are informational rather than gating.
+    pub handshake_established: bool,
+}
+
+fn observe_tunnels(sh: &Shell, plan: &GatewayPlan) -> Vec<TunnelObservation> {
+    plan.tunnels
+        .iter()
+        .map(|t| {
+            let present = sh.link_exists(&t.name);
+            let public_key = sh
+                .run("wg", &["show", &t.name, "public-key"])
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            let handshake_established = sh
+                .run("wg", &["show", &t.name, "latest-handshakes"])
+                .map(|s| {
+                    // `<pubkey>\t<unix-seconds>`; 0 means "never."
+                    s.split_whitespace()
+                        .next_back()
+                        .and_then(|secs| secs.parse::<u64>().ok())
+                        .is_some_and(|secs| secs > 0)
+                })
+                .unwrap_or(false);
+            TunnelObservation {
+                id: t.id.clone(),
+                name: t.name.clone(),
+                present,
+                public_key,
+                handshake_established,
+            }
+        })
+        .collect()
+}
+
 /// VLAN membership for the 5G core's uplink port on a `vlan_filtering 1`
 /// bridge (`vxbr0`): every port needs an explicit membership or it drops
 /// all traffic. `host_veth` must already be attached to the bridge and up
@@ -746,7 +862,15 @@ pub trait DataPlane {
 
     fn observe(&self, sh: &Shell, plan: &GatewayPlan) -> Result<GatewayObservation, NetOpsError>;
 
-    /// The three stages in dependency order.
+    /// WireGuard tunnels the gateway terminates (`docs/TASKS.md` #16). Given a default
+    /// implementation here, not per-backend: a tunnel is a routed L3 endpoint independent of
+    /// which fabric backs the VLAN slices, so `KernelBridge` and `Ovs` share one implementation
+    /// rather than each redeclaring it — see `apply_tunnels`'s own doc comment.
+    fn apply_tunnels(&self, sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
+        apply_tunnels(sh, plan)
+    }
+
+    /// The four stages in dependency order.
     ///
     /// They are separate trait methods rather than one opaque `apply` because the daemon
     /// reports progress between them, and a seam that forces a caller to reach underneath it to
@@ -755,6 +879,7 @@ pub trait DataPlane {
         self.apply_links(sh, plan)?;
         self.apply_slices(sh, plan)?;
         self.apply_endpoints(sh, plan)?;
+        self.apply_tunnels(sh, plan)?;
         Ok(())
     }
 }
@@ -899,6 +1024,7 @@ fn ovs_teardown(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
         )?;
         sh.run_tolerate_missing("ip", &["link", "del", &ep.name])?;
     }
+    teardown_tunnels(sh, plan)?;
     sh.run(
         "ovs-vsctl",
         &["--if-exists", "del-port", &plan.bridge, &plan.uplink],
@@ -1013,6 +1139,7 @@ fn ovs_observe(sh: &Shell, plan: &GatewayPlan) -> Result<GatewayObservation, Net
         endpoints_expected: plan.endpoints.len(),
         impairments,
         ingress_filters,
+        tunnels: observe_tunnels(sh, plan),
     })
 }
 
@@ -1161,6 +1288,7 @@ pub fn teardown(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
         teardown_ingress_filter(sh, ep)?;
         sh.run_tolerate_missing("ip", &["link", "del", &ep.name])?;
     }
+    teardown_tunnels(sh, plan)?;
     sh.run_tolerate_missing("ip", &["link", "del", &plan.uplink])?;
     sh.run_tolerate_missing("ip", &["link", "del", &plan.bridge])?;
     Ok(())
@@ -1220,6 +1348,7 @@ pub struct GatewayObservation {
     pub endpoints_expected: usize,
     pub impairments: Vec<ImpairmentObservation>,
     pub ingress_filters: Vec<IngressFilterObservation>,
+    pub tunnels: Vec<TunnelObservation>,
 }
 
 impl GatewayObservation {
@@ -1236,6 +1365,10 @@ impl GatewayObservation {
             // missing impairment: it's a security control reporting healthy while doing
             // nothing. Same treatment, for the stronger reason.
             && self.ingress_filters.iter().all(|f| f.present)
+            // A declared tunnel must exist and be configured — but *not* have a handshake
+            // (`TunnelObservation::handshake_established` is deliberately excluded here, see its
+            // own doc comment): a correctly configured, idle WireGuard link is fully up.
+            && self.tunnels.iter().all(|t| t.present)
     }
 }
 
@@ -1342,5 +1475,6 @@ pub fn observe(sh: &Shell, plan: &GatewayPlan) -> Result<GatewayObservation, Net
         endpoints_expected: plan.endpoints.len(),
         impairments,
         ingress_filters,
+        tunnels: observe_tunnels(sh, plan),
     })
 }

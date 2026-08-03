@@ -702,3 +702,183 @@ fn ingress_filter_drops_spoofed_source_but_allows_declared_one() {
     );
     let _ = std::fs::remove_dir_all(&runtime);
 }
+
+/// Two simulated "hosts," each with one WireGuard tunnel declared and a placeholder peer key —
+/// no handshake is possible until each side's real, kernel-minted public key is learned and
+/// substituted in (`PLACEHOLDER_PEER_KEY`, replaced in the test itself). `address`/`allowed_ips`
+/// (10.240.0.0/30) are the tunnel's own overlay subnet; `endpoint` points at the *other* fixture
+/// below's `wan*` address — the plain veth pair the test wires up to stand in for the internet
+/// between two real hosts. One throwaway VLAN slice with no devices, only because
+/// `GatewayPlan::from_model` refuses a manifest with zero slices of any kind
+/// (`PlanError::NoSlices`) — irrelevant to what this test actually exercises.
+const TUNNEL_SITE_A_WORKSPACE: &str = r#"
+kind: experiment
+id: exp-tunnel-a
+vehicles: [veh]
+network:
+  slices:
+    - { id: dummy, mode: vlan, vlan: 101 }
+  tunnels:
+    - id: ota-uplink
+      listen_port: 51820
+      address: 10.240.0.1/30
+      peer: { public_key: 'PLACEHOLDER_PEER_KEY', endpoint: '10.250.0.2:51821', allowed_ips: [10.240.0.2/32] }
+---
+kind: vehicle
+id: veh
+devices: {}
+"#;
+const TUNNEL_SITE_B_WORKSPACE: &str = r#"
+kind: experiment
+id: exp-tunnel-b
+vehicles: [veh]
+network:
+  slices:
+    - { id: dummy, mode: vlan, vlan: 101 }
+  tunnels:
+    - id: ota-downlink
+      listen_port: 51821
+      address: 10.240.0.2/30
+      peer: { public_key: 'PLACEHOLDER_PEER_KEY', endpoint: '10.250.0.1:51820', allowed_ips: [10.240.0.1/32] }
+---
+kind: vehicle
+id: veh
+devices: {}
+"#;
+
+/// Regression/acceptance test for docs/TASKS.md #16's WireGuard link setup. Not just "the
+/// interface exists" — the unit tests in `plan.rs` already cover plan derivation — but that two
+/// independent gateways, simulated as two network namespaces connected only by a plain veth pair
+/// standing in for the internet between two real hosts, complete a **real WireGuard handshake**
+/// and pass traffic over the resulting encrypted overlay. Also exercises the actual operator
+/// workflow this design is built around: `up` once to mint an identity (never written to disk —
+/// see `provision::apply_tunnel`'s doc comment), read it back via `observe`/`status`, hand it to
+/// the other side out of band, re-apply with the corrected peer key — an idempotent
+/// *reconfigure*, not a no-op, and it has to converge cleanly rather than erroring on an
+/// interface that already exists.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN and wireguard-tools (`wg`); run under sudo (see module docs)"]
+fn tunnel_completes_a_real_handshake_between_two_simulated_hosts() {
+    let ns_a = format!("vxwga{}", std::process::id());
+    let ns_b = format!("vxwgb{}", std::process::id());
+    for ns in [&ns_a, &ns_b] {
+        let created = std::process::Command::new("ip")
+            .args(["netns", "add", ns])
+            .output()
+            .expect("iproute2 installed");
+        assert!(
+            created.status.success(),
+            "cannot create netns (run as root): {}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+    }
+    let _guard_a = NetnsGuard(ns_a.clone());
+    let _guard_b = NetnsGuard(ns_b.clone());
+    let sh_a = Shell {
+        netns: Some(ns_a.clone()),
+        escalate: false,
+    };
+    let sh_b = Shell {
+        netns: Some(ns_b.clone()),
+        escalate: false,
+    };
+
+    // The "internet" between the two simulated hosts: a plain veth pair, one end per netns, on
+    // its own subnet — distinct from the tunnel's own overlay addresses below. Created and moved
+    // from the host context (`run_host`), same reasoning `gateway_and_container_zone_cycle_in_
+    // netns` already documents for named-netns operations: a bind mount created from inside `ip
+    // netns exec` does not propagate.
+    sh_a.run_host(
+        "ip",
+        &[
+            "link", "add", "wanA", "type", "veth", "peer", "name", "wanB",
+        ],
+    )
+    .unwrap();
+    sh_a.run_host("ip", &["link", "set", "wanA", "netns", &ns_a])
+        .unwrap();
+    sh_a.run_host("ip", &["link", "set", "wanB", "netns", &ns_b])
+        .unwrap();
+    sh_a.run("ip", &["addr", "add", "10.250.0.1/30", "dev", "wanA"])
+        .unwrap();
+    sh_a.run("ip", &["link", "set", "wanA", "up"]).unwrap();
+    sh_b.run("ip", &["addr", "add", "10.250.0.2/30", "dev", "wanB"])
+        .unwrap();
+    sh_b.run("ip", &["link", "set", "wanB", "up"]).unwrap();
+
+    let plan_a =
+        GatewayPlan::from_model(&vxedge_core::model::load_yaml(TUNNEL_SITE_A_WORKSPACE).unwrap())
+            .unwrap();
+    let plan_b =
+        GatewayPlan::from_model(&vxedge_core::model::load_yaml(TUNNEL_SITE_B_WORKSPACE).unwrap())
+            .unwrap();
+
+    // First apply: each side mints its own identity. Still carrying the placeholder peer key —
+    // no handshake is possible yet, which is expected: `apply` itself doesn't require one (see
+    // `TunnelObservation::handshake_established`'s own doc comment on why that is deliberately
+    // not a `fully_up` condition).
+    apply(&sh_a, &plan_a).unwrap();
+    apply(&sh_b, &plan_b).unwrap();
+
+    let obs_a = observe(&sh_a, &plan_a).unwrap();
+    let obs_b = observe(&sh_b, &plan_b).unwrap();
+    assert!(obs_a.fully_up(), "site A not fully up: {obs_a:?}");
+    assert!(obs_b.fully_up(), "site B not fully up: {obs_b:?}");
+    let pubkey_a = obs_a.tunnels[0].public_key.clone();
+    let pubkey_b = obs_b.tunnels[0].public_key.clone();
+    assert!(
+        !pubkey_a.is_empty() && !pubkey_b.is_empty(),
+        "public keys not read back from the kernel: a={pubkey_a:?} b={pubkey_b:?}"
+    );
+    assert_ne!(pubkey_a, pubkey_b, "both sides minted the same identity");
+
+    // The real operator workflow: correct each side's peer key to what the other side actually
+    // minted, then re-apply.
+    let plan_a = GatewayPlan::from_model(
+        &vxedge_core::model::load_yaml(&TUNNEL_SITE_A_WORKSPACE.replacen(
+            "PLACEHOLDER_PEER_KEY",
+            &pubkey_b,
+            1,
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let plan_b = GatewayPlan::from_model(
+        &vxedge_core::model::load_yaml(&TUNNEL_SITE_B_WORKSPACE.replacen(
+            "PLACEHOLDER_PEER_KEY",
+            &pubkey_a,
+            1,
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    apply(&sh_a, &plan_a).unwrap();
+    apply(&sh_b, &plan_b).unwrap();
+
+    // Force a handshake: ping across the tunnel's own overlay addresses, not the underlying WAN
+    // link — this only succeeds if the packet is actually encrypted, sent over `wanA`/`wanB`,
+    // decrypted, and answered.
+    let ping = sh_a
+        .run("ping", &["-c", "3", "-W", "2", "10.240.0.2"])
+        .unwrap();
+    assert!(
+        ping.contains("3 received") || ping.contains("3 packets received"),
+        "ping across the tunnel overlay did not complete: {ping}"
+    );
+
+    let obs_a = observe(&sh_a, &plan_a).unwrap();
+    let obs_b = observe(&sh_b, &plan_b).unwrap();
+    assert!(
+        obs_a.tunnels[0].handshake_established,
+        "site A recorded no handshake after real traffic crossed the tunnel"
+    );
+    assert!(
+        obs_b.tunnels[0].handshake_established,
+        "site B recorded no handshake after real traffic crossed the tunnel"
+    );
+
+    teardown(&sh_a, &plan_a).unwrap();
+    teardown(&sh_b, &plan_b).unwrap();
+    assert!(!observe(&sh_a, &plan_a).unwrap().tunnels[0].present);
+    assert!(!observe(&sh_b, &plan_b).unwrap().tunnels[0].present);
+}

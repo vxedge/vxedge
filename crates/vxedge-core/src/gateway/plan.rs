@@ -38,6 +38,11 @@ pub enum PlanError {
          and attaching a device that declares a `backend:`."
     )]
     ImpairmentNotRenderable { link: String },
+    #[error(
+        "tunnels `{a}` and `{b}` both derive the host interface name `{name}` — rename one of \
+         them (see `gateway::ifnames::wireguard_tunnel`)"
+    )]
+    TunnelNameCollision { a: String, b: String, name: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +103,22 @@ pub struct EndpointImpairment {
     pub params: crate::model::Impairment,
 }
 
+/// A gateway-terminated WireGuard tunnel, planned from `model::Tunnel`
+/// (`docs/TASKS.md` #16, "WireGuard link setup"). Carries only what a manifest may state; the
+/// local private key is minted by `provision::apply_tunnel` on first `up` and never appears
+/// here — see `model::Tunnel`'s own doc comment for why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TunnelPlan {
+    pub id: String,
+    /// Host interface name (`gateway::ifnames::wireguard_tunnel`).
+    pub name: String,
+    pub listen_port: u16,
+    pub address: String,
+    pub peer_public_key: String,
+    pub peer_endpoint: Option<String>,
+    pub peer_allowed_ips: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayPlan {
     pub bridge: String,
@@ -111,6 +132,7 @@ pub struct GatewayPlan {
     pub root_rate_mbps: u64,
     pub slices: Vec<SlicePlan>,
     pub endpoints: Vec<EndpointPlan>,
+    pub tunnels: Vec<TunnelPlan>,
     /// Ids of `mode: s-nssai` slices present in the manifest — tracked, not
     /// yet provisioned by this reconciler. Real S-NSSAI slice lifecycle is
     /// `vxedge_core::fiveg`'s job (its own CN/RAN pods); a manifest mixing
@@ -334,6 +356,29 @@ impl GatewayPlan {
 
         assign_impairments(exp, &mut endpoints, &endpoint_link)?;
 
+        let mut tunnels: Vec<TunnelPlan> = Vec::new();
+        let mut claimed_tunnels: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for t in &exp.tunnels {
+            let name = super::ifnames::wireguard_tunnel(&t.id);
+            if let Some(other) = claimed_tunnels.insert(name.clone(), t.id.clone()) {
+                return Err(PlanError::TunnelNameCollision {
+                    a: other,
+                    b: t.id.clone(),
+                    name,
+                });
+            }
+            tunnels.push(TunnelPlan {
+                id: t.id.clone(),
+                name,
+                listen_port: t.listen_port,
+                address: t.address.clone(),
+                peer_public_key: t.peer_public_key.clone(),
+                peer_endpoint: t.peer_endpoint.clone(),
+                peer_allowed_ips: t.peer_allowed_ips.clone(),
+            });
+        }
+
         Ok(Self {
             bridge: "vxbr0".into(),
             uplink: "vxup0".into(),
@@ -344,6 +389,7 @@ impl GatewayPlan {
                 .unwrap_or(1000),
             slices,
             endpoints,
+            tunnels,
             snssai_slice_ids,
             data_plane: exp.data_plane,
         })
@@ -509,6 +555,55 @@ parts:
             .find(|e| e.node == "node-ecu-01")
             .expect("unpinned endpoint planned");
         assert!(unpinned.expected_source.is_none());
+    }
+
+    #[test]
+    fn tunnels_are_planned_with_deterministic_interface_names() {
+        // BASE itself declares none — absence must plan to an empty list, not error, the same
+        // property `slices_of`/`data_plane_of` already have for their own absent blocks.
+        let base_plan = GatewayPlan::from_model(&model(BASE)).unwrap();
+        assert!(base_plan.tunnels.is_empty());
+
+        let ws = BASE.replacen(
+            "network:\n  defaults: { bandwidth: 500000000 }",
+            "network:\n  defaults: { bandwidth: 500000000 }\n  tunnels:\n    - id: ota-uplink\n      \
+             listen_port: 51820\n      address: 10.200.0.1/24\n      peer: { public_key: \
+             'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=', endpoint: '198.51.100.7:51820', \
+             allowed_ips: [10.200.0.0/24] }",
+            1,
+        );
+        let plan = GatewayPlan::from_model(&model(&ws)).unwrap();
+        assert_eq!(plan.tunnels.len(), 1);
+        let t = &plan.tunnels[0];
+        assert_eq!(t.id, "ota-uplink");
+        assert_eq!(t.name, "vxwg-ota-uplink");
+        assert_eq!(t.listen_port, 51820);
+        assert_eq!(t.address, "10.200.0.1/24");
+        assert_eq!(
+            t.peer_public_key,
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        );
+        assert_eq!(t.peer_endpoint.as_deref(), Some("198.51.100.7:51820"));
+        assert_eq!(t.peer_allowed_ips, vec!["10.200.0.0/24".to_string()]);
+    }
+
+    /// Two tunnel ids that sanitize to the same interface name are refused rather than
+    /// provisioned over each other — same failure mode `two_devices_deriving_one_interface_
+    /// name_are_refused` already covers for endpoints, same fix (rename one).
+    #[test]
+    fn two_tunnels_deriving_one_interface_name_are_refused() {
+        let ws = BASE.replacen(
+            "network:\n  defaults: { bandwidth: 500000000 }",
+            "network:\n  defaults: { bandwidth: 500000000 }\n  tunnels:\n    - { id: 'tun.a', \
+             listen_port: 51820, address: 10.200.0.1/24, peer: { public_key: k1 } }\n    - { id: \
+             'tun-a', listen_port: 51821, address: 10.200.1.1/24, peer: { public_key: k2 } }",
+            1,
+        );
+        let err = GatewayPlan::from_model(&model(&ws)).unwrap_err();
+        assert!(
+            matches!(&err, PlanError::TunnelNameCollision { name, .. } if name == "vxwg-tun-a"),
+            "{err}"
+        );
     }
 
     #[test]

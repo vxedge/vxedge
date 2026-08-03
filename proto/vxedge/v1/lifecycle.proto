@@ -37,6 +37,11 @@ message GatewayStatus {
   // endpoint declares a pinned source address. UP means the filter is installed; DOWN means a
   // declared filter is missing, which `GatewayService.Up` already refuses to converge on.
   repeated IngressFilterStatus ingress_filters = 4;
+  // Gateway-terminated WireGuard tunnels actually observed on the kernel — empty if none are
+  // declared. UP means the interface exists and is configured; a tunnel's own public key
+  // (`TunnelStatus.public_key`) is read live off the kernel, since a manifest never declares
+  // this side's key material (see `model::Tunnel`'s doc comment).
+  repeated TunnelStatus tunnels = 5;
 }
 
 message SliceStatus {
@@ -60,6 +65,20 @@ message IngressFilterStatus {
   // UP or DOWN only — a filter is either installed or it isn't, no partial state.
   ResourceState state = 3;
   string detail = 4;
+}
+
+message TunnelStatus {
+  string id = 1;
+  // UP or DOWN only, like IngressFilterStatus — a tunnel interface either exists and is
+  // configured, or it doesn't. A missing handshake is *not* DEGRADED: WireGuard is
+  // connectionless, so a correctly configured, idle tunnel has no handshake yet and that is
+  // not a fault (see `TunnelObservation::handshake_established`'s own doc comment).
+  ResourceState state = 2;
+  // This side's current public key, read live off the kernel — hand this to the peer so it can
+  // be configured as their `peer.public_key`. Empty when the tunnel isn't up.
+  string public_key = 3;
+  bool handshake_established = 4;
+  string detail = 5;
 }
 
 service GatewayService {

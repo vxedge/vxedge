@@ -471,7 +471,38 @@ exp-001 measurements).
       (unaffected by the bug) remained the authoritative proof throughout. Re-run after the fix:
       all 4 privileged gateway tests pass (`gateway_netns.rs`'s 3, unchanged, plus the new one).
       Item #16's nftables sub-item is closed.
-- [ ] WireGuard link setup; VXLAN inter-host links
+- [x] WireGuard link setup — **built 2026-08-03**: `network.tunnels` (`docs/ARCHITECTURE.md`
+      §6.0.3/§7), one gateway-terminated point-to-point WireGuard link per entry. Backend-
+      independent by design — a WireGuard interface is a routed L3 endpoint, never enslaved to
+      the bridge/OVS switch, so it's a single default `DataPlane::apply_tunnels` both
+      `KernelBridge` and `Ovs` share for free, not a per-backend feature. No local key material
+      in the manifest: the gateway mints its own identity on first `up` (`wg genkey` piped
+      straight into `wg set`'s stdin via the new `Shell::run_with_stdin`, never written to
+      disk), and `GatewayStatus.tunnels[].public_key` (vxAPI, buf-clean) reports it back so an
+      operator can hand it to the peer out of band. Re-applying an already-existing tunnel
+      reconfigures peer/listen-port declaratively without touching that identity — the
+      idempotency split is deliberate (interface creation gated on `sh.link_exists`, peer
+      config unconditional every `apply`), the same class of lesson `apply_impairment` recorded
+      for `tc filter add`, just on the "must not silently recreate" side rather than "must not
+      duplicate." `ifnames::wireguard_tunnel` gives tunnels the same deterministic, collision-
+      checked interface-naming contract as endpoints (§6.0.5), refactored to share
+      `shorten_to_budget` with `stem` rather than duplicating the hash-shortening logic. CLI
+      (human + `--json`) wired. Tests: unit tests for the model parse
+      (`tunnels_of`)/plan derivation/name-collision refusal (18→ now more `plan.rs` tests,
+      145 total unit tests, all passing); a new privileged test,
+      `tunnel_completes_a_real_handshake_between_two_simulated_hosts` in `gateway_netns.rs` —
+      two network namespaces standing in for two real hosts, connected only by a plain veth
+      "internet" link, each mints its own identity, the test corrects each side's peer key to
+      the other's real one (the actual operator workflow) and re-applies, then proves a **real
+      WireGuard handshake** completed by pinging across the tunnel's own encrypted overlay
+      address and checking both the kernel's own handshake timer and that the ping actually
+      got through. Requires `wireguard-tools` (`apt install wireguard-tools` — already listed
+      in `docs/TESTBED-SETUP.md` Tier 2, unrelated to this change) for the `wg` CLI; **not yet
+      live-verified in this environment** — `wg` isn't installed on the dev host this was built
+      on. `vxota` is **not** yet wired to bind `config.listen` onto a tunnel address — this
+      delivers the mechanism `docs/ARCHITECTURE.md` §8 was waiting on, not the integration;
+      that remains open, tracked in §4 below.
+- [ ] VXLAN inter-host links
 - [ ] FRR config rendering (BGP optional path)
 - [ ] Port NetOps from iproute2 argv exec to pure rtnetlink/netlink (recorded deviation
       from AGENTS.md; plan/observe layers are unaffected)
@@ -548,9 +579,11 @@ exp-001 measurements).
     else polling status. Fixed with a dedicated reaper thread per spawn.
 - [ ] `vxcompute` scheduling: v1 co-locates every service with vxedged on the host — real
       placement onto a compute node is blocked on the `vxcompute` backend not existing yet
-- [ ] WireGuard `ota`/telemetry slice transport (§7) — v1's `config.listen` must be an
-      address zone nodes can already reach (typically the gateway's own bridge address)
-      since there's no encrypted overlay yet
+- [ ] WireGuard `ota`/telemetry slice transport (§7) — the mechanism now exists
+      (`network.tunnels`, §2 above, **built 2026-08-03**), but `SvcService`'s generic process
+      backend is not wired to bind `config.listen` onto a tunnel address; v1's `config.listen`
+      is still an address zone nodes can already reach (typically the gateway's own bridge
+      address). What's left is the integration, not the primitive.
 - [x] `telemetry` service type in the generic process backend (2026-07-31) — landed with the
       `ServiceBackend` seam: a backend translates a `ServiceDef` into a command line, and the
       supervision every service shares (idempotent up, pidfile, child reaping, graceful-then-

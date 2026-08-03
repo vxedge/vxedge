@@ -74,6 +74,14 @@ pub enum ModelError {
     LossOutOfRange { link: String, loss: f64 },
     #[error("`network.data_plane` is `{data_plane}` — expected `kernel-bridge` or `ovs`")]
     UnknownDataPlane { data_plane: String },
+    #[error("tunnel `{tunnel}` declares `kind: {kind}` — expected `wireguard`")]
+    UnknownTunnelKind { tunnel: String, kind: String },
+    #[error(
+        "tunnel `{tunnel}` is missing `{field}` — a tunnel needs its own listen_port, address \
+         and the peer's public_key to be provisionable; the local private key is never declared \
+         here (`vxedge status` reports it once minted)"
+    )]
+    MissingTunnelField { tunnel: String, field: &'static str },
 }
 
 /// Range-checked narrowing from YAML's `u64`.
@@ -563,6 +571,63 @@ fn slices_of(raw: &Value) -> Result<Vec<Slice>, ModelError> {
     Ok(out)
 }
 
+/// `network.tunnels` (`docs/TASKS.md` #16's WireGuard link setup) — absent, like `slices`,
+/// means "no tunnels," not an error: most experiments (everything single-host today) have none.
+fn tunnels_of(raw: &Value) -> Result<Vec<Tunnel>, ModelError> {
+    let Some(list) = raw
+        .get("network")
+        .and_then(|n| n.get("tunnels"))
+        .and_then(|t| t.as_sequence())
+    else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for t in list {
+        let Some(id) = t.get("id").and_then(|v| v.as_str()).map(str::to_owned) else {
+            continue;
+        };
+        let kind = match t.get("kind").and_then(|v| v.as_str()) {
+            Some("wireguard") | None => TunnelKind::Wireguard,
+            Some(other) => {
+                return Err(ModelError::UnknownTunnelKind {
+                    tunnel: id,
+                    kind: other.to_string(),
+                });
+            }
+        };
+        let missing = |field| ModelError::MissingTunnelField {
+            tunnel: id.clone(),
+            field,
+        };
+        let listen_port = narrow(t, "listen_port", &format!("tunnel {id}.listen_port"))?
+            .ok_or_else(|| missing("listen_port"))?;
+        let address = t
+            .get("address")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .ok_or_else(|| missing("address"))?;
+        let peer = t.get("peer").ok_or_else(|| missing("peer"))?;
+        let peer_public_key = peer
+            .get("public_key")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .ok_or_else(|| missing("peer.public_key"))?;
+        out.push(Tunnel {
+            id,
+            kind,
+            listen_port,
+            address,
+            peer_public_key,
+            peer_endpoint: peer
+                .get("endpoint")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned),
+            peer_allowed_ips: string_list(peer, "allowed_ips"),
+        });
+    }
+    Ok(out)
+}
+
 fn traffic_endpoint(raw: &str, devices: &BTreeMap<String, Device>) -> TrafficEndpoint {
     if devices.contains_key(raw) {
         TrafficEndpoint::Device(raw.to_string())
@@ -719,6 +784,7 @@ pub fn build(ws: &Workspace) -> Result<Experiment, ModelError> {
             .and_then(|v| v.as_u64()),
         data_plane: data_plane_of(&raw)?,
         slices: slices_of(&raw)?,
+        tunnels: tunnels_of(&raw)?,
         entities,
         traffic,
         method,

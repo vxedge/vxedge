@@ -47,9 +47,6 @@ const IFB_PREFIX: &str = "vxi-";
 /// two ends could not both be named.
 const STEM_MAX: usize = IFNAME_MAX - PEER_PREFIX.len();
 
-/// Characters of the id kept verbatim when a stem must be shortened, leaving `-` + 4 hex digits.
-const HEAD: usize = STEM_MAX - 5;
-
 /// The port name elided from a stem.
 ///
 /// Every attachment in every manifest to date is `eth0`, and spelling it would spend 5 of the 11
@@ -87,6 +84,18 @@ fn sanitize(raw: &str) -> String {
         .collect()
 }
 
+/// Shortens `key` to fit `budget` bytes, keeping a readable head plus a hash of the whole
+/// original key — shared by every prefix in this module (`stem`, `wireguard_tunnel`) so the
+/// shortening rule can only drift in one place, not silently between them.
+fn shorten_to_budget(key: String, budget: usize) -> String {
+    if key.len() <= budget {
+        return key;
+    }
+    // ASCII by construction after `sanitize`, so slicing on a byte index is safe.
+    let head = key[..budget - 5].trim_end_matches('-');
+    format!("{head}-{:04x}", fnv1a(key.as_bytes()) as u16)
+}
+
 /// The shared stem of an attachment's two interface names.
 ///
 /// Deterministic, and depends on nothing but its arguments — that is the whole property this
@@ -105,12 +114,25 @@ pub fn stem(device: &str, port: Option<&str>) -> String {
         // about to become a kernel object name, so it is never allowed to be empty.
         key.push_str("dev");
     }
-    if key.len() <= STEM_MAX {
-        return key;
-    }
-    // ASCII by construction after `sanitize`, so slicing on a byte index is safe.
-    let head = key[..HEAD].trim_end_matches('-');
-    format!("{head}-{:04x}", fnv1a(key.as_bytes()) as u16)
+    shorten_to_budget(key, STEM_MAX)
+}
+
+/// Gateway-terminated WireGuard tunnel interface (`docs/TASKS.md` #16, "WireGuard link
+/// setup"), derived from the tunnel's own id — the same pure-function contract as
+/// [`access_port`]: nothing but the id itself (declaration order, tunnel count) can move it.
+/// Its own prefix and budget, not `stem`'s: a tunnel has no `(device, port)` pair, only one id,
+/// and no peer name to share a budget with the way `vz-`/`vzp-` do.
+const WIREGUARD_PREFIX: &str = "vxwg-";
+const WG_STEM_MAX: usize = IFNAME_MAX - WIREGUARD_PREFIX.len();
+
+pub fn wireguard_tunnel(id: &str) -> String {
+    let key = sanitize(id);
+    let key = if key.is_empty() {
+        "tun".to_string()
+    } else {
+        key
+    };
+    format!("{WIREGUARD_PREFIX}{}", shorten_to_budget(key, WG_STEM_MAX))
 }
 
 /// The bridge access port for an attachment (veth host side, or the tap itself).
@@ -244,5 +266,23 @@ mod tests {
             "{name}"
         );
         assert!(name.len() <= IFNAME_MAX);
+    }
+
+    #[test]
+    fn wireguard_tunnel_names_are_deterministic_and_fit_ifnamsiz() {
+        assert_eq!(wireguard_tunnel("ota-uplink"), "vxwg-ota-uplink");
+        // Same pure-function contract as `access_port`: depends on its own id alone.
+        let before = wireguard_tunnel("tun-b");
+        for neighbour in ["tun-a", "aaa", "zzz"] {
+            assert_ne!(wireguard_tunnel(neighbour), before);
+        }
+        assert_eq!(wireguard_tunnel("tun-b"), before);
+        // Long ids shorten deterministically, same scheme as `stem`.
+        let long = wireguard_tunnel("ota-uplink-to-central-compute-site-2");
+        assert!(long.len() <= IFNAME_MAX, "{long} is {} bytes", long.len());
+        assert_eq!(
+            long,
+            wireguard_tunnel("ota-uplink-to-central-compute-site-2")
+        );
     }
 }

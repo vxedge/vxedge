@@ -354,6 +354,39 @@ pub enum SliceMode {
     SNssai,
 }
 
+/// A point-to-point encrypted overlay link the gateway itself terminates (`docs/TASKS.md` #16,
+/// "WireGuard link setup") — the mechanism behind §7's "WireGuard (in-kernel) for secure
+/// telemetry and OTA transport." Distinct from `Slice`/VLANs: a slice partitions the *local*
+/// bridge fabric zone nodes attach to, a tunnel is a routed L3 endpoint reaching a *remote* peer
+/// (another site's gateway, in the multi-host case `VXLAN` shares this same `network.tunnels`
+/// block for). One `TunnelKind` today; a `vxlan` sibling is a documented future addition to the
+/// same block, not a reason to design a second one later.
+///
+/// No local key material here, deliberately: a manifest is a versioned document, and a private
+/// key does not belong in one. The gateway mints its own identity on first `up` (never written
+/// to disk, see `provision::apply_tunnel`) and `GatewayStatus` reports the resulting public key
+/// back — the peer's public key is the only secret-adjacent value this struct ever carries, and
+/// it is public by definition.
+#[derive(Debug, Clone)]
+pub struct Tunnel {
+    pub id: String,
+    pub kind: TunnelKind,
+    pub listen_port: u16,
+    /// This side's address on the tunnel interface, CIDR form.
+    pub address: String,
+    pub peer_public_key: String,
+    /// Omit when this side only listens and learns the peer's endpoint from its first
+    /// authenticated packet — WireGuard's own roaming behavior, the right shape for a
+    /// controller reaching a NAT'd site rather than the other way round.
+    pub peer_endpoint: Option<String>,
+    pub peer_allowed_ips: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunnelKind {
+    Wireguard,
+}
+
 /// Which mechanism renders a [`crate::gateway::GatewayPlan`] onto the host: `gateway::provision`'s
 /// `KernelBridge` (the default, and the one every frozen H1/H3/H4 number was measured on) or the
 /// OVS variant behind the same plan. A manifest field rather than a daemon flag, matching every
@@ -386,6 +419,7 @@ pub struct Experiment {
     pub id: String,
     pub entities: Vec<Entity>,
     pub slices: Vec<Slice>,
+    pub tunnels: Vec<Tunnel>,
     /// Aggregate rate of the shared uplink bottleneck, in bits per second.
     ///
     /// This is where slice contention is actually measured, so dropping it silently would change

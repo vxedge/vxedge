@@ -24,8 +24,9 @@ use vxedge_api::v1::{
     GatewayStatus, GatewayStatusRequest, GatewayUpRequest, GetJobRequest, ImagePushRequest,
     ImagePushResponse, ImpairmentStatus, IngressFilterStatus, Job, ManifestRef, ResourceKind,
     ResourceState, ResourceStatus, SliceStatus, SubscribeRequest, SvcDownRequest, SvcStatusRequest,
-    SvcUpRequest, TrafficDownRequest, TrafficUpRequest, WatchJobRequest, ZoneApplyRequest,
-    ZoneDownRequest, ZoneListRequest, ZoneListResponse, ZoneRemoveRequest, ZoneUpRequest,
+    SvcUpRequest, TrafficDownRequest, TrafficUpRequest, TunnelStatus, WatchJobRequest,
+    ZoneApplyRequest, ZoneDownRequest, ZoneListRequest, ZoneListResponse, ZoneRemoveRequest,
+    ZoneUpRequest,
 };
 use vxedge_core::Workspace;
 use vxedge_core::fiveg::{self, FiveGLifecycleConfig, FiveGPlan};
@@ -570,7 +571,7 @@ impl GatewayService for GatewaySvc {
             let st = self.state.lock().await;
             (st.gateway.clone(), st.fiveg.clone())
         };
-        let (state, detail, slices, impairments, ingress_filters) = match plan {
+        let (state, detail, slices, impairments, ingress_filters, tunnels) = match plan {
             Some(plan) => {
                 let snssai_count = plan.snssai_slice_ids.len();
                 let shell = self.shell.clone();
@@ -661,6 +662,24 @@ impl GatewayService for GatewaySvc {
                         detail: format!("present={}", f.present),
                     })
                     .collect();
+                // A tunnel's own public key belongs in `status` for the same reason a filter's
+                // presence does — it's the value an operator hands to the peer, and the
+                // manifest never carries it (`model::Tunnel`'s own doc comment).
+                let tunnels: Vec<TunnelStatus> = obs
+                    .tunnels
+                    .iter()
+                    .map(|t| TunnelStatus {
+                        id: t.id.clone(),
+                        state: if t.present {
+                            ResourceState::Up as i32
+                        } else {
+                            ResourceState::Down as i32
+                        },
+                        public_key: t.public_key.clone(),
+                        handshake_established: t.handshake_established,
+                        detail: format!("present={}", t.present),
+                    })
+                    .collect();
                 if obs.fully_up() {
                     (
                         ResourceState::Up,
@@ -673,6 +692,7 @@ impl GatewayService for GatewaySvc {
                         slices,
                         impairments,
                         ingress_filters,
+                        tunnels,
                     )
                 } else {
                     (
@@ -687,6 +707,7 @@ impl GatewayService for GatewaySvc {
                         slices,
                         impairments,
                         ingress_filters,
+                        tunnels,
                     )
                 }
             }
@@ -706,11 +727,13 @@ impl GatewayService for GatewaySvc {
                         vec![],
                         vec![],
                         vec![],
+                        vec![],
                     )
                 } else {
                     (
                         ResourceState::Down,
                         "no gateway provisioned".to_string(),
+                        vec![],
                         vec![],
                         vec![],
                         vec![],
@@ -772,6 +795,7 @@ impl GatewayService for GatewaySvc {
             slices,
             impairments,
             ingress_filters,
+            tunnels,
         }))
     }
 }
