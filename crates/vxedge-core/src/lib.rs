@@ -11,6 +11,7 @@ pub mod model;
 pub mod package;
 pub mod scaffold;
 pub mod services;
+pub mod sonic;
 pub mod traffic;
 pub mod workspace;
 pub mod zones;
