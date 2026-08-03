@@ -543,6 +543,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         sl.slice_id, sl.state, sl.detail
                     );
                 }
+                for imp in &status.impairments {
+                    println!(
+                        "  impairment {} ({}): state={} {}",
+                        imp.link, imp.access_port, imp.state, imp.detail
+                    );
+                }
             } else {
                 println!("gateway: no status reported");
             }
@@ -961,11 +967,20 @@ struct JsonSliceStatus {
 }
 
 #[derive(serde::Serialize)]
+struct JsonImpairmentStatus {
+    link: String,
+    access_port: String,
+    state: i32,
+    detail: String,
+}
+
+#[derive(serde::Serialize)]
 struct JsonStatus {
     vxid: String,
     state: i32,
     detail: String,
     slices: Vec<JsonSliceStatus>,
+    impairments: Vec<JsonImpairmentStatus>,
 }
 
 impl From<&vxedge_api::v1::GatewayStatus> for JsonStatus {
@@ -982,6 +997,16 @@ impl From<&vxedge_api::v1::GatewayStatus> for JsonStatus {
                     slice_id: sl.slice_id.clone(),
                     state: sl.state,
                     detail: sl.detail.clone(),
+                })
+                .collect(),
+            impairments: g
+                .impairments
+                .iter()
+                .map(|imp| JsonImpairmentStatus {
+                    link: imp.link.clone(),
+                    access_port: imp.access_port.clone(),
+                    state: imp.state,
+                    detail: imp.detail.clone(),
                 })
                 .collect(),
         }

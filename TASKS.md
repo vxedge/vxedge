@@ -961,6 +961,13 @@ exp-001 measurements).
       test gained a second, impairment-specific case (both directions installed, redirect count
       pinned across a re-apply) but — like the cycle test it sits beside — has not yet run
       against a real kernel; this is the same standing item the board already tracks for #3/#5/#21.
+      **vxAPI gap found and closed 2026-08-03** (`docs/TASKS.md` #29): this delivery only
+      surfaced impairment health as free text folded into `GatewayStatus`'s aggregate `detail`
+      string, not as a structured, addressable field — a `--json` client had no way to tell
+      which link, on which access port, without parsing prose. Added
+      `GatewayStatus.impairments: repeated ImpairmentStatus` (additive, `buf breaking`-clean),
+      mapped from `GatewayObservation.impairments` in `vxedged`'s status handler, surfaced in
+      `vxedge status` (human + `--json`).
 - [ ] **The seam is in** (2026-07-31): `DataPlane` — `apply_links`/`apply_slices`/
       `apply_endpoints`/`teardown`/`observe`, with `KernelBridge` as the first implementation
       and `data_plane()` the single selection point. The three apply stages are separate trait

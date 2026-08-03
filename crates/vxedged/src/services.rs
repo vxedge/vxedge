@@ -22,10 +22,10 @@ use vxedge_api::v1::{
     ComputeApplyRequest, ComputeDownRequest, ComputeListRequest, ComputeListResponse,
     ComputeRemoveRequest, ComputeUpRequest, Event, GatewayApplyRequest, GatewayDownRequest,
     GatewayStatus, GatewayStatusRequest, GatewayUpRequest, GetJobRequest, ImagePushRequest,
-    ImagePushResponse, Job, ManifestRef, ResourceKind, ResourceState, ResourceStatus, SliceStatus,
-    SubscribeRequest, SvcDownRequest, SvcStatusRequest, SvcUpRequest, TrafficDownRequest,
-    TrafficUpRequest, WatchJobRequest, ZoneApplyRequest, ZoneDownRequest, ZoneListRequest,
-    ZoneListResponse, ZoneRemoveRequest, ZoneUpRequest,
+    ImagePushResponse, ImpairmentStatus, Job, ManifestRef, ResourceKind, ResourceState,
+    ResourceStatus, SliceStatus, SubscribeRequest, SvcDownRequest, SvcStatusRequest, SvcUpRequest,
+    TrafficDownRequest, TrafficUpRequest, WatchJobRequest, ZoneApplyRequest, ZoneDownRequest,
+    ZoneListRequest, ZoneListResponse, ZoneRemoveRequest, ZoneUpRequest,
 };
 use vxedge_core::Workspace;
 use vxedge_core::fiveg::{self, FiveGLifecycleConfig, FiveGPlan};
@@ -539,7 +539,7 @@ impl GatewayService for GatewaySvc {
             let st = self.state.lock().await;
             (st.gateway.clone(), st.fiveg.clone())
         };
-        let (state, detail, slices) = match plan {
+        let (state, detail, slices, impairments) = match plan {
             Some(plan) => {
                 let snssai_count = plan.snssai_slice_ids.len();
                 let shell = self.shell.clone();
@@ -568,7 +568,31 @@ impl GatewayService for GatewaySvc {
                 // Impairments change what every latency number in the run means, so `status`
                 // names them rather than leaving the operator to infer a healthy gateway is an
                 // unimpaired one. A half-installed impairment already makes `fully_up` false;
-                // without this, the degraded line would not say which one.
+                // without this, the degraded line would not say which one. Addressable per-link
+                // (`docs/TASKS.md` #29) rather than folded only into the free-text `detail`
+                // string below — a `--json` client can now tell which link, not just how many.
+                let impairments: Vec<ImpairmentStatus> = obs
+                    .impairments
+                    .iter()
+                    .map(|i| {
+                        let state = if i.healthy() {
+                            ResourceState::Up
+                        } else if i.egress_present || i.ingress_present {
+                            ResourceState::Degraded
+                        } else {
+                            ResourceState::Down
+                        };
+                        ImpairmentStatus {
+                            link: i.link.clone(),
+                            access_port: i.access_port.clone(),
+                            state: state as i32,
+                            detail: format!(
+                                "egress={} ingress={}",
+                                i.egress_present, i.ingress_present
+                            ),
+                        }
+                    })
+                    .collect();
                 let harness = if obs.impairments.is_empty() {
                     String::new()
                 } else {
@@ -597,6 +621,7 @@ impl GatewayService for GatewaySvc {
                             obs.endpoints_expected
                         ),
                         slices,
+                        impairments,
                     )
                 } else {
                     (
@@ -609,6 +634,7 @@ impl GatewayService for GatewaySvc {
                             obs.endpoints_expected
                         ),
                         slices,
+                        impairments,
                     )
                 }
             }
@@ -626,11 +652,13 @@ impl GatewayService for GatewaySvc {
                          run `vxedge up --manifest ...` to reconcile or `vxedge down` to remove"
                             .to_string(),
                         vec![],
+                        vec![],
                     )
                 } else {
                     (
                         ResourceState::Down,
                         "no gateway provisioned".to_string(),
+                        vec![],
                         vec![],
                     )
                 }
@@ -688,6 +716,7 @@ impl GatewayService for GatewaySvc {
                 since_unix_ms: now_ms(),
             }),
             slices,
+            impairments,
         }))
     }
 }

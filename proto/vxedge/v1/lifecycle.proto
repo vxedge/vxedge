@@ -27,12 +27,27 @@ message GatewayStatus {
   ResourceStatus status = 1;
   // Per-slice observed state (VLAN, queue tree, counters summary).
   repeated SliceStatus slices = 2;
+  // Per-link harness impairments actually observed on the kernel (both netem
+  // directions) — empty if none are declared. Was previously folded into
+  // `status.detail` as free text only; addressable per-link here so a
+  // `--json` client doesn't have to parse prose to tell which link is
+  // impaired or whether one direction dropped.
+  repeated ImpairmentStatus impairments = 3;
 }
 
 message SliceStatus {
   string slice_id = 1;
   ResourceState state = 2;
   string detail = 3;
+}
+
+message ImpairmentStatus {
+  string link = 1;
+  string access_port = 2;
+  // UP: both netem directions present. DEGRADED: exactly one — an
+  // asymmetric wire nobody asked for, always a bug. DOWN: neither.
+  ResourceState state = 3;
+  string detail = 4;
 }
 
 service GatewayService {
