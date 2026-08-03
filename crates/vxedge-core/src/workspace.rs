@@ -1242,7 +1242,7 @@ fn collect_files(
     Ok(())
 }
 
-fn is_sha256(d: &str) -> bool {
+pub(crate) fn is_sha256(d: &str) -> bool {
     d.strip_prefix("sha256:")
         .is_some_and(|hex| hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()))
 }

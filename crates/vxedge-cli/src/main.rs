@@ -742,27 +742,52 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             ExperimentCmd::Validate => {
+                // Every cross-file join, *then* every model invariant — found live 2026-08-04:
+                // this used to stop at `ws.validate()` (cross-file joins only) and never called
+                // `model::build()`, so a manifest with an unknown `network.data_plane`, an
+                // unrecognized tunnel/nos_check kind, or any other model-level error reported
+                // "ok" here and only failed later — at `up`, or worse, inside `vxedged`'s own
+                // model build during provisioning. `vxedge manifest validate <path>` already did
+                // this correctly; this command just wasn't calling the same function.
                 let here = here()?;
                 let found = vxedge_core::discover(&here)?;
-                let ws = vxedge_core::Workspace::load(&found.root)?;
-                let errors = ws.validate();
-                if errors.is_empty() {
-                    println!(
-                        "ok: {} — {} experiment, {} vehicle(s), {} baseline(s), {} road(s)",
-                        found.package.id,
-                        ws.experiments.len(),
-                        ws.vehicles.len(),
-                        ws.baselines.len(),
-                        ws.roads.len()
-                    );
-                } else {
-                    // Every problem at once: an engineer fixing a workspace wants the list,
-                    // not a fix-one-rerun loop.
-                    eprintln!("{} problem(s) in {}:", errors.len(), found.root.display());
-                    for e in &errors {
-                        eprintln!("  - {e}");
+                match validate_workspace_dir(&found.root) {
+                    Ok((summary, human)) => {
+                        if cli.json {
+                            let mut obj = serde_json::json!({
+                                "workspace": found.root.display().to_string(), "valid": true,
+                            });
+                            if let (Some(o), Some(extra)) =
+                                (obj.as_object_mut(), summary.as_object())
+                            {
+                                for (k, v) in extra {
+                                    o.insert(k.clone(), v.clone());
+                                }
+                            }
+                            println!("{}", serde_json::to_string_pretty(&obj)?);
+                        } else {
+                            println!("ok: {human}");
+                        }
                     }
-                    std::process::exit(1);
+                    Err(e) => {
+                        if cli.json {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "workspace": found.root.display().to_string(),
+                                    "valid": false, "error": e,
+                                })
+                            );
+                        } else {
+                            // `validate_workspace_dir` already joins every cross-file problem
+                            // it finds into one "  - "-prefixed list (an engineer fixing a
+                            // workspace wants the whole list, not a fix-one-rerun loop); a
+                            // model-level error is a single, specific line. Either way, `e` is
+                            // already the complete message.
+                            eprintln!("problem(s) in {}:\n{e}", found.root.display());
+                        }
+                        std::process::exit(1);
+                    }
                 }
             }
             // The daemon receives the workspace *directory* and lowers it itself. The CLI

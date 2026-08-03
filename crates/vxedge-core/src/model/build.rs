@@ -82,6 +82,31 @@ pub enum ModelError {
          here (`vxedge status` reports it once minted)"
     )]
     MissingTunnelField { tunnel: String, field: &'static str },
+    #[error("`network.nos_check.kind` is `{kind}` — expected `sonic-vs`")]
+    UnknownNosCheckKind { kind: String },
+    #[error("`network.nos_check` is missing `trunk_port`")]
+    MissingNosCheckTrunkPort,
+    #[error(
+        "`network.nos_check.trunk_port` is `{port}`, which is not one of the pinned image's own \
+         port names — expected one of: {valid}. This isn't a name vxedge invents; it comes from \
+         the image itself (confirmed by actually booting it, `vxparts/parts/gw/nos/os/sonic-vs`), \
+         so a typo here is caught now rather than as a boot-time failure later."
+    )]
+    UnknownNosCheckTrunkPort { port: String, valid: String },
+    #[error(
+        "`network.nos_check` declares `{present}` without `{missing}` — both `part_ref` and \
+         `digest` are required together (a ref with no digest isn't reproducible, §13; a digest \
+         with no ref names nothing) or both omitted, to use the default pinned build"
+    )]
+    NosCheckRefWithoutDigest {
+        present: &'static str,
+        missing: &'static str,
+    },
+    #[error(
+        "`network.nos_check.digest` is `{digest}` — expected `sha256:` followed by 64 hex \
+         characters"
+    )]
+    MalformedNosCheckDigest { digest: String },
 }
 
 /// Range-checked narrowing from YAML's `u64`.
@@ -628,6 +653,64 @@ fn tunnels_of(raw: &Value) -> Result<Vec<Tunnel>, ModelError> {
     Ok(out)
 }
 
+/// `network.nos_check` (`docs/TASKS.md` #16/#31) — absent, like `tunnels`, means "no check,"
+/// not an error: most experiments don't declare it.
+fn nos_check_of(raw: &Value) -> Result<Option<NosCheck>, ModelError> {
+    let Some(n) = raw.get("network").and_then(|n| n.get("nos_check")) else {
+        return Ok(None);
+    };
+    let kind = match n.get("kind").and_then(|v| v.as_str()) {
+        Some("sonic-vs") | None => NosCheckKind::SonicVs,
+        Some(other) => {
+            return Err(ModelError::UnknownNosCheckKind {
+                kind: other.to_string(),
+            });
+        }
+    };
+    let trunk_port = n
+        .get("trunk_port")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+        .ok_or(ModelError::MissingNosCheckTrunkPort)?;
+    if !kind.valid_trunk_ports().contains(&trunk_port.as_str()) {
+        return Err(ModelError::UnknownNosCheckTrunkPort {
+            port: trunk_port,
+            valid: kind.valid_trunk_ports().join(", "),
+        });
+    }
+    let part_ref = n
+        .get("part_ref")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    let digest = n.get("digest").and_then(|v| v.as_str()).map(str::to_owned);
+    match (&part_ref, &digest) {
+        (Some(_), None) => {
+            return Err(ModelError::NosCheckRefWithoutDigest {
+                present: "part_ref",
+                missing: "digest",
+            });
+        }
+        (None, Some(_)) => {
+            return Err(ModelError::NosCheckRefWithoutDigest {
+                present: "digest",
+                missing: "part_ref",
+            });
+        }
+        _ => {}
+    }
+    if let Some(d) = &digest
+        && !crate::workspace::is_sha256(d)
+    {
+        return Err(ModelError::MalformedNosCheckDigest { digest: d.clone() });
+    }
+    Ok(Some(NosCheck {
+        kind,
+        trunk_port,
+        part_ref,
+        digest,
+    }))
+}
+
 fn traffic_endpoint(raw: &str, devices: &BTreeMap<String, Device>) -> TrafficEndpoint {
     if devices.contains_key(raw) {
         TrafficEndpoint::Device(raw.to_string())
@@ -785,6 +868,7 @@ pub fn build(ws: &Workspace) -> Result<Experiment, ModelError> {
         data_plane: data_plane_of(&raw)?,
         slices: slices_of(&raw)?,
         tunnels: tunnels_of(&raw)?,
+        nos_check: nos_check_of(&raw)?,
         entities,
         traffic,
         method,
@@ -1401,5 +1485,153 @@ links:
         assert_eq!(h.medium.as_deref(), Some("100BASE-T1"));
         assert_eq!(h.length_m, Some(2.4));
         assert_eq!(h.weight_g, Some(85.0));
+    }
+
+    /// Base fixture for every `network.nos_check` test below — one valid slice (required
+    /// regardless, `PlanError::NoSlices` is a separate concern) and no devices, since
+    /// `nos_check` doesn't attach to anything in the vehicle.
+    const NOS_CHECK_BASE: &str = r#"
+kind: experiment
+id: e
+vehicles: [veh]
+network:
+  slices: [{ id: adas, mode: vlan, vlan: 101 }]
+  nos_check:
+    kind: sonic-vs
+    trunk_port: Ethernet0
+---
+kind: vehicle
+id: veh
+devices: {}
+"#;
+
+    #[test]
+    fn absent_nos_check_is_none_not_an_error() {
+        let ws = r#"
+kind: experiment
+id: e
+vehicles: [veh]
+network:
+  slices: [{ id: adas, mode: vlan, vlan: 101 }]
+---
+kind: vehicle
+id: veh
+devices: {}
+"#;
+        let m = load_yaml(ws).expect("valid workspace");
+        assert!(m.nos_check.is_none());
+    }
+
+    #[test]
+    fn a_valid_nos_check_declaration_parses() {
+        let m = load_yaml(NOS_CHECK_BASE).expect("valid workspace");
+        let n = m.nos_check.expect("nos_check present");
+        assert_eq!(n.kind, NosCheckKind::SonicVs);
+        assert_eq!(n.trunk_port, "Ethernet0");
+        assert!(n.part_ref.is_none());
+        assert!(n.digest.is_none());
+    }
+
+    #[test]
+    fn an_unknown_nos_check_kind_is_refused() {
+        let ws = NOS_CHECK_BASE.replacen("kind: sonic-vs", "kind: dent", 1);
+        match load_yaml(&ws) {
+            Err(LoadError::Model(ModelError::UnknownNosCheckKind { kind })) => {
+                assert_eq!(kind, "dent");
+            }
+            other => panic!("expected UnknownNosCheckKind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nos_check_without_a_trunk_port_is_refused() {
+        let ws = NOS_CHECK_BASE.replacen("    trunk_port: Ethernet0\n", "", 1);
+        match load_yaml(&ws) {
+            Err(LoadError::Model(ModelError::MissingNosCheckTrunkPort)) => {}
+            other => panic!("expected MissingNosCheckTrunkPort, got {other:?}"),
+        }
+    }
+
+    /// The whole point of validating against an enumerated, live-confirmed list rather than a
+    /// pattern: `Ethernet1` matches a naive `Ethernet\d+` regex but is not a real port on this
+    /// image (real ports are multiples of 4), and a free-form string would let this through to
+    /// fail as a confusing boot-time error instead of a clear declaration error now.
+    #[test]
+    fn a_trunk_port_not_on_the_pinned_images_own_list_is_refused() {
+        let ws = NOS_CHECK_BASE.replacen("Ethernet0", "Ethernet1", 1);
+        match load_yaml(&ws) {
+            Err(LoadError::Model(ModelError::UnknownNosCheckTrunkPort { port, valid })) => {
+                assert_eq!(port, "Ethernet1");
+                assert!(valid.contains("Ethernet0"));
+                assert!(valid.contains("Ethernet124"));
+            }
+            other => panic!("expected UnknownNosCheckTrunkPort, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_part_ref_without_a_digest_is_refused() {
+        let ws = NOS_CHECK_BASE.replacen(
+            "    trunk_port: Ethernet0\n",
+            "    trunk_port: Ethernet0\n    part_ref: ghcr.io/vxedge/parts/gw/nos/os/sonic-vs:202505.1182664\n",
+            1,
+        );
+        match load_yaml(&ws) {
+            Err(LoadError::Model(ModelError::NosCheckRefWithoutDigest { present, missing })) => {
+                assert_eq!(present, "part_ref");
+                assert_eq!(missing, "digest");
+            }
+            other => panic!("expected NosCheckRefWithoutDigest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_digest_without_a_part_ref_is_refused() {
+        let ws = NOS_CHECK_BASE.replacen(
+            "    trunk_port: Ethernet0\n",
+            "    trunk_port: Ethernet0\n    digest: sha256:0a95ffa745e8e9871653d8605f372a2761edcef2ec53844a37651e343be7dda5\n",
+            1,
+        );
+        match load_yaml(&ws) {
+            Err(LoadError::Model(ModelError::NosCheckRefWithoutDigest { present, missing })) => {
+                assert_eq!(present, "digest");
+                assert_eq!(missing, "part_ref");
+            }
+            other => panic!("expected NosCheckRefWithoutDigest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_malformed_nos_check_digest_is_refused() {
+        let ws = NOS_CHECK_BASE.replacen(
+            "    trunk_port: Ethernet0\n",
+            "    trunk_port: Ethernet0\n    part_ref: ghcr.io/vxedge/parts/gw/nos/os/sonic-vs:202505.1182664\n    digest: not-a-real-digest\n",
+            1,
+        );
+        match load_yaml(&ws) {
+            Err(LoadError::Model(ModelError::MalformedNosCheckDigest { digest })) => {
+                assert_eq!(digest, "not-a-real-digest");
+            }
+            other => panic!("expected MalformedNosCheckDigest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_valid_part_ref_and_digest_override_parse_together() {
+        let ws = NOS_CHECK_BASE.replacen(
+            "    trunk_port: Ethernet0\n",
+            "    trunk_port: Ethernet0\n    part_ref: ghcr.io/vxedge/parts/gw/nos/os/sonic-vs:202505.1182664\n    digest: sha256:0a95ffa745e8e9871653d8605f372a2761edcef2ec53844a37651e343be7dda5\n",
+            1,
+        );
+        let m = load_yaml(&ws).expect("valid workspace");
+        let n = m.nos_check.expect("nos_check present");
+        assert_eq!(
+            n.part_ref.as_deref(),
+            Some("ghcr.io/vxedge/parts/gw/nos/os/sonic-vs:202505.1182664")
+        );
+        assert_eq!(
+            n.digest.as_deref(),
+            Some("sha256:0a95ffa745e8e9871653d8605f372a2761edcef2ec53844a37651e343be7dda5")
+        );
     }
 }

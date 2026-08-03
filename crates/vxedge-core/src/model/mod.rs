@@ -387,6 +387,85 @@ pub enum TunnelKind {
     Wireguard,
 }
 
+/// Opts an experiment into checking its `network.slices` VLAN intent against a real production
+/// network OS, alongside — never instead of — the actual measured path (`network.data_plane`).
+/// (`docs/TASKS.md` #16/#31, schema settled 2026-08-04.)
+///
+/// Deliberately not named "twin": the whole testbed already is one, so reusing that word for
+/// one internal field would describe nothing. What this is: a **check** — boot a real instance
+/// of the named NOS, hand it the same VLAN declaration `network.slices` already expresses, and
+/// confirm it accepts and reports back exactly that. It never carries measured traffic (§7:
+/// SONiC-VS is functional but not timing-representative) and is not part of `experiment up`'s
+/// provisioning sequence — a missing or misconfigured block never blocks or changes what an
+/// experiment actually measures.
+#[derive(Debug, Clone)]
+pub struct NosCheck {
+    pub kind: NosCheckKind,
+    /// One of the pinned image's own, fixed port names — not a name vxedge invents. Validated
+    /// in `model::build` against the enumerated, live-confirmed list for the pinned image
+    /// (SONiC-VS's default reference platform: 32 names, `Ethernet0`/`Ethernet4`/.../
+    /// `Ethernet124`), not a free-form string or a loose pattern — a wrong port name is a
+    /// declaration error, caught at `vxedge experiment validate` time, not an uncaught runtime
+    /// surprise three stages later.
+    pub trunk_port: String,
+    /// Override the pinned build this NOS's part resolves to. Required together, never one
+    /// without the other (a ref with no digest isn't reproducible — §13 — and a digest with no
+    /// ref names nothing); both absent means the default pinned build.
+    pub part_ref: Option<String>,
+    pub digest: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NosCheckKind {
+    SonicVs,
+}
+
+impl NosCheckKind {
+    /// The image's fixed, live-confirmed port names — see [`NosCheck::trunk_port`]'s own doc
+    /// comment for why this is an enumerated list rather than a pattern. `SonicVs`'s default
+    /// reference platform (`Force10-S6000` HwSKU) exposes exactly these 32, confirmed by
+    /// actually booting it (`vxparts/parts/gw/nos/os/sonic-vs`) — a different pinned image or a
+    /// second `NosCheckKind` would need its own confirmed list, not a formula assumed to hold.
+    pub fn valid_trunk_ports(self) -> &'static [&'static str] {
+        match self {
+            NosCheckKind::SonicVs => &[
+                "Ethernet0",
+                "Ethernet4",
+                "Ethernet8",
+                "Ethernet12",
+                "Ethernet16",
+                "Ethernet20",
+                "Ethernet24",
+                "Ethernet28",
+                "Ethernet32",
+                "Ethernet36",
+                "Ethernet40",
+                "Ethernet44",
+                "Ethernet48",
+                "Ethernet52",
+                "Ethernet56",
+                "Ethernet60",
+                "Ethernet64",
+                "Ethernet68",
+                "Ethernet72",
+                "Ethernet76",
+                "Ethernet80",
+                "Ethernet84",
+                "Ethernet88",
+                "Ethernet92",
+                "Ethernet96",
+                "Ethernet100",
+                "Ethernet104",
+                "Ethernet108",
+                "Ethernet112",
+                "Ethernet116",
+                "Ethernet120",
+                "Ethernet124",
+            ],
+        }
+    }
+}
+
 /// Which mechanism renders a [`crate::gateway::GatewayPlan`] onto the host: `gateway::provision`'s
 /// `KernelBridge` (the default, and the one every frozen H1/H3/H4 number was measured on) or the
 /// OVS variant behind the same plan. A manifest field rather than a daemon flag, matching every
@@ -420,6 +499,7 @@ pub struct Experiment {
     pub entities: Vec<Entity>,
     pub slices: Vec<Slice>,
     pub tunnels: Vec<Tunnel>,
+    pub nos_check: Option<NosCheck>,
     /// Aggregate rate of the shared uplink bottleneck, in bits per second.
     ///
     /// This is where slice contention is actually measured, so dropping it silently would change
