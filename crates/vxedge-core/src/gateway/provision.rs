@@ -1271,6 +1271,7 @@ pub fn apply(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
     apply_links(sh, plan)?;
     apply_slices(sh, plan)?;
     apply_endpoints(sh, plan)?;
+    apply_tunnels(sh, plan)?;
     Ok(())
 }
 
