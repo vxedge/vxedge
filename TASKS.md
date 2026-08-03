@@ -497,10 +497,26 @@ exp-001 measurements).
       WireGuard handshake** completed by pinging across the tunnel's own encrypted overlay
       address and checking both the kernel's own handshake timer and that the ping actually
       got through. Requires `wireguard-tools` (`apt install wireguard-tools` — already listed
-      in `docs/TESTBED-SETUP.md` Tier 2, unrelated to this change) for the `wg` CLI; **not yet
-      live-verified in this environment** — `wg` isn't installed on the dev host this was built
-      on. `vxota` is **not** yet wired to bind `config.listen` onto a tunnel address — this
-      delivers the mechanism `docs/ARCHITECTURE.md` §8 was waiting on, not the integration;
+      in `docs/TESTBED-SETUP.md` Tier 2, unrelated to this change) for the `wg` CLI.
+      **Live-verified under sudo 2026-08-03**, after installing `wireguard-tools` and three
+      rounds of real bugs the live run caught (each fixed and re-verified before the next):
+      (1) a second, older free `provision::apply` function duplicating the trait's default
+      `apply_links`/`apply_slices`/`apply_endpoints` sequence — used only by this test harness,
+      confirmed via grep never reachable from `vxedged` in production — still existed
+      unbeknownst and was missing the new `apply_tunnels` call, so a plan with a tunnel silently
+      provisioned everything except the tunnel with no error; (2) this build of
+      `wireguard-tools` (Ubuntu noble, 1.0.20210914) rejects `-` for `wg set ... private-key -`
+      with a literal `fopen` error instead of reading stdin, despite that being documented
+      behavior for some other `wg` options — switched to `/dev/stdin`, a real path that
+      resolves to the piped stdin regardless of `wg`'s own argument-parsing special cases;
+      (3) the test's placeholder peer key was a literal string, and `wg` validates a peer's key
+      strictly (format and curve validity) before applying anything else in the same `wg set`
+      call — fixed by generating a real, if meaningless, throwaway keypair for the placeholder
+      instead. All 5 privileged gateway tests pass on the final run (the pre-existing 4
+      unaffected throughout — proof no regression rode in on this work). Item #16's WireGuard
+      sub-item is closed as a mechanism. `vxota` is **not** yet wired to bind `config.listen`
+      onto a tunnel address — this delivers the mechanism `docs/ARCHITECTURE.md` §8 was waiting
+      on, not the integration;
       that remains open, tracked in §4 below.
 - [ ] VXLAN inter-host links
 - [ ] FRR config rendering (BGP optional path)
