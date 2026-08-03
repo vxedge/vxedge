@@ -611,6 +611,27 @@ exp-001 measurements).
 
 ## 4. Phase 2
 
+- [x] `network.nos_check`: model + validation — **delivered 2026-08-04**
+      (`docs/TASKS.md` #31). `model::NosCheck`/`NosCheckKind`, parsed from
+      `network.nos_check`, mirroring `Tunnel`/`TunnelKind`'s shape. Scoped to model +
+      validation only — lifecycle wiring (booting the check, loading config, live
+      verification) is a separate, larger follow-on, not rushed into this pass. Two-layer
+      validation: structural (offline, at `experiment validate`/model-build time — `kind`
+      recognized, `trunk_port` checked against the pinned image's own enumerated,
+      live-confirmed 32-port list rather than a regex, `part_ref`/`digest` required
+      together or not at all, digest well-formed `sha256:<64 hex>` — each a named
+      `ModelError`, 9 unit tests) and semantic (only checkable once a real instance boots,
+      documented as a real boundary, not promised early). **Found and fixed a real,
+      separately significant bug along the way**: `vxedge experiment validate` (the
+      cwd-addressed everyday command) only ever ran `ws.validate()` (cross-file joins) and
+      never called `model::build()` at all — so *any* model-level error, not just
+      `nos_check`'s, silently reported "ok" and would only have surfaced later, at `up` or
+      inside `vxedged`'s own model build during provisioning. `vxedge manifest validate
+      <path>` already did this correctly; fixed `experiment validate` to route through the
+      same `validate_workspace_dir` helper (which also gains `--json` support it lacked).
+      Live-verified: bad `trunk_port` fails with the exact model error, valid config
+      passes (human + `--json`), pre-existing cross-file errors still caught — additive,
+      no regression.
 - [ ] Open5GS/UERANSIM driver: `mode: s-nssai` slice provisioning (H2). *In progress,
       major milestone reached 2026-07-14 — **end-to-end slice-differentiated PDU
       sessions proven live**:
