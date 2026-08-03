@@ -455,11 +455,14 @@ exp-001 measurements).
       bounded so a persistent failure (a real bug) still fails with the observed delta, not
       retried forever. Progress messages note the attempt number on retries
       (`... (reconcile attempt 2/3)`); the final error message states how many attempts ran.
-      Verified: full workspace build/clippy/fmt clean, 141 unit tests unchanged. **Not yet
-      live-verified against a real transient failure** — that needs fault injection this
-      change didn't add a seam for, and the common (first-attempt-succeeds) path is already
-      covered by the existing privileged netns tests, which should be re-run to confirm no
-      regression to that path since this touches `GatewayService.Up` directly.
+      Verified: full workspace build/clippy/fmt clean, 141 unit tests unchanged; all 4
+      privileged gateway tests re-run live 2026-08-03 (`gateway_netns.rs`'s 3 +
+      `gateway_ovs.rs`'s 1), all pass — confirms no regression to the common
+      (first-attempt-succeeds) path now that it's wrapped in the loop. **Still not
+      live-verified against a real transient failure specifically** — that needs fault
+      injection this change didn't add a seam for; not blocking, since the loop's own logic is
+      simple (break on first success, same idempotent calls either way) and the thing that
+      could regress — the common path — is exactly what was just reconfirmed.
 
 ## 3. Zone & compute backends (phase 1 minimal, phase 2 full)
 
