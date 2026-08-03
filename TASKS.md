@@ -915,8 +915,15 @@ exp-001 measurements).
       `crates/vxedge-core/src/manifest.rs`). Remove the guard when/if this
       item above is actually implemented.
 - [ ] SONiC-VS twin: render slice intent to SONiC config, boot VS qcow2, verify config parity
-- [ ] TrafficService: synthetic generator (pps/bandwidth/payload per profile)
-- [ ] TS SDK (connect-es) generation + tonic-web enablement; minimal web dashboard repo/dir
+- [x] TrafficService: synthetic generator (pps/bandwidth/payload per profile) — **delivered and
+      live-verified end to end**, see the H2 section above (`vxedge-core::traffic`,
+      `TrafficPlan` + `traffic::lifecycle`, real `vxprobe`/`vxtraffic` processes). This bullet
+      was stale phantom debt (checked 2026-08-03, same class as item #13's earlier one) — found
+      while re-reading this section before starting #16, not a new issue.
+- [ ] TS SDK (connect-es) generation + tonic-web enablement; minimal web dashboard repo/dir —
+      **moved to phase 3/4** (`docs/TASKS.md`'s 2026-08-01 re-scope, "the CLI is the only
+      frontend any experiment uses"). Kept here, not deleted, so this section stays a complete
+      record of everything phase 2 originally scoped; not phase-2 remaining work.
 - [ ] mTLS + OIDC auth path; viewer/operator/admin roles
 - [x] Harness `impairments` rendering: tc netem per link (rate cap, latency/jitter, loss —
       100/1000BASE-T1 emulation) — **delivered 2026-08-01**. `links[].impairments` in the §6.0
