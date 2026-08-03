@@ -651,27 +651,29 @@ fn ingress_filter_drops_spoofed_source_but_allows_declared_one() {
         ],
     )
     .unwrap();
-    let spoofed = sh
-        .run_host(
-            "ip",
-            &[
-                "netns",
-                "exec",
-                &container_ns,
-                "ping",
-                "-c",
-                "5",
-                "-W",
-                "1",
-                "-I",
-                spoofed_addr,
-                &far_side_addr,
-            ],
-        )
-        .unwrap();
+    // `Shell::run_host` treats a non-zero exit as `Err` and does not carry stdout on that path
+    // (`netops.rs`'s `NetOpsError::Command` — by design, "the command failed" is what callers
+    // act on, not its output text). `ping` exits non-zero on 100% loss, so that `Err` itself
+    // *is* the signal here — there is no `Ok` text to pattern-match the way `legit` above does.
+    let spoofed = sh.run_host(
+        "ip",
+        &[
+            "netns",
+            "exec",
+            &container_ns,
+            "ping",
+            "-c",
+            "5",
+            "-W",
+            "1",
+            "-I",
+            spoofed_addr,
+            &far_side_addr,
+        ],
+    );
     assert!(
-        spoofed.contains("0 received") || spoofed.contains("100% packet loss"),
-        "spoofed ping (from an address other than the declared one) was not dropped: {spoofed}"
+        spoofed.is_err(),
+        "spoofed ping (from an address other than the declared one) unexpectedly succeeded: {spoofed:?}"
     );
 
     // Not just "the ping failed" — the drop rule's own counter proves *this* filter is why,
