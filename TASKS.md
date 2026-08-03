@@ -445,8 +445,21 @@ exp-001 measurements).
 - [ ] FRR config rendering (BGP optional path)
 - [ ] Port NetOps from iproute2 argv exec to pure rtnetlink/netlink (recorded deviation
       from AGENTS.md; plan/observe layers are unaffected)
-- [ ] Reconciler: converge partial state (up-after-partial-failure repairs deltas rather
-      than failing verify)
+- [x] Reconciler: converge partial state (up-after-partial-failure repairs deltas rather
+      than failing verify) — **delivered 2026-08-03**. `GatewayService.Up`'s
+      apply→apply→apply→observe→verify sequence is now a bounded retry loop (3 attempts,
+      300ms between): `apply_links`/`apply_slices`/`apply_endpoints` are each already
+      individually idempotent (proven by the netns test's double-apply case), so a single
+      observed gap after one pass no longer fails `up` outright — it retries the same
+      idempotent sequence automatically, the same re-run an operator would have done by hand,
+      bounded so a persistent failure (a real bug) still fails with the observed delta, not
+      retried forever. Progress messages note the attempt number on retries
+      (`... (reconcile attempt 2/3)`); the final error message states how many attempts ran.
+      Verified: full workspace build/clippy/fmt clean, 141 unit tests unchanged. **Not yet
+      live-verified against a real transient failure** — that needs fault injection this
+      change didn't add a seam for, and the common (first-attempt-succeeds) path is already
+      covered by the existing privileged netns tests, which should be re-run to confirm no
+      regression to that path since this touches `GatewayService.Up` directly.
 
 ## 3. Zone & compute backends (phase 1 minimal, phase 2 full)
 

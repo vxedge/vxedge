@@ -281,45 +281,76 @@ impl GatewaySvc {
                         plan.summary()
                     )),
                     Verb::Up => {
-                        p.update(50, "provisioning bridge + uplink");
-                        let sh = shell.clone();
-                        let pl = plan.clone();
-                        blocking(move || {
-                            gateway::data_plane(pl.data_plane)
-                                .apply_links(&sh, &pl)
-                                .map_err(|e| e.to_string())
-                        })
-                        .await?;
-                        p.update(65, "applying slice VLANs + HTB queue tree");
-                        let sh = shell.clone();
-                        let pl = plan.clone();
-                        blocking(move || {
-                            gateway::data_plane(pl.data_plane)
-                                .apply_slices(&sh, &pl)
-                                .map_err(|e| e.to_string())
-                        })
-                        .await?;
-                        p.update(80, "attaching zone endpoints");
-                        let sh = shell.clone();
-                        let pl = plan.clone();
-                        blocking(move || {
-                            gateway::data_plane(pl.data_plane)
-                                .apply_endpoints(&sh, &pl)
-                                .map_err(|e| e.to_string())
-                        })
-                        .await?;
-                        p.update(90, "verifying observed state");
-                        let sh = shell.clone();
-                        let pl = plan.clone();
-                        let obs = blocking(move || {
-                            gateway::data_plane(pl.data_plane)
-                                .observe(&sh, &pl)
-                                .map_err(|e| e.to_string())
-                        })
-                        .await?;
+                        // Converging reconciler (`docs/TASKS.md` #16 / vxedge/TASKS.md §2):
+                        // `apply_links`/`apply_slices`/`apply_endpoints` are each individually
+                        // idempotent (the netns integration test proves double-apply is a
+                        // no-op), but until now a single observed gap after one pass — a
+                        // transient kernel-level hiccup, not a real misconfiguration — failed
+                        // the whole `up` outright and left the operator to notice and re-run
+                        // it themselves, even though a second, identical apply pass would very
+                        // likely have converged. Retrying the same idempotent sequence in
+                        // place is that same re-run, just automatic and bounded rather than
+                        // manual and open-ended. `MAX_ATTEMPTS` bounds it: a persistent
+                        // failure (a real bug, not a transient one) still fails `up`, with the
+                        // observed delta after every attempt, not silently retried forever.
+                        const MAX_ATTEMPTS: u32 = 3;
+                        let mut last_obs = None;
+                        for attempt in 1..=MAX_ATTEMPTS {
+                            let note = if attempt == 1 {
+                                String::new()
+                            } else {
+                                format!(" (reconcile attempt {attempt}/{MAX_ATTEMPTS})")
+                            };
+                            p.update(50, &format!("provisioning bridge + uplink{note}"));
+                            let sh = shell.clone();
+                            let pl = plan.clone();
+                            blocking(move || {
+                                gateway::data_plane(pl.data_plane)
+                                    .apply_links(&sh, &pl)
+                                    .map_err(|e| e.to_string())
+                            })
+                            .await?;
+                            p.update(65, &format!("applying slice VLANs + HTB queue tree{note}"));
+                            let sh = shell.clone();
+                            let pl = plan.clone();
+                            blocking(move || {
+                                gateway::data_plane(pl.data_plane)
+                                    .apply_slices(&sh, &pl)
+                                    .map_err(|e| e.to_string())
+                            })
+                            .await?;
+                            p.update(80, &format!("attaching zone endpoints{note}"));
+                            let sh = shell.clone();
+                            let pl = plan.clone();
+                            blocking(move || {
+                                gateway::data_plane(pl.data_plane)
+                                    .apply_endpoints(&sh, &pl)
+                                    .map_err(|e| e.to_string())
+                            })
+                            .await?;
+                            p.update(90, "verifying observed state");
+                            let sh = shell.clone();
+                            let pl = plan.clone();
+                            let obs = blocking(move || {
+                                gateway::data_plane(pl.data_plane)
+                                    .observe(&sh, &pl)
+                                    .map_err(|e| e.to_string())
+                            })
+                            .await?;
+                            let converged = obs.fully_up();
+                            last_obs = Some(obs);
+                            if converged {
+                                break;
+                            }
+                            if attempt < MAX_ATTEMPTS {
+                                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                            }
+                        }
+                        let obs = last_obs.expect("loop runs at least once");
                         if !obs.fully_up() {
                             return Err(format!(
-                                "provisioning incomplete: bridge={} uplink={} endpoints={}/{}",
+                                "provisioning incomplete after {MAX_ATTEMPTS} attempts (idempotent \
+                                 re-apply did not converge): bridge={} uplink={} endpoints={}/{}",
                                 obs.bridge_present,
                                 obs.uplink_present,
                                 obs.endpoints_present,
