@@ -43,6 +43,24 @@ parts:
   - { ref: 'local/probe:host-process', target_ids: fn-info }
 "#;
 
+/// A second usable IPv4 address in the same subnet as a declared CIDR (e.g. `10.103.0.2/24`
+/// -> `("10.103.0.1", 24)`) — for placing a "far side" address on the same subnet as a node's
+/// own, the production shape (`vxup0p.<vlan>` sharing a /24 with the zone), derived from the
+/// node's actual declared address rather than a second literal picked to happen to match it.
+fn sibling_address(cidr: &str) -> (String, u8) {
+    let (ip, prefix) = cidr.split_once('/').expect("CIDR has a prefix");
+    let prefix: u8 = prefix.parse().expect("prefix is numeric");
+    let mut octets: Vec<u8> = ip.split('.').map(|o| o.parse().unwrap()).collect();
+    assert_eq!(octets.len(), 4, "IPv4 only: {cidr}");
+    octets[3] = if octets[3] == 1 { 2 } else { 1 };
+    let addr = octets
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>()
+        .join(".");
+    (addr, prefix)
+}
+
 /// Deletes the test netns even if assertions panic.
 struct NetnsGuard(String);
 
@@ -278,4 +296,196 @@ fn impairments_install_both_directions_and_survive_reapply() {
     let gone = observe(&sh, &plan).unwrap();
     assert!(!gone.bridge_present && gone.endpoints_present == 0);
     teardown(&sh, &plan).unwrap();
+}
+
+/// Deliberately its own fixture, not a reuse of `WORKSPACE` above: a device's netns name
+/// (`vx-<device-id>`) carries no per-test salt, so two tests sharing a device id race for the
+/// identical netns when `cargo test` runs them concurrently (found live — this test's first
+/// version reused `node-info-01` and broke `gateway_and_container_zone_cycle_in_netns` with
+/// "File exists" on `eth0`, an actual collision, not a hypothetical one). Same reasoning
+/// `IMPAIRED_WORKSPACE` above already established for its own distinct device id.
+const LOCALITY_WORKSPACE: &str = r#"
+kind: experiment
+id: exp-locality
+vehicles: [veh]
+network:
+  slices:
+    - { id: adas, mode: vlan, vlan: 101 }
+---
+kind: vehicle
+id: veh
+devices:
+  node-locality-01: { role: ecu, backend: container }
+links:
+  - { id: l-locality, endpoints: [{ node: node-locality-01, port: eth0, ip: 10.109.0.2/24 }], slice: adas }
+"#;
+/// The one place this test's device id is spelled out — every other reference below reads
+/// from here, so renaming or reusing the fixture can't silently drift the two apart again.
+const LOCALITY_DEVICE_ID: &str = "node-locality-01";
+
+/// Regression test for docs/TASKS.md #24/#28: exp-001 and exp-003 measured their probe/
+/// reflector exchange over loopback for months, because both addresses lived in the same
+/// network namespace — the kernel's `local` routing table delivers to a same-netns local
+/// address directly, never touching the bridge, HTB tree, or VLAN filtering the manifest
+/// declares. Found live against the real campaign scripts, not just an isolated repro; this
+/// is what makes sure it never comes back silently.
+///
+/// Two independent signals, matching how the original bug was actually characterized:
+/// the routing *decision* from inside the zone's own netns (must not read `dev lo`), and
+/// actual packet delivery on the access port via its own interface counters — `ping`, not a
+/// parsed capture, the same tool the isolated repro used first ("reproduced with plain
+/// ping, not vxprobe-specific").
+#[test]
+#[ignore = "needs CAP_NET_ADMIN; run under sudo (see module docs)"]
+fn zone_traffic_reaches_the_access_port_not_loopback() {
+    let ns = format!("vxlocal{}", std::process::id());
+    let created = std::process::Command::new("ip")
+        .args(["netns", "add", &ns])
+        .output()
+        .expect("iproute2 installed");
+    assert!(
+        created.status.success(),
+        "cannot create netns (run as root): {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let _guard = NetnsGuard(ns.clone());
+    let sh = Shell {
+        netns: Some(ns),
+        escalate: false,
+    };
+
+    let model = vxedge_core::model::load_yaml(LOCALITY_WORKSPACE).expect("workspace loads");
+    let plan = GatewayPlan::from_model(&model).unwrap();
+    apply(&sh, &plan).unwrap();
+
+    let runtime =
+        std::env::temp_dir().join(format!("vxzones-locality-test-{}", std::process::id()));
+    std::fs::create_dir_all(&runtime).unwrap();
+    let nodes = plan_nodes_from_model(&model, &plan, std::path::Path::new("/")).unwrap();
+    let container = nodes
+        .iter()
+        .find(|n| n.node_id == LOCALITY_DEVICE_ID)
+        .expect("container node planned");
+    node_up(&sh, container, &runtime).unwrap();
+
+    let endpoint = plan
+        .endpoints
+        .iter()
+        .find(|e| e.node == LOCALITY_DEVICE_ID)
+        .expect("device's endpoint planned");
+    let slice = plan
+        .slices
+        .iter()
+        .find(|s| s.id == endpoint.slice.as_deref().unwrap_or_default())
+        .expect("device's slice planned");
+
+    // Far side: a VLAN subinterface on the uplink's own peer, on the node's own slice and
+    // subnet — the exact production shape (`vxup0p.<vlan>`, sharing one /24 with the zone's
+    // own address, e.g. `10.103.0.2` + `10.103.0.1`), derived from the node's declared CIDR
+    // rather than a second literal picked to happen to match it. A *different* subnet (tried
+    // first, before this fix) makes the container's netns refuse the route entirely
+    // ("Network is unreachable") rather than exercise the shortcut this test checks for —
+    // same-subnet placement is precisely what let the real bug happen.
+    let node_cidr = container
+        .ip_cidr
+        .as_deref()
+        .expect("the device has a declared ip_cidr");
+    let (far_side_addr, prefix_len) = sibling_address(node_cidr);
+    let far_side_dev = format!("{}.{}", plan.uplink_peer, slice.vlan);
+    sh.run(
+        "ip",
+        &[
+            "link",
+            "add",
+            "link",
+            &plan.uplink_peer,
+            "name",
+            &far_side_dev,
+            "type",
+            "vlan",
+            "id",
+            &slice.vlan.to_string(),
+        ],
+    )
+    .unwrap();
+    sh.run(
+        "ip",
+        &[
+            "addr",
+            "add",
+            &format!("{far_side_addr}/{prefix_len}"),
+            "dev",
+            &far_side_dev,
+        ],
+    )
+    .unwrap();
+    sh.run("ip", &["link", "set", &far_side_dev, "up"]).unwrap();
+    sh.run("ip", &["link", "set", &plan.uplink_peer, "up"])
+        .unwrap();
+
+    // Named netns are host-wide, not nested under `sh.netns` — reaching the container's own
+    // sibling netns needs `run_host`, exactly as the cycle test above does for the same reason.
+    let container_ns = container.runtime_name();
+    let route = sh
+        .run_host(
+            "ip",
+            &[
+                "netns",
+                "exec",
+                &container_ns,
+                "ip",
+                "route",
+                "get",
+                &far_side_addr,
+            ],
+        )
+        .unwrap();
+    assert!(
+        !route.contains(" lo "),
+        "sender resolved the far side via loopback instead of the access port: {route}"
+    );
+
+    // Packet delivery: the access port's own rx counter, read from inside `sh.netns` since
+    // that's where the bridge and its ports live — not a parsed tcpdump capture.
+    let rx_stat_path = format!("/sys/class/net/{}/statistics/rx_packets", endpoint.name);
+    let read_rx = |sh: &Shell| -> u64 {
+        sh.run("cat", &[rx_stat_path.as_str()])
+            .unwrap()
+            .trim()
+            .parse()
+            .expect("rx_packets is an integer")
+    };
+    let rx_before = read_rx(&sh);
+    let ping = sh
+        .run_host(
+            "ip",
+            &[
+                "netns",
+                "exec",
+                &container_ns,
+                "ping",
+                "-c",
+                "5",
+                "-W",
+                "1",
+                &far_side_addr,
+            ],
+        )
+        .unwrap();
+    assert!(
+        ping.contains("5 received") || ping.contains("5 packets received"),
+        "ping to the far side did not complete: {ping}"
+    );
+    let rx_after = read_rx(&sh);
+    assert!(
+        rx_after >= rx_before + 5,
+        "only {} new packets on {} (expected >= 5) — traffic took a shortcut instead of \
+         crossing the access port",
+        rx_after - rx_before,
+        endpoint.name
+    );
+
+    node_down(&sh, container, &runtime).unwrap();
+    teardown(&sh, &plan).unwrap();
+    let _ = std::fs::remove_dir_all(&runtime);
 }
