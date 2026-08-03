@@ -1009,8 +1009,8 @@ exp-001 measurements).
       `parses_and_validates_worked_example` in
       `crates/vxedge-core/src/manifest.rs`). Remove the guard when/if this
       item above is actually implemented.
-- [ ] SONiC-VS twin: render slice intent to SONiC config (**delivered 2026-08-03**), source +
-      publish the image (**delivered 2026-08-03**), boot + verify live config parity (open).
+- [x] SONiC-VS twin: render slice intent to SONiC config, source + publish the image, boot +
+      verify live config parity — **all delivered 2026-08-03**.
       `vxedge_core::sonic` (`plan.rs`/`render.rs`) reduces a `GatewayPlan` to its VLAN slices
       (`SonicPlan`, s-nssai out of scope — that's `fiveg`'s territory) and renders SONiC's
       `config_db.json` `VLAN`/`VLAN_MEMBER` tables, deterministic (`BTreeMap`), 5 unit tests
@@ -1038,13 +1038,26 @@ exp-001 measurements).
       third-party terms, recorded honestly rather than as one clean SPDX. **Published**:
       `ghcr.io/vxedge/parts/gw/nos/os/sonic-vs:202505.1182664`, confirmed via `oras manifest
       fetch` (digest/size/annotations match `meta.json` exactly, not just a successful push
-      exit code). **Still remaining**: pushing `vxedge_core::sonic`'s rendered `config_db.json`
-      into a running instance (`config load`) and reading it back
-      (`show vlan brief`/`redis-cli`) to confirm it matches what the renderer produced —
-      genuine live config-parity verification, distinct from "the image boots and is usable"
-      (now proven) and materially smaller than the sourcing work just finished, since the image
-      itself is now in hand and boot-proven. A privileged test mirroring `gateway_ovs.rs`'s own
-      "second implementation, explicit cleanup" pattern is the natural home.
+      exit code). **Live config-parity verification also delivered, same day**: a new
+      `vxedge-core` example, `render_sonic` (mirrors `render_fiveg`'s existing shape — manifest
+      + trunk port in, `vxedge_core::sonic`'s real rendered JSON out, not a hand-written
+      recreation), feeds `vxparts`' `verify-config-parity.py`, which boots a disposable copy,
+      clears whichever ports the rendered config's own `VLAN_MEMBER` entries name (SONiC-VS's
+      default config pre-assigns every front-panel port as a routed L3 interface — repurposing
+      one for VLAN membership the way a real operator would), loads the config with SONiC's own
+      `config load`, and reads every declared field back via direct CONFIG_DB queries. Result
+      with a 2-VLAN example: **all 4 declared fields matched exactly**
+      (`VLAN|Vlan101.vlanid`, `VLAN|Vlan103.vlanid`,
+      `VLAN_MEMBER|Vlan101|Ethernet0.tagging_mode`,
+      `VLAN_MEMBER|Vlan103|Ethernet0.tagging_mode`), `sonic-cfggen` accepted the renderer's JSON
+      with no errors. Two real `pexpect`-over-serial-console bugs found and fixed getting the
+      verification script itself right (a bare `\$` prompt pattern matching a `$` echoed from a
+      command's own text rather than the actual returning prompt; a rendered JSON's bare row
+      keys needing the table name prefixed for a direct redis-cli lookup) — both documented in
+      `vxparts/parts/gw/nos/os/sonic-vs/README.md` since they're generic gotchas worth knowing
+      again, not specific to this part. **Item #16's SONiC-VS twin is now fully closed**:
+      mechanism, image sourcing, publish, and live config-parity verification all delivered and
+      proven, not assumed.
 - [x] TrafficService: synthetic generator (pps/bandwidth/payload per profile) — **delivered and
       live-verified end to end**, see the H2 section above (`vxedge-core::traffic`,
       `TrafficPlan` + `traffic::lifecycle`, real `vxprobe`/`vxtraffic` processes). This bullet
