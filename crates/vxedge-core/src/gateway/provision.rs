@@ -420,16 +420,22 @@ fn apply_tunnel(
 }
 
 /// Idempotency splits in two, deliberately: interface *creation* (and the one-time key
-/// generation that goes with it) happens only when `sh.link_exists` says the tunnel does not
-/// exist yet; peer/listen-port configuration below that point is `wg set`'s own declarative,
-/// safe-to-repeat form, run on every `apply` regardless. Folding key generation into the
-/// declarative half would regenerate this side's identity on every reconcile pass, silently
-/// invalidating whatever the peer already trusts — the same class of bug `apply_impairment`'s
-/// own doc comment warns about for `tc filter add`, just on the "recreates instead of no-ops"
-/// side rather than the "duplicates" side.
+/// generation that goes with it) happens only when `netlink::link_exists` says the tunnel does
+/// not exist yet; peer/listen-port configuration below that point is `wg set`'s own
+/// declarative, safe-to-repeat form, run on every `apply` regardless. Folding key generation
+/// into the declarative half would regenerate this side's identity on every reconcile pass,
+/// silently invalidating whatever the peer already trusts — the same class of bug
+/// `apply_impairment`'s own doc comment warns about for `tc filter add`, just on the
+/// "recreates instead of no-ops" side rather than the "duplicates" side.
+///
+/// Device creation goes through `netlink::ensure_wireguard` (`docs/TASKS.md` #16, delivered
+/// 2026-08-04) — everything after it (`wg genkey`/`wg set`, the address, bringing the link up)
+/// stays on `Shell`: `wg`'s own configuration is a generic-netlink protocol `rtnetlink` doesn't
+/// implement, not a deferred gap.
 fn apply_wireguard_tunnel(sh: &Shell, t: &super::plan::TunnelPlan) -> Result<(), NetOpsError> {
-    if !sh.link_exists(&t.name) {
-        sh.run("ip", &["link", "add", &t.name, "type", "wireguard"])?;
+    let ns = sh.netns.as_deref();
+    if !netlink::link_exists(ns, &t.name) {
+        netlink::ensure_wireguard(ns, &t.name).map_err(nl)?;
         // The private key never touches disk: piped straight from `wg genkey`'s stdout into
         // `wg set`'s stdin. `/dev/stdin`, not the documented `-` shorthand: found live
         // 2026-08-03 that Ubuntu noble's `wireguard-tools` 1.0.20210914 rejects `-` for
@@ -523,22 +529,13 @@ fn apply_tunnels(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
     Ok(())
 }
 
-/// WireGuard teardown **deliberately stays on `Shell`** even though `netlink::delete_link`
-/// would work identically here (link deletion doesn't care what created the link) — unifying
-/// the two is a real, separate migration decision outside this change's scope
-/// (minimal-footprint principle: don't touch an already-proven path — the one
-/// `tunnel_completes_a_real_handshake_between_two_simulated_hosts` exercises — for a stylistic
-/// win). VXLAN teardown goes through `netlink.rs` because that component was never on the
-/// shell-out to begin with.
+/// Both kinds now tear down through `netlink::delete_link` — link deletion never cared what
+/// created the link, so once `apply_wireguard_tunnel` moved its own creation onto
+/// `netlink.rs` (`docs/TASKS.md` #16, delivered 2026-08-04) there was no remaining reason to
+/// keep WireGuard's delete on the `ip` shell-out; the earlier doc comment here called that a
+/// "separate migration decision outside this change's scope" — this change is that migration.
 fn teardown_tunnel(sh: &Shell, t: &super::plan::TunnelPlan) -> Result<(), NetOpsError> {
-    match t.kind {
-        crate::model::TunnelKind::Wireguard => {
-            sh.run_tolerate_missing("ip", &["link", "del", &t.name])
-        }
-        crate::model::TunnelKind::Vxlan => {
-            netlink::delete_link(sh.netns.as_deref(), &t.name).map_err(nl)
-        }
-    }
+    netlink::delete_link(sh.netns.as_deref(), &t.name).map_err(nl)
 }
 
 fn teardown_tunnels(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
@@ -579,7 +576,7 @@ fn observe_tunnels(sh: &Shell, plan: &GatewayPlan) -> Vec<TunnelObservation> {
 }
 
 fn observe_wireguard_tunnel(sh: &Shell, t: &super::plan::TunnelPlan) -> TunnelObservation {
-    let present = sh.link_exists(&t.name);
+    let present = netlink::link_exists(sh.netns.as_deref(), &t.name);
     let public_key = sh
         .run("wg", &["show", &t.name, "public-key"])
         .map(|s| s.trim().to_string())

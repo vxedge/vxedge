@@ -7,14 +7,19 @@
 //! by reading the actual v0.21.0 source before committing to this — but their `tc` support
 //! covers only `fq_codel`/`ingress` qdiscs, nothing for HTB, netem, or filter actions. The
 //! only crate that claims that coverage is 7 months old with ~1.4K downloads: too immature to
-//! bet the mechanism behind H1's headline number on. So `tc`/`nft`/`wg`/`ovs-vsctl` stay on
+//! bet the mechanism behind H1's headline number on. So `tc`/`ovs-vsctl` stay on
 //! `Shell` — this module covers `apply_links`, `apply_slices`'s trunk-VLAN half,
 //! `apply_endpoints`'s link+VLAN halves, `teardown`'s link deletes, `observe`'s link/VLAN
-//! queries, VXLAN link creation, and (added for zones' container netns lifecycle,
-//! `docs/TASKS.md` #16) netns create/delete/exists plus moving/renaming a link across
-//! namespaces. `docs/TASKS.md` #16 tracks the still-deferred remainder (OVS's own link calls,
-//! the fiveg uplink, WireGuard tunnel device creation, tap devices) as separate, smaller
-//! follow-ons — not silently implied done by this module.
+//! queries, VXLAN link creation, zones' container netns lifecycle (netns create/delete/
+//! exists plus moving/renaming a link across namespaces, `docs/TASKS.md` #16), and (added
+//! 2026-08-04) WireGuard tunnel **device creation only** — `nft`/`wg` genuinely stay on
+//! `Shell` even after this: `nft` has its own JSON-based CLI protocol with no netlink crate
+//! coverage here, and WireGuard peer/key configuration is a *different kernel protocol
+//! family* (generic netlink's `wireguard` family, not rtnetlink), which `LinkWireguard`
+//! deliberately does not attempt to cover — see [`ensure_wireguard`]'s own doc comment.
+//! `docs/TASKS.md` #16 tracks the still-deferred remainder (OVS's own link calls, the fiveg
+//! uplink, tap devices — the last one confirmed not even netlink-portable at all) as
+//! separate, smaller follow-ons — not silently implied done by this module.
 //!
 //! **Netns creation/deletion is not hand-rolled here.** `rtnetlink::NetworkNamespace::add`/
 //! `del` already do exactly what `ip netns add`/`del` do — confirmed by reading the actual
@@ -45,7 +50,9 @@ use rtnetlink::packet_route::AddressFamily;
 use rtnetlink::packet_route::link::{
     AfSpecBridge, BridgeVlanInfoFlags, LinkAttribute, LinkExtentMask,
 };
-use rtnetlink::{LinkBridge, LinkBridgeVlan, LinkUnspec, LinkVeth, LinkVxlan, NetworkNamespace};
+use rtnetlink::{
+    LinkBridge, LinkBridgeVlan, LinkUnspec, LinkVeth, LinkVxlan, LinkWireguard, NetworkNamespace,
+};
 use std::os::fd::AsRawFd;
 
 // Netlink error codes are the kernel's own `-errno`, carried in `ErrorMessage::code`. Named
@@ -314,6 +321,37 @@ pub fn ensure_vxlan(
                     Ok(())
                 } else {
                     Err(op_err("ensure_vxlan", e))
+                }
+            })
+    })
+}
+
+/// Idempotent, same contract as [`ensure_bridge`]. **Device creation only** — `IFLA_LINKINFO`
+/// with `INFO_KIND=wireguard` and no `INFO_DATA`, which is all `ip link add ... type
+/// wireguard` itself does. Peer/key/listen-port configuration is a *different* protocol
+/// entirely (the kernel's `wireguard` generic-netlink family, not rtnetlink at all — no
+/// `IFLA_*` attribute carries a private key or a peer list), so `wg genkey`/`wg set` stay on
+/// the `wg` shell-out in `provision.rs` permanently, not as deferred scope.
+pub fn ensure_wireguard(netns: Option<&str>, name: &str) -> Result<(), NetlinkError> {
+    let name = name.to_string();
+    run_async(netns, "ensure_wireguard", move |handle| async move {
+        if link_index(&handle, &name)
+            .await
+            .map_err(|e| op_err("ensure_wireguard", e))?
+            .is_some()
+        {
+            return Ok(());
+        }
+        handle
+            .link()
+            .add(LinkWireguard::new(&name).build())
+            .execute()
+            .await
+            .or_else(|e| {
+                if is_eexist(&e) {
+                    Ok(())
+                } else {
+                    Err(op_err("ensure_wireguard", e))
                 }
             })
     })
