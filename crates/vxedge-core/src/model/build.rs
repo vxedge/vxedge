@@ -92,6 +92,11 @@ pub enum ModelError {
          network identifier (max 16777215)"
     )]
     VniOutOfRange { tunnel: String, vni: u64 },
+    #[error(
+        "device `{device}` declares `realtime.pinned_cpus` containing `{value}`, which is not \
+         a non-negative integer that fits a CPU index — every entry must be, not just some"
+    )]
+    MalformedPinnedCpu { device: String, value: String },
     #[error("vxlan tunnel `{tunnel}` declares `remote: {remote}`, which is not a valid IP address")]
     MalformedTunnelRemote { tunnel: String, remote: String },
     #[error("`network.nos_check.kind` is `{kind}` — expected `sonic-vs`")]
@@ -501,6 +506,28 @@ fn channel_qos_of(
     })
 }
 
+/// A device's `realtime.pinned_cpus` — §30's audit found this silently dropping any entry that
+/// wasn't a non-negative integer fitting a CPU index (`filter_map` twice over), so a typo'd
+/// `pinned_cpus: [0, one, 2]` used to quietly pin two cores instead of three, no error anywhere.
+fn pinned_cpus_of(device: &str, realtime: Option<&Value>) -> Result<Vec<u32>, ModelError> {
+    let Some(seq) = realtime
+        .and_then(|r| r.get("pinned_cpus"))
+        .and_then(|v| v.as_sequence())
+    else {
+        return Ok(Vec::new());
+    };
+    seq.iter()
+        .map(|v| {
+            v.as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| ModelError::MalformedPinnedCpu {
+                    device: device.to_string(),
+                    value: format!("{v:?}"),
+                })
+        })
+        .collect()
+}
+
 /// §6.0 → entity. Nothing is synthesized: the schema declares zones, devices and functions as
 /// separate things, so this reads them. The earlier builder had to invent a function per device
 /// because §6.0 could not say what a function was — that was the gap this schema closed.
@@ -543,18 +570,7 @@ fn build_entity(ws: &Workspace, doc: &VehicleDoc) -> Result<Entity, ModelError> 
                         dbc: dbc.clone(),
                     }],
                 },
-                pinned_cpus: d
-                    .realtime
-                    .as_ref()
-                    .and_then(|r| r.get("pinned_cpus"))
-                    .and_then(|v| v.as_sequence())
-                    .map(|q| {
-                        q.iter()
-                            .filter_map(|v| v.as_u64())
-                            .filter_map(|v| u32::try_from(v).ok())
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                pinned_cpus: pinned_cpus_of(id, d.realtime.as_ref())?,
             },
         );
     }
@@ -1886,6 +1902,37 @@ links:
         assert_eq!(h.medium.as_deref(), Some("100BASE-T1"));
         assert_eq!(h.length_m, Some(2.4));
         assert_eq!(h.weight_g, Some(85.0));
+    }
+
+    const PINNED_CPUS_BASE: &str = r#"
+kind: experiment
+id: e
+vehicles: [veh]
+network: { slices: [] }
+---
+kind: vehicle
+id: veh
+devices:
+  zonefl: { role: zone-controller, backend: container, realtime: { pinned_cpus: [0, 2, 3] } }
+"#;
+
+    #[test]
+    fn valid_pinned_cpus_reach_the_model() {
+        let m = load_yaml(PINNED_CPUS_BASE).expect("valid workspace");
+        assert_eq!(m.entities[0].devices["zonefl"].pinned_cpus, vec![0, 2, 3]);
+    }
+
+    #[test]
+    fn a_malformed_pinned_cpu_entry_is_refused_not_silently_dropped() {
+        let bad = PINNED_CPUS_BASE.replace("[0, 2, 3]", "[0, one, 3]");
+        match load_yaml(&bad) {
+            Err(crate::model::LoadError::Model(ModelError::MalformedPinnedCpu {
+                device, ..
+            })) => {
+                assert_eq!(device, "zonefl");
+            }
+            other => panic!("expected MalformedPinnedCpu, got {other:?}"),
+        }
     }
 
     /// Base fixture for every `network.tunnels` `kind: vxlan` test below — one declared slice

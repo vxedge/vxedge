@@ -4,11 +4,9 @@
 //! indexes on that pair and every cross-reference is by id, never by path — so files can be
 //! renamed or reorganised freely.
 //!
-//! **Additive on purpose.** This lives alongside [`crate::manifest`] and changes nothing about
-//! it: the ARCHITECTURE.md §6 rewrite that would *replace* the existing schema is a breaking
-//! change still awaiting sign-off. Every current experiment keeps parsing through the old path.
-//! What this module buys before that sign-off is the thing prose review cannot give — the
-//! cross-file joins actually executed, so §6 can be written from something proven.
+//! §6.0 is **the only authored schema, and the only runnable one** (`docs/ARCHITECTURE.md`
+//! §6.0.6, 2026-07-31) — the earlier §6.1/§6.2 manifest format and its `crate::manifest`
+//! module are deleted, not merely superseded; every workspace parses through this module.
 //!
 //! House layering: [`Workspace::load`] does the I/O, [`Workspace::validate`] is pure and
 //! returns *all* problems rather than the first, because an engineer fixing a workspace wants
@@ -263,21 +261,77 @@ struct Header {
     id: String,
 }
 
+/// Every top-level field a `kind: experiment` document may declare — needed in full so
+/// `#[serde(deny_unknown_fields)]` can catch a typo'd key without also rejecting every field
+/// this struct doesn't itself interpret. `services`/`telemetry`/`results`/`method`/
+/// `traffic_profiles` are carried as opaque `Value`s deliberately: `model::build` already
+/// parses and validates each of them from the same raw document (`Workspace::experiments_raw`)
+/// with its own named errors (e.g. `ServiceDef`'s own `deny_unknown_fields`, `narrow()`'s range
+/// checks) — retyping them here would be a second copy of that validation to keep in sync, for
+/// no additional protection. `kind`/`world` are accepted-but-unused here for the same reason
+/// `rxswin` is on `BaselineDoc`: `kind` is dispatched by `Header` before this struct is ever
+/// parsed (it must still be a *declared* field, or `deny_unknown_fields` would reject every
+/// real document's own `kind: experiment` line); `world` is documented in `ARCHITECTURE.md`
+/// §6.0.3 but nothing in this codebase reads it yet (§30's audit found it, `docs/TASKS.md`
+/// tracks it as a documented-but-unimplemented gap, not a validation bug — there is nothing to
+/// misdeclare in a field nothing consumes).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExperimentDoc {
+    pub kind: String,
     pub id: String,
+    /// A human-readable label, distinct from `id`. Not in `ARCHITECTURE.md`'s own §6.0.3
+    /// schema at all — found live while checking this change against `vxmodels`' real
+    /// renderer (`vxmodel render --experiment ...`, which emits it from a SysML model's own
+    /// `name` attribute) rather than only against this repo's own hand-authored fixtures.
+    /// Without this field, `deny_unknown_fields` would have broken every real `vxmodel`
+    /// render — and, per `vxmodels/.github/workflows/ci.yml`, that repo's own CI.
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(default)]
     pub vehicles: Vec<String>,
     #[serde(default)]
     pub baseline: Option<String>,
     #[serde(default)]
+    pub world: Option<String>,
+    #[serde(default)]
     pub network: Option<NetworkDoc>,
+    #[serde(default)]
+    pub services: Option<serde_yaml_ng::Value>,
+    #[serde(default)]
+    pub telemetry: Option<serde_yaml_ng::Value>,
+    #[serde(default)]
+    pub results: Option<serde_yaml_ng::Value>,
+    #[serde(default)]
+    pub method: Option<serde_yaml_ng::Value>,
+    #[serde(default)]
+    pub traffic_profiles: Option<serde_yaml_ng::Value>,
 }
 
+/// `slices` stays the only *typed* field — `model::build::slices_of` re-parses each slice
+/// entry's own fields (`mode`/`vlan`/`qos`/`s_nssai`) from the raw document independently
+/// (`SliceDoc` exists only so `Workspace::validate`'s cross-file "vehicle names a slice the
+/// experiment must define" check has slice ids to check against). `tunnels`/`nos_check`/
+/// `data_plane`/`defaults` are opaque `Value`s for the same reason `ExperimentDoc`'s own
+/// blocks are: `model::build` already validates each with its own named errors, so retyping
+/// them here would duplicate that validation rather than add to it. Per-slice-field typo
+/// protection (`SliceDoc` itself gaining `deny_unknown_fields`) is real, tracked, remaining
+/// scope from §30's audit — not done here, since `mode`/`vlan`/`qos`/`s_nssai` would all need
+/// typing in first, the same "duplicate validation surface" question this struct's own
+/// comment already answers for the blocks that got the `Value` treatment instead.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkDoc {
     #[serde(default)]
     pub slices: Vec<SliceDoc>,
+    #[serde(default)]
+    pub tunnels: Option<serde_yaml_ng::Value>,
+    #[serde(default)]
+    pub nos_check: Option<serde_yaml_ng::Value>,
+    #[serde(default)]
+    pub data_plane: Option<String>,
+    #[serde(default)]
+    pub defaults: Option<serde_yaml_ng::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -285,9 +339,24 @@ pub struct SliceDoc {
     pub id: String,
 }
 
+/// Unlike `ExperimentDoc`, every field this document declares is typed all the way down
+/// (`build_entity` reads only from `&VehicleDoc`, never a parallel raw `Value` — confirmed
+/// before adding `deny_unknown_fields` here, since that duplication is exactly what would have
+/// made this unsafe). `kind` is accepted-but-unused for the same reason `ExperimentDoc`'s own
+/// is: `Header` already dispatches on it, but it must still be a declared field or every real
+/// vehicle document's own `kind: vehicle` line would be rejected.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VehicleDoc {
+    pub kind: String,
     pub id: String,
+    /// A human-readable label, distinct from `id`. Same finding as `ExperimentDoc::name` —
+    /// not in `ARCHITECTURE.md`'s §6.0.1 schema, but real, live-produced data
+    /// (`vxmodel render --vehicle ...` emits it from a SysML model's own `name`), found by
+    /// checking against `vxmodels`' actual renderer output rather than only this repo's own
+    /// fixtures.
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(default)]
     pub class: Option<String>,
     #[serde(default)]
@@ -598,9 +667,19 @@ pub struct ChannelQosDoc {
     pub rate_hz: Option<f64>,
 }
 
+/// `kind` is accepted-but-unused, the same reason `ExperimentDoc`'s/`VehicleDoc`'s own are.
+/// `rxswin` (`ARCHITECTURE.md` §6.0.2: "UN R156, a property of the vehicle TYPE") was, until
+/// §30's audit found it, silently dropped by serde with no `deny_unknown_fields` to catch it —
+/// declared here now so it round-trips, though nothing in this codebase reads it yet (`vxedge
+/// manifest bom`'s planned RxSWIN roll-up is real, separate, not-yet-built scope, not this
+/// field's own gap).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BaselineDoc {
+    pub kind: String,
     pub id: String,
+    #[serde(default)]
+    pub rxswin: Option<String>,
     #[serde(default)]
     pub parts: Vec<PartEntry>,
 }
