@@ -560,10 +560,10 @@ exp-001 measurements).
       **unchanged**, plus a live smoke test through the real daemon/CLI against `exp-001-ws`
       (up/status/down/double-up-down), kernel state cross-checked directly against `ip -j link
       show`/`bridge -j vlan show`. **Still open** (deferred, not silently folded in — zone netns
-      lifecycle and WireGuard device creation, the first two items, both closed the same day,
-      see below): the fiveg uplink, the `Ovs` `DataPlane`'s own link calls, tap devices
-      (`ioctl(TUNSETIFF)`, confirmed not an `RTM_NEWLINK` operation) — each a real, separate,
-      smaller follow-on.
+      lifecycle, WireGuard device creation, and the fiveg host-attachment path, the first three
+      items, all closed the same day, see below): the `Ovs` `DataPlane`'s own link calls, tap
+      devices (`ioctl(TUNSETIFF)`, confirmed not an `RTM_NEWLINK` operation) — each a real,
+      separate, smaller follow-on.
 - [x] Port `zones::backend`'s container netns lifecycle to native rtnetlink — **slice 2 of
       the rtnetlink port, delivered 2026-08-04** (`docs/TASKS.md` #16, full account there).
       The highest-exposure code the port could touch: every container-backed zone in every
@@ -599,6 +599,24 @@ exp-001 measurements).
       created a real `vxwg-ota-uplink` interface with a real kernel-minted public key, a
       second `up` left the key **unchanged** (idempotency split intact), and `down` removed
       it completely.
+- [x] Port the fiveg host-attachment path to native rtnetlink — **slice 4 of the rtnetlink
+      port, delivered 2026-08-04** (`docs/TASKS.md` #16, full account there).
+      `apply_fiveg_uplink`/`apply_fiveg_ue_routes`/`teardown_fiveg_uplink` still shelled out
+      for bridge-self VLAN membership, an 802.1q VLAN subinterface, and route creation.
+      `rtnetlink`'s `LinkBridgeVlan::bridge_self()`, `LinkVlan`, and its `route()`
+      handle/`RouteMessageBuilder` cover all three, confirmed present in v0.21.0. Four new
+      primitives: `link_master`, `bridge_vlan_add_self` (kept separate from `bridge_vlan_add`
+      — `self` changes which device the entry applies to, not just a flag), `ensure_vlan_subif`,
+      `add_route`. `tc` stays on `Shell` for `apply_fiveg_slice_qos`'s own HTB tree. **No
+      existing privileged test covered this path** — the only prior coverage needs podman +
+      real vx5g images this environment doesn't have. Added a new privileged test standing in
+      for the CN pod with a throwaway veth pair, proving the netlink mechanics against a real
+      kernel independent of podman availability. **Live-verified, no new bugs found**: full
+      build/clippy/fmt clean, 203 unit tests unchanged, all 7 privileged tests (6 pre-existing
+      + the new one) pass, zero leftover state. Confirmed the daemon's `FiveGSvc` calls the
+      exact same functions the test exercises directly — no separate code path. Could not run
+      a full live daemon/CLI smoke test end-to-end (needs a real CN pod via podman) — a
+      pre-existing environment limitation, not something skipped for this change.
 - [x] Reconciler: converge partial state (up-after-partial-failure repairs deltas rather
       than failing verify) — **delivered 2026-08-03**. `GatewayService.Up`'s
       apply→apply→apply→observe→verify sequence is now a bounded retry loop (3 attempts,
