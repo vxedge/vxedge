@@ -16,10 +16,15 @@
 //! `Shell` even after this: `nft` has its own JSON-based CLI protocol with no netlink crate
 //! coverage here, and WireGuard peer/key configuration is a *different kernel protocol
 //! family* (generic netlink's `wireguard` family, not rtnetlink), which `LinkWireguard`
-//! deliberately does not attempt to cover — see [`ensure_wireguard`]'s own doc comment.
-//! `docs/TASKS.md` #16 tracks the still-deferred remainder (OVS's own link calls, the fiveg
-//! uplink, tap devices — the last one confirmed not even netlink-portable at all) as
-//! separate, smaller follow-ons — not silently implied done by this module.
+//! deliberately does not attempt to cover — see [`ensure_wireguard`]'s own doc comment. Also
+//! added 2026-08-04: the fiveg host-attachment path (`apply_fiveg_uplink`/
+//! `apply_fiveg_ue_routes` in `provision.rs`) — bridge-self VLAN membership
+//! ([`bridge_vlan_add_self`]), an 802.1q VLAN subinterface ([`ensure_vlan_subif`]), resolving a
+//! link's current bridge master ([`link_master`]), and route creation ([`add_route`]). `tc`
+//! stays on `Shell` there too (`apply_fiveg_slice_qos`'s own HTB tree). `docs/TASKS.md` #16
+//! tracks the still-deferred remainder (OVS's own link calls, tap devices — confirmed not even
+//! netlink-portable at all) as separate, smaller follow-ons — not silently implied done by this
+//! module.
 //!
 //! **Netns creation/deletion is not hand-rolled here.** `rtnetlink::NetworkNamespace::add`/
 //! `del` already do exactly what `ip netns add`/`del` do — confirmed by reading the actual
@@ -51,7 +56,8 @@ use rtnetlink::packet_route::link::{
     AfSpecBridge, BridgeVlanInfoFlags, LinkAttribute, LinkExtentMask,
 };
 use rtnetlink::{
-    LinkBridge, LinkBridgeVlan, LinkUnspec, LinkVeth, LinkVxlan, LinkWireguard, NetworkNamespace,
+    LinkBridge, LinkBridgeVlan, LinkUnspec, LinkVeth, LinkVlan, LinkVxlan, LinkWireguard,
+    NetworkNamespace, RouteMessageBuilder,
 };
 use std::os::fd::AsRawFd;
 
@@ -86,6 +92,8 @@ pub enum NetlinkError {
     LinkNotFound { name: String },
     #[error("`{cidr}` is not a valid CIDR address (expected `<ip>/<prefix>`)")]
     MalformedCidr { cidr: String },
+    #[error("netlink route operation `{op}` rejected the route: {detail}")]
+    InvalidRoute { op: String, detail: String },
 }
 
 fn is_eexist(e: &rtnetlink::Error) -> bool {
@@ -229,6 +237,43 @@ pub fn link_exists(netns: Option<&str>, name: &str) -> bool {
             .map_err(|e| op_err("link_exists", e))
     })
     .unwrap_or(false)
+}
+
+/// Resolves `dev`'s current bridge master (`IFLA_MASTER`/`LinkAttribute::Controller`), if any —
+/// `ip -json link show <dev>`'s own `master` field, read directly rather than parsed from JSON.
+/// Two lookups: the ifindex the attribute carries still needs resolving back to a name via a
+/// second query. `None` covers both "`dev` doesn't exist" and "`dev` exists but has no
+/// master" — the caller (`provision.rs::host_veth_master`) is the one that turns "no master"
+/// into an error, since a bare link with nothing attached is a valid state elsewhere in this
+/// module (e.g. before [`set_master`] runs).
+pub fn link_master(netns: Option<&str>, dev: &str) -> Result<Option<String>, NetlinkError> {
+    let dev = dev.to_string();
+    run_async(netns, "link_master", move |handle| async move {
+        let mut links = handle.link().get().match_name(dev.clone()).execute();
+        let msg = match links.try_next().await {
+            Ok(Some(msg)) => msg,
+            Ok(None) => return Ok(None),
+            Err(e) if is_missing(&e) => return Ok(None),
+            Err(e) => return Err(op_err("link_master", e)),
+        };
+        let Some(master_idx) = msg.attributes.iter().find_map(|a| match a {
+            LinkAttribute::Controller(idx) => Some(*idx),
+            _ => None,
+        }) else {
+            return Ok(None);
+        };
+        let mut masters = handle.link().get().match_index(master_idx).execute();
+        let master_msg = match masters.try_next().await {
+            Ok(Some(msg)) => msg,
+            Ok(None) => return Ok(None),
+            Err(e) if is_missing(&e) => return Ok(None),
+            Err(e) => return Err(op_err("link_master", e)),
+        };
+        Ok(master_msg.attributes.iter().find_map(|a| match a {
+            LinkAttribute::IfName(name) => Some(name.clone()),
+            _ => None,
+        }))
+    })
 }
 
 /// Idempotent: tolerates an already-existing bridge, the same contract
@@ -482,6 +527,125 @@ pub fn bridge_vlan_del(netns: Option<&str>, dev: &str, vid: u16) -> Result<(), N
                     Err(op_err("bridge_vlan_del", e))
                 }
             })
+    })
+}
+
+/// `bridge vlan add dev <bridge> vid <vid> self` — the bridge device's own internal ("self")
+/// VLAN membership, distinct from [`bridge_vlan_add`]'s regular port entry: a `vlan_filtering`
+/// bridge's own internal path needs explicit VLAN membership too before the host can address a
+/// subinterface on it (`apply_fiveg_uplink`'s own doc comment in `provision.rs` has the full
+/// story). A separate function rather than a flag on `bridge_vlan_add` — that one is already
+/// proven by every existing caller (slices, endpoints, VXLAN tunnels), and `self` changes which
+/// *device* the entry applies to, not just a flag on the same shape. Idempotent, same contract.
+pub fn bridge_vlan_add_self(
+    netns: Option<&str>,
+    bridge: &str,
+    vid: u16,
+) -> Result<(), NetlinkError> {
+    let bridge_owned = bridge.to_string();
+    run_async(netns, "bridge_vlan_add_self", move |handle| async move {
+        let Some(idx) = link_index(&handle, &bridge_owned)
+            .await
+            .map_err(|e| op_err("bridge_vlan_add_self", e))?
+        else {
+            return Err(NetlinkError::LinkNotFound { name: bridge_owned });
+        };
+        let msg = LinkBridgeVlan::new(idx)
+            .vlan(vid, BridgeVlanInfoFlags::empty())
+            .bridge_self()
+            .build();
+        handle.link().set(msg).execute().await.or_else(|e| {
+            if is_eexist(&e) {
+                Ok(())
+            } else {
+                Err(op_err("bridge_vlan_add_self", e))
+            }
+        })
+    })
+}
+
+/// `ip link add link <parent> name <name> type vlan id <vid>` — an 802.1q VLAN subinterface,
+/// structurally different from [`bridge_vlan_add`]'s bridge-filtering membership: this creates
+/// a whole new netdev the host can address (`apply_fiveg_uplink`'s `<bridge>.<vid>`
+/// convention), not a tag on an existing port. Idempotent, same contract as [`ensure_bridge`].
+pub fn ensure_vlan_subif(
+    netns: Option<&str>,
+    name: &str,
+    parent: &str,
+    vlan_id: u16,
+) -> Result<(), NetlinkError> {
+    let name_owned = name.to_string();
+    let parent_owned = parent.to_string();
+    run_async(netns, "ensure_vlan_subif", move |handle| async move {
+        if link_index(&handle, &name_owned)
+            .await
+            .map_err(|e| op_err("ensure_vlan_subif", e))?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let Some(parent_idx) = link_index(&handle, &parent_owned)
+            .await
+            .map_err(|e| op_err("ensure_vlan_subif", e))?
+        else {
+            return Err(NetlinkError::LinkNotFound { name: parent_owned });
+        };
+        handle
+            .link()
+            .add(LinkVlan::new(&name_owned, parent_idx, vlan_id).build())
+            .execute()
+            .await
+            .or_else(|e| {
+                if is_eexist(&e) {
+                    Ok(())
+                } else {
+                    Err(op_err("ensure_vlan_subif", e))
+                }
+            })
+    })
+}
+
+/// `ip route add <dest-cidr> via <gateway> dev <name>` — idempotent (tolerates an
+/// already-present route, matching `Shell::run_tolerate_exists`'s contract for the same
+/// command). `dest_cidr` reuses [`parse_cidr`]; `via` is a bare address, not CIDR.
+pub fn add_route(
+    netns: Option<&str>,
+    dest_cidr: &str,
+    via: &str,
+    dev: &str,
+) -> Result<(), NetlinkError> {
+    let (dest, prefix) = parse_cidr(dest_cidr)?;
+    let via: std::net::IpAddr = via.parse().map_err(|_| NetlinkError::MalformedCidr {
+        cidr: via.to_string(),
+    })?;
+    let dev_owned = dev.to_string();
+    run_async(netns, "add_route", move |handle| async move {
+        let Some(idx) = link_index(&handle, &dev_owned)
+            .await
+            .map_err(|e| op_err("add_route", e))?
+        else {
+            return Err(NetlinkError::LinkNotFound { name: dev_owned });
+        };
+        let msg = RouteMessageBuilder::<std::net::IpAddr>::new()
+            .destination_prefix(dest, prefix)
+            .map_err(|e| NetlinkError::InvalidRoute {
+                op: "add_route".to_string(),
+                detail: e.to_string(),
+            })?
+            .gateway(via)
+            .map_err(|e| NetlinkError::InvalidRoute {
+                op: "add_route".to_string(),
+                detail: e.to_string(),
+            })?
+            .output_interface(idx)
+            .build();
+        handle.route().add(msg).execute().await.or_else(|e| {
+            if is_eexist(&e) {
+                Ok(())
+            } else {
+                Err(op_err("add_route", e))
+            }
+        })
     })
 }
 

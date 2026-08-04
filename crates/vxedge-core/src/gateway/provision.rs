@@ -654,42 +654,24 @@ fn observe_vxlan_tunnel(sh: &Shell, t: &super::plan::TunnelPlan) -> TunnelObserv
 /// *entirely different* subnet reachable only via the CN pod's own routing;
 /// found live the same day, one call deeper than this bug (see that
 /// function's own doc comment).
+///
+/// Ported to `gateway::netlink` 2026-08-04 (`docs/TASKS.md` #16, rtnetlink port slice 4) —
+/// every step here (bridge-VLAN membership, the bridge-self membership, the VLAN subinterface,
+/// its address, bringing it up) is netlink-portable; only [`apply_fiveg_slice_qos`]'s HTB tree
+/// on this same interface stays on `Shell`.
 pub fn apply_fiveg_uplink(sh: &Shell, host_veth: &str) -> Result<String, NetOpsError> {
-    let vid = crate::fiveg::FIVEG_UPLINK_VLAN.to_string();
-    sh.run_tolerate_exists(
-        "bridge",
-        &[
-            "vlan", "add", "dev", host_veth, "vid", &vid, "pvid", "untagged",
-        ],
-    )?;
-    sh.run_tolerate_missing("bridge", &["vlan", "del", "dev", host_veth, "vid", "1"])?;
+    let ns = sh.netns.as_deref();
+    let vid = crate::fiveg::FIVEG_UPLINK_VLAN;
+    netlink::bridge_vlan_add(ns, host_veth, vid, true).map_err(nl)?;
+    netlink::bridge_vlan_del(ns, host_veth, 1).map_err(nl)?;
 
     let bridge = host_veth_master(sh, host_veth)?;
-    sh.run_tolerate_exists(
-        "bridge",
-        &["vlan", "add", "dev", &bridge, "vid", &vid, "self"],
-    )?;
+    netlink::bridge_vlan_add_self(ns, &bridge, vid).map_err(nl)?;
     let host_iface = format!("{bridge}.{vid}");
-    if !sh.link_exists(&host_iface) {
-        sh.run(
-            "ip",
-            &[
-                "link",
-                "add",
-                "link",
-                &bridge,
-                "name",
-                &host_iface,
-                "type",
-                "vlan",
-                "id",
-                &vid,
-            ],
-        )?;
-    }
+    netlink::ensure_vlan_subif(ns, &host_iface, &bridge, vid).map_err(nl)?;
     let host_addr = format!("{}/24", crate::fiveg::BRIDGE_ATTACH_HOST_ADDR);
-    sh.run_tolerate_exists("ip", &["addr", "add", &host_addr, "dev", &host_iface])?;
-    sh.run("ip", &["link", "set", &host_iface, "up"])?;
+    netlink::add_address(ns, &host_iface, &host_addr).map_err(nl)?;
+    netlink::link_up(ns, &host_iface).map_err(nl)?;
     Ok(host_iface)
 }
 
@@ -715,19 +697,10 @@ pub fn apply_fiveg_ue_routes(
     host_iface: &str,
     ue_subnets: &[String],
 ) -> Result<(), NetOpsError> {
+    let ns = sh.netns.as_deref();
     for subnet in ue_subnets {
-        sh.run_tolerate_exists(
-            "ip",
-            &[
-                "route",
-                "add",
-                subnet,
-                "via",
-                crate::fiveg::BRIDGE_ATTACH_CN_ADDR,
-                "dev",
-                host_iface,
-            ],
-        )?;
+        netlink::add_route(ns, subnet, crate::fiveg::BRIDGE_ATTACH_CN_ADDR, host_iface)
+            .map_err(nl)?;
     }
     Ok(())
 }
@@ -889,15 +862,11 @@ pub fn apply_fiveg_slice_qos(
 /// avoids threading a second parameter through every call site just to
 /// duplicate what `ip -json link show` already reports.
 fn host_veth_master(sh: &Shell, host_veth: &str) -> Result<String, NetOpsError> {
-    let out = sh.json("ip", &["-json", "link", "show", host_veth])?;
-    out.as_array()
-        .and_then(|a| a.first())
-        .and_then(|l| l.get("master"))
-        .and_then(|m| m.as_str())
-        .map(|s| s.to_string())
+    netlink::link_master(sh.netns.as_deref(), host_veth)
+        .map_err(nl)?
         .ok_or_else(|| NetOpsError::Parse {
-            cmdline: format!("ip -json link show {host_veth}"),
-            detail: "no `master` field — is this veth actually attached to a bridge?".to_string(),
+            cmdline: format!("netlink link_master({host_veth})"),
+            detail: "no bridge master — is this veth actually attached to a bridge?".to_string(),
         })
 }
 
@@ -907,7 +876,7 @@ fn host_veth_master(sh: &Shell, host_veth: &str) -> Result<String, NetOpsError> 
 /// determined by `bridge` + the fixed uplink VLAN id.
 pub fn teardown_fiveg_uplink(sh: &Shell, bridge: &str) -> Result<(), NetOpsError> {
     let vid = crate::fiveg::FIVEG_UPLINK_VLAN;
-    sh.run_tolerate_missing("ip", &["link", "del", &format!("{bridge}.{vid}")])
+    netlink::delete_link(sh.netns.as_deref(), &format!("{bridge}.{vid}")).map_err(nl)
 }
 
 /// One data-plane implementation: how a [`GatewayPlan`] is rendered onto a host, removed, and

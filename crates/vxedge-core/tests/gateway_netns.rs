@@ -8,7 +8,8 @@
 
 #![cfg(target_os = "linux")]
 
-use vxedge_core::gateway::{GatewayPlan, Shell, apply, observe, teardown};
+use vxedge_core::fiveg::lifecycle::{BRIDGE_ATTACH_CN_ADDR, FIVEG_UPLINK_VLAN};
+use vxedge_core::gateway::{GatewayPlan, Shell, apply, netlink, observe, provision, teardown};
 use vxedge_core::zones::backend::NodeState;
 use vxedge_core::zones::{node_down, node_status, node_up, plan_nodes_from_model};
 
@@ -1083,4 +1084,90 @@ fn vxlan_tunnel_carries_slice_traffic_between_two_simulated_hosts() {
     assert!(!observe(&sh_b, &plan_b).unwrap().tunnels[0].present);
     let _ = std::fs::remove_dir_all(&runtime_a);
     let _ = std::fs::remove_dir_all(&runtime_b);
+}
+
+/// Regression/acceptance test for `docs/TASKS.md` #16's rtnetlink port slice 4
+/// (`apply_fiveg_uplink`/`apply_fiveg_ue_routes`). The real 5G CN pod attachment
+/// (`fiveg_podman.rs`) is gated on podman + real vx5g-core images this environment doesn't
+/// have — this test proves the netlink mechanics those functions now use (bridge-self VLAN
+/// membership, an 802.1q VLAN subinterface, route creation) against a real kernel, standing in
+/// for the CN pod with a throwaway veth pair rather than a real container.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN; run under sudo (see module docs)"]
+fn fiveg_uplink_creates_a_real_vlan_subinterface_and_routes_a_ue_subnet() {
+    let ns = format!("vxfiveg{}", std::process::id());
+    let created = std::process::Command::new("ip")
+        .args(["netns", "add", &ns])
+        .output()
+        .expect("iproute2 installed");
+    assert!(
+        created.status.success(),
+        "cannot create netns (run as root): {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let _guard = NetnsGuard(ns.clone());
+    let sh = Shell {
+        netns: Some(ns.clone()),
+        escalate: false,
+    };
+
+    let model = vxedge_core::model::load_yaml(WORKSPACE).expect("workspace loads");
+    let plan = GatewayPlan::from_model(&model).unwrap();
+    apply(&sh, &plan).unwrap();
+
+    // A throwaway veth pair standing in for the CN pod's own bridge-attached leg.
+    let host_veth = "vxfg-host";
+    let pod_veth = "vxfg-pod";
+    let netns = sh.netns.as_deref();
+    netlink::ensure_veth_pair(netns, host_veth, pod_veth).unwrap();
+    netlink::set_master(netns, host_veth, &plan.bridge).unwrap();
+    netlink::link_up(netns, host_veth).unwrap();
+
+    let host_iface = provision::apply_fiveg_uplink(&sh, host_veth).unwrap();
+    let expected_iface = format!("{}.{FIVEG_UPLINK_VLAN}", plan.bridge);
+    assert_eq!(host_iface, expected_iface);
+    assert!(
+        netlink::link_exists(netns, &host_iface),
+        "vlan subinterface missing"
+    );
+
+    // Idempotent re-apply: same interface, no error, no duplicate-entry failure.
+    let host_iface_again = provision::apply_fiveg_uplink(&sh, host_veth).unwrap();
+    assert_eq!(host_iface, host_iface_again);
+
+    // The bridge's own "self" VLAN membership — apply_fiveg_uplink's second, easy-to-miss
+    // half, distinct from host_veth's own regular port membership.
+    let self_vlans = netlink::bridge_vlan_list(netns, &plan.bridge).unwrap();
+    assert!(
+        self_vlans.contains(&FIVEG_UPLINK_VLAN),
+        "bridge self-membership missing: {self_vlans:?}"
+    );
+
+    // Route a UE subnet through the CN pod's own address, applied twice (idempotency).
+    let ue_subnet = "10.46.0.0/16".to_string();
+    provision::apply_fiveg_ue_routes(&sh, &host_iface, std::slice::from_ref(&ue_subnet)).unwrap();
+    provision::apply_fiveg_ue_routes(&sh, &host_iface, std::slice::from_ref(&ue_subnet)).unwrap();
+
+    let route = sh
+        .run_host(
+            "ip",
+            &["netns", "exec", &ns, "ip", "route", "get", "10.46.0.5"],
+        )
+        .unwrap();
+    assert!(
+        route.contains(BRIDGE_ATTACH_CN_ADDR) && route.contains(&host_iface),
+        "UE subnet route missing or wrong: {route}"
+    );
+
+    // Teardown removes the vlan subinterface — and, as a kernel side effect, every route bound
+    // to it, which is exactly why no separate route-teardown function exists.
+    provision::teardown_fiveg_uplink(&sh, &plan.bridge).unwrap();
+    assert!(
+        !netlink::link_exists(netns, &host_iface),
+        "vlan subinterface survived teardown"
+    );
+    // Idempotent teardown.
+    provision::teardown_fiveg_uplink(&sh, &plan.bridge).unwrap();
+
+    teardown(&sh, &plan).unwrap();
 }
