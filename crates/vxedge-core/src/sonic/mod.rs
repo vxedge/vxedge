@@ -7,18 +7,27 @@
 //! (`network.data_plane: kernel-bridge|ovs`). This twin exists to prove config portability, not
 //! to carry traffic, and is not part of `experiment up`'s provisioning sequence.
 //!
-//! Two stages, the same shape `gateway`/`fiveg` already use: a pure-data plan compiled from
-//! [`crate::gateway::GatewayPlan`] ([`plan::SonicPlan`]), and deterministic rendering onto
-//! SONiC's config format ([`render::render`]) — `config_db.json`, the format a SONiC (or
-//! SONiC-VS) instance loads at boot (`config load`, or as the initial
-//! `/etc/sonic/config_db.json`), not `minigraph.xml` (built for real fabric deployment, far
-//! more than a slice/VLAN twin needs to claim).
+//! Three stages, the same shape `gateway`/`fiveg` already use: a pure-data plan compiled from
+//! [`crate::gateway::GatewayPlan`] ([`plan::SonicPlan`]), deterministic rendering onto SONiC's
+//! config format ([`render::render`]) — `config_db.json`, the format a SONiC (or SONiC-VS)
+//! instance loads at boot (`config load`, or as the initial `/etc/sonic/config_db.json`), not
+//! `minigraph.xml` (built for real fabric deployment, far more than a slice/VLAN twin needs to
+//! claim) — and a side-effecting [`lifecycle`] stage that boots the image and talks to it over
+//! its serial console, mirroring `fiveg`'s own plan/render/lifecycle split.
 //!
-//! **Delivered here**: the renderer, pure data, unit-tested, no VM required.
-//! **Not yet delivered**: booting the actual community qcow2 and verifying live parity against
-//! it — the other half of `docs/TASKS.md` #16's SONiC-VS item. That needs the real image (not
-//! vendored in this repo) and a multi-minute VM boot, so it is tracked as its own follow-on step
-//! rather than assumed proven because the renderer exists and its output looks right.
+//! **Delivered**: the renderer (pure data, unit-tested, no VM required); the image itself
+//! sourced, boot-verified, and published via `vxparts/parts/gw/nos/os/sonic-vs`; live config
+//! parity manually proven end to end (a real `config load` against a real booted instance, read
+//! back exactly matching what the renderer produced — see that part's own README) via a
+//! Python/`pexpect` script; [`lifecycle`]'s own process boot/teardown and generic serial-console
+//! driver ([`lifecycle::Console`]), porting the proven-by-hand sequence to a native driver so
+//! the daemon needs no Python dependency at runtime.
+//!
+//! **Not yet delivered**: the actual "log in, clear a port, load a rendered config, read it
+//! back and compare" business logic wired onto [`lifecycle::Console`], and hooking any of this
+//! into `GatewayService`/`experiment up`. Both real, separately-scoped follow-ons —
+//! `docs/TASKS.md` tracks them, not assumed done because the pieces underneath exist.
 
+pub mod lifecycle;
 pub mod plan;
 pub mod render;
