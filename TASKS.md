@@ -518,7 +518,16 @@ exp-001 measurements).
       onto a tunnel address — this delivers the mechanism `docs/ARCHITECTURE.md` §8 was waiting
       on, not the integration;
       that remains open, tracked in §4 below.
-- [ ] VXLAN inter-host links
+- [x] VXLAN inter-host links: **model + validation delivered 2026-08-04** (`docs/TASKS.md`
+      #16, full account there); **provisioning/lifecycle still open**, tracked separately —
+      `network.tunnels` `kind: vxlan` parses and validates (`vni`/`remote`/`dstport`/
+      `slices`), but `GatewayPlan::from_model` explicitly refuses to plan one
+      (`PlanError::VxlanTunnelNotYetProvisionable`) rather than silently dropping it.
+      Structurally the opposite of `wireguard`: joins the bridge as a trunk-like port
+      extending local `network.slices` across hosts, rather than a routed L3 endpoint — so
+      `Tunnel`'s WireGuard fields became kind-conditional `Option<T>`, verified not to
+      regress the already-shipped WireGuard path by re-running the exact privileged netns
+      suite unchanged (all 5 tests, including the real handshake test).
 - [ ] FRR config rendering (BGP optional path)
 - [x] Port NetOps from iproute2 argv exec to pure rtnetlink/netlink — **slice 1 delivered
       2026-08-04** (`docs/TASKS.md` #16, full account there). Scope decided by research, not
