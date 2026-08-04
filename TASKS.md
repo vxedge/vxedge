@@ -560,8 +560,8 @@ exp-001 measurements).
       **unchanged**, plus a live smoke test through the real daemon/CLI against `exp-001-ws`
       (up/status/down/double-up-down), kernel state cross-checked directly against `ip -j link
       show`/`bridge -j vlan show`. **Still open** (deferred, not silently folded in — zone netns
-      lifecycle, the first item, closed the same day, see below): WireGuard device
-      creation, the fiveg uplink, the `Ovs` `DataPlane`'s own link calls, tap devices
+      lifecycle and WireGuard device creation, the first two items, both closed the same day,
+      see below): the fiveg uplink, the `Ovs` `DataPlane`'s own link calls, tap devices
       (`ioctl(TUNSETIFF)`, confirmed not an `RTM_NEWLINK` operation) — each a real, separate,
       smaller follow-on.
 - [x] Port `zones::backend`'s container netns lifecycle to native rtnetlink — **slice 2 of
@@ -584,6 +584,21 @@ exp-001 measurements).
       (`experiment up --stage gateway --stage zones`, real `vx-gw1`/`vx-zonefl` namespaces,
       veth peer moved+renamed+addressed with the manifest's exact pinned CIDR, idempotent
       double-up, clean double-down).
+- [x] Port WireGuard tunnel device creation to native rtnetlink — **slice 3 of the
+      rtnetlink port, delivered 2026-08-04** (`docs/TASKS.md` #16, full account there).
+      `rtnetlink`'s `LinkWireguard` builder (confirmed present in v0.21.0) covers device
+      creation (`IFLA_LINKINFO`/`INFO_KIND=wireguard`, no `INFO_DATA`) exactly. New
+      `netlink::ensure_wireguard`, same idempotent-creation shape as `ensure_vxlan`.
+      **`wg genkey`/`wg set` stay on `Shell` permanently** — WireGuard peer/key
+      configuration is the kernel's `wireguard` generic-netlink family, a different
+      protocol `rtnetlink` doesn't implement, not remaining deferred scope. Teardown and
+      `present`-observation both moved onto `netlink.rs` too, now that creation has —
+      link deletion/existence never cared what created the link. **Live-verified two ways,
+      both clean, no new bugs found**: the full privileged suite (6 tests, including the
+      real handshake test) passes **unchanged**; a smoke test through the real daemon/CLI
+      created a real `vxwg-ota-uplink` interface with a real kernel-minted public key, a
+      second `up` left the key **unchanged** (idempotency split intact), and `down` removed
+      it completely.
 - [x] Reconciler: converge partial state (up-after-partial-failure repairs deltas rather
       than failing verify) — **delivered 2026-08-03**. `GatewayService.Up`'s
       apply→apply→apply→observe→verify sequence is now a bounded retry loop (3 attempts,
