@@ -42,6 +42,15 @@ pub enum NodeState {
     Down,
 }
 
+impl crate::status::Observable for NodeState {
+    fn state(&self) -> crate::status::ObservedState {
+        match self {
+            NodeState::Up => crate::status::ObservedState::Up,
+            NodeState::Down => crate::status::ObservedState::Down,
+        }
+    }
+}
+
 fn kernel_cmdline(np: &NodePlan) -> String {
     let ip = np.ip_cidr.as_deref().unwrap_or("");
     format!(

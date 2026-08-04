@@ -9,6 +9,7 @@ mod events;
 mod experiment;
 mod jobs;
 mod services;
+mod status;
 
 use clap::Parser;
 use std::sync::Arc;

@@ -1065,25 +1065,20 @@ impl ZoneService for ZoneSvc {
                 .iter()
                 .map(|np| {
                     let s = zones::node_status(&shell, np, &rd);
-                    ResourceStatus {
-                        vxid: np.node_id.clone(),
-                        kind: ResourceKind::Zone as i32,
-                        state: if s == vxedge_core::zones::backend::NodeState::Up {
-                            ResourceState::Up as i32
-                        } else {
-                            ResourceState::Down as i32
-                        },
+                    crate::status::resource_status(
+                        np.node_id.clone(),
+                        ResourceKind::Zone,
+                        &s,
                         // `peer` is here because interface names are derived from the device id
                         // and shortened to fit IFNAMSIZ, so `vz-node-a-c06a` is not something an
                         // operator reconstructs by eye. This listing is the answer to "which
                         // interface is this device", and for a container-backed node the useful
                         // half is the peer — that is the end campaign scripts address.
-                        detail: format!(
+                        format!(
                             "zone={} backend={:?} port={} peer={} vlan={}",
                             np.zone_id, np.backend, np.endpoint, np.peer, np.vlan
                         ),
-                        since_unix_ms: now_ms(),
-                    }
+                    )
                 })
                 .collect()
         })
@@ -1306,20 +1301,15 @@ impl ComputeService for ComputeSvc {
                 .iter()
                 .map(|np| {
                     let s = zones::node_status(&shell, np, &rd);
-                    ResourceStatus {
-                        vxid: np.node_id.clone(),
-                        kind: ResourceKind::Compute as i32,
-                        state: if s == vxedge_core::zones::backend::NodeState::Up {
-                            ResourceState::Up as i32
-                        } else {
-                            ResourceState::Down as i32
-                        },
-                        detail: format!(
+                    crate::status::resource_status(
+                        np.node_id.clone(),
+                        ResourceKind::Compute,
+                        &s,
+                        format!(
                             "backend={:?} port={} peer={} vlan={}",
                             np.backend, np.endpoint, np.peer, np.vlan
                         ),
-                        since_unix_ms: now_ms(),
-                    }
+                    )
                 })
                 .collect()
         })

@@ -37,8 +37,8 @@ use vxedge_api::v1::zone_service_server::ZoneService;
 use vxedge_api::v1::{
     ExperimentDownRequest, ExperimentStage, ExperimentStatus, ExperimentStatusRequest,
     ExperimentUpRequest, GatewayDownRequest, GatewayStatusRequest, GatewayUpRequest, Job, JobState,
-    ManifestRef, ResourceKind, ResourceState, ResourceStatus, SvcDownRequest, SvcUpRequest,
-    VxidRef, ZoneDownRequest, ZoneListRequest, ZoneUpRequest, manifest_ref::Source,
+    ManifestRef, ResourceKind, ResourceStatus, SvcDownRequest, SvcUpRequest, VxidRef,
+    ZoneDownRequest, ZoneListRequest, ZoneUpRequest, manifest_ref::Source,
 };
 
 use crate::audit::Audit;
@@ -362,21 +362,18 @@ impl ExperimentService for ExperimentSvc {
                 .unwrap_or_default(),
         );
 
-        // The experiment is up only when everything it declares is up. Reporting `Up` while a
-        // zone is down would let a campaign start measuring an incomplete topology.
-        let all_up = !resources.is_empty()
-            && resources
-                .iter()
-                .all(|r| r.state == ResourceState::Up as i32);
+        // Composite pattern (`vxedge_core::status::aggregate`): the experiment's own state is
+        // *derived* from its components, never independently declared, so it can't silently
+        // disagree with what's actually running underneath it. Also fixes a real edge case the
+        // old hand-rolled `all_up` check got wrong: zero resources used to report `Degraded`
+        // (`!resources.is_empty() && ...` is false either way an empty list gets there) — now
+        // correctly `Down`, since nothing partially worked, nothing is declared at all.
+        let state = crate::status::aggregate_resource_states(&resources);
         Ok(Response::new(ExperimentStatus {
             status: Some(ResourceStatus {
                 vxid: model.id.clone(),
                 kind: ResourceKind::Experiment as i32,
-                state: if all_up {
-                    ResourceState::Up as i32
-                } else {
-                    ResourceState::Degraded as i32
-                },
+                state: state as i32,
                 detail: format!("{} resource(s)", resources.len()),
                 since_unix_ms: gw_status.since_unix_ms,
             }),
