@@ -528,7 +528,11 @@ exp-001 measurements).
       `Tunnel`'s WireGuard fields became kind-conditional `Option<T>`, verified not to
       regress the already-shipped WireGuard path by re-running the exact privileged netns
       suite unchanged (all 5 tests, including the real handshake test).
-- [ ] FRR config rendering (BGP optional path)
+- [ ] ~~FRR config rendering (BGP optional path)~~ — **moved to phase 5, 2026-08-04**
+      (`docs/TASKS.md`): unlike VXLAN (extends the already-documented `network.tunnels`
+      hook), FRR has no manifest schema field at all — one would need designing from
+      scratch — and its only purpose (cloud interconnect) has no current consumer; every
+      experiment today uses static routing. Not new scope, just relocated.
 - [x] Port NetOps from iproute2 argv exec to pure rtnetlink/netlink — **slice 1 delivered
       2026-08-04** (`docs/TASKS.md` #16, full account there). Scope decided by research, not
       assumption: the mature `rtnetlink`/`netlink-packet-route` crates cover links/addresses/
