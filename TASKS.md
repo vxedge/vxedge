@@ -661,6 +661,27 @@ exp-001 measurements).
       without `deny_unknown_fields` — they're partial by design (several experiment-level
       blocks are read from raw YAML, not typed in yet; `rxswin` isn't implemented at
       all) — closing that is real remaining #30 scope, not done here.
+- [x] Schema audit third pass: `ExperimentDoc`/`NetworkDoc`/`VehicleDoc`/`BaselineDoc`
+      fully typed and `deny_unknown_fields`-protected — **delivered 2026-08-04**
+      (`docs/TASKS.md` #30, full account there). Closes the exact gap the second pass
+      named as remaining. `ExperimentDoc` gained `kind`/`world`/`services`/`telemetry`/
+      `results`/`method`/`traffic_profiles` as declared (mostly opaque `Value`) fields —
+      not re-typed in full, since `model::build` already validates each with its own
+      named errors, so duplicating that would be a second copy to keep in sync, not
+      additional protection. `VehicleDoc`/`BaselineDoc` gained `kind` (required, or
+      `deny_unknown_fields` rejects every real document's own `kind:` line);
+      `BaselineDoc` finally gained `rxswin`. `SliceDoc` deliberately left untouched
+      (`mode`/`vlan`/`qos`/`s_nssai` typing is separate, still-open scope). **A real bug
+      found before it shipped**: `name: Option<String>` had to be added to both
+      `ExperimentDoc` and `VehicleDoc` — found by testing against `vxmodels`' actual
+      renderer output (`vxmodel render` emits `name:` from a SysML model's own attribute,
+      a field `ARCHITECTURE.md` never documents), not just this repo's own fixtures.
+      Without it, this change would have broken every real `vxmodel` render and,
+      per `vxmodels/.github/workflows/ci.yml`, that repo's own CI. Also fixed:
+      `pinned_cpus`' own silent-drop bug (an invalid entry used to vanish rather than
+      erroring) and a stale `workspace.rs` doc comment referencing a module deleted since
+      2026-07-31. 4 new tests; re-verified all six real workspaces *and* both
+      `vxmodels`-CI-covered renders — zero regressions.
 - [x] `network.nos_check`: model + validation — **delivered 2026-08-04**
       (`docs/TASKS.md` #31). `model::NosCheck`/`NosCheckKind`, parsed from
       `network.nos_check`, mirroring `Tunnel`/`TunnelKind`'s shape. Scoped to model +
