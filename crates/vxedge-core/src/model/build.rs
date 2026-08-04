@@ -2108,18 +2108,19 @@ devices: {}
         }
     }
 
-    /// A `kind: vxlan` tunnel's *model* is valid, but `GatewayPlan` refuses to plan it —
-    /// provisioning is a separate, not-yet-built follow-on (`docs/TASKS.md` #16). This must
-    /// fail loudly, not silently drop the tunnel from the plan.
+    /// A `kind: vxlan` tunnel's model builds *and* plans successfully end to end — provisioning
+    /// landed 2026-08-04 (`docs/TASKS.md` #16). `plan.rs`'s own
+    /// `a_vxlan_tunnel_plans_successfully_extending_its_declared_slice` covers the plan's exact
+    /// shape in detail; this test exercises the full `load_yaml` → `GatewayPlan::from_model`
+    /// pipeline through `model/build.rs`'s own fixture, so a regression in either layer's own
+    /// glue to the other is caught here even if each layer's own unit tests stay green.
     #[test]
-    fn a_vxlan_tunnel_is_refused_at_plan_time_not_silently_dropped() {
+    fn a_vxlan_tunnel_builds_and_plans_successfully() {
         let m = load_yaml(VXLAN_TUNNEL_BASE).expect("model itself is valid");
-        match crate::gateway::GatewayPlan::from_model(&m) {
-            Err(crate::gateway::plan::PlanError::VxlanTunnelNotYetProvisionable(id)) => {
-                assert_eq!(id, "site-b");
-            }
-            other => panic!("expected VxlanTunnelNotYetProvisionable, got {other:?}"),
-        }
+        let plan = crate::gateway::GatewayPlan::from_model(&m).expect("plans successfully");
+        assert_eq!(plan.tunnels.len(), 1);
+        assert_eq!(plan.tunnels[0].id, "site-b");
+        assert_eq!(plan.tunnels[0].kind, TunnelKind::Vxlan);
     }
 
     /// Base fixture for every `network.nos_check` test below — one valid slice (required

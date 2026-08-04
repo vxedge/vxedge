@@ -44,12 +44,12 @@ pub enum PlanError {
     )]
     TunnelNameCollision { a: String, b: String, name: String },
     #[error(
-        "tunnel `{0}` declares `kind: vxlan` — the model and validation for this landed \
-         2026-08-04 (`docs/TASKS.md` #16), but provisioning it did not: `GatewayPlan` only \
-         knows how to plan `wireguard` tunnels today. Remove it, or track the follow-on that \
-         wires vxlan provisioning in before relying on this manifest."
+        "vxlan tunnel `{tunnel}` extends slice `{slice}`, which is `mode: s-nssai` — an s-nssai \
+         slice has no VLAN for a vxlan tunnel to carry (`model::build`'s own \
+         `UndefinedVxlanSlice` check only confirms the slice exists, not that it's `mode: \
+         vlan`). Point `slices` at a vlan-mode slice, or drop this one from the tunnel."
     )]
-    VxlanTunnelNotYetProvisionable(String),
+    VxlanSliceHasNoVlan { tunnel: String, slice: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,20 +110,31 @@ pub struct EndpointImpairment {
     pub params: crate::model::Impairment,
 }
 
-/// A gateway-terminated WireGuard tunnel, planned from `model::Tunnel`
-/// (`docs/TASKS.md` #16, "WireGuard link setup"). Carries only what a manifest may state; the
-/// local private key is minted by `provision::apply_tunnel` on first `up` and never appears
+/// A gateway-terminated tunnel, planned from `model::Tunnel` (`docs/TASKS.md` #16). Kind-
+/// conditional fields, the same shape `model::Tunnel` itself already uses — a `Wireguard`-kind
+/// plan never has a `vni`, a `Vxlan`-kind plan never has a `peer_public_key`. The local
+/// WireGuard private key is minted by `provision::apply_tunnel` on first `up` and never appears
 /// here — see `model::Tunnel`'s own doc comment for why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunnelPlan {
     pub id: String,
-    /// Host interface name (`gateway::ifnames::wireguard_tunnel`).
+    /// Host interface name (`gateway::ifnames::wireguard_tunnel`/`vxlan_tunnel`).
     pub name: String,
-    pub listen_port: u16,
-    pub address: String,
-    pub peer_public_key: String,
+    pub kind: crate::model::TunnelKind,
+    // wireguard-only
+    pub listen_port: Option<u16>,
+    pub address: Option<String>,
+    pub peer_public_key: Option<String>,
     pub peer_endpoint: Option<String>,
     pub peer_allowed_ips: Vec<String>,
+    // vxlan-only
+    pub vni: Option<u32>,
+    pub remote: Option<std::net::IpAddr>,
+    pub dstport: Option<u16>,
+    /// VLAN ids resolved from the tunnel's declared `slices` at plan time, not provision time —
+    /// the plan stays pure (`service-boundaries`: "plans stay pure; backends are the impure
+    /// edge"), so provisioning never re-does a slice→VLAN lookup itself.
+    pub vxlan_vlans: Vec<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -364,18 +375,17 @@ impl GatewayPlan {
         assign_impairments(exp, &mut endpoints, &endpoint_link)?;
 
         let mut tunnels: Vec<TunnelPlan> = Vec::new();
+        // One map for both kinds, deliberately: a name is a name to the kernel regardless of
+        // which tunnel kind derived it, so a single `claimed_tunnels` catches a wireguard/vxlan
+        // collision on the same id just as readily as a same-kind one — splitting this into a
+        // per-kind map would silently lose that.
         let mut claimed_tunnels: std::collections::BTreeMap<String, String> =
             std::collections::BTreeMap::new();
         for t in &exp.tunnels {
-            // `vxlan`'s model + validation landed 2026-08-04, but planning/provisioning is a
-            // separate, not-yet-built follow-on (`docs/TASKS.md` #16) — refused here rather
-            // than silently skipped, so a declared-but-unplannable tunnel fails loudly at
-            // `experiment validate` instead of an experiment believing it has an inter-host
-            // link that `gateway up` never actually provisions.
-            if t.kind == crate::model::TunnelKind::Vxlan {
-                return Err(PlanError::VxlanTunnelNotYetProvisionable(t.id.clone()));
-            }
-            let name = super::ifnames::wireguard_tunnel(&t.id);
+            let name = match t.kind {
+                crate::model::TunnelKind::Wireguard => super::ifnames::wireguard_tunnel(&t.id),
+                crate::model::TunnelKind::Vxlan => super::ifnames::vxlan_tunnel(&t.id),
+            };
             if let Some(other) = claimed_tunnels.insert(name.clone(), t.id.clone()) {
                 return Err(PlanError::TunnelNameCollision {
                     a: other,
@@ -383,23 +393,67 @@ impl GatewayPlan {
                     name,
                 });
             }
-            tunnels.push(TunnelPlan {
-                id: t.id.clone(),
-                name,
-                listen_port: t.listen_port.expect(
-                    "model invariant: wireguard tunnels always carry listen_port \
-                     (tunnels_of's MissingTunnelField check)",
-                ),
-                address: t
-                    .address
-                    .clone()
-                    .expect("model invariant: wireguard tunnels always carry address"),
-                peer_public_key: t
-                    .peer_public_key
-                    .clone()
-                    .expect("model invariant: wireguard tunnels always carry peer_public_key"),
-                peer_endpoint: t.peer_endpoint.clone(),
-                peer_allowed_ips: t.peer_allowed_ips.clone(),
+            tunnels.push(match t.kind {
+                crate::model::TunnelKind::Wireguard => {
+                    TunnelPlan {
+                        id: t.id.clone(),
+                        name,
+                        kind: t.kind,
+                        listen_port: Some(t.listen_port.expect(
+                            "model invariant: wireguard tunnels always carry listen_port \
+                         (tunnels_of's MissingTunnelField check)",
+                        )),
+                        address: Some(
+                            t.address
+                                .clone()
+                                .expect("model invariant: wireguard tunnels always carry address"),
+                        ),
+                        peer_public_key: Some(t.peer_public_key.clone().expect(
+                            "model invariant: wireguard tunnels always carry peer_public_key",
+                        )),
+                        peer_endpoint: t.peer_endpoint.clone(),
+                        peer_allowed_ips: t.peer_allowed_ips.clone(),
+                        vni: None,
+                        remote: None,
+                        dstport: None,
+                        vxlan_vlans: Vec::new(),
+                    }
+                }
+                crate::model::TunnelKind::Vxlan => {
+                    let vxlan_vlans = t
+                        .vxlan_slices
+                        .iter()
+                        .map(|slice| {
+                            vlan_of(slice).ok_or_else(|| PlanError::VxlanSliceHasNoVlan {
+                                tunnel: t.id.clone(),
+                                slice: slice.clone(),
+                            })
+                        })
+                        .collect::<Result<Vec<u16>, PlanError>>()?;
+                    TunnelPlan {
+                        id: t.id.clone(),
+                        name,
+                        kind: t.kind,
+                        listen_port: None,
+                        address: None,
+                        peer_public_key: None,
+                        peer_endpoint: None,
+                        peer_allowed_ips: Vec::new(),
+                        vni: Some(t.vni.expect(
+                            "model invariant: vxlan tunnels always carry vni \
+                             (tunnels_of's MissingVxlanTunnelField check)",
+                        )),
+                        remote: Some(
+                            t.remote
+                                .expect("model invariant: vxlan tunnels always carry remote"),
+                        ),
+                        // IANA-assigned VXLAN port when the manifest omits it (§6.0.3) —
+                        // resolved here, not in provisioning, so the plan stays the single
+                        // place a default is decided.
+                        dstport: Some(t.dstport.unwrap_or(4789)),
+                        vxlan_vlans,
+                    }
+                }
             });
         }
 
@@ -601,14 +655,19 @@ parts:
         let t = &plan.tunnels[0];
         assert_eq!(t.id, "ota-uplink");
         assert_eq!(t.name, "vxwg-ota-uplink");
-        assert_eq!(t.listen_port, 51820);
-        assert_eq!(t.address, "10.200.0.1/24");
+        assert_eq!(t.kind, crate::model::TunnelKind::Wireguard);
+        assert_eq!(t.listen_port, Some(51820));
+        assert_eq!(t.address.as_deref(), Some("10.200.0.1/24"));
         assert_eq!(
-            t.peer_public_key,
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            t.peer_public_key.as_deref(),
+            Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
         );
         assert_eq!(t.peer_endpoint.as_deref(), Some("198.51.100.7:51820"));
         assert_eq!(t.peer_allowed_ips, vec!["10.200.0.0/24".to_string()]);
+        // Kind-conditional fields stay absent for a wireguard tunnel.
+        assert_eq!(t.vni, None);
+        assert_eq!(t.remote, None);
+        assert!(t.vxlan_vlans.is_empty());
     }
 
     /// Two tunnel ids that sanitize to the same interface name are refused rather than
@@ -626,6 +685,49 @@ parts:
         let err = GatewayPlan::from_model(&model(&ws)).unwrap_err();
         assert!(
             matches!(&err, PlanError::TunnelNameCollision { name, .. } if name == "vxwg-tun-a"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_vxlan_tunnel_plans_successfully_extending_its_declared_slice() {
+        let ws = BASE.replacen(
+            "network:\n  defaults: { bandwidth: 500000000 }",
+            "network:\n  defaults: { bandwidth: 500000000 }\n  tunnels:\n    - { id: site-b, \
+             kind: vxlan, vni: 100, remote: 198.51.100.7, slices: [adas] }",
+            1,
+        );
+        let plan = GatewayPlan::from_model(&model(&ws)).unwrap();
+        assert_eq!(plan.tunnels.len(), 1);
+        let t = &plan.tunnels[0];
+        assert_eq!(t.id, "site-b");
+        assert_eq!(t.name, "vxln-site-b");
+        assert_eq!(t.kind, crate::model::TunnelKind::Vxlan);
+        assert_eq!(t.vni, Some(100));
+        assert_eq!(t.remote, Some("198.51.100.7".parse().unwrap()));
+        // Absent in the manifest — resolved to the IANA-assigned VXLAN port at plan time.
+        assert_eq!(t.dstport, Some(4789));
+        assert_eq!(t.vxlan_vlans, vec![101]);
+        // Kind-conditional fields stay absent for a vxlan tunnel.
+        assert_eq!(t.listen_port, None);
+        assert_eq!(t.peer_public_key, None);
+    }
+
+    #[test]
+    fn a_vxlan_tunnel_extending_an_s_nssai_slice_is_refused() {
+        let ws = slices_only("  - { id: adas, mode: s-nssai, s_nssai: { sst: 1 } }").replacen(
+            "network:\n  slices:",
+            "network:\n  tunnels:\n    - { id: site-b, kind: vxlan, vni: 100, remote: \
+             198.51.100.7, slices: [adas] }\n  slices:",
+            1,
+        );
+        let err = GatewayPlan::from_model(&model(&ws)).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                PlanError::VxlanSliceHasNoVlan { tunnel, slice }
+                    if tunnel == "site-b" && slice == "adas"
+            ),
             "{err}"
         );
     }

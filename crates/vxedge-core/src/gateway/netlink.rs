@@ -9,10 +9,11 @@
 //! claims that coverage is 7 months old with ~1.4K downloads: too immature to bet the mechanism
 //! behind H1's headline number on. So `tc`/`nft`/`wg`/`ovs-vsctl` stay on `Shell` — this module
 //! covers exactly what `apply_links`, `apply_slices`'s trunk-VLAN half, `apply_endpoints`'s
-//! link+VLAN halves, `teardown`'s link deletes, and `observe`'s link/VLAN queries need, and
-//! nothing else. `docs/TASKS.md` #16 tracks the deferred remainder (OVS's own link calls, the
-//! fiveg uplink, tunnel device creation, zone netns lifecycle, tap devices) as separate,
-//! smaller follow-ons — not silently implied done by this slice.
+//! link+VLAN halves, `teardown`'s link deletes, `observe`'s link/VLAN queries, and (added for
+//! VXLAN tunnel provisioning) VXLAN link creation need, and nothing else. `docs/TASKS.md` #16
+//! tracks the deferred remainder (OVS's own link calls, the fiveg uplink, WireGuard tunnel
+//! device creation, zone netns lifecycle, tap devices) as separate, smaller follow-ons — not
+//! silently implied done by this slice.
 //!
 //! **A genuine side benefit, not just fewer shell-outs**: `Shell::escalate`'s sudo-wrapping
 //! exists because `setcap cap_net_admin+ep` on the `vxedged` binary does *not* propagate to the
@@ -33,7 +34,7 @@ use rtnetlink::packet_route::AddressFamily;
 use rtnetlink::packet_route::link::{
     AfSpecBridge, BridgeVlanInfoFlags, LinkAttribute, LinkExtentMask,
 };
-use rtnetlink::{LinkBridge, LinkBridgeVlan, LinkUnspec, LinkVeth};
+use rtnetlink::{LinkBridge, LinkBridgeVlan, LinkUnspec, LinkVeth, LinkVxlan};
 
 // Netlink error codes are the kernel's own `-errno`, carried in `ErrorMessage::code`. Named
 // here rather than pulling in `libc` for three constants.
@@ -231,6 +232,47 @@ pub fn ensure_veth_pair(netns: Option<&str>, name: &str, peer: &str) -> Result<(
                     Ok(())
                 } else {
                     Err(op_err("ensure_veth_pair", e))
+                }
+            })
+    })
+}
+
+/// Idempotent, same contract as [`ensure_bridge`]. Unicast point-to-point VXLAN only — no
+/// `group`/multicast support, matching `network.tunnels`' own `kind: vxlan` schema
+/// (`docs/ARCHITECTURE.md` §6.0.3: `vni`/`remote`/`dstport`, no group address). `rtnetlink`'s
+/// `LinkVxlan::remote`/`remote6` are separate methods (no single `IpAddr`-generic one), hence
+/// the branch on `remote`'s own variant.
+pub fn ensure_vxlan(
+    netns: Option<&str>,
+    name: &str,
+    vni: u32,
+    remote: std::net::IpAddr,
+    dstport: u16,
+) -> Result<(), NetlinkError> {
+    let name = name.to_string();
+    run_async(netns, "ensure_vxlan", move |handle| async move {
+        if link_index(&handle, &name)
+            .await
+            .map_err(|e| op_err("ensure_vxlan", e))?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let builder = LinkVxlan::new(&name, vni).port(dstport);
+        let builder = match remote {
+            std::net::IpAddr::V4(addr) => builder.remote(addr),
+            std::net::IpAddr::V6(addr) => builder.remote6(addr),
+        };
+        handle
+            .link()
+            .add(builder.build())
+            .execute()
+            .await
+            .or_else(|e| {
+                if is_eexist(&e) {
+                    Ok(())
+                } else {
+                    Err(op_err("ensure_vxlan", e))
                 }
             })
     })

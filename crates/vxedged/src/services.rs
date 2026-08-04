@@ -331,6 +331,26 @@ impl GatewaySvc {
                                     .map_err(|e| e.to_string())
                             })
                             .await?;
+                            // Found live 2026-08-04, testing VXLAN provisioning end to end
+                            // through this exact RPC: this reconciler loop calls the first three
+                            // `DataPlane` stages individually (for the per-stage progress
+                            // updates above) but never called `apply_tunnels` — so no declared
+                            // tunnel, WireGuard or vxlan, was ever actually provisioned through
+                            // `vxedge up`, only through the lower-level `apply()` helper the
+                            // netns test suite calls directly. `observe()` below already checked
+                            // tunnel status via `fully_up()`, so a manifest declaring one would
+                            // retry three times and fail with a confusing "did not converge"
+                            // rather than the real cause (the stage that would have provisioned
+                            // it was simply never called).
+                            p.update(85, &format!("applying tunnels{note}"));
+                            let sh = shell.clone();
+                            let pl = plan.clone();
+                            blocking(move || {
+                                gateway::data_plane(pl.data_plane)
+                                    .apply_tunnels(&sh, &pl)
+                                    .map_err(|e| e.to_string())
+                            })
+                            .await?;
                             p.update(90, "verifying observed state");
                             let sh = shell.clone();
                             let pl = plan.clone();
@@ -680,6 +700,7 @@ impl GatewayService for GatewaySvc {
                         public_key: t.public_key.clone(),
                         handshake_established: t.handshake_established,
                         detail: format!("present={}", t.present),
+                        kind: crate::status::wire_tunnel_kind(t.kind) as i32,
                     })
                     .collect();
                 if obs.fully_up() {

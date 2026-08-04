@@ -590,8 +590,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 for t in &status.tunnels {
                     println!(
-                        "  tunnel {}: state={} handshake={} public_key={} {}",
-                        t.id, t.state, t.handshake_established, t.public_key, t.detail
+                        "  tunnel {} ({}): state={} handshake={} public_key={} {}",
+                        t.id, t.kind, t.state, t.handshake_established, t.public_key, t.detail
                     );
                 }
             } else {
@@ -1122,6 +1122,7 @@ struct JsonTunnelStatus {
     public_key: String,
     handshake_established: bool,
     detail: String,
+    kind: i32,
 }
 
 #[derive(serde::Serialize)]
@@ -1180,6 +1181,7 @@ impl From<&vxedge_api::v1::GatewayStatus> for JsonStatus {
                     public_key: t.public_key.clone(),
                     handshake_established: t.handshake_established,
                     detail: t.detail.clone(),
+                    kind: t.kind,
                 })
                 .collect(),
         }

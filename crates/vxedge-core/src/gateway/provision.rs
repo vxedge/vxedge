@@ -402,12 +402,23 @@ fn teardown_ingress_filter(sh: &Shell, ep: &super::plan::EndpointPlan) -> Result
     sh.run_tolerate_missing("nft", &["delete", "table", "netdev", &table])
 }
 
-/// One gateway-terminated WireGuard tunnel (`docs/TASKS.md` #16, "WireGuard link setup"),
-/// applied or torn down identically regardless of `network.data_plane`: a WireGuard interface
-/// is a routed L3 endpoint, never enslaved to the bridge/OVS switch itself, so there is nothing
-/// backend-specific here — called once, from the `DataPlane` trait's shared default `apply`,
-/// and from both backends' `teardown`/`observe`.
-///
+/// One gateway-terminated tunnel (`docs/TASKS.md` #16), applied or torn down identically
+/// regardless of `network.data_plane` for both kinds: a WireGuard interface is a routed L3
+/// endpoint, never enslaved to the bridge/OVS switch itself; a VXLAN interface *does* enslave
+/// to the bridge, but as a trunk-like port the same way the uplink itself is — neither depends
+/// on which switching fabric is otherwise in use. Called once, from the `DataPlane` trait's
+/// shared default `apply`, and from both backends' `teardown`/`observe`.
+fn apply_tunnel(
+    sh: &Shell,
+    plan: &GatewayPlan,
+    t: &super::plan::TunnelPlan,
+) -> Result<(), NetOpsError> {
+    match t.kind {
+        crate::model::TunnelKind::Wireguard => apply_wireguard_tunnel(sh, t),
+        crate::model::TunnelKind::Vxlan => apply_vxlan_tunnel(sh, plan, t),
+    }
+}
+
 /// Idempotency splits in two, deliberately: interface *creation* (and the one-time key
 /// generation that goes with it) happens only when `sh.link_exists` says the tunnel does not
 /// exist yet; peer/listen-port configuration below that point is `wg set`'s own declarative,
@@ -416,7 +427,7 @@ fn teardown_ingress_filter(sh: &Shell, ep: &super::plan::EndpointPlan) -> Result
 /// invalidating whatever the peer already trusts — the same class of bug `apply_impairment`'s
 /// own doc comment warns about for `tc filter add`, just on the "recreates instead of no-ops"
 /// side rather than the "duplicates" side.
-fn apply_tunnel(sh: &Shell, t: &super::plan::TunnelPlan) -> Result<(), NetOpsError> {
+fn apply_wireguard_tunnel(sh: &Shell, t: &super::plan::TunnelPlan) -> Result<(), NetOpsError> {
     if !sh.link_exists(&t.name) {
         sh.run("ip", &["link", "add", &t.name, "type", "wireguard"])?;
         // The private key never touches disk: piped straight from `wg genkey`'s stdout into
@@ -437,7 +448,14 @@ fn apply_tunnel(sh: &Shell, t: &super::plan::TunnelPlan) -> Result<(), NetOpsErr
             privkey.trim(),
         )?;
     }
-    let listen_port = t.listen_port.to_string();
+    let listen_port = t
+        .listen_port
+        .expect("plan invariant: wireguard tunnels always carry listen_port")
+        .to_string();
+    let peer_public_key = t
+        .peer_public_key
+        .as_deref()
+        .expect("plan invariant: wireguard tunnels always carry peer_public_key");
     let allowed_ips = t.peer_allowed_ips.join(",");
     let mut args: Vec<&str> = vec![
         "set",
@@ -445,7 +463,7 @@ fn apply_tunnel(sh: &Shell, t: &super::plan::TunnelPlan) -> Result<(), NetOpsErr
         "listen-port",
         &listen_port,
         "peer",
-        &t.peer_public_key,
+        peer_public_key,
     ];
     if !allowed_ips.is_empty() {
         args.push("allowed-ips");
@@ -457,20 +475,70 @@ fn apply_tunnel(sh: &Shell, t: &super::plan::TunnelPlan) -> Result<(), NetOpsErr
     }
     sh.run("wg", &args)?;
 
-    sh.run_tolerate_exists("ip", &["addr", "add", &t.address, "dev", &t.name])?;
+    let address = t
+        .address
+        .as_deref()
+        .expect("plan invariant: wireguard tunnels always carry address");
+    sh.run_tolerate_exists("ip", &["addr", "add", address, "dev", &t.name])?;
     sh.run("ip", &["link", "set", &t.name, "up"])?;
+    Ok(())
+}
+
+/// A VXLAN tunnel joins the bridge as a trunk-like port carrying whatever local slice VLANs it
+/// declared (`plan.rs`'s own `vxlan_vlans`, already resolved from `slices` at plan time) —
+/// structurally the same shape `apply_slices` already gives the uplink's own trunk membership,
+/// not the access-port (`pvid untagged`) shape `apply_endpoints` gives a zone device. Goes
+/// straight through `netlink.rs`: VXLAN link creation was never on the iproute2 shell-out to
+/// begin with (confirmed supported by the same `rtnetlink` crate this session's own rtnetlink
+/// port already vetted and adopted), so this lands already-modernized.
+fn apply_vxlan_tunnel(
+    sh: &Shell,
+    plan: &GatewayPlan,
+    t: &super::plan::TunnelPlan,
+) -> Result<(), NetOpsError> {
+    let ns = sh.netns.as_deref();
+    netlink::ensure_vxlan(
+        ns,
+        &t.name,
+        t.vni
+            .expect("plan invariant: vxlan tunnels always carry vni"),
+        t.remote
+            .expect("plan invariant: vxlan tunnels always carry remote"),
+        t.dstport
+            .expect("plan invariant: vxlan tunnels always carry dstport (defaulted at plan time)"),
+    )
+    .map_err(nl)?;
+    netlink::set_master(ns, &t.name, &plan.bridge).map_err(nl)?;
+    for vlan in &t.vxlan_vlans {
+        netlink::bridge_vlan_add(ns, &t.name, *vlan, false).map_err(nl)?;
+    }
+    netlink::link_up(ns, &t.name).map_err(nl)?;
     Ok(())
 }
 
 fn apply_tunnels(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
     for t in &plan.tunnels {
-        apply_tunnel(sh, t)?;
+        apply_tunnel(sh, plan, t)?;
     }
     Ok(())
 }
 
+/// WireGuard teardown **deliberately stays on `Shell`** even though `netlink::delete_link`
+/// would work identically here (link deletion doesn't care what created the link) — unifying
+/// the two is a real, separate migration decision outside this change's scope
+/// (minimal-footprint principle: don't touch an already-proven path — the one
+/// `tunnel_completes_a_real_handshake_between_two_simulated_hosts` exercises — for a stylistic
+/// win). VXLAN teardown goes through `netlink.rs` because that component was never on the
+/// shell-out to begin with.
 fn teardown_tunnel(sh: &Shell, t: &super::plan::TunnelPlan) -> Result<(), NetOpsError> {
-    sh.run_tolerate_missing("ip", &["link", "del", &t.name])
+    match t.kind {
+        crate::model::TunnelKind::Wireguard => {
+            sh.run_tolerate_missing("ip", &["link", "del", &t.name])
+        }
+        crate::model::TunnelKind::Vxlan => {
+            netlink::delete_link(sh.netns.as_deref(), &t.name).map_err(nl)
+        }
+    }
 }
 
 fn teardown_tunnels(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
@@ -485,46 +553,81 @@ fn teardown_tunnels(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
 pub struct TunnelObservation {
     pub id: String,
     pub name: String,
+    pub kind: crate::model::TunnelKind,
     pub present: bool,
     /// This side's current public key, read live off the kernel — the only place it is ever
     /// recorded, since `apply_tunnel` never writes it to disk. Empty when the interface is
-    /// absent.
+    /// absent, and always empty for a `Vxlan`-kind tunnel (no key material at all — an
+    /// unencrypted L2 extension, the same trust model as a physical inter-switch link).
     pub public_key: String,
     /// Whether the peer has completed a handshake recently. **Not** a `fully_up` condition:
     /// WireGuard is connectionless, so a correctly configured but idle tunnel legitimately has
     /// no handshake yet — this is informational (`status`), the same way an unimpaired link's
-    /// tc counters are informational rather than gating.
+    /// tc counters are informational rather than gating. Always `false` for a `Vxlan`-kind
+    /// tunnel — VXLAN has no handshake concept at all, not merely an unestablished one.
     pub handshake_established: bool,
 }
 
 fn observe_tunnels(sh: &Shell, plan: &GatewayPlan) -> Vec<TunnelObservation> {
     plan.tunnels
         .iter()
-        .map(|t| {
-            let present = sh.link_exists(&t.name);
-            let public_key = sh
-                .run("wg", &["show", &t.name, "public-key"])
-                .map(|s| s.trim().to_string())
-                .unwrap_or_default();
-            let handshake_established = sh
-                .run("wg", &["show", &t.name, "latest-handshakes"])
-                .map(|s| {
-                    // `<pubkey>\t<unix-seconds>`; 0 means "never."
-                    s.split_whitespace()
-                        .next_back()
-                        .and_then(|secs| secs.parse::<u64>().ok())
-                        .is_some_and(|secs| secs > 0)
-                })
-                .unwrap_or(false);
-            TunnelObservation {
-                id: t.id.clone(),
-                name: t.name.clone(),
-                present,
-                public_key,
-                handshake_established,
-            }
+        .map(|t| match t.kind {
+            crate::model::TunnelKind::Wireguard => observe_wireguard_tunnel(sh, t),
+            crate::model::TunnelKind::Vxlan => observe_vxlan_tunnel(sh, t),
         })
         .collect()
+}
+
+fn observe_wireguard_tunnel(sh: &Shell, t: &super::plan::TunnelPlan) -> TunnelObservation {
+    let present = sh.link_exists(&t.name);
+    let public_key = sh
+        .run("wg", &["show", &t.name, "public-key"])
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let handshake_established = sh
+        .run("wg", &["show", &t.name, "latest-handshakes"])
+        .map(|s| {
+            // `<pubkey>\t<unix-seconds>`; 0 means "never."
+            s.split_whitespace()
+                .next_back()
+                .and_then(|secs| secs.parse::<u64>().ok())
+                .is_some_and(|secs| secs > 0)
+        })
+        .unwrap_or(false);
+    TunnelObservation {
+        id: t.id.clone(),
+        name: t.name.clone(),
+        kind: t.kind,
+        present,
+        public_key,
+        handshake_established,
+    }
+}
+
+/// "Present" means both the link exists *and* carries every declared VLAN — a VXLAN interface
+/// up but missing one of the slices it was supposed to extend is not meaningfully "up" any more
+/// than a missing interface is. No separate `link_exists` check needed:
+/// `netlink::bridge_vlan_list` already returns an empty list for a missing link, which can
+/// never contain the non-empty `vxlan_vlans` every successfully-planned vxlan tunnel carries
+/// (`tunnels_of`'s own `MissingVxlanTunnelField` guarantees at least one declared slice).
+///
+/// A subset check, not exact-set equality — found live: a `vlan_filtering` bridge auto-assigns
+/// every new port an untagged default membership in VLAN 1 alongside whatever's explicitly
+/// added, the same behavior `observe`'s own uplink trunk check already tolerates via
+/// `trunk_vlans.contains(&s.vlan)`. This tunnel is a trunk-like port, the same shape as the
+/// uplink, so it inherits the same default-VLAN-1 membership and needs the same tolerant check.
+fn observe_vxlan_tunnel(sh: &Shell, t: &super::plan::TunnelPlan) -> TunnelObservation {
+    let ns = sh.netns.as_deref();
+    let actual = netlink::bridge_vlan_list(ns, &t.name).unwrap_or_default();
+    let present = t.vxlan_vlans.iter().all(|vlan| actual.contains(vlan));
+    TunnelObservation {
+        id: t.id.clone(),
+        name: t.name.clone(),
+        kind: t.kind,
+        present,
+        public_key: String::new(),
+        handshake_established: false,
+    }
 }
 
 /// VLAN membership for the 5G core's uplink port on a `vlan_filtering 1`

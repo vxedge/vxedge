@@ -135,6 +135,22 @@ pub fn wireguard_tunnel(id: &str) -> String {
     format!("{WIREGUARD_PREFIX}{}", shorten_to_budget(key, WG_STEM_MAX))
 }
 
+/// Gateway-side VXLAN tunnel interface (`docs/TASKS.md` #16, VXLAN provisioning), derived from
+/// the tunnel's own id — same pure-function contract, own prefix and budget, for the same
+/// reason [`wireguard_tunnel`]'s own doc comment gives.
+const VXLAN_PREFIX: &str = "vxln-";
+const VXLAN_STEM_MAX: usize = IFNAME_MAX - VXLAN_PREFIX.len();
+
+pub fn vxlan_tunnel(id: &str) -> String {
+    let key = sanitize(id);
+    let key = if key.is_empty() {
+        "tun".to_string()
+    } else {
+        key
+    };
+    format!("{VXLAN_PREFIX}{}", shorten_to_budget(key, VXLAN_STEM_MAX))
+}
+
 /// The bridge access port for an attachment (veth host side, or the tap itself).
 pub fn access_port(device: &str, port: Option<&str>) -> String {
     format!("{ACCESS_PREFIX}{}", stem(device, port))
@@ -284,5 +300,20 @@ mod tests {
             long,
             wireguard_tunnel("ota-uplink-to-central-compute-site-2")
         );
+    }
+
+    #[test]
+    fn vxlan_tunnel_names_are_deterministic_and_fit_ifnamsiz() {
+        assert_eq!(vxlan_tunnel("site-b"), "vxln-site-b");
+        let before = vxlan_tunnel("tun-b");
+        for neighbour in ["tun-a", "aaa", "zzz"] {
+            assert_ne!(vxlan_tunnel(neighbour), before);
+        }
+        assert_eq!(vxlan_tunnel("tun-b"), before);
+        let long = vxlan_tunnel("ota-uplink-to-central-compute-site-2");
+        assert!(long.len() <= IFNAME_MAX, "{long} is {} bytes", long.len());
+        assert_eq!(long, vxlan_tunnel("ota-uplink-to-central-compute-site-2"));
+        // Distinct prefixes keep the two tunnel kinds' names from colliding even on the same id.
+        assert_ne!(vxlan_tunnel("ota-uplink"), wireguard_tunnel("ota-uplink"));
     }
 }

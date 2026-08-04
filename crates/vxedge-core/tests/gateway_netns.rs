@@ -908,3 +908,179 @@ fn tunnel_completes_a_real_handshake_between_two_simulated_hosts() {
     assert!(!observe(&sh_a, &plan_a).unwrap().tunnels[0].present);
     assert!(!observe(&sh_b, &plan_b).unwrap().tunnels[0].present);
 }
+
+// Both sites declare the *same* VLAN id for their own locally-named slice — that agreement,
+// plus the same VNI, is what makes the two sides' bridges join into one L2 domain once the
+// VXLAN tunnel is up: an 802.1Q-tagged frame the local bridge forwards onto the tunnel arrives
+// at the other side still tagged for the same VLAN, which that side's own bridge is a member of
+// for the same reason. A real operator declares this agreement independently in each site's own
+// manifest, exactly as these two fixtures do.
+const VXLAN_SITE_A_WORKSPACE: &str = r#"
+kind: experiment
+id: exp-vxlan-a
+vehicles: [veh]
+network:
+  slices:
+    - { id: adas, mode: vlan, vlan: 101 }
+  tunnels:
+    - { id: site-b, kind: vxlan, vni: 100, remote: 10.250.0.2, slices: [adas] }
+---
+kind: vehicle
+id: veh
+devices:
+  node-a: { role: ecu, backend: container }
+links:
+  - { id: l-a, endpoints: [{ node: node-a, port: eth0, ip: 10.113.0.2/24 }], slice: adas }
+"#;
+const VXLAN_SITE_B_WORKSPACE: &str = r#"
+kind: experiment
+id: exp-vxlan-b
+vehicles: [veh]
+network:
+  slices:
+    - { id: adas, mode: vlan, vlan: 101 }
+  tunnels:
+    - { id: site-a, kind: vxlan, vni: 100, remote: 10.250.0.1, slices: [adas] }
+---
+kind: vehicle
+id: veh
+devices:
+  node-b: { role: ecu, backend: container }
+links:
+  - { id: l-b, endpoints: [{ node: node-b, port: eth0, ip: 10.113.0.3/24 }], slice: adas }
+"#;
+
+/// Regression/acceptance test for docs/TASKS.md #16's VXLAN tunnel provisioning. Not just "the
+/// interface exists" (`plan.rs`'s own unit tests already cover plan derivation) but that two
+/// independent gateways, simulated as two network namespaces connected only by a plain veth pair
+/// standing in for the internet between two real hosts (same `wanA`/`wanB` shape the WireGuard
+/// test above uses), actually join their bridges into one L2 domain: a real container zone on
+/// site A reaches a real container zone on site B, over their shared `adas` slice, with the only
+/// path between the two netns being the VXLAN-encapsulated UDP traffic crossing `wanA`/`wanB`.
+/// Structurally different from the WireGuard test on purpose — a VXLAN tunnel joins the bridge
+/// as a trunk-like port rather than staying a routed L3 endpoint, so this can't be device-less
+/// the way that one is.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN; run under sudo (see module docs)"]
+fn vxlan_tunnel_carries_slice_traffic_between_two_simulated_hosts() {
+    let ns_a = format!("vxvxa{}", std::process::id());
+    let ns_b = format!("vxvxb{}", std::process::id());
+    for ns in [&ns_a, &ns_b] {
+        let created = std::process::Command::new("ip")
+            .args(["netns", "add", ns])
+            .output()
+            .expect("iproute2 installed");
+        assert!(
+            created.status.success(),
+            "cannot create netns (run as root): {}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+    }
+    let _guard_a = NetnsGuard(ns_a.clone());
+    let _guard_b = NetnsGuard(ns_b.clone());
+    let sh_a = Shell {
+        netns: Some(ns_a.clone()),
+        escalate: false,
+    };
+    let sh_b = Shell {
+        netns: Some(ns_b.clone()),
+        escalate: false,
+    };
+
+    // The "internet" between the two simulated hosts — identical shape to the WireGuard test's
+    // own `wanA`/`wanB`, and for the same reason (`run_host`: a bind mount created from inside
+    // `ip netns exec` does not propagate).
+    sh_a.run_host(
+        "ip",
+        &[
+            "link", "add", "wanA", "type", "veth", "peer", "name", "wanB",
+        ],
+    )
+    .unwrap();
+    sh_a.run_host("ip", &["link", "set", "wanA", "netns", &ns_a])
+        .unwrap();
+    sh_a.run_host("ip", &["link", "set", "wanB", "netns", &ns_b])
+        .unwrap();
+    sh_a.run("ip", &["addr", "add", "10.250.0.1/30", "dev", "wanA"])
+        .unwrap();
+    sh_a.run("ip", &["link", "set", "wanA", "up"]).unwrap();
+    sh_b.run("ip", &["addr", "add", "10.250.0.2/30", "dev", "wanB"])
+        .unwrap();
+    sh_b.run("ip", &["link", "set", "wanB", "up"]).unwrap();
+
+    let model_a = vxedge_core::model::load_yaml(VXLAN_SITE_A_WORKSPACE).unwrap();
+    let model_b = vxedge_core::model::load_yaml(VXLAN_SITE_B_WORKSPACE).unwrap();
+    let plan_a = GatewayPlan::from_model(&model_a).unwrap();
+    let plan_b = GatewayPlan::from_model(&model_b).unwrap();
+
+    apply(&sh_a, &plan_a).unwrap();
+    apply(&sh_b, &plan_b).unwrap();
+
+    let obs_a = observe(&sh_a, &plan_a).unwrap();
+    let obs_b = observe(&sh_b, &plan_b).unwrap();
+    assert!(obs_a.fully_up(), "site A not fully up: {obs_a:?}");
+    assert!(obs_b.fully_up(), "site B not fully up: {obs_b:?}");
+    assert_eq!(obs_a.tunnels[0].kind, vxedge_core::model::TunnelKind::Vxlan);
+    // No key material and no handshake concept at all — distinct from the WireGuard test's own
+    // assertions on the same fields, which is the whole point of the two kinds' own distinction.
+    assert!(obs_a.tunnels[0].public_key.is_empty());
+    assert!(!obs_a.tunnels[0].handshake_established);
+
+    let runtime_a = std::env::temp_dir().join(format!("vxzones-vxlan-a-{}", std::process::id()));
+    let runtime_b = std::env::temp_dir().join(format!("vxzones-vxlan-b-{}", std::process::id()));
+    std::fs::create_dir_all(&runtime_a).unwrap();
+    std::fs::create_dir_all(&runtime_b).unwrap();
+    let nodes_a = plan_nodes_from_model(&model_a, &plan_a, std::path::Path::new("/")).unwrap();
+    let nodes_b = plan_nodes_from_model(&model_b, &plan_b, std::path::Path::new("/")).unwrap();
+    let node_a = nodes_a
+        .iter()
+        .find(|n| n.node_id == "node-a")
+        .expect("node-a planned");
+    let node_b = nodes_b
+        .iter()
+        .find(|n| n.node_id == "node-b")
+        .expect("node-b planned");
+    node_up(&sh_a, node_a, &runtime_a).unwrap();
+    node_up(&sh_b, node_b, &runtime_b).unwrap();
+
+    // The real proof: a ping from site A's container to site B's container, over their shared
+    // `adas` slice — the *only* path between the two netns is the VXLAN-encapsulated UDP
+    // traffic crossing `wanA`/`wanB`, so this only succeeds if the tunnel is genuinely carrying
+    // the slice's L2 traffic, not merely present as an interface.
+    let node_b_addr = node_b
+        .ip_cidr
+        .as_deref()
+        .and_then(|cidr| cidr.split_once('/'))
+        .map(|(ip, _)| ip)
+        .expect("node-b has a declared ip_cidr");
+    let container_ns_a = node_a.runtime_name();
+    let ping = sh_a
+        .run_host(
+            "ip",
+            &[
+                "netns",
+                "exec",
+                &container_ns_a,
+                "ping",
+                "-c",
+                "5",
+                "-W",
+                "2",
+                node_b_addr,
+            ],
+        )
+        .unwrap();
+    assert!(
+        ping.contains("5 received") || ping.contains("5 packets received"),
+        "ping across the vxlan overlay did not complete: {ping}"
+    );
+
+    node_down(&sh_a, node_a, &runtime_a).unwrap();
+    node_down(&sh_b, node_b, &runtime_b).unwrap();
+    teardown(&sh_a, &plan_a).unwrap();
+    teardown(&sh_b, &plan_b).unwrap();
+    assert!(!observe(&sh_a, &plan_a).unwrap().tunnels[0].present);
+    assert!(!observe(&sh_b, &plan_b).unwrap().tunnels[0].present);
+    let _ = std::fs::remove_dir_all(&runtime_a);
+    let _ = std::fs::remove_dir_all(&runtime_b);
+}

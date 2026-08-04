@@ -67,6 +67,18 @@ message IngressFilterStatus {
   string detail = 4;
 }
 
+// `wireguard` (a routed L3 endpoint, encrypted, connection-oriented) and `vxlan` (joins the
+// bridge as a trunk-like port, unencrypted, connectionless — no key material or handshake
+// concept at all) are structurally opposite kinds under one `network.tunnels` block
+// (`docs/ARCHITECTURE.md` §6.0.3). `TunnelStatus.kind` lets a client tell them apart instead of
+// inferring it from `public_key`/`handshake_established` being empty/false, which is also what
+// an unestablished wireguard tunnel looks like.
+enum TunnelKind {
+  TUNNEL_KIND_UNSPECIFIED = 0;
+  TUNNEL_KIND_WIREGUARD = 1;
+  TUNNEL_KIND_VXLAN = 2;
+}
+
 message TunnelStatus {
   string id = 1;
   // UP or DOWN only, like IngressFilterStatus — a tunnel interface either exists and is
@@ -75,10 +87,14 @@ message TunnelStatus {
   // not a fault (see `TunnelObservation::handshake_established`'s own doc comment).
   ResourceState state = 2;
   // This side's current public key, read live off the kernel — hand this to the peer so it can
-  // be configured as their `peer.public_key`. Empty when the tunnel isn't up.
+  // be configured as their `peer.public_key`. Empty when the tunnel isn't up, and always empty
+  // for a `TUNNEL_KIND_VXLAN` entry — vxlan has no key material at all.
   string public_key = 3;
+  // Always `false` for a `TUNNEL_KIND_VXLAN` entry — vxlan has no handshake concept, not merely
+  // an unestablished one.
   bool handshake_established = 4;
   string detail = 5;
+  TunnelKind kind = 6;
 }
 
 service GatewayService {

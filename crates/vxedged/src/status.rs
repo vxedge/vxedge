@@ -22,6 +22,15 @@ fn wire_state(s: ObservedState) -> ResourceState {
     }
 }
 
+/// `vxedge_core::model::TunnelKind` (domain) → `vxedge_api::v1::TunnelKind` (wire) — the same
+/// one-place translation this module already owns for `ObservedState`/`ResourceState`.
+pub fn wire_tunnel_kind(k: vxedge_core::model::TunnelKind) -> vxedge_api::v1::TunnelKind {
+    match k {
+        vxedge_core::model::TunnelKind::Wireguard => vxedge_api::v1::TunnelKind::Wireguard,
+        vxedge_core::model::TunnelKind::Vxlan => vxedge_api::v1::TunnelKind::Vxlan,
+    }
+}
+
 /// Builds one `ResourceStatus` from anything `Observable`, plus the identity/kind vxedged
 /// itself always knows. An `Observable` domain type never carries its own `vxid`/`kind` — those
 /// are routing information the daemon owns (which node, which resource kind), not something
