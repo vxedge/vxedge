@@ -520,8 +520,27 @@ exp-001 measurements).
       that remains open, tracked in §4 below.
 - [ ] VXLAN inter-host links
 - [ ] FRR config rendering (BGP optional path)
-- [ ] Port NetOps from iproute2 argv exec to pure rtnetlink/netlink (recorded deviation
-      from AGENTS.md; plan/observe layers are unaffected)
+- [x] Port NetOps from iproute2 argv exec to pure rtnetlink/netlink — **slice 1 delivered
+      2026-08-04** (`docs/TASKS.md` #16, full account there). Scope decided by research, not
+      assumption: the mature `rtnetlink`/`netlink-packet-route` crates cover links/addresses/
+      bridge-VLAN filtering (confirmed against the real v0.21.0 source) but **not** `tc`
+      (confirmed `TcOption` has no `Htb`/`Netem` variant); the only crate that claims `tc`
+      coverage is 7 months old with ~1.4K downloads, too immature for H1's own measurement
+      mechanism. New `gateway::netlink` module (sync wrapper, `rtnetlink`'s async API bridged
+      internally — plan/observe layers genuinely unaffected, confirmed by the unchanged privileged
+      netns suite) covers exactly `KernelBridge`'s `apply`/`teardown`/`observe`: bridge/veth
+      create, master/up/delete, bridge VLAN add/del/query. `tc`/`nft`/`wg`/`ovs-vsctl` unchanged
+      on `Shell`. `Shell{netns}`'s exact semantics preserved via a dedicated `std::thread` per
+      call that `setns(2)`s before opening its own connection — the one genuinely new piece of
+      engineering, since a shared connection across namespaces would silently break netns
+      isolation. Live-verified: the full privileged `gateway_netns.rs` suite (5 tests) passes
+      **unchanged**, plus a live smoke test through the real daemon/CLI against `exp-001-ws`
+      (up/status/down/double-up-down), kernel state cross-checked directly against `ip -j link
+      show`/`bridge -j vlan show`. **Still open** (deferred, not silently folded in): zone netns
+      lifecycle (`unshare`+mount, not netlink at all) + move-into-netns, WireGuard device
+      creation, the fiveg uplink, the `Ovs` `DataPlane`'s own link calls, tap devices
+      (`ioctl(TUNSETIFF)`, confirmed not an `RTM_NEWLINK` operation) — each a real, separate,
+      smaller follow-on.
 - [x] Reconciler: converge partial state (up-after-partial-failure repairs deltas rather
       than failing verify) — **delivered 2026-08-03**. `GatewayService.Up`'s
       apply→apply→apply→observe→verify sequence is now a bounded retry loop (3 attempts,
