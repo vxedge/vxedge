@@ -611,6 +611,24 @@ exp-001 measurements).
 
 ## 4. Phase 2
 
+- [x] Schema audit second pass: five silent-acceptance model bugs found and fixed —
+      **delivered 2026-08-04** (`docs/TASKS.md` #30, full account there). Went
+      block-by-block through `traffic_profiles`, `functions.asil`, `channels`, and the
+      `LinkDoc`/`ChannelDoc`/`PartEntry` document structs. Found: `traffic_profiles`
+      silently dropped an entire profile on a missing `source`/`target` or an
+      out-of-range numeric field (an old `filter_map` + `?`-on-`Option` chain swallowing
+      the error); it also resolved devices against `entities[0]` only, misclassifying a
+      second vehicle's device as `Simulator` instead of `Device`; `functions.asil` read
+      an invalid ASIL string as "none declared"; `channels[].protocol`/`qos` were part
+      of the documented schema but never actually read — the model hardcoded
+      `Protocol::Udp`/`qos: None` regardless; and `LinkDoc`/`ChannelDoc`/`PartEntry` were
+      missing `#[serde(deny_unknown_fields)]`, the convention every other doc struct
+      already follows, so a typo'd field was silently ignored. All five fixed with named
+      `ModelError` variants, 18 new tests, zero regressions across all six real
+      workspaces. `ExperimentDoc`/`NetworkDoc`/`SliceDoc`/`BaselineDoc` deliberately left
+      without `deny_unknown_fields` — they're partial by design (several experiment-level
+      blocks are read from raw YAML, not typed in yet; `rxswin` isn't implemented at
+      all) — closing that is real remaining #30 scope, not done here.
 - [x] `network.nos_check`: model + validation — **delivered 2026-08-04**
       (`docs/TASKS.md` #31). `model::NosCheck`/`NosCheckKind`, parsed from
       `network.nos_check`, mirroring `Tunnel`/`TunnelKind`'s shape. Scoped to model +
