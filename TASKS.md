@@ -682,6 +682,19 @@ exp-001 measurements).
       erroring) and a stale `workspace.rs` doc comment referencing a module deleted since
       2026-07-31. 4 new tests; re-verified all six real workspaces *and* both
       `vxmodels`-CI-covered renders — zero regressions.
+- [x] Schema audit fourth pass: `SliceDoc` fully typed — **#30 CLOSED, 2026-08-04**
+      (`docs/TASKS.md` #30, full account there). The one struct the third pass left
+      untouched: now types `mode`/`vlan`/`qos`/`s_nssai` (the latter three deliberately
+      kept as opaque `Value`s — `slices_of`'s own `narrow()`-based range checks already
+      produce a named `ModelError::OutOfRange`, and a strict `u16` field here would
+      instead fail at workspace-load time with a generic serde overflow message) and
+      carries `deny_unknown_fields`. **A second real bug found**: `slices_of`'s `mode`
+      match treated any unrecognized string, not just an absent one, as
+      `SliceMode::Vlan` — a typo'd `mode: vlann` silently planned as a plain VLAN slice.
+      Fixed with `ModelError::UnknownSliceMode`. 4 new tests; re-verified all six real
+      workspaces and both `vxmodels`-CI-covered renders again — zero regressions. Every
+      workspace-document struct now has complete field coverage and
+      `deny_unknown_fields` protection.
 - [x] `network.nos_check`: model + validation — **delivered 2026-08-04**
       (`docs/TASKS.md` #31). `model::NosCheck`/`NosCheckKind`, parsed from
       `network.nos_check`, mirroring `Tunnel`/`TunnelKind`'s shape. Scoped to model +
