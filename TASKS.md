@@ -672,12 +672,26 @@ exp-001 measurements).
       (`vxparts/parts/gw/nos/os/sonic-vs/verify-config-parity.py`) as the mechanism
       `vxedged` would actually run, so the daemon needs no Python dependency at runtime —
       both proven correct independently via live boots against the real published image
-      (disposable copies only, per the boot-mutates-the-disk discipline). Still open: no
-      `GatewayService` RPC or CLI verb wires this in yet — remains a callable library.
-      When that wiring lands it must be a real vxAPI RPC + `vxedged` handler; verified
-      (not modified) this pass that the CLI's existing `vxedge_core::` usage is already
-      fully compliant with "no orchestration logic in any frontend" — every call site is
-      limited to local-only `validate`/`doctor`/`experiment new` scaffolding.
+      (disposable copies only, per the boot-mutates-the-disk discipline).
+- [x] `NosCheckService`: RPC + CLI wiring for `network.nos_check` — **delivered
+      2026-08-04** (`docs/TASKS.md` #33, full detail there), closing #33's last open
+      piece. A dedicated service, not folded into `GatewayService`/`ExperimentService`
+      — §6.0.3 requires a missing or failed check to never affect provisioning, which a
+      shared service could only guarantee by convention. `Up`/`Down` manage a long-lived
+      instance for manual inspection; `Status` reports through #32's `Observable` pattern
+      and refuses experiments with no declared `network.nos_check` (a real bug found live:
+      it originally reported "not running" for any experiment regardless of whether a
+      check existed at all); `Verify` always does its own fresh, disposable boot under a
+      call-unique name — never reusing a running `Up` instance, since a second console
+      connection to an already-logged-in guest hangs waiting for a `login:` prompt that
+      won't reappear — and fails the job on a mismatch rather than burying it in a
+      "succeeded" message. Image resolution: local `part_ref` resolves like a baseline
+      part; a published ref is refused naming #19 (no registry fetch yet); omitted
+      `part_ref`/`digest` falls back to a new `--sonic-vs-image` daemon flag. CLI:
+      `vxedge nos-check up|down|status|verify`, going through `NosCheckServiceClient`
+      only. Live-verified end to end against the real published image: boot, status
+      transitions, clean teardown, and a full verify run ("4/4 fields match") against a
+      scratch workspace — full account in `docs/TASKS.md`.
 - [ ] Open5GS/UERANSIM driver: `mode: s-nssai` slice provisioning (H2). *In progress,
       major milestone reached 2026-07-14 — **end-to-end slice-differentiated PDU
       sessions proven live**:
