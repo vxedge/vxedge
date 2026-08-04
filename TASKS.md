@@ -632,6 +632,34 @@ exp-001 measurements).
       Live-verified: bad `trunk_port` fails with the exact model error, valid config
       passes (human + `--json`), pre-existing cross-file errors still caught — additive,
       no regression.
+- [x] Status reporting: `Observable` trait + Composite `aggregate()` — **delivered
+      2026-08-04** (`docs/TASKS.md` #32). `vxedge_core::status`: `ObservedState` (`Up,
+      Down, Staging, Degraded, Error`), `Observable` (just `fn state(&self)` — `detail()`
+      deliberately not part of the trait, since detail is contextual/caller-supplied, not
+      an entity property), and `aggregate()` (Composite pattern: no children → `Down`;
+      uniform children → that state; any `Error` wins; else any `Degraded` wins; else a mix
+      → `Degraded`). Proto-agnostic — `vxedge-core` still never depends on `vxedge-api`
+      (crate-layering rule below). `vxedged::status` is the one place that bridges
+      `Observable` to the wire `ResourceStatus`/`ResourceState`. Applied to `NodeState`
+      (`zones::backend`), `ZoneSvc::list`/`ComputeSvc::list` (replacing hand-rolled
+      up/down branches), and `ExperimentSvc::status` (replacing a hand-rolled `all_up`
+      check that had a real bug: zero declared resources reported `Degraded` instead of
+      `Down` — fixed as a side effect of switching to `aggregate()`). Deliberately not
+      retrofitted onto `GatewayObservation`'s own richer per-slice/impairment/tunnel status
+      construction — that code is what every frozen H1/H3/H4 number was measured through;
+      not worth the risk to published numbers for a stylistic win.
+- [x] `sonic::lifecycle` + `sonic::config_check`: native process boot, serial console
+      driver, config-parity business logic — **delivered 2026-08-04** (`docs/TASKS.md`
+      #33, full detail there). Replaces the Python/`pexpect` proof script
+      (`vxparts/parts/gw/nos/os/sonic-vs/verify-config-parity.py`) as the mechanism
+      `vxedged` would actually run, so the daemon needs no Python dependency at runtime —
+      both proven correct independently via live boots against the real published image
+      (disposable copies only, per the boot-mutates-the-disk discipline). Still open: no
+      `GatewayService` RPC or CLI verb wires this in yet — remains a callable library.
+      When that wiring lands it must be a real vxAPI RPC + `vxedged` handler; verified
+      (not modified) this pass that the CLI's existing `vxedge_core::` usage is already
+      fully compliant with "no orchestration logic in any frontend" — every call site is
+      limited to local-only `validate`/`doctor`/`experiment new` scaffolding.
 - [ ] Open5GS/UERANSIM driver: `mode: s-nssai` slice provisioning (H2). *In progress,
       major milestone reached 2026-07-14 — **end-to-end slice-differentiated PDU
       sessions proven live**:
