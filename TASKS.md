@@ -518,16 +518,26 @@ exp-001 measurements).
       onto a tunnel address — this delivers the mechanism `docs/ARCHITECTURE.md` §8 was waiting
       on, not the integration;
       that remains open, tracked in §4 below.
-- [x] VXLAN inter-host links: **model + validation delivered 2026-08-04** (`docs/TASKS.md`
-      #16, full account there); **provisioning/lifecycle still open**, tracked separately —
-      `network.tunnels` `kind: vxlan` parses and validates (`vni`/`remote`/`dstport`/
-      `slices`), but `GatewayPlan::from_model` explicitly refuses to plan one
-      (`PlanError::VxlanTunnelNotYetProvisionable`) rather than silently dropping it.
-      Structurally the opposite of `wireguard`: joins the bridge as a trunk-like port
-      extending local `network.slices` across hosts, rather than a routed L3 endpoint — so
-      `Tunnel`'s WireGuard fields became kind-conditional `Option<T>`, verified not to
-      regress the already-shipped WireGuard path by re-running the exact privileged netns
-      suite unchanged (all 5 tests, including the real handshake test).
+- [x] VXLAN inter-host links: **model + validation, then provisioning, both delivered
+      2026-08-04** (`docs/TASKS.md` #16, full account there) — fully closed, model
+      through live-provisioned. `network.tunnels` `kind: vxlan` parses, validates
+      (`vni`/`remote`/`dstport`/`slices`), and `GatewayPlan` now actually joins the
+      bridge as a trunk-like port extending local `network.slices`' VLANs to a remote
+      host — structurally the opposite of `wireguard` (a routed L3 endpoint), so
+      `Tunnel`/`TunnelPlan`'s WireGuard fields are kind-conditional `Option<T>`. VXLAN
+      interface creation goes straight through the native `gateway/netlink.rs` (the
+      rtnetlink crate already vetted for the rtnetlink port confirmed to support it),
+      never the iproute2 shell-out. **Two real bugs found live**: an exact-set-equality
+      VLAN check that didn't tolerate a bridge's own default VLAN-1 membership, and —
+      more significantly — `GatewayService.Up`'s reconciler never called
+      `apply_tunnels` at all, so no tunnel of *either* kind was ever actually
+      provisioned through the real daemon RPC before this fix (retroactively affecting
+      the already-shipped WireGuard delivery, found via this change's own live smoke
+      test). New privileged test proves real cross-host L2 connectivity (a ping between
+      two container zones in separate netns, the only path between them being the
+      VXLAN-encapsulated traffic). All 6 privileged tests pass, including the
+      pre-existing WireGuard handshake test unchanged — zero regression despite the
+      `TunnelPlan`/`TunnelObservation` restructuring.
 - [ ] ~~FRR config rendering (BGP optional path)~~ — **moved to phase 5, 2026-08-04**
       (`docs/TASKS.md`): unlike VXLAN (extends the already-documented `network.tunnels`
       hook), FRR has no manifest schema field at all — one would need designing from
