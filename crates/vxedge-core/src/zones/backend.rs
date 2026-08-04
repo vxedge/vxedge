@@ -22,6 +22,7 @@
 use std::path::Path;
 
 use super::plan::NodePlan;
+use crate::gateway::netlink;
 use crate::gateway::netops::{NetOpsError, Shell};
 use crate::model::Backend;
 
@@ -33,6 +34,16 @@ pub enum ZoneBackendError {
     BundleFile { node: String, path: String },
     #[error("node `{node}`: {detail}")]
     Runtime { node: String, detail: String },
+}
+
+/// Wraps a [`netlink::NetlinkError`] with the node this seam's callers actually need to act on
+/// — mirrors `gateway::provision`'s own `nl()` mapper, adapted to carry the node id
+/// `ZoneBackendError::Runtime` already asks for rather than a bare command line.
+fn nl(np: &NodePlan, e: netlink::NetlinkError) -> ZoneBackendError {
+    ZoneBackendError::Runtime {
+        node: np.node_id.clone(),
+        detail: format!("netlink: {e}"),
+    }
 }
 
 /// Observed state of one node.
@@ -83,59 +94,32 @@ fn bundle_paths(np: &NodePlan) -> Result<(String, String), ZoneBackendError> {
 
 fn container_up(sh: &Shell, np: &NodePlan) -> Result<(), ZoneBackendError> {
     let ns = np.runtime_name();
-    // Netns registry ops run in the HOST context (see Shell::run_host);
-    // only the veth move runs where the interface currently lives.
-    sh.run_host_tolerate_exists("ip", &["netns", "add", &ns])?;
-    if sh.link_exists(&np.peer) {
-        sh.run("ip", &["link", "set", &np.peer, "netns", &ns])?;
-        sh.run_host(
-            "ip",
-            &[
-                "netns", "exec", &ns, "ip", "link", "set", &np.peer, "name", "eth0",
-            ],
-        )?;
+    // Netns registry ops run in the HOST context — never nested inside another netns, since a
+    // bind mount created from inside one doesn't propagate; only the veth move targets where
+    // the interface currently lives. See `gateway::netlink`'s own module doc for why netns
+    // create/delete is `rtnetlink::NetworkNamespace`, not a hand-rolled unshare/mount.
+    netlink::ensure_netns(&ns).map_err(|e| nl(np, e))?;
+    if netlink::link_exists(sh.netns.as_deref(), &np.peer) {
+        netlink::move_to_netns(sh.netns.as_deref(), &np.peer, &ns).map_err(|e| nl(np, e))?;
+        netlink::rename_link(Some(&ns), &np.peer, "eth0").map_err(|e| nl(np, e))?;
     }
-    sh.run_host(
-        "ip",
-        &["netns", "exec", &ns, "ip", "link", "set", "lo", "up"],
-    )?;
+    netlink::link_up(Some(&ns), "lo").map_err(|e| nl(np, e))?;
     if let Some(cidr) = &np.ip_cidr {
-        sh.run_host_tolerate_exists(
-            "ip",
-            &[
-                "netns", "exec", &ns, "ip", "addr", "add", cidr, "dev", "eth0",
-            ],
-        )?;
+        netlink::add_address(Some(&ns), "eth0", cidr).map_err(|e| nl(np, e))?;
     }
-    sh.run_host(
-        "ip",
-        &["netns", "exec", &ns, "ip", "link", "set", "eth0", "up"],
-    )?;
+    netlink::link_up(Some(&ns), "eth0").map_err(|e| nl(np, e))?;
     Ok(())
 }
 
-fn container_down(sh: &Shell, np: &NodePlan) -> Result<(), ZoneBackendError> {
+fn container_down(_sh: &Shell, np: &NodePlan) -> Result<(), ZoneBackendError> {
     // Destroys the moved veth peer (and thus the bridge-side pair);
     // `vxedge up` re-creates endpoints idempotently.
-    sh.run_host_tolerate_missing("ip", &["netns", "del", &np.runtime_name()])?;
-    Ok(())
+    netlink::delete_netns(&np.runtime_name()).map_err(|e| nl(np, e))
 }
 
-fn container_status(sh: &Shell, np: &NodePlan) -> NodeState {
+fn container_status(_sh: &Shell, np: &NodePlan) -> NodeState {
     let ns = np.runtime_name();
-    let listed = sh.run_host("ip", &["netns", "list"]).unwrap_or_default();
-    if listed
-        .lines()
-        .any(|l| l.split_whitespace().next() == Some(ns.as_str()))
-        && sh
-            .run_host(
-                "ip",
-                &[
-                    "netns", "exec", &ns, "ip", "-j", "link", "show", "dev", "eth0",
-                ],
-            )
-            .is_ok()
-    {
+    if netlink::netns_exists(&ns) && netlink::link_exists(Some(&ns), "eth0") {
         NodeState::Up
     } else {
         NodeState::Down

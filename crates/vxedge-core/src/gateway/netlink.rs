@@ -3,17 +3,28 @@
 //!
 //! Deliberately **not** a full replacement for [`super::netops::Shell`]: `rtnetlink`/
 //! `netlink-packet-route` (rust-netlink org, an 8-year, tens-of-millions-of-downloads track
-//! record) cover links, addresses and bridge VLAN filtering well, confirmed by reading the
-//! actual v0.21.0 source before committing to this — but their `tc` support covers only
-//! `fq_codel`/`ingress` qdiscs, nothing for HTB, netem, or filter actions. The only crate that
-//! claims that coverage is 7 months old with ~1.4K downloads: too immature to bet the mechanism
-//! behind H1's headline number on. So `tc`/`nft`/`wg`/`ovs-vsctl` stay on `Shell` — this module
-//! covers exactly what `apply_links`, `apply_slices`'s trunk-VLAN half, `apply_endpoints`'s
-//! link+VLAN halves, `teardown`'s link deletes, `observe`'s link/VLAN queries, and (added for
-//! VXLAN tunnel provisioning) VXLAN link creation need, and nothing else. `docs/TASKS.md` #16
-//! tracks the deferred remainder (OVS's own link calls, the fiveg uplink, WireGuard tunnel
-//! device creation, zone netns lifecycle, tap devices) as separate, smaller follow-ons — not
-//! silently implied done by this slice.
+//! record) cover links, addresses, bridge VLAN filtering and netns lifecycle well, confirmed
+//! by reading the actual v0.21.0 source before committing to this — but their `tc` support
+//! covers only `fq_codel`/`ingress` qdiscs, nothing for HTB, netem, or filter actions. The
+//! only crate that claims that coverage is 7 months old with ~1.4K downloads: too immature to
+//! bet the mechanism behind H1's headline number on. So `tc`/`nft`/`wg`/`ovs-vsctl` stay on
+//! `Shell` — this module covers `apply_links`, `apply_slices`'s trunk-VLAN half,
+//! `apply_endpoints`'s link+VLAN halves, `teardown`'s link deletes, `observe`'s link/VLAN
+//! queries, VXLAN link creation, and (added for zones' container netns lifecycle,
+//! `docs/TASKS.md` #16) netns create/delete/exists plus moving/renaming a link across
+//! namespaces. `docs/TASKS.md` #16 tracks the still-deferred remainder (OVS's own link calls,
+//! the fiveg uplink, WireGuard tunnel device creation, tap devices) as separate, smaller
+//! follow-ons — not silently implied done by this module.
+//!
+//! **Netns creation/deletion is not hand-rolled here.** `rtnetlink::NetworkNamespace::add`/
+//! `del` already do exactly what `ip netns add`/`del` do — confirmed by reading the actual
+//! source: a `fork()`-based child process (the calling thread's own namespace is never
+//! touched), `unshare(CLONE_NEWNET)`, the same `mount --make-shared /run/netns` + fallback
+//! strategy iproute2 itself uses (the upstream code comment says so directly), then a
+//! bind-mount of `/proc/self/ns/net` onto `/run/netns/<name>`. Using the already-vetted crate
+//! for this is a direct extension of the same trust decision made for the rest of this
+//! module, not a new one — the alternative (hand-rolling `unshare`/`mount` ourselves) is
+//! exactly the kind of low-level systems programming a mistake in is hardest to notice.
 //!
 //! **A genuine side benefit, not just fewer shell-outs**: `Shell::escalate`'s sudo-wrapping
 //! exists because `setcap cap_net_admin+ep` on the `vxedged` binary does *not* propagate to the
@@ -34,7 +45,8 @@ use rtnetlink::packet_route::AddressFamily;
 use rtnetlink::packet_route::link::{
     AfSpecBridge, BridgeVlanInfoFlags, LinkAttribute, LinkExtentMask,
 };
-use rtnetlink::{LinkBridge, LinkBridgeVlan, LinkUnspec, LinkVeth, LinkVxlan};
+use rtnetlink::{LinkBridge, LinkBridgeVlan, LinkUnspec, LinkVeth, LinkVxlan, NetworkNamespace};
+use std::os::fd::AsRawFd;
 
 // Netlink error codes are the kernel's own `-errno`, carried in `ErrorMessage::code`. Named
 // here rather than pulling in `libc` for three constants.
@@ -65,6 +77,8 @@ pub enum NetlinkError {
     ThreadPanic { op: String, detail: String },
     #[error("link `{name}` not found")]
     LinkNotFound { name: String },
+    #[error("`{cidr}` is not a valid CIDR address (expected `<ip>/<prefix>`)")]
+    MalformedCidr { cidr: String },
 }
 
 fn is_eexist(e: &rtnetlink::Error) -> bool {
@@ -143,6 +157,33 @@ where
             tokio::spawn(connection);
             f(handle).await
         })
+    });
+    handle.join().unwrap_or_else(|e| {
+        Err(NetlinkError::ThreadPanic {
+            op: op.to_string(),
+            detail: panic_message(&*e),
+        })
+    })
+}
+
+/// The same dedicated-thread-plus-runtime shape [`run_async`] uses, minus the netlink
+/// connection it always opens — for [`NetworkNamespace::add`]/[`NetworkNamespace::del`], which
+/// don't touch an `rtnetlink::Handle` at all (they `fork()`/`unshare()`/`mount()` directly).
+/// Deliberately a separate, small function rather than a refactor of `run_async` itself: that
+/// function is already proven correct by the whole privileged netns suite, and duplicating a
+/// few lines here is cheaper than risking it.
+fn run_blocking<F, Fut, T>(op: &'static str, f: F) -> Result<T, NetlinkError>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<T, NetlinkError>>,
+    T: Send + 'static,
+{
+    let handle = std::thread::spawn(move || -> Result<T, NetlinkError> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build a current-thread tokio runtime for a netlink call");
+        rt.block_on(f())
     });
     handle.join().unwrap_or_else(|e| {
         Err(NetlinkError::ThreadPanic {
@@ -451,6 +492,162 @@ pub fn bridge_vlan_list(netns: Option<&str>, dev: &str) -> Result<Vec<u16>, Netl
     })
 }
 
+// ---------------------------------------------------------------------------
+// Zone container netns lifecycle (`docs/TASKS.md` #16) — the second rtnetlink-port slice.
+// ---------------------------------------------------------------------------
+
+fn netns_path(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(rtnetlink::NETNS_PATH).join(name)
+}
+
+/// A plain file-existence check at `rtnetlink::NETNS_PATH` (`/run/netns/<name>`) — no netlink
+/// call needed, and strictly more precise than the old `ip netns list` + line-parsing this
+/// replaces (an exact filename match, not a prefix-tolerant string search).
+pub fn netns_exists(name: &str) -> bool {
+    netns_path(name).exists()
+}
+
+/// Host-context only, deliberately — never nested inside another netns, the same reason
+/// `Shell::run_host` was used for this before the port: a bind mount created from inside `ip
+/// netns exec` does not propagate. Idempotent: tolerates an already-existing namespace.
+///
+/// `NetworkNamespace::add` has no "already exists" tolerance of its own (it opens the netns
+/// file with `O_EXCL`, so a second call errors) — checked here instead, before *and* after the
+/// attempt, the same "check first, tolerate on the way out too" shape [`ensure_bridge`]/
+/// [`ensure_veth_pair`] already use for the same idempotency contract against a real EEXIST
+/// errno. `NetworkNamespace`'s own error type carries only a `String`, not a structured errno
+/// to match on, which is why this checks existence directly rather than inspecting the error.
+pub fn ensure_netns(name: &str) -> Result<(), NetlinkError> {
+    if netns_exists(name) {
+        return Ok(());
+    }
+    let owned = name.to_string();
+    run_blocking("ensure_netns", move || async move {
+        NetworkNamespace::add(owned.clone())
+            .await
+            .map_err(|e| NetlinkError::Namespace {
+                netns: owned,
+                detail: e.to_string(),
+            })
+    })
+    .or_else(|e| if netns_exists(name) { Ok(()) } else { Err(e) })
+}
+
+/// Idempotent: tolerates an already-absent namespace, the same contract every other `delete_*`
+/// in this module carries.
+pub fn delete_netns(name: &str) -> Result<(), NetlinkError> {
+    if !netns_exists(name) {
+        return Ok(());
+    }
+    let owned = name.to_string();
+    run_blocking("delete_netns", move || async move {
+        NetworkNamespace::del(owned.clone())
+            .await
+            .map_err(|e| NetlinkError::Namespace {
+                netns: owned,
+                detail: e.to_string(),
+            })
+    })
+    .or_else(|e| if netns_exists(name) { Err(e) } else { Ok(()) })
+}
+
+/// Moves `name` (found in the caller's own `netns` context, which may itself be a netns) into
+/// `target_ns` — `LinkMessageBuilder::setns_by_fd`, opening `/run/netns/<target_ns>` as the fd
+/// source. The link stays down across the move: this is called before [`rename_link`]/
+/// [`link_up`] in `zones::backend::container_up`'s own sequence, never after, avoiding any
+/// kernel rename-while-up edge case for interface types that care.
+pub fn move_to_netns(netns: Option<&str>, name: &str, target_ns: &str) -> Result<(), NetlinkError> {
+    let name_owned = name.to_string();
+    let target_path = netns_path(target_ns);
+    let target_ns_owned = target_ns.to_string();
+    run_async(netns, "move_to_netns", move |handle| async move {
+        let Some(idx) = link_index(&handle, &name_owned)
+            .await
+            .map_err(|e| op_err("move_to_netns", e))?
+        else {
+            return Err(NetlinkError::LinkNotFound { name: name_owned });
+        };
+        let file = std::fs::File::open(&target_path).map_err(|source| NetlinkError::Namespace {
+            netns: target_ns_owned,
+            detail: source.to_string(),
+        })?;
+        handle
+            .link()
+            .set(
+                LinkUnspec::new_with_index(idx)
+                    .setns_by_fd(file.as_raw_fd())
+                    .build(),
+            )
+            .execute()
+            .await
+            .map_err(|e| op_err("move_to_netns", e))
+    })
+}
+
+/// Renames a link, in whatever `netns` context it currently lives in.
+pub fn rename_link(
+    netns: Option<&str>,
+    old_name: &str,
+    new_name: &str,
+) -> Result<(), NetlinkError> {
+    let old_name_owned = old_name.to_string();
+    let new_name_owned = new_name.to_string();
+    run_async(netns, "rename_link", move |handle| async move {
+        let Some(idx) = link_index(&handle, &old_name_owned)
+            .await
+            .map_err(|e| op_err("rename_link", e))?
+        else {
+            return Err(NetlinkError::LinkNotFound {
+                name: old_name_owned,
+            });
+        };
+        handle
+            .link()
+            .set(LinkUnspec::new_with_index(idx).name(new_name_owned).build())
+            .execute()
+            .await
+            .map_err(|e| op_err("rename_link", e))
+    })
+}
+
+fn parse_cidr(cidr: &str) -> Result<(std::net::IpAddr, u8), NetlinkError> {
+    let malformed = || NetlinkError::MalformedCidr {
+        cidr: cidr.to_string(),
+    };
+    let (ip, prefix) = cidr.split_once('/').ok_or_else(malformed)?;
+    let ip: std::net::IpAddr = ip.parse().map_err(|_| malformed())?;
+    let prefix: u8 = prefix.parse().map_err(|_| malformed())?;
+    Ok((ip, prefix))
+}
+
+/// `ip addr add <cidr> dev <name>` — idempotent (tolerates an already-present address), the
+/// one primitive slice 1 deliberately deferred (not needed for the kernel-bridge path it
+/// scoped).
+pub fn add_address(netns: Option<&str>, name: &str, cidr: &str) -> Result<(), NetlinkError> {
+    let (addr, prefix) = parse_cidr(cidr)?;
+    let name_owned = name.to_string();
+    run_async(netns, "add_address", move |handle| async move {
+        let Some(idx) = link_index(&handle, &name_owned)
+            .await
+            .map_err(|e| op_err("add_address", e))?
+        else {
+            return Err(NetlinkError::LinkNotFound { name: name_owned });
+        };
+        handle
+            .address()
+            .add(idx, addr, prefix)
+            .execute()
+            .await
+            .or_else(|e| {
+                if is_eexist(&e) {
+                    Ok(())
+                } else {
+                    Err(op_err("add_address", e))
+                }
+            })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,5 +662,52 @@ mod tests {
     #[test]
     fn deleting_an_absent_link_is_a_no_op() {
         assert!(delete_link(None, "vx-nonexist").is_ok());
+    }
+
+    #[test]
+    fn a_nonexistent_netns_reports_absent_without_erroring() {
+        // Same "runs unprivileged" property as link_exists — a plain file-existence check.
+        assert!(!netns_exists("vx-nonexist-ns"));
+    }
+
+    #[test]
+    fn deleting_an_absent_netns_is_a_no_op() {
+        assert!(delete_netns("vx-nonexist-ns").is_ok());
+    }
+
+    #[test]
+    fn parse_cidr_accepts_v4_and_v6_addresses_with_a_prefix() {
+        assert_eq!(
+            parse_cidr("192.0.2.7/24").unwrap(),
+            ("192.0.2.7".parse().unwrap(), 24)
+        );
+        assert_eq!(
+            parse_cidr("2001:db8::7/64").unwrap(),
+            ("2001:db8::7".parse().unwrap(), 64)
+        );
+    }
+
+    #[test]
+    fn parse_cidr_rejects_a_bare_address_with_no_prefix() {
+        assert!(matches!(
+            parse_cidr("192.0.2.7"),
+            Err(NetlinkError::MalformedCidr { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_cidr_rejects_an_unparsable_address() {
+        assert!(matches!(
+            parse_cidr("not-an-address/24"),
+            Err(NetlinkError::MalformedCidr { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_cidr_rejects_a_non_numeric_prefix() {
+        assert!(matches!(
+            parse_cidr("192.0.2.7/thirty-two"),
+            Err(NetlinkError::MalformedCidr { .. })
+        ));
     }
 }
