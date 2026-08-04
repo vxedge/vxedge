@@ -8,6 +8,7 @@
 //! behind the same [`plan::GatewayPlan`], not a replacement — see AGENTS.md.
 
 pub mod ifnames;
+pub mod netlink;
 pub mod netops;
 pub mod plan;
 pub mod provision;

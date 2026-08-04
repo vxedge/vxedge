@@ -3,48 +3,34 @@
 //! are idempotent: creates tolerate "exists", deletes tolerate "missing",
 //! and tc uses `replace` semantics throughout.
 
+use super::netlink;
 use super::netops::{NetOpsError, Shell};
 use super::plan::GatewayPlan;
+
+/// `netlink::NetlinkError` wrapped as a `NetOpsError`, so the in-scope functions below can keep
+/// returning the one error type every other `provision.rs` function does — this is where a
+/// backend-specific error crosses into the seam's own vocabulary
+/// (`service-boundaries`: "an implementation's internal error is wrapped, never leaked").
+fn nl(e: netlink::NetlinkError) -> NetOpsError {
+    NetOpsError::Command {
+        cmdline: "native netlink call".to_string(),
+        stderr: e.to_string(),
+    }
+}
 
 /// HTB minor of the default (unclassified traffic) class.
 const DEFAULT_CLASS: &str = "fffe";
 
 /// Phase 1 of apply: bridge + trunk uplink.
 pub fn apply_links(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
-    if !sh.link_exists(&plan.bridge) {
-        sh.run(
-            "ip",
-            &[
-                "link",
-                "add",
-                &plan.bridge,
-                "type",
-                "bridge",
-                "vlan_filtering",
-                "1",
-            ],
-        )?;
-    }
-    sh.run("ip", &["link", "set", &plan.bridge, "up"])?;
+    let ns = sh.netns.as_deref();
+    netlink::ensure_bridge(ns, &plan.bridge).map_err(nl)?;
+    netlink::link_up(ns, &plan.bridge).map_err(nl)?;
 
-    if !sh.link_exists(&plan.uplink) {
-        sh.run(
-            "ip",
-            &[
-                "link",
-                "add",
-                &plan.uplink,
-                "type",
-                "veth",
-                "peer",
-                "name",
-                &plan.uplink_peer,
-            ],
-        )?;
-    }
-    sh.run("ip", &["link", "set", &plan.uplink, "master", &plan.bridge])?;
-    sh.run("ip", &["link", "set", &plan.uplink, "up"])?;
-    sh.run("ip", &["link", "set", &plan.uplink_peer, "up"])?;
+    netlink::ensure_veth_pair(ns, &plan.uplink, &plan.uplink_peer).map_err(nl)?;
+    netlink::set_master(ns, &plan.uplink, &plan.bridge).map_err(nl)?;
+    netlink::link_up(ns, &plan.uplink).map_err(nl)?;
+    netlink::link_up(ns, &plan.uplink_peer).map_err(nl)?;
     Ok(())
 }
 
@@ -178,9 +164,9 @@ fn apply_slice_htb_class(
 pub fn apply_slices(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
     ensure_htb_root_and_default(sh, &plan.uplink, plan.root_rate_mbps)?;
     for (i, slice) in plan.slices.iter().enumerate() {
-        let vid = slice.vlan.to_string();
         // Trunk carries every slice VLAN tagged.
-        sh.run_tolerate_exists("bridge", &["vlan", "add", "dev", &plan.uplink, "vid", &vid])?;
+        netlink::bridge_vlan_add(sh.netns.as_deref(), &plan.uplink, slice.vlan, false)
+            .map_err(nl)?;
         apply_slice_htb_class(sh, &plan.uplink, slice, i)?;
     }
     Ok(())
@@ -193,37 +179,33 @@ pub fn apply_slices(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
 /// since a device attachment is the same kernel object whether its access port ends up enslaved
 /// to a Linux bridge or added as an OVS port.
 fn ensure_endpoint_device(sh: &Shell, ep: &super::plan::EndpointPlan) -> Result<(), NetOpsError> {
-    if !sh.link_exists(&ep.name) {
-        match ep.kind {
-            super::plan::EndpointKind::Veth => sh.run(
-                "ip",
-                &[
-                    "link", "add", &ep.name, "type", "veth", "peer", "name", &ep.peer,
-                ],
-            )?,
-            super::plan::EndpointKind::Tap => {
-                sh.run("ip", &["tuntap", "add", "dev", &ep.name, "mode", "tap"])?
+    match ep.kind {
+        super::plan::EndpointKind::Veth => {
+            netlink::ensure_veth_pair(sh.netns.as_deref(), &ep.name, &ep.peer).map_err(nl)
+        }
+        // `ip tuntap add ... mode tap` is not an `RTM_NEWLINK` operation at all — tun/tap
+        // devices are created via `ioctl(TUNSETIFF)` on `/dev/net/tun`, a genuinely different
+        // kernel interface than the rest of this port. Deferred (`docs/TASKS.md` #16): not on
+        // H1's own path, which is container-backed (`Veth`), not VM-backed.
+        super::plan::EndpointKind::Tap => {
+            if !sh.link_exists(&ep.name) {
+                sh.run("ip", &["tuntap", "add", "dev", &ep.name, "mode", "tap"])?;
             }
-        };
+            Ok(())
+        }
     }
-    Ok(())
 }
 
 pub fn apply_endpoints(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
+    let ns = sh.netns.as_deref();
     for ep in &plan.endpoints {
         ensure_endpoint_device(sh, ep)?;
-        sh.run("ip", &["link", "set", &ep.name, "master", &plan.bridge])?;
-        let vid = ep.vlan.to_string();
+        netlink::set_master(ns, &ep.name, &plan.bridge).map_err(nl)?;
         // Access port: node-side traffic is untagged, tagged as the slice
         // VLAN on ingress to the bridge. Drop the default VLAN 1 membership.
-        sh.run_tolerate_exists(
-            "bridge",
-            &[
-                "vlan", "add", "dev", &ep.name, "vid", &vid, "pvid", "untagged",
-            ],
-        )?;
-        sh.run_tolerate_missing("bridge", &["vlan", "del", "dev", &ep.name, "vid", "1"])?;
-        sh.run("ip", &["link", "set", &ep.name, "up"])?;
+        netlink::bridge_vlan_add(ns, &ep.name, ep.vlan, true).map_err(nl)?;
+        netlink::bridge_vlan_del(ns, &ep.name, 1).map_err(nl)?;
+        netlink::link_up(ns, &ep.name).map_err(nl)?;
         // Bringing the peer up is only meaningful while the peer is still on this side. A
         // running container zone has already taken it into its own netns and renamed it `eth0`
         // (`zones::backend`), so its *absence here* is the converged state, not a failure.
@@ -233,8 +215,8 @@ pub fn apply_endpoints(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError
         // dies on `ip link set vzp0 up: Cannot find device`. Latent until `experiment up` made
         // gateway-then-zones a single command anyone would naturally re-run — found on the
         // first real provisioning run, 2026-07-30.
-        if ep.kind == super::plan::EndpointKind::Veth && sh.link_exists(&ep.peer) {
-            sh.run("ip", &["link", "set", &ep.peer, "up"])?;
+        if ep.kind == super::plan::EndpointKind::Veth && netlink::link_exists(ns, &ep.peer) {
+            netlink::link_up(ns, &ep.peer).map_err(nl)?;
         }
         if let Some(imp) = &ep.impairment {
             apply_impairment(sh, &ep.name, imp)?;
@@ -1287,20 +1269,21 @@ pub fn apply(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
 /// Remove everything the plan created. Deleting a veth removes its peer;
 /// deleting the bridge detaches remaining ports. Tolerates absence.
 pub fn teardown(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
+    let ns = sh.netns.as_deref();
     for ep in &plan.endpoints {
         // The IFB is a link of its own, so deleting the access port does not take it — only its
         // own qdiscs and the ingress redirect pointing at it. Left behind, it would survive
         // `down` and be silently reused by the next `up`, which is how a stale netem outlives
         // the manifest that asked for it.
         if let Some(imp) = &ep.impairment {
-            sh.run_tolerate_missing("ip", &["link", "del", &imp.ifb])?;
+            netlink::delete_link(ns, &imp.ifb).map_err(nl)?;
         }
         teardown_ingress_filter(sh, ep)?;
-        sh.run_tolerate_missing("ip", &["link", "del", &ep.name])?;
+        netlink::delete_link(ns, &ep.name).map_err(nl)?;
     }
     teardown_tunnels(sh, plan)?;
-    sh.run_tolerate_missing("ip", &["link", "del", &plan.uplink])?;
-    sh.run_tolerate_missing("ip", &["link", "del", &plan.bridge])?;
+    netlink::delete_link(ns, &plan.uplink).map_err(nl)?;
+    netlink::delete_link(ns, &plan.bridge).map_err(nl)?;
     Ok(())
 }
 
@@ -1384,8 +1367,9 @@ impl GatewayObservation {
 
 /// Observe kernel state against the plan (the reconciler's read side).
 pub fn observe(sh: &Shell, plan: &GatewayPlan) -> Result<GatewayObservation, NetOpsError> {
-    let bridge_present = sh.link_exists(&plan.bridge);
-    let uplink_present = sh.link_exists(&plan.uplink);
+    let ns = sh.netns.as_deref();
+    let bridge_present = netlink::link_exists(ns, &plan.bridge);
+    let uplink_present = netlink::link_exists(ns, &plan.uplink);
 
     // HTB classes on the uplink. Parsed from text output — `tc -j class show`
     // emits non-JSON on several shipped iproute2 versions (bit us in CI).
@@ -1401,20 +1385,8 @@ pub fn observe(sh: &Shell, plan: &GatewayPlan) -> Result<GatewayObservation, Net
         Vec::new()
     };
 
-    // Trunk VLANs: [{"ifname":"vxup0","vlans":[{"vlan":101,...}]}]
     let trunk_vlans: Vec<u16> = if uplink_present {
-        let v = sh.json("bridge", &["-j", "vlan", "show", "dev", &plan.uplink])?;
-        v.as_array()
-            .and_then(|a| a.first())
-            .and_then(|e| e.get("vlans"))
-            .and_then(|vs| vs.as_array())
-            .map(|vs| {
-                vs.iter()
-                    .filter_map(|v| v.get("vlan").and_then(|x| x.as_u64()))
-                    .map(|x| x as u16)
-                    .collect()
-            })
-            .unwrap_or_default()
+        netlink::bridge_vlan_list(ns, &plan.uplink).map_err(nl)?
     } else {
         Vec::new()
     };
@@ -1435,7 +1407,7 @@ pub fn observe(sh: &Shell, plan: &GatewayPlan) -> Result<GatewayObservation, Net
     let endpoints_present = plan
         .endpoints
         .iter()
-        .filter(|ep| sh.link_exists(&ep.name))
+        .filter(|ep| netlink::link_exists(ns, &ep.name))
         .count();
 
     let mut impairments = Vec::new();
@@ -1445,12 +1417,12 @@ pub fn observe(sh: &Shell, plan: &GatewayPlan) -> Result<GatewayObservation, Net
         // shipped iproute2 versions applies to qdiscs too, and `htb_root_present` above already
         // reads qdiscs this way. What is checked is that netem is *there*, not that its
         // parameters match — a full parameter diff belongs with the converging reconciler.
-        let egress_present = sh.link_exists(&ep.name)
+        let egress_present = netlink::link_exists(ns, &ep.name)
             && sh
                 .run("tc", &["qdisc", "show", "dev", &ep.name])?
                 .lines()
                 .any(|l| l.starts_with("qdisc netem "));
-        let ingress_present = sh.link_exists(&imp.ifb)
+        let ingress_present = netlink::link_exists(ns, &imp.ifb)
             && sh
                 .run("tc", &["qdisc", "show", "dev", &imp.ifb])?
                 .lines()

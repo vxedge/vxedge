@@ -27,6 +27,9 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal
 tokio-stream = { version = "0.1", features = ["net", "sync"] }
 sha2 = "0.10"
 tower = "0.5"
+rtnetlink = "0.21"
+futures-util = "0.3"
+nix = { version = "0.31", features = ["sched"] }
 hyper-util = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
