@@ -17,17 +17,18 @@
 //!
 //! **Delivered**: the renderer (pure data, unit-tested, no VM required); the image itself
 //! sourced, boot-verified, and published via `vxparts/parts/gw/nos/os/sonic-vs`; live config
-//! parity manually proven end to end (a real `config load` against a real booted instance, read
-//! back exactly matching what the renderer produced — see that part's own README) via a
-//! Python/`pexpect` script; [`lifecycle`]'s own process boot/teardown and generic serial-console
-//! driver ([`lifecycle::Console`]), porting the proven-by-hand sequence to a native driver so
-//! the daemon needs no Python dependency at runtime.
+//! parity manually proven end to end first (a real `config load` against a real booted
+//! instance, read back exactly matching what the renderer produced — see that part's own
+//! README) via a Python/`pexpect` script, then ported to a native driver
+//! ([`lifecycle::Console`], process boot/teardown in [`lifecycle`]) and native business logic
+//! ([`config_check::verify_config_parity`]) so the daemon needs no Python dependency at
+//! runtime.
 //!
-//! **Not yet delivered**: the actual "log in, clear a port, load a rendered config, read it
-//! back and compare" business logic wired onto [`lifecycle::Console`], and hooking any of this
-//! into `GatewayService`/`experiment up`. Both real, separately-scoped follow-ons —
-//! `docs/TASKS.md` tracks them, not assumed done because the pieces underneath exist.
+//! **Not yet delivered**: hooking any of this into `GatewayService`/`experiment up` — today it
+//! is a callable library, not wired into any RPC or CLI verb. A real, separately-scoped
+//! follow-on — `docs/TASKS.md` tracks it, not assumed done because the pieces underneath exist.
 
+pub mod config_check;
 pub mod lifecycle;
 pub mod plan;
 pub mod render;
