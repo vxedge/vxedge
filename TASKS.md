@@ -1176,7 +1176,11 @@ exp-001 measurements).
       **moved to phase 3/4** (`docs/TASKS.md`'s 2026-08-01 re-scope, "the CLI is the only
       frontend any experiment uses"). Kept here, not deleted, so this section stays a complete
       record of everything phase 2 originally scoped; not phase-2 remaining work.
-- [ ] mTLS + OIDC auth path; viewer/operator/admin roles
+- [ ] ~~mTLS + OIDC auth path; viewer/operator/admin roles~~ — **moved to phase 5,
+      2026-08-04** (`docs/TASKS.md`): deferred until a real remote consumer exists — every
+      frontend that would use it (web dashboard, Qt/QML, Electron) is itself deferred to
+      phase 3/4, and the CLI only ever talks over the local Unix socket. Not new scope,
+      just relocated to the right phase.
 - [x] Harness `impairments` rendering: tc netem per link (rate cap, latency/jitter, loss —
       100/1000BASE-T1 emulation) — **delivered 2026-08-01**. `links[].impairments` in the §6.0
       schema (`rate_mbps`/`delay_us`/`jitter_us`/`loss_pct`); the model carries loss as parts
