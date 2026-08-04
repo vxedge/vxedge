@@ -559,11 +559,31 @@ exp-001 measurements).
       isolation. Live-verified: the full privileged `gateway_netns.rs` suite (5 tests) passes
       **unchanged**, plus a live smoke test through the real daemon/CLI against `exp-001-ws`
       (up/status/down/double-up-down), kernel state cross-checked directly against `ip -j link
-      show`/`bridge -j vlan show`. **Still open** (deferred, not silently folded in): zone netns
-      lifecycle (`unshare`+mount, not netlink at all) + move-into-netns, WireGuard device
+      show`/`bridge -j vlan show`. **Still open** (deferred, not silently folded in — zone netns
+      lifecycle, the first item, closed the same day, see below): WireGuard device
       creation, the fiveg uplink, the `Ovs` `DataPlane`'s own link calls, tap devices
       (`ioctl(TUNSETIFF)`, confirmed not an `RTM_NEWLINK` operation) — each a real, separate,
       smaller follow-on.
+- [x] Port `zones::backend`'s container netns lifecycle to native rtnetlink — **slice 2 of
+      the rtnetlink port, delivered 2026-08-04** (`docs/TASKS.md` #16, full account there).
+      The highest-exposure code the port could touch: every container-backed zone in every
+      experiment runs through `container_up`/`down`/`status`. Researched before
+      implementing, same discipline as slice 1: `rtnetlink::NetworkNamespace::add`/`del`
+      (already a transitive dependency, already re-exported at the crate root) already does
+      exactly what `ip netns add`/`del` do — `fork()`-isolated `unshare(CLONE_NEWNET)` +
+      the same `mount --make-shared /run/netns` strategy iproute2 itself uses, confirmed by
+      reading the actual v0.21.0 source — so the riskiest part (hand-rolling
+      `unshare`/`mount`) turned out unnecessary. Six new `gateway::netlink` primitives
+      (`ensure_netns`/`delete_netns`/`netns_exists`/`move_to_netns`/`rename_link`/
+      `add_address`), a new `run_blocking` helper for the two that don't open an
+      `rtnetlink::Handle` at all. `container_up`/`down`/`status` become one-for-one
+      primitive swaps, identical control flow and ordering. **Live-verified two ways, both
+      clean, no new bugs found**: the full privileged `gateway_netns.rs` suite (6 tests)
+      passes **unchanged**, zero leftover `/run/netns` state after; and a smoke test
+      through the real daemon/CLI against a scaffolded container-backed workspace
+      (`experiment up --stage gateway --stage zones`, real `vx-gw1`/`vx-zonefl` namespaces,
+      veth peer moved+renamed+addressed with the manifest's exact pinned CIDR, idempotent
+      double-up, clean double-down).
 - [x] Reconciler: converge partial state (up-after-partial-failure repairs deltas rather
       than failing verify) — **delivered 2026-08-03**. `GatewayService.Up`'s
       apply→apply→apply→observe→verify sequence is now a bounded retry loop (3 attempts,
