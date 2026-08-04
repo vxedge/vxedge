@@ -64,4 +64,4 @@ patterns** (fiveg/ config rendering + UE-netns networking gotchas), **vxapi-prot
 design** (proto/ RPC/message design and versioning), **network-provisioning-patterns**
 (writing gateway/ netops/plan/provision code, as opposed to verifying it), and
 **zone-backend-contract** (the container/qemu-microvm/libvirt attachment + guest-bundle
-contract, shared with `vxzones`).
+contract, shared with `vxparts` — zone-class guest images).

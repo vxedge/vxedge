@@ -1,15 +1,16 @@
 ---
 name: zone-backend-contract
-description: The shared contract all three zone backends (container/qemu-microvm/libvirt) and every guest image must satisfy — use when touching crates/vxedge-core/src/zones/ in vxedge, or building/publishing a guest image (Zephyr/FreeRTOS/QNX/AAOS) in vxzones. One contract, three isolation mechanisms — that's the H3 variable itself.
+description: The shared contract all three zone backends (container/qemu-microvm/libvirt) and every guest image must satisfy — use when touching crates/vxedge-core/src/zones/ in vxedge, or building/publishing a zone-class guest image (Zephyr/FreeRTOS/QNX/AAOS) in vxparts. One contract, three isolation mechanisms — that's the H3 variable itself.
 ---
 
 # Zone backend contract
 
 Reference: `ARCHITECTURE.md` §9 (virtualization & zone provisioning). Code:
 `crates/vxedge-core/src/zones/{backend,plan}.rs` (vxedge); guest recipes + publish
-scripts live in `vxzones`. This contract is shared across both repos — a new guest image
-in `vxzones` and a new backend feature in `vxedge` must agree on it independently, since
-neither repo reads the other's source.
+scripts live in `vxparts` (`parts/zone/<subtype>/...`, `scripts/publish/
+publish-vm-bundle.sh`/`publish-vm-disk.sh`). This contract is shared across both repos — a
+new guest image in `vxparts` and a new backend feature in `vxedge` must agree on it
+independently, since neither repo reads the other's source.
 
 ## The three backends attach to the gateway identically — only isolation differs
 
@@ -28,11 +29,12 @@ Adding a fourth backend (Renode, phase 3) or a new guest under an existing backe
 satisfying this attachment contract exactly — don't special-case gateway wiring per
 guest OS.
 
-## Guest bundle contract (what every new image in vxzones must produce)
+## Guest bundle contract (what every new zone-class image in vxparts must produce)
 
-Established by `linux-probe` (`vxzones/scripts/build-guest-bundle.sh`), the pattern every
-future guest (QNX SDP 8, AAOS, real Zephyr/FreeRTOS) must follow, not just imitate
-loosely:
+Established by `linux-probe`
+(`vxparts/parts/zone/linux/stack/probe-bundle/build.sh`, migrated from `vxzones`'
+`scripts/build-guest-bundle.sh` — Track P, 2026-07-28), the pattern every future guest
+(QNX SDP 8, AAOS, real Zephyr/FreeRTOS) must follow, not just imitate loosely:
 
 - `vmlinuz` + `initrd.img`, boots from the kernel cmdline `vx.ip=<address>` — guest init
   reads it and payload autostarts; no interactive provisioning step.
@@ -40,9 +42,9 @@ loosely:
   every artifact traceable to a digest).
 - Document, in the recipe's own README, exactly which `backend:` values the image
   supports — QNX's recipe in particular must state the QNX-Hypervisor-inversion fidelity
-  caveat (`vxzones/AGENTS.md`) inline, not leave it implicit.
+  caveat (`vxparts/AGENTS.md`) inline, not leave it implicit.
 - Agents (`vxagents`) are injected per experiment, never baked into the image
-  (`vxzones/AGENTS.md`) — a guest image that assumes vxprobe/vxtraffic is already
+  (`vxparts/AGENTS.md`) — a guest image that assumes vxprobe/vxtraffic is already
   present breaks the inject-per-experiment model.
 
 ## Ordering contract (both repos must respect it, neither enforces it for you)
