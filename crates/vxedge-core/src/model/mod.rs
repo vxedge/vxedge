@@ -354,37 +354,58 @@ pub enum SliceMode {
     SNssai,
 }
 
-/// A point-to-point encrypted overlay link the gateway itself terminates (`docs/TASKS.md` #16,
-/// "WireGuard link setup") — the mechanism behind §7's "WireGuard (in-kernel) for secure
-/// telemetry and OTA transport." Distinct from `Slice`/VLANs: a slice partitions the *local*
-/// bridge fabric zone nodes attach to, a tunnel is a routed L3 endpoint reaching a *remote* peer
-/// (another site's gateway, in the multi-host case `VXLAN` shares this same `network.tunnels`
-/// block for). One `TunnelKind` today; a `vxlan` sibling is a documented future addition to the
-/// same block, not a reason to design a second one later.
+/// A point-to-point tunnel the gateway itself terminates, reaching a *remote* peer (another
+/// site's gateway) — distinct from `Slice`/VLANs, which partition the *local* bridge fabric zone
+/// nodes attach to. Two kinds under one block (`network.tunnels`), each with only the fields it
+/// needs: `wireguard` (`docs/TASKS.md` #16, "WireGuard link setup" — §7's "WireGuard (in-kernel)
+/// for secure telemetry and OTA transport") is a routed L3 endpoint, never enslaved to the
+/// bridge/OVS switch; `vxlan` (§7's "VXLAN for inter-host communication," delivered
+/// 2026-08-04) is the opposite shape — it *joins* the bridge as a trunk-like port, extending one
+/// or more local slice VLANs' L2 domain across hosts, so two experiments on separate physical
+/// hosts can share one slice. The fields that don't apply to a given `kind` are simply absent
+/// (`None`/empty), never populated — `build.rs`'s `tunnels_of` is the one place that enforces
+/// which fields a given `kind` requires, the same two-layer discipline every other `kind`-
+/// discriminated block in this model follows.
 ///
 /// No local key material here, deliberately: a manifest is a versioned document, and a private
-/// key does not belong in one. The gateway mints its own identity on first `up` (never written
-/// to disk, see `provision::apply_tunnel`) and `GatewayStatus` reports the resulting public key
-/// back — the peer's public key is the only secret-adjacent value this struct ever carries, and
-/// it is public by definition.
+/// key does not belong in one. The gateway mints its own WireGuard identity on first `up` (never
+/// written to disk, see `provision::apply_tunnel`) and `GatewayStatus` reports the resulting
+/// public key back — the peer's public key is the only secret-adjacent value this struct ever
+/// carries, and it is public by definition. VXLAN has no key material at all (unencrypted L2
+/// extension, same trust model as a physical inter-switch link).
 #[derive(Debug, Clone)]
 pub struct Tunnel {
     pub id: String,
     pub kind: TunnelKind,
-    pub listen_port: u16,
+    // WireGuard fields — `Some`/non-empty only when `kind == Wireguard`.
+    pub listen_port: Option<u16>,
     /// This side's address on the tunnel interface, CIDR form.
-    pub address: String,
-    pub peer_public_key: String,
+    pub address: Option<String>,
+    pub peer_public_key: Option<String>,
     /// Omit when this side only listens and learns the peer's endpoint from its first
     /// authenticated packet — WireGuard's own roaming behavior, the right shape for a
     /// controller reaching a NAT'd site rather than the other way round.
     pub peer_endpoint: Option<String>,
     pub peer_allowed_ips: Vec<String>,
+    // VXLAN fields — `Some`/non-empty only when `kind == Vxlan`.
+    /// 24-bit VXLAN network identifier (0..=16_777_215).
+    pub vni: Option<u32>,
+    /// The remote gateway's reachable address — a bare IP, not CIDR: this is the UDP
+    /// encapsulation destination (`ip link add type vxlan ... remote <addr>`), not an interface
+    /// address.
+    pub remote: Option<std::net::IpAddr>,
+    /// UDP destination port. Absent means the IANA-assigned VXLAN port, 4789.
+    pub dstport: Option<u16>,
+    /// Which of this experiment's own `network.slices` this tunnel extends across hosts —
+    /// validated the same way a link's `slice:` is (`InvariantError::UndefinedSlice`'s VXLAN
+    /// counterpart).
+    pub vxlan_slices: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TunnelKind {
     Wireguard,
+    Vxlan,
 }
 
 /// Opts an experiment into checking its `network.slices` VLAN intent against a real production
@@ -672,6 +693,11 @@ pub enum InvariantError {
     #[error("link `{link}` binds slice `{slice}`, which the experiment does not define")]
     UndefinedSlice { link: String, slice: String },
     #[error(
+        "vxlan tunnel `{tunnel}` extends slice `{slice}`, which this experiment's \
+         `network.slices` does not define"
+    )]
+    UndefinedVxlanSlice { tunnel: String, slice: String },
+    #[error(
         "link `{link}` carries impairments but binds no slice — it has no access port to render \
          netem onto, so the impairment would be dropped without a word"
     )]
@@ -708,6 +734,17 @@ impl Experiment {
             }
         }
         let slice_ids: Vec<&str> = self.slices.iter().map(|s| s.id.as_str()).collect();
+
+        for t in &self.tunnels {
+            for slice in &t.vxlan_slices {
+                if !slice_ids.contains(&slice.as_str()) {
+                    errors.push(E::UndefinedVxlanSlice {
+                        tunnel: t.id.clone(),
+                        slice: slice.clone(),
+                    });
+                }
+            }
+        }
 
         // Device ids stay unique across the *whole experiment*, not merely per entity: parts
         // target them flatly (`target_ids: fn-hpc1`) and traffic profiles name them flatly, so a

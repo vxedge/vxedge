@@ -74,14 +74,26 @@ pub enum ModelError {
     LossOutOfRange { link: String, loss: f64 },
     #[error("`network.data_plane` is `{data_plane}` — expected `kernel-bridge` or `ovs`")]
     UnknownDataPlane { data_plane: String },
-    #[error("tunnel `{tunnel}` declares `kind: {kind}` — expected `wireguard`")]
+    #[error("tunnel `{tunnel}` declares `kind: {kind}` — expected `wireguard` or `vxlan`")]
     UnknownTunnelKind { tunnel: String, kind: String },
     #[error(
-        "tunnel `{tunnel}` is missing `{field}` — a tunnel needs its own listen_port, address \
-         and the peer's public_key to be provisionable; the local private key is never declared \
-         here (`vxedge status` reports it once minted)"
+        "tunnel `{tunnel}` is missing `{field}` — a `wireguard` tunnel needs its own \
+         listen_port, address and the peer's public_key to be provisionable; the local private \
+         key is never declared here (`vxedge status` reports it once minted)"
     )]
     MissingTunnelField { tunnel: String, field: &'static str },
+    #[error(
+        "vxlan tunnel `{tunnel}` is missing `{field}` — a vxlan tunnel needs its own vni, the \
+         remote gateway's address, and at least one slice to extend"
+    )]
+    MissingVxlanTunnelField { tunnel: String, field: &'static str },
+    #[error(
+        "vxlan tunnel `{tunnel}` declares `vni: {vni}`, which does not fit VXLAN's 24-bit \
+         network identifier (max 16777215)"
+    )]
+    VniOutOfRange { tunnel: String, vni: u64 },
+    #[error("vxlan tunnel `{tunnel}` declares `remote: {remote}`, which is not a valid IP address")]
+    MalformedTunnelRemote { tunnel: String, remote: String },
     #[error("`network.nos_check.kind` is `{kind}` — expected `sonic-vs`")]
     UnknownNosCheckKind { kind: String },
     #[error("`network.nos_check` is missing `trunk_port`")]
@@ -674,8 +686,9 @@ fn slices_of(raw: &Value) -> Result<Vec<Slice>, ModelError> {
     Ok(out)
 }
 
-/// `network.tunnels` (`docs/TASKS.md` #16's WireGuard link setup) — absent, like `slices`,
-/// means "no tunnels," not an error: most experiments (everything single-host today) have none.
+/// `network.tunnels` (`docs/TASKS.md` #16's WireGuard link setup, and the `vxlan` sibling
+/// delivered 2026-08-04) — absent, like `slices`, means "no tunnels," not an error: most
+/// experiments (everything single-host today) have none.
 fn tunnels_of(raw: &Value) -> Result<Vec<Tunnel>, ModelError> {
     let Some(list) = raw
         .get("network")
@@ -691,6 +704,7 @@ fn tunnels_of(raw: &Value) -> Result<Vec<Tunnel>, ModelError> {
         };
         let kind = match t.get("kind").and_then(|v| v.as_str()) {
             Some("wireguard") | None => TunnelKind::Wireguard,
+            Some("vxlan") => TunnelKind::Vxlan,
             Some(other) => {
                 return Err(ModelError::UnknownTunnelKind {
                     tunnel: id,
@@ -698,35 +712,91 @@ fn tunnels_of(raw: &Value) -> Result<Vec<Tunnel>, ModelError> {
                 });
             }
         };
-        let missing = |field| ModelError::MissingTunnelField {
-            tunnel: id.clone(),
-            field,
-        };
-        let listen_port = narrow(t, "listen_port", &format!("tunnel {id}.listen_port"))?
-            .ok_or_else(|| missing("listen_port"))?;
-        let address = t
-            .get("address")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned)
-            .ok_or_else(|| missing("address"))?;
-        let peer = t.get("peer").ok_or_else(|| missing("peer"))?;
-        let peer_public_key = peer
-            .get("public_key")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned)
-            .ok_or_else(|| missing("peer.public_key"))?;
-        out.push(Tunnel {
-            id,
-            kind,
-            listen_port,
-            address,
-            peer_public_key,
-            peer_endpoint: peer
-                .get("endpoint")
-                .and_then(|v| v.as_str())
-                .map(str::to_owned),
-            peer_allowed_ips: string_list(peer, "allowed_ips"),
-        });
+        match kind {
+            TunnelKind::Wireguard => {
+                let missing = |field| ModelError::MissingTunnelField {
+                    tunnel: id.clone(),
+                    field,
+                };
+                let listen_port = narrow(t, "listen_port", &format!("tunnel {id}.listen_port"))?
+                    .ok_or_else(|| missing("listen_port"))?;
+                let address = t
+                    .get("address")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+                    .ok_or_else(|| missing("address"))?;
+                let peer = t.get("peer").ok_or_else(|| missing("peer"))?;
+                let peer_public_key = peer
+                    .get("public_key")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+                    .ok_or_else(|| missing("peer.public_key"))?;
+                out.push(Tunnel {
+                    id,
+                    kind,
+                    listen_port: Some(listen_port),
+                    address: Some(address),
+                    peer_public_key: Some(peer_public_key),
+                    peer_endpoint: peer
+                        .get("endpoint")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned),
+                    peer_allowed_ips: string_list(peer, "allowed_ips"),
+                    vni: None,
+                    remote: None,
+                    dstport: None,
+                    vxlan_slices: Vec::new(),
+                });
+            }
+            TunnelKind::Vxlan => {
+                let missing = |field| ModelError::MissingVxlanTunnelField {
+                    tunnel: id.clone(),
+                    field,
+                };
+                let vni_raw = t
+                    .get("vni")
+                    .and_then(|v| v.as_u64())
+                    .ok_or_else(|| missing("vni"))?;
+                let vni: u32 = vni_raw.try_into().map_err(|_| ModelError::VniOutOfRange {
+                    tunnel: id.clone(),
+                    vni: vni_raw,
+                })?;
+                if vni > 0xFF_FFFF {
+                    return Err(ModelError::VniOutOfRange {
+                        tunnel: id.clone(),
+                        vni: vni_raw,
+                    });
+                }
+                let remote_raw = t
+                    .get("remote")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| missing("remote"))?;
+                let remote = remote_raw.parse::<std::net::IpAddr>().map_err(|_| {
+                    ModelError::MalformedTunnelRemote {
+                        tunnel: id.clone(),
+                        remote: remote_raw.to_string(),
+                    }
+                })?;
+                let vxlan_slices = string_list(t, "slices");
+                if vxlan_slices.is_empty() {
+                    return Err(missing("slices"));
+                }
+                let dstport = narrow(t, "dstport", &format!("tunnel {id}.dstport"))?;
+                out.push(Tunnel {
+                    id,
+                    kind,
+                    listen_port: None,
+                    address: None,
+                    peer_public_key: None,
+                    peer_endpoint: None,
+                    peer_allowed_ips: Vec::new(),
+                    vni: Some(vni),
+                    remote: Some(remote),
+                    dstport,
+                    vxlan_slices,
+                });
+            }
+        }
     }
     Ok(out)
 }
@@ -1816,6 +1886,141 @@ links:
         assert_eq!(h.medium.as_deref(), Some("100BASE-T1"));
         assert_eq!(h.length_m, Some(2.4));
         assert_eq!(h.weight_g, Some(85.0));
+    }
+
+    /// Base fixture for every `network.tunnels` `kind: vxlan` test below — one declared slice
+    /// the tunnel extends, matching §7's own worked scenario (two hosts sharing one slice).
+    const VXLAN_TUNNEL_BASE: &str = r#"
+kind: experiment
+id: e
+vehicles: [veh]
+network:
+  slices: [{ id: adas, mode: vlan, vlan: 101 }]
+  tunnels:
+    - id: site-b
+      kind: vxlan
+      vni: 100
+      remote: 198.51.100.7
+      slices: [adas]
+---
+kind: vehicle
+id: veh
+devices: {}
+"#;
+
+    #[test]
+    fn a_valid_vxlan_tunnel_parses() {
+        let m = load_yaml(VXLAN_TUNNEL_BASE).expect("valid workspace");
+        let t = &m.tunnels[0];
+        assert_eq!(t.kind, TunnelKind::Vxlan);
+        assert_eq!(t.vni, Some(100));
+        assert_eq!(t.remote, Some("198.51.100.7".parse().unwrap()));
+        assert_eq!(t.dstport, None);
+        assert_eq!(t.vxlan_slices, vec!["adas".to_string()]);
+        // The fields that only mean something for `wireguard` stay absent — a vxlan tunnel
+        // never silently inherits WireGuard vocabulary it didn't declare.
+        assert_eq!(t.listen_port, None);
+        assert_eq!(t.address, None);
+        assert_eq!(t.peer_public_key, None);
+    }
+
+    #[test]
+    fn a_vxlan_tunnel_may_declare_a_custom_dstport() {
+        let ws = VXLAN_TUNNEL_BASE.replace(
+            "remote: 198.51.100.7",
+            "remote: 198.51.100.7\n      dstport: 8472",
+        );
+        let m = load_yaml(&ws).expect("valid workspace");
+        assert_eq!(m.tunnels[0].dstport, Some(8472));
+    }
+
+    #[test]
+    fn vxlan_tunnel_missing_vni_is_refused() {
+        let bad = VXLAN_TUNNEL_BASE.replace("vni: 100\n      ", "");
+        match load_yaml(&bad) {
+            Err(crate::model::LoadError::Model(ModelError::MissingVxlanTunnelField {
+                tunnel,
+                field,
+            })) => {
+                assert_eq!(tunnel, "site-b");
+                assert_eq!(field, "vni");
+            }
+            other => panic!("expected MissingVxlanTunnelField, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vxlan_tunnel_vni_out_of_24_bits_is_refused() {
+        let bad = VXLAN_TUNNEL_BASE.replace("vni: 100", "vni: 16777216");
+        match load_yaml(&bad) {
+            Err(crate::model::LoadError::Model(ModelError::VniOutOfRange { tunnel, vni })) => {
+                assert_eq!(tunnel, "site-b");
+                assert_eq!(vni, 16_777_216);
+            }
+            other => panic!("expected VniOutOfRange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vxlan_tunnel_malformed_remote_is_refused() {
+        let bad = VXLAN_TUNNEL_BASE.replace("remote: 198.51.100.7", "remote: not-an-ip");
+        match load_yaml(&bad) {
+            Err(crate::model::LoadError::Model(ModelError::MalformedTunnelRemote {
+                tunnel,
+                remote,
+            })) => {
+                assert_eq!(tunnel, "site-b");
+                assert_eq!(remote, "not-an-ip");
+            }
+            other => panic!("expected MalformedTunnelRemote, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vxlan_tunnel_with_no_slices_is_refused() {
+        let bad = VXLAN_TUNNEL_BASE.replace("slices: [adas]", "slices: []");
+        match load_yaml(&bad) {
+            Err(crate::model::LoadError::Model(ModelError::MissingVxlanTunnelField {
+                tunnel,
+                field,
+            })) => {
+                assert_eq!(tunnel, "site-b");
+                assert_eq!(field, "slices");
+            }
+            other => panic!("expected MissingVxlanTunnelField, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vxlan_tunnel_extending_an_undefined_slice_is_refused() {
+        let bad = VXLAN_TUNNEL_BASE.replace("slices: [adas]", "slices: [nonexistent]");
+        match load_yaml(&bad) {
+            Err(crate::model::LoadError::Invariants(errs)) => {
+                assert!(
+                    errs.iter().any(|e| matches!(
+                        e,
+                        InvariantError::UndefinedVxlanSlice { tunnel, slice }
+                            if tunnel == "site-b" && slice == "nonexistent"
+                    )),
+                    "{errs:?}"
+                );
+            }
+            other => panic!("expected an Invariants error, got {other:?}"),
+        }
+    }
+
+    /// A `kind: vxlan` tunnel's *model* is valid, but `GatewayPlan` refuses to plan it —
+    /// provisioning is a separate, not-yet-built follow-on (`docs/TASKS.md` #16). This must
+    /// fail loudly, not silently drop the tunnel from the plan.
+    #[test]
+    fn a_vxlan_tunnel_is_refused_at_plan_time_not_silently_dropped() {
+        let m = load_yaml(VXLAN_TUNNEL_BASE).expect("model itself is valid");
+        match crate::gateway::GatewayPlan::from_model(&m) {
+            Err(crate::gateway::plan::PlanError::VxlanTunnelNotYetProvisionable(id)) => {
+                assert_eq!(id, "site-b");
+            }
+            other => panic!("expected VxlanTunnelNotYetProvisionable, got {other:?}"),
+        }
     }
 
     /// Base fixture for every `network.nos_check` test below — one valid slice (required

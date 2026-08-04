@@ -43,6 +43,13 @@ pub enum PlanError {
          them (see `gateway::ifnames::wireguard_tunnel`)"
     )]
     TunnelNameCollision { a: String, b: String, name: String },
+    #[error(
+        "tunnel `{0}` declares `kind: vxlan` — the model and validation for this landed \
+         2026-08-04 (`docs/TASKS.md` #16), but provisioning it did not: `GatewayPlan` only \
+         knows how to plan `wireguard` tunnels today. Remove it, or track the follow-on that \
+         wires vxlan provisioning in before relying on this manifest."
+    )]
+    VxlanTunnelNotYetProvisionable(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -360,6 +367,14 @@ impl GatewayPlan {
         let mut claimed_tunnels: std::collections::BTreeMap<String, String> =
             std::collections::BTreeMap::new();
         for t in &exp.tunnels {
+            // `vxlan`'s model + validation landed 2026-08-04, but planning/provisioning is a
+            // separate, not-yet-built follow-on (`docs/TASKS.md` #16) — refused here rather
+            // than silently skipped, so a declared-but-unplannable tunnel fails loudly at
+            // `experiment validate` instead of an experiment believing it has an inter-host
+            // link that `gateway up` never actually provisions.
+            if t.kind == crate::model::TunnelKind::Vxlan {
+                return Err(PlanError::VxlanTunnelNotYetProvisionable(t.id.clone()));
+            }
             let name = super::ifnames::wireguard_tunnel(&t.id);
             if let Some(other) = claimed_tunnels.insert(name.clone(), t.id.clone()) {
                 return Err(PlanError::TunnelNameCollision {
@@ -371,9 +386,18 @@ impl GatewayPlan {
             tunnels.push(TunnelPlan {
                 id: t.id.clone(),
                 name,
-                listen_port: t.listen_port,
-                address: t.address.clone(),
-                peer_public_key: t.peer_public_key.clone(),
+                listen_port: t.listen_port.expect(
+                    "model invariant: wireguard tunnels always carry listen_port \
+                     (tunnels_of's MissingTunnelField check)",
+                ),
+                address: t
+                    .address
+                    .clone()
+                    .expect("model invariant: wireguard tunnels always carry address"),
+                peer_public_key: t
+                    .peer_public_key
+                    .clone()
+                    .expect("model invariant: wireguard tunnels always carry peer_public_key"),
                 peer_endpoint: t.peer_endpoint.clone(),
                 peer_allowed_ips: t.peer_allowed_ips.clone(),
             });
