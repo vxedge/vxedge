@@ -30,6 +30,7 @@ enum ResourceKind {
   RESOURCE_KIND_VEHICLE = 5;
   RESOURCE_KIND_EXPERIMENT = 6;
   RESOURCE_KIND_TRAFFIC = 7;
+  RESOURCE_KIND_NOS_CHECK = 8;
 }
 
 enum ResourceState {

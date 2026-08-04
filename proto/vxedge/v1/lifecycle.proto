@@ -289,3 +289,47 @@ service TrafficService {
   rpc Up(TrafficUpRequest) returns (Job);
   rpc Down(TrafficDownRequest) returns (Job);
 }
+
+// ---------------------------------------------------------------------------
+// NOS check (SONiC-VS production-NOS config-parity check — ARCHITECTURE.md §7,
+// network.nos_check). Never part of ExperimentService.Up's provisioning sequence: this
+// checks network.slices' VLAN intent against a real production NOS, alongside — never
+// instead of — the actual measured data plane (network.data_plane). A missing or failed
+// check never blocks or changes what an experiment measures.
+// ---------------------------------------------------------------------------
+
+message NosCheckUpRequest {
+  ManifestRef experiment = 1;
+}
+
+message NosCheckDownRequest {
+  ManifestRef experiment = 1;
+}
+
+message NosCheckStatusRequest {
+  ManifestRef experiment = 1;
+}
+
+message NosCheckStatus {
+  ResourceStatus status = 1;
+}
+
+message NosCheckVerifyRequest {
+  ManifestRef experiment = 1;
+}
+
+service NosCheckService {
+  // Boots a long-lived instance for manual inspection (`nos-check status`, a console attached
+  // out of band). Distinct from `Verify`, which is self-contained and does its own fresh boot —
+  // an `Up` instance is never reused by `Verify`, since a second console connection to an
+  // already-logged-in guest would hang `Verify`'s own login sequence waiting for a `login:`
+  // prompt that will not reappear.
+  rpc Up(NosCheckUpRequest) returns (Job);
+  rpc Down(NosCheckDownRequest) returns (Job);
+  rpc Status(NosCheckStatusRequest) returns (NosCheckStatus);
+  // Boots a fresh, disposable instance, logs in, loads the experiment's declared
+  // `network.slices` onto it, and reads every field back to confirm parity — one atomic
+  // sequence, always torn down when it completes. The result (fields checked, any mismatches)
+  // is reported in the returned Job's `message`.
+  rpc Verify(NosCheckVerifyRequest) returns (Job);
+}

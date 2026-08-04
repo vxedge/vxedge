@@ -15,6 +15,7 @@ use vxedge_api::v1::event_service_server::EventService;
 use vxedge_api::v1::gateway_service_server::GatewayService;
 use vxedge_api::v1::job_service_server::JobService;
 use vxedge_api::v1::manifest_ref::Source;
+use vxedge_api::v1::nos_check_service_server::NosCheckService;
 use vxedge_api::v1::svc_service_server::SvcService;
 use vxedge_api::v1::traffic_service_server::TrafficService;
 use vxedge_api::v1::zone_service_server::ZoneService;
@@ -22,11 +23,12 @@ use vxedge_api::v1::{
     ComputeApplyRequest, ComputeDownRequest, ComputeListRequest, ComputeListResponse,
     ComputeRemoveRequest, ComputeUpRequest, Event, GatewayApplyRequest, GatewayDownRequest,
     GatewayStatus, GatewayStatusRequest, GatewayUpRequest, GetJobRequest, ImagePushRequest,
-    ImagePushResponse, ImpairmentStatus, IngressFilterStatus, Job, ManifestRef, ResourceKind,
-    ResourceState, ResourceStatus, SliceStatus, SubscribeRequest, SvcDownRequest, SvcStatusRequest,
-    SvcUpRequest, TrafficDownRequest, TrafficUpRequest, TunnelStatus, WatchJobRequest,
-    ZoneApplyRequest, ZoneDownRequest, ZoneListRequest, ZoneListResponse, ZoneRemoveRequest,
-    ZoneUpRequest,
+    ImagePushResponse, ImpairmentStatus, IngressFilterStatus, Job, ManifestRef,
+    NosCheckDownRequest, NosCheckStatus, NosCheckStatusRequest, NosCheckUpRequest,
+    NosCheckVerifyRequest, ResourceKind, ResourceState, ResourceStatus, SliceStatus,
+    SubscribeRequest, SvcDownRequest, SvcStatusRequest, SvcUpRequest, TrafficDownRequest,
+    TrafficUpRequest, TunnelStatus, WatchJobRequest, ZoneApplyRequest, ZoneDownRequest,
+    ZoneListRequest, ZoneListResponse, ZoneRemoveRequest, ZoneUpRequest,
 };
 use vxedge_core::Workspace;
 use vxedge_core::fiveg::{self, FiveGLifecycleConfig, FiveGPlan};
@@ -1646,6 +1648,337 @@ impl TrafficService for TrafficSvc {
                 }
                 p.update(100, "all traffic profiles down");
                 Ok(messages.join("; "))
+            })
+            .await;
+        Ok(Response::new(job))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NosCheckService (network.nos_check — production-NOS config-parity check,
+// ARCHITECTURE.md §7/§6.0.3). Deliberately its own service, never folded into
+// ExperimentService: a missing or failed check must never block or change what an
+// experiment's own GatewayService/ZoneService actually provision or measure.
+// ---------------------------------------------------------------------------
+
+/// True for a local ref (`./…`, an absolute path, or the `local/` convention `PartEntry`
+/// already uses) — the same "local vs. published" distinction `ARCHITECTURE.md` §6.0's
+/// "Local-first" section makes for every other ref in the schema.
+fn is_local_nos_check_ref(r: &str) -> bool {
+    r.starts_with('.') || r.starts_with('/') || r.starts_with("local/")
+}
+
+pub struct NosCheckSvc {
+    pub engine: JobEngine,
+    pub audit: Arc<Audit>,
+    pub runtime_dir: PathBuf,
+    /// Local disk image used when a `network.nos_check` block omits `part_ref`/`digest` — the
+    /// "use the pinned default build" case §6.0.3 documents. No registry-fetch mechanism exists
+    /// yet (`docs/TASKS.md` #19), so this is the daemon operator's own pre-fetched copy, the
+    /// same convention `--vxota-bin`/`--vxtelemetry-bin` already use for "something vxedged
+    /// needs but does not itself provision."
+    pub default_image: Option<PathBuf>,
+}
+
+impl NosCheckSvc {
+    /// Resolves the experiment's declared `network.nos_check` to a local disk image this host
+    /// can boot. A published (non-local) `part_ref` is refused with a named, actionable error
+    /// rather than silently attempted and failing deep inside QEMU's own "file not found."
+    async fn resolve(
+        &self,
+        mref: Option<&ManifestRef>,
+    ) -> Result<(vxedge_core::model::Experiment, PathBuf, String), Status> {
+        let (yaml, sha256, dir) = resolve_manifest(mref).await?;
+        let model = parse_to_model(&yaml)
+            .map_err(|e| Status::invalid_argument(format!("workspace invalid: {e}")))?;
+        let nos_check = model.nos_check.clone().ok_or_else(|| {
+            Status::failed_precondition(
+                "this experiment declares no `network.nos_check` block — nothing to check",
+            )
+        })?;
+        let image = match &nos_check.part_ref {
+            Some(r) if is_local_nos_check_ref(r) => {
+                let p = PathBuf::from(r);
+                if p.is_absolute() {
+                    p
+                } else {
+                    let Some(dir) = &dir else {
+                        return Err(Status::invalid_argument(
+                            "`network.nos_check.part_ref` is a relative path, which needs a \
+                             workspace directory to resolve against — an inline manifest has none",
+                        ));
+                    };
+                    dir.join(p)
+                }
+            }
+            Some(r) => {
+                return Err(Status::unimplemented(format!(
+                    "`network.nos_check.part_ref` `{r}` is a published ref — vxedged does not \
+                     fetch from a registry yet (docs/TASKS.md #19); use a local part_ref \
+                     (`./…`) or omit part_ref/digest to use this daemon's configured default \
+                     image (`--sonic-vs-image`)"
+                )));
+            }
+            None => self.default_image.clone().ok_or_else(|| {
+                Status::failed_precondition(
+                    "this experiment's `network.nos_check` declares no `part_ref` and this \
+                     daemon has no default image configured — start vxedged with \
+                     `--sonic-vs-image <path>`, or declare a local `part_ref` in the manifest",
+                )
+            })?,
+        };
+        if !image.is_file() {
+            return Err(Status::failed_precondition(format!(
+                "nos_check image `{}` does not exist on this host",
+                image.display()
+            )));
+        }
+        Ok((model, image, sha256))
+    }
+
+    fn instance_dir(&self, experiment_id: &str) -> PathBuf {
+        self.runtime_dir.join(format!("nos-check-{experiment_id}"))
+    }
+}
+
+/// Copies `image` into `instance_dir` if not already there, and boots it under `name`. Shared by
+/// `Up` and `Verify`: both need the same never-boot-the-shared-path-directly discipline (QEMU
+/// opens a qcow2 read-write, and SONiC's first-boot sequence writes to disk — found live,
+/// `docs/TASKS.md` #16).
+fn boot_disposable_copy(
+    name: &str,
+    image: &std::path::Path,
+    instance_dir: &std::path::Path,
+) -> Result<vxedge_core::sonic::lifecycle::NosCheckLifecyclePlan, String> {
+    std::fs::create_dir_all(instance_dir).map_err(|e| e.to_string())?;
+    let copy = instance_dir.join("nos-check.img");
+    if !copy.exists() {
+        std::fs::copy(image, &copy).map_err(|e| e.to_string())?;
+    }
+    let plan = vxedge_core::sonic::lifecycle::NosCheckLifecyclePlan {
+        name: name.to_string(),
+        image: copy,
+        memory_mb: 4096,
+        vcpus: 2,
+    };
+    vxedge_core::sonic::lifecycle::nos_check_up(&plan, instance_dir).map_err(|e| e.to_string())?;
+    Ok(plan)
+}
+
+#[tonic::async_trait]
+impl NosCheckService for NosCheckSvc {
+    async fn up(&self, req: Request<NosCheckUpRequest>) -> Result<Response<Job>, Status> {
+        let req = req.into_inner();
+        let (model, image, sha256) = self.resolve(req.experiment.as_ref()).await?;
+        self.audit.record(
+            "NosCheckService.Up",
+            serde_json::json!({ "manifest_sha256": sha256, "experiment": model.id }),
+        );
+        let name = format!("nos-check-{}", model.id);
+        let instance_dir = self.instance_dir(&model.id);
+        let experiment_id = model.id.clone();
+        let events = self.engine.events().clone();
+        let job = self
+            .engine
+            .submit("nos-check.up", move |p| async move {
+                p.update(20, "copying disposable boot image and starting QEMU");
+                blocking(move || boot_disposable_copy(&name, &image, &instance_dir)).await?;
+                let msg = "nos_check instance up".to_string();
+                events.emit(crate::events::EventKind::NosCheckUp, &experiment_id, &msg);
+                p.update(100, &msg);
+                Ok(msg)
+            })
+            .await;
+        Ok(Response::new(job))
+    }
+
+    async fn down(&self, req: Request<NosCheckDownRequest>) -> Result<Response<Job>, Status> {
+        let req = req.into_inner();
+        let (yaml, sha256, _dir) = resolve_manifest(req.experiment.as_ref()).await?;
+        let model = parse_to_model(&yaml)
+            .map_err(|e| Status::invalid_argument(format!("workspace invalid: {e}")))?;
+        self.audit.record(
+            "NosCheckService.Down",
+            serde_json::json!({ "manifest_sha256": sha256, "experiment": model.id }),
+        );
+        let name = format!("nos-check-{}", model.id);
+        let instance_dir = self.instance_dir(&model.id);
+        let experiment_id = model.id.clone();
+        let events = self.engine.events().clone();
+        let job = self
+            .engine
+            .submit("nos-check.down", move |p| async move {
+                p.update(50, "stopping nos_check instance");
+                blocking(move || {
+                    let plan = vxedge_core::sonic::lifecycle::NosCheckLifecyclePlan {
+                        name,
+                        // Unused by `nos_check_down` (only `.name` matters for locating the
+                        // pidfile/socket), but the type demands them.
+                        image: PathBuf::new(),
+                        memory_mb: 0,
+                        vcpus: 0,
+                    };
+                    vxedge_core::sonic::lifecycle::nos_check_down(&plan, &instance_dir)
+                        .map_err(|e| e.to_string())?;
+                    let _ = std::fs::remove_dir_all(&instance_dir);
+                    Ok(())
+                })
+                .await?;
+                let msg = "nos_check instance down".to_string();
+                events.emit(crate::events::EventKind::NosCheckDown, &experiment_id, &msg);
+                p.update(100, &msg);
+                Ok(msg)
+            })
+            .await;
+        Ok(Response::new(job))
+    }
+
+    async fn status(
+        &self,
+        req: Request<NosCheckStatusRequest>,
+    ) -> Result<Response<NosCheckStatus>, Status> {
+        let req = req.into_inner();
+        let (yaml, _sha256, _dir) = resolve_manifest(req.experiment.as_ref()).await?;
+        let model = parse_to_model(&yaml)
+            .map_err(|e| Status::invalid_argument(format!("workspace invalid: {e}")))?;
+        // Same requirement `Up`/`Down`/`Verify` enforce via `resolve()` — checked directly here
+        // rather than through it, since `Status` needs no image resolution. Without this, an
+        // experiment declaring no `network.nos_check` at all would report "not running" as if
+        // a check existed and simply wasn't up, rather than naming the real reason there's
+        // nothing to report on.
+        if model.nos_check.is_none() {
+            return Err(Status::failed_precondition(
+                "this experiment declares no `network.nos_check` block — nothing to check",
+            ));
+        }
+        let name = format!("nos-check-{}", model.id);
+        let instance_dir = self.instance_dir(&model.id);
+        let observation = tokio::task::spawn_blocking(move || {
+            let plan = vxedge_core::sonic::lifecycle::NosCheckLifecyclePlan {
+                name,
+                image: PathBuf::new(),
+                memory_mb: 0,
+                vcpus: 0,
+            };
+            vxedge_core::sonic::lifecycle::nos_check_status(&plan, &instance_dir)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("status task panicked: {e}")))?;
+        let detail = if observation.present {
+            "nos_check instance running"
+        } else {
+            "nos_check instance not running"
+        };
+        Ok(Response::new(NosCheckStatus {
+            status: Some(crate::status::resource_status(
+                format!("nos-check-{}", model.id),
+                ResourceKind::NosCheck,
+                &observation,
+                detail,
+            )),
+        }))
+    }
+
+    async fn verify(&self, req: Request<NosCheckVerifyRequest>) -> Result<Response<Job>, Status> {
+        let req = req.into_inner();
+        let (model, image, sha256) = self.resolve(req.experiment.as_ref()).await?;
+        self.audit.record(
+            "NosCheckService.Verify",
+            serde_json::json!({ "manifest_sha256": sha256, "experiment": model.id }),
+        );
+        let gateway_plan = vxedge_core::gateway::GatewayPlan::from_model(&model)
+            .map_err(|e| Status::invalid_argument(format!("gateway plan: {e}")))?;
+        let trunk_port = model
+            .nos_check
+            .as_ref()
+            .expect("resolve() already required network.nos_check to be declared")
+            .trunk_port
+            .clone();
+        let sonic_plan =
+            vxedge_core::sonic::plan::SonicPlan::from_gateway_plan(&gateway_plan, trunk_port);
+        let config = vxedge_core::sonic::render::render(&sonic_plan);
+
+        // A name unique per call, never `Up`'s own `nos-check-<id>`: `Verify` always does its
+        // own fresh boot and always tears down when it finishes, so it must never collide with
+        // — or reuse — an instance a separate `Up` call left running. Reusing one would hang:
+        // a second console connection to an already-logged-in guest never sees `login:` again.
+        let name = format!("nos-check-verify-{}-{}", model.id, std::process::id());
+        let instance_dir = self
+            .runtime_dir
+            .join(format!("nos-check-verify-{}", model.id));
+        let experiment_id = model.id.clone();
+        let events = self.engine.events().clone();
+        let job = self
+            .engine
+            .submit("nos-check.verify", move |p| async move {
+                p.update(10, "booting a disposable nos_check instance");
+                let outcome = blocking(move || {
+                    let plan = boot_disposable_copy(&name, &image, &instance_dir)?;
+                    let teardown = |plan: &vxedge_core::sonic::lifecycle::NosCheckLifecyclePlan,
+                                    dir: &std::path::Path| {
+                        let _ = vxedge_core::sonic::lifecycle::nos_check_down(plan, dir);
+                        let _ = std::fs::remove_dir_all(dir);
+                    };
+                    let sock = instance_dir.join(format!("nos-check-{}.console.sock", plan.name));
+                    let result = (|| {
+                        let mut console = vxedge_core::sonic::lifecycle::Console::connect(
+                            &sock,
+                            &plan.name,
+                            std::time::Duration::from_secs(10),
+                        )
+                        .map_err(|e| e.to_string())?;
+                        vxedge_core::sonic::config_check::login(
+                            &mut console,
+                            std::time::Duration::from_secs(150),
+                        )
+                        .map_err(|e| e.to_string())?;
+                        vxedge_core::sonic::config_check::verify_config_parity(
+                            &mut console,
+                            &config,
+                        )
+                        .map_err(|e| e.to_string())
+                    })();
+                    teardown(&plan, &instance_dir);
+                    result
+                })
+                .await;
+                let report = outcome?;
+                if report.ok() {
+                    let msg = format!(
+                        "nos_check verify: {}/{} fields match",
+                        report.checked, report.checked
+                    );
+                    events.emit(
+                        crate::events::EventKind::NosCheckVerified,
+                        &experiment_id,
+                        &msg,
+                    );
+                    p.update(100, &msg);
+                    Ok(msg)
+                } else {
+                    let matched = report.checked - report.mismatches.len();
+                    let detail = report
+                        .mismatches
+                        .iter()
+                        .map(|m| {
+                            format!(
+                                "{}.{}: declared `{}`, live `{}`",
+                                m.key, m.field, m.declared, m.live
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    let msg = format!(
+                        "nos_check verify: {matched}/{} fields match — {detail}",
+                        report.checked
+                    );
+                    events.emit(
+                        crate::events::EventKind::NosCheckVerified,
+                        &experiment_id,
+                        &msg,
+                    );
+                    Err(msg)
+                }
             })
             .await;
         Ok(Response::new(job))

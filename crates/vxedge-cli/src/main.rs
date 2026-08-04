@@ -27,13 +27,15 @@ use vxedge_api::v1::experiment_service_client::ExperimentServiceClient;
 use vxedge_api::v1::gateway_service_client::GatewayServiceClient;
 use vxedge_api::v1::job_service_client::JobServiceClient;
 use vxedge_api::v1::manifest_ref::Source;
+use vxedge_api::v1::nos_check_service_client::NosCheckServiceClient;
 use vxedge_api::v1::svc_service_client::SvcServiceClient;
 use vxedge_api::v1::traffic_service_client::TrafficServiceClient;
 use vxedge_api::v1::zone_service_client::ZoneServiceClient;
 use vxedge_api::v1::{
     ComputeDownRequest, ComputeListRequest, ComputeUpRequest, ExperimentDownRequest,
     ExperimentStatusRequest, ExperimentUpRequest, GatewayDownRequest, GatewayStatusRequest,
-    GatewayUpRequest, Job, JobState, ManifestRef, SvcDownRequest, SvcUpRequest, TrafficDownRequest,
+    GatewayUpRequest, Job, JobState, ManifestRef, NosCheckDownRequest, NosCheckStatusRequest,
+    NosCheckUpRequest, NosCheckVerifyRequest, SvcDownRequest, SvcUpRequest, TrafficDownRequest,
     TrafficUpRequest, VxidRef, WatchJobRequest, ZoneDownRequest, ZoneListRequest, ZoneUpRequest,
 };
 
@@ -115,6 +117,13 @@ enum Command {
     Traffic {
         #[command(subcommand)]
         cmd: TrafficCmd,
+    },
+    /// `network.nos_check` — check an experiment's declared VLAN intent against a real
+    /// production NOS (ARCHITECTURE.md §7/§6.0.3). Never part of `experiment up`: a missing or
+    /// failed check never blocks or changes what an experiment actually provisions or measures.
+    NosCheck {
+        #[command(subcommand)]
+        cmd: NosCheckCmd,
     },
     /// Manifest schema + semantic checks (local — no daemon connection needed;
     /// this is the same read-only check `vxedge up` runs before provisioning,
@@ -227,6 +236,30 @@ enum SvcCmd {
         experiment: Option<String>,
     },
     Down {
+        #[arg(long)]
+        experiment: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum NosCheckCmd {
+    /// Boot a long-lived instance for manual inspection.
+    Up {
+        /// Workspace to check. Defaults to the current directory, like `experiment up`.
+        #[arg(long)]
+        experiment: Option<String>,
+    },
+    Down {
+        #[arg(long)]
+        experiment: Option<String>,
+    },
+    Status {
+        #[arg(long)]
+        experiment: Option<String>,
+    },
+    /// Boot a fresh, disposable instance, load the experiment's declared `network.slices` onto
+    /// it, confirm every field reads back exactly, then tear down — one self-contained check.
+    Verify {
         #[arg(long)]
         experiment: Option<String>,
     },
@@ -700,6 +733,69 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let job = svc
                     .down(SvcDownRequest {
                         service_type: "ota".to_string(),
+                        experiment: manifest_ref(&Some(workspace)),
+                    })
+                    .await?
+                    .into_inner();
+                watch_job(channel, job, cli.json).await?;
+            }
+        },
+        Command::NosCheck { cmd } => match cmd {
+            NosCheckCmd::Up { experiment } => {
+                let workspace = resolve_experiment_arg(experiment)?;
+                let channel = connect(&cli.endpoint).await?;
+                let mut nc = NosCheckServiceClient::new(channel.clone());
+                let job = nc
+                    .up(NosCheckUpRequest {
+                        experiment: manifest_ref(&Some(workspace)),
+                    })
+                    .await?
+                    .into_inner();
+                watch_job(channel, job, cli.json).await?;
+            }
+            NosCheckCmd::Down { experiment } => {
+                let workspace = resolve_experiment_arg(experiment)?;
+                let channel = connect(&cli.endpoint).await?;
+                let mut nc = NosCheckServiceClient::new(channel.clone());
+                let job = nc
+                    .down(NosCheckDownRequest {
+                        experiment: manifest_ref(&Some(workspace)),
+                    })
+                    .await?
+                    .into_inner();
+                watch_job(channel, job, cli.json).await?;
+            }
+            NosCheckCmd::Status { experiment } => {
+                let workspace = resolve_experiment_arg(experiment)?;
+                let channel = connect(&cli.endpoint).await?;
+                let mut nc = NosCheckServiceClient::new(channel);
+                let resp = nc
+                    .status(NosCheckStatusRequest {
+                        experiment: manifest_ref(&Some(workspace)),
+                    })
+                    .await?
+                    .into_inner();
+                if let Some(s) = &resp.status {
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "vxid": s.vxid, "state": s.state, "detail": s.detail
+                            }))?
+                        );
+                    } else {
+                        println!("nos_check {}: state={} {}", s.vxid, s.state, s.detail);
+                    }
+                } else {
+                    println!("nos_check: no status reported");
+                }
+            }
+            NosCheckCmd::Verify { experiment } => {
+                let workspace = resolve_experiment_arg(experiment)?;
+                let channel = connect(&cli.endpoint).await?;
+                let mut nc = NosCheckServiceClient::new(channel.clone());
+                let job = nc
+                    .verify(NosCheckVerifyRequest {
                         experiment: manifest_ref(&Some(workspace)),
                     })
                     .await?

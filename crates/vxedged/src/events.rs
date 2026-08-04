@@ -51,6 +51,13 @@ pub enum EventKind {
     TrafficStarted,
     /// A traffic profile stopped.
     TrafficStopped,
+    /// A `network.nos_check` instance was booted (via `NosCheckService.Up`).
+    NosCheckUp,
+    /// A `network.nos_check` instance was torn down.
+    NosCheckDown,
+    /// `NosCheckService.Verify` completed a config-parity check (pass or fail — the fact is
+    /// "a check ran," not "it passed"; the outcome is in the event's own detail).
+    NosCheckVerified,
     // Deliberately absent: a `fiveg.ue-registered` event. It is an obvious next member, but
     // `fiveg::lifecycle` has no point today where registration is *observed* — it is inferred
     // from a successful `ue_up`, which is not the same fact. Adding the variant before the
@@ -74,6 +81,9 @@ impl EventKind {
             EventKind::ServiceDown => "service.down",
             EventKind::TrafficStarted => "traffic.started",
             EventKind::TrafficStopped => "traffic.stopped",
+            EventKind::NosCheckUp => "nos-check.up",
+            EventKind::NosCheckDown => "nos-check.down",
+            EventKind::NosCheckVerified => "nos-check.verified",
         }
     }
 
@@ -90,6 +100,9 @@ impl EventKind {
             EventKind::ComputeUp | EventKind::ComputeDown => ResourceKind::Compute,
             EventKind::ServiceUp | EventKind::ServiceDown => ResourceKind::Service,
             EventKind::TrafficStarted | EventKind::TrafficStopped => ResourceKind::Traffic,
+            EventKind::NosCheckUp | EventKind::NosCheckDown | EventKind::NosCheckVerified => {
+                ResourceKind::NosCheck
+            }
         }
     }
 }

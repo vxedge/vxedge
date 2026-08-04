@@ -22,6 +22,7 @@ use vxedge_api::v1::event_service_server::EventServiceServer;
 use vxedge_api::v1::experiment_service_server::ExperimentServiceServer;
 use vxedge_api::v1::gateway_service_server::GatewayServiceServer;
 use vxedge_api::v1::job_service_server::JobServiceServer;
+use vxedge_api::v1::nos_check_service_server::NosCheckServiceServer;
 use vxedge_api::v1::svc_service_server::SvcServiceServer;
 use vxedge_api::v1::traffic_service_server::TrafficServiceServer;
 use vxedge_api::v1::zone_service_server::ZoneServiceServer;
@@ -63,6 +64,14 @@ struct Args {
     /// Default assumes it's on PATH.
     #[arg(long, default_value = "vxtraffic", env = "VXEDGE_VXTRAFFIC_BIN")]
     vxtraffic_bin: String,
+
+    /// Local disk image `NosCheckService` boots when an experiment's `network.nos_check`
+    /// omits `part_ref`/`digest` (the "use the pinned default build" case,
+    /// `ARCHITECTURE.md` §6.0.3). No registry-fetch mechanism exists yet (`docs/TASKS.md`
+    /// #19), so this names a copy the daemon operator already has on disk — unset means
+    /// `nos_check` only works for experiments declaring a local `part_ref` themselves.
+    #[arg(long, env = "VXEDGE_SONIC_VS_IMAGE")]
+    sonic_vs_image: Option<std::path::PathBuf>,
 }
 
 #[tokio::main]
@@ -154,12 +163,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             vxtelemetry: args.vxtelemetry_bin.clone(),
         },
     });
+    let nos_check = Arc::new(services::NosCheckSvc {
+        engine: engine.clone(),
+        audit: audit.clone(),
+        runtime_dir: args.runtime_dir.clone(),
+        default_image: args.sonic_vs_image.clone(),
+    });
 
     Server::builder()
         .add_service(GatewayServiceServer::from_arc(gateway.clone()))
         .add_service(ZoneServiceServer::from_arc(zones.clone()))
         .add_service(ComputeServiceServer::from_arc(compute))
         .add_service(SvcServiceServer::from_arc(svcs.clone()))
+        .add_service(NosCheckServiceServer::from_arc(nos_check))
         .add_service(ExperimentServiceServer::new(experiment::ExperimentSvc {
             audit: audit.clone(),
             handles: experiment::Handles {
