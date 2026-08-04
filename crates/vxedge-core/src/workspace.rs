@@ -308,17 +308,9 @@ pub struct ExperimentDoc {
     pub traffic_profiles: Option<serde_yaml_ng::Value>,
 }
 
-/// `slices` stays the only *typed* field — `model::build::slices_of` re-parses each slice
-/// entry's own fields (`mode`/`vlan`/`qos`/`s_nssai`) from the raw document independently
-/// (`SliceDoc` exists only so `Workspace::validate`'s cross-file "vehicle names a slice the
-/// experiment must define" check has slice ids to check against). `tunnels`/`nos_check`/
-/// `data_plane`/`defaults` are opaque `Value`s for the same reason `ExperimentDoc`'s own
-/// blocks are: `model::build` already validates each with its own named errors, so retyping
-/// them here would duplicate that validation rather than add to it. Per-slice-field typo
-/// protection (`SliceDoc` itself gaining `deny_unknown_fields`) is real, tracked, remaining
-/// scope from §30's audit — not done here, since `mode`/`vlan`/`qos`/`s_nssai` would all need
-/// typing in first, the same "duplicate validation surface" question this struct's own
-/// comment already answers for the blocks that got the `Value` treatment instead.
+/// `tunnels`/`nos_check`/`data_plane`/`defaults` are opaque `Value`s for the same reason
+/// `ExperimentDoc`'s own blocks are: `model::build` already validates each with its own named
+/// errors, so retyping them here would duplicate that validation rather than add to it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkDoc {
@@ -334,9 +326,27 @@ pub struct NetworkDoc {
     pub defaults: Option<serde_yaml_ng::Value>,
 }
 
+/// Every field a slice entry may declare — closes §30's last remaining gap (this struct used
+/// to type only `id`, so a typo'd slice field was silently ignored). `mode`/`vlan`/`qos`/
+/// `s_nssai` stay opaque (`Value`/loosely-typed) rather than fully structured on purpose:
+/// `model::build::slices_of` already re-parses and range-checks each of them from the same raw
+/// document via `narrow()`, which produces a named `ModelError::OutOfRange` naming the exact
+/// field and its max — typing `vlan` as a strict `u16` here would make an out-of-range value
+/// fail at *workspace load* with a generic serde overflow message instead, a strictly worse
+/// error for the same mistake. This struct's job is catching an unknown field name, not
+/// re-validating a value shape `slices_of` already owns.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SliceDoc {
     pub id: String,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub vlan: Option<serde_yaml_ng::Value>,
+    #[serde(default)]
+    pub qos: Option<serde_yaml_ng::Value>,
+    #[serde(default)]
+    pub s_nssai: Option<serde_yaml_ng::Value>,
 }
 
 /// Unlike `ExperimentDoc`, every field this document declares is typed all the way down

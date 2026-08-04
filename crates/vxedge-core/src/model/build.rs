@@ -97,6 +97,8 @@ pub enum ModelError {
          a non-negative integer that fits a CPU index — every entry must be, not just some"
     )]
     MalformedPinnedCpu { device: String, value: String },
+    #[error("slice `{slice}` declares `mode: {mode}` — expected `vlan` or `s-nssai`")]
+    UnknownSliceMode { slice: String, mode: String },
     #[error("vxlan tunnel `{tunnel}` declares `remote: {remote}`, which is not a valid IP address")]
     MalformedTunnelRemote { tunnel: String, remote: String },
     #[error("`network.nos_check.kind` is `{kind}` — expected `sonic-vs`")]
@@ -663,8 +665,14 @@ fn slices_of(raw: &Value) -> Result<Vec<Slice>, ModelError> {
             continue;
         };
         let mode = match s.get("mode").and_then(|m| m.as_str()) {
+            None | Some("vlan") => SliceMode::Vlan,
             Some("s-nssai") => SliceMode::SNssai,
-            _ => SliceMode::Vlan,
+            Some(other) => {
+                return Err(ModelError::UnknownSliceMode {
+                    slice: id,
+                    mode: other.to_string(),
+                });
+            }
         };
         let qos = match s.get("qos") {
             Some(q) => Some(SliceQos {
@@ -1632,6 +1640,50 @@ channels:
             matches!(load_yaml(&bad), Err(crate::model::LoadError::Workspace(_))),
             "a typo'd channel field should fail to parse"
         );
+    }
+
+    /// §30's audit, closing its last remaining gap: `SliceDoc` used to type only `id`, so a
+    /// typo'd slice field was silently ignored — the same class of bug the link/channel/part
+    /// structs were already fixed for.
+    #[test]
+    fn a_typo_d_field_on_a_slice_is_refused_not_silently_ignored() {
+        let bad = r#"
+kind: experiment
+id: e
+vehicles: [veh]
+network:
+  slices: [{ id: adas, mode: vlan, vlan: 101, sli: oops }]
+---
+kind: vehicle
+id: veh
+devices: {}
+"#;
+        assert!(
+            matches!(load_yaml(bad), Err(crate::model::LoadError::Workspace(_))),
+            "a typo'd slice field should fail to parse"
+        );
+    }
+
+    #[test]
+    fn an_unknown_slice_mode_is_refused_not_silently_treated_as_vlan() {
+        let bad = r#"
+kind: experiment
+id: e
+vehicles: [veh]
+network:
+  slices: [{ id: adas, mode: vlann, vlan: 101 }]
+---
+kind: vehicle
+id: veh
+devices: {}
+"#;
+        match load_yaml(bad) {
+            Err(crate::model::LoadError::Model(ModelError::UnknownSliceMode { slice, mode })) => {
+                assert_eq!(slice, "adas");
+                assert_eq!(mode, "vlann");
+            }
+            other => panic!("expected UnknownSliceMode, got {other:?}"),
+        }
     }
 
     /// Every scaffolded template must satisfy every model invariant. If the generator can emit
