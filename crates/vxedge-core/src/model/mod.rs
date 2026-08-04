@@ -325,7 +325,7 @@ pub enum Protocol {
     Tcp,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ChannelQos {
     pub deadline_ms: Option<u32>,
     pub reliability: Option<Reliability>,

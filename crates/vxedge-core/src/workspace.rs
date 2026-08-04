@@ -362,6 +362,7 @@ impl VehicleDoc {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LinkDoc {
     pub id: String,
     #[serde(default)]
@@ -566,6 +567,7 @@ impl<'de> Deserialize<'de> for EndpointDoc {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChannelDoc {
     pub id: String,
     pub from: String,
@@ -573,6 +575,27 @@ pub struct ChannelDoc {
     pub to: Vec<String>,
     #[serde(default)]
     pub carried_by: Vec<String>,
+    /// `dds` | `zenoh` | `someip` | `udp` | `tcp` | `can` (`ARCHITECTURE.md` §6.0.1). Absent
+    /// means `udp` — every channel declared before this field existed omits it and keeps
+    /// planning the same way.
+    #[serde(default)]
+    pub protocol: Option<String>,
+    #[serde(default)]
+    pub qos: Option<ChannelQosDoc>,
+}
+
+/// A channel's own QoS, distinct from the slice's — a DDS topic has its own deadline and
+/// reliability, which is half of what H1/H2 attribute per topic rather than only per link.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelQosDoc {
+    /// `reliable` | `best-effort`.
+    #[serde(default)]
+    pub reliability: Option<String>,
+    #[serde(default)]
+    pub deadline_ms: Option<u32>,
+    #[serde(default)]
+    pub rate_hz: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -583,6 +606,7 @@ pub struct BaselineDoc {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PartEntry {
     #[serde(rename = "ref")]
     pub reference: String,

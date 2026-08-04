@@ -107,6 +107,30 @@ pub enum ModelError {
          characters"
     )]
     MalformedNosCheckDigest { digest: String },
+    #[error("traffic profile `{profile}` is missing `{field}`")]
+    MissingTrafficField {
+        profile: String,
+        field: &'static str,
+    },
+    #[error(
+        "function `{function}` declares `asil: {asil}` — expected QM, A, B, C or D \
+         (case-insensitive). A typo here would otherwise silently read as \"no ASIL declared\", \
+         which is the wrong failure mode for a safety classification."
+    )]
+    UnknownAsil { function: String, asil: String },
+    #[error(
+        "channel `{channel}` declares `protocol: {protocol}` — expected dds, zenoh, someip, \
+         udp, tcp or can"
+    )]
+    UnknownChannelProtocol { channel: String, protocol: String },
+    #[error(
+        "channel `{channel}` declares `qos.reliability: {reliability}` — expected `reliable` \
+         or `best-effort`"
+    )]
+    UnknownChannelReliability {
+        channel: String,
+        reliability: String,
+    },
 }
 
 /// Range-checked narrowing from YAML's `u64`.
@@ -406,15 +430,63 @@ fn role_of(device: &str, raw: &str) -> Result<DeviceRole, ModelError> {
     })
 }
 
-fn asil_of(raw: &str) -> Option<Asil> {
-    match raw.to_ascii_uppercase().as_str() {
-        "QM" => Some(Asil::Qm),
-        "A" => Some(Asil::A),
-        "B" => Some(Asil::B),
-        "C" => Some(Asil::C),
-        "D" => Some(Asil::D),
-        _ => None,
-    }
+fn asil_of(function: &str, raw: &str) -> Result<Asil, ModelError> {
+    Ok(match raw.to_ascii_uppercase().as_str() {
+        "QM" => Asil::Qm,
+        "A" => Asil::A,
+        "B" => Asil::B,
+        "C" => Asil::C,
+        "D" => Asil::D,
+        _ => {
+            return Err(ModelError::UnknownAsil {
+                function: function.to_string(),
+                asil: raw.to_string(),
+            });
+        }
+    })
+}
+
+fn protocol_of(channel: &str, raw: Option<&str>) -> Result<Protocol, ModelError> {
+    Ok(match raw {
+        // Every channel declared before this field existed omits it; `udp` keeps them planning
+        // exactly as before.
+        None => Protocol::Udp,
+        Some("dds") => Protocol::Dds,
+        Some("zenoh") => Protocol::Zenoh,
+        Some("someip") => Protocol::SomeIp,
+        Some("udp") => Protocol::Udp,
+        Some("tcp") => Protocol::Tcp,
+        Some("can") => Protocol::Can,
+        Some(other) => {
+            return Err(ModelError::UnknownChannelProtocol {
+                channel: channel.to_string(),
+                protocol: other.to_string(),
+            });
+        }
+    })
+}
+
+fn channel_qos_of(
+    channel: &str,
+    doc: &crate::workspace::ChannelQosDoc,
+) -> Result<ChannelQos, ModelError> {
+    let reliability = doc
+        .reliability
+        .as_deref()
+        .map(|r| match r {
+            "reliable" => Ok(Reliability::Reliable),
+            "best-effort" => Ok(Reliability::BestEffort),
+            other => Err(ModelError::UnknownChannelReliability {
+                channel: channel.to_string(),
+                reliability: other.to_string(),
+            }),
+        })
+        .transpose()?;
+    Ok(ChannelQos {
+        deadline_ms: doc.deadline_ms,
+        reliability,
+        rate_hz: doc.rate_hz,
+    })
 }
 
 /// §6.0 → entity. Nothing is synthesized: the schema declares zones, devices and functions as
@@ -492,7 +564,7 @@ fn build_entity(ws: &Workspace, doc: &VehicleDoc) -> Result<Entity, ModelError> 
                     Err(ModelError::NoPart { .. }) => None,
                     Err(e) => return Err(e),
                 },
-                asil: f.asil.as_deref().and_then(asil_of),
+                asil: f.asil.as_deref().map(|a| asil_of(id, a)).transpose()?,
             },
         );
     }
@@ -531,15 +603,21 @@ fn build_entity(ws: &Workspace, doc: &VehicleDoc) -> Result<Entity, ModelError> 
         channels: doc
             .channels
             .iter()
-            .map(|c| Channel {
-                id: c.id.clone(),
-                from: channel_endpoint(&c.from),
-                to: c.to.iter().map(|e| channel_endpoint(e)).collect(),
-                protocol: Protocol::Udp,
-                qos: None,
-                carried_by: c.carried_by.clone(),
+            .map(|c| {
+                Ok(Channel {
+                    id: c.id.clone(),
+                    from: channel_endpoint(&c.from),
+                    to: c.to.iter().map(|e| channel_endpoint(e)).collect(),
+                    protocol: protocol_of(&c.id, c.protocol.as_deref())?,
+                    qos: c
+                        .qos
+                        .as_ref()
+                        .map(|q| channel_qos_of(&c.id, q))
+                        .transpose()?,
+                    carried_by: c.carried_by.clone(),
+                })
             })
-            .collect(),
+            .collect::<Result<_, ModelError>>()?,
     })
 }
 
@@ -711,8 +789,8 @@ fn nos_check_of(raw: &Value) -> Result<Option<NosCheck>, ModelError> {
     }))
 }
 
-fn traffic_endpoint(raw: &str, devices: &BTreeMap<String, Device>) -> TrafficEndpoint {
-    if devices.contains_key(raw) {
+fn traffic_endpoint(raw: &str, devices: &std::collections::BTreeSet<&str>) -> TrafficEndpoint {
+    if devices.contains(raw) {
         TrafficEndpoint::Device(raw.to_string())
     } else if raw == "internet" {
         TrafficEndpoint::Internet
@@ -793,26 +871,60 @@ pub fn build(ws: &Workspace) -> Result<Experiment, ModelError> {
         });
     }
 
-    let devices = &entities[0].devices;
-    let traffic = raw
-        .get("traffic_profiles")
-        .and_then(|t| t.as_mapping())
-        .map(|m| {
-            m.iter()
-                .filter_map(|(k, v)| {
-                    Some(TrafficProfile {
-                        id: k.as_str()?.to_string(),
-                        source: traffic_endpoint(v.get("source")?.as_str()?, devices),
-                        target: traffic_endpoint(v.get("target")?.as_str()?, devices),
-                        pps: narrow(v, "pps", "traffic.pps").ok()?,
-                        bandwidth_mbps: narrow(v, "bandwidth_mbps", "traffic.bandwidth_mbps")
-                            .ok()?,
-                        payload_bytes: narrow(v, "payload_bytes", "traffic.payload_bytes").ok()?,
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    // Merged across every entity, not just `entities[0]`: an experiment naming several
+    // `vehicles:` shares one gateway (`ARCHITECTURE.md` §6.0), and a traffic profile targeting
+    // the second vehicle's device must resolve to `TrafficEndpoint::Device`, not silently
+    // fall through to `Simulator` because only the first vehicle's ids were checked.
+    let device_ids: std::collections::BTreeSet<&str> = entities
+        .iter()
+        .flat_map(|e| e.devices.keys().map(String::as_str))
+        .collect();
+
+    let mut traffic = Vec::new();
+    if let Some(m) = raw.get("traffic_profiles").and_then(|t| t.as_mapping()) {
+        for (k, v) in m {
+            // Every failure below used to be swallowed by a `filter_map` + `?`-on-`Option`
+            // chain: a missing `source`/`target` or an out-of-range `pps`/`bandwidth_mbps`/
+            // `payload_bytes` silently dropped the *entire* profile from the model — an
+            // experiment would declare traffic, validate clean, run, and simply never generate
+            // it, with nothing in the model or the logs saying why. Named errors here instead.
+            let id = k
+                .as_str()
+                .ok_or_else(|| ModelError::MalformedBlock {
+                    block: "traffic_profiles",
+                    detail: "every key must be a string id".to_string(),
+                })?
+                .to_string();
+            let source = v.get("source").and_then(|s| s.as_str()).ok_or_else(|| {
+                ModelError::MissingTrafficField {
+                    profile: id.clone(),
+                    field: "source",
+                }
+            })?;
+            let target = v.get("target").and_then(|s| s.as_str()).ok_or_else(|| {
+                ModelError::MissingTrafficField {
+                    profile: id.clone(),
+                    field: "target",
+                }
+            })?;
+            traffic.push(TrafficProfile {
+                source: traffic_endpoint(source, &device_ids),
+                target: traffic_endpoint(target, &device_ids),
+                pps: narrow(v, "pps", &format!("traffic_profiles.{id}.pps"))?,
+                bandwidth_mbps: narrow(
+                    v,
+                    "bandwidth_mbps",
+                    &format!("traffic_profiles.{id}.bandwidth_mbps"),
+                )?,
+                payload_bytes: narrow(
+                    v,
+                    "payload_bytes",
+                    &format!("traffic_profiles.{id}.payload_bytes"),
+                )?,
+                id,
+            });
+        }
+    }
 
     let method = raw
         .get("method")
@@ -1215,6 +1327,225 @@ devices: {}
             }
             other => panic!("expected MalformedBlock, got {other:?}"),
         }
+    }
+
+    /// §30's audit: `traffic_profiles` used to build each entry through a `filter_map` chain
+    /// that turned every failure — a missing `source`/`target`, an out-of-range `pps` — into a
+    /// silently dropped profile rather than an error. An experiment that declared traffic would
+    /// validate clean, run, and simply never generate it. These pin the fixed behaviour: every
+    /// misdeclaration is now a named, reported error.
+    const TRAFFIC_BASE: &str = r#"
+kind: experiment
+id: e
+vehicles: [veh]
+network: { slices: [{ id: adas, mode: vlan, vlan: 101 }] }
+traffic_profiles:
+  load: { source: zonefl, target: internet, pps: 1000 }
+---
+kind: vehicle
+id: veh
+devices: { zonefl: { role: zone-controller, backend: container } }
+"#;
+
+    #[test]
+    fn a_valid_traffic_profile_still_builds() {
+        let m = load_yaml(TRAFFIC_BASE).expect("valid workspace");
+        assert_eq!(m.traffic.len(), 1);
+        assert_eq!(m.traffic[0].id, "load");
+        assert_eq!(m.traffic[0].pps, Some(1000));
+    }
+
+    #[test]
+    fn traffic_profile_missing_source_is_a_named_error_not_a_silent_drop() {
+        let bad = TRAFFIC_BASE.replace("source: zonefl, ", "");
+        match load_yaml(&bad) {
+            Err(crate::model::LoadError::Model(ModelError::MissingTrafficField {
+                profile,
+                field,
+            })) => {
+                assert_eq!(profile, "load");
+                assert_eq!(field, "source");
+            }
+            other => panic!("expected MissingTrafficField, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn traffic_profile_out_of_range_field_is_reported_not_silently_dropped() {
+        // u32::MAX + 1: out of range for `pps`. The old code turned this `narrow()` error into
+        // `None` via `.ok()`, then dropped the whole profile via `?` on that `None` — the
+        // experiment would validate clean and simply never generate this traffic.
+        let bad = TRAFFIC_BASE.replace("pps: 1000", "pps: 4294967296");
+        match load_yaml(&bad) {
+            Err(crate::model::LoadError::Model(ModelError::OutOfRange { field, .. })) => {
+                assert_eq!(field, "traffic_profiles.load.pps");
+            }
+            other => panic!("expected OutOfRange, got {other:?}"),
+        }
+    }
+
+    /// A traffic profile targeting the *second* declared vehicle's device used to resolve
+    /// against only `entities[0].devices`, so it silently misclassified as
+    /// `TrafficEndpoint::Simulator` instead of `TrafficEndpoint::Device` — the wrong endpoint
+    /// kind, with no error, for the exact multi-vehicle scenario `ARCHITECTURE.md` §6.0.1
+    /// documents as sharing one gateway.
+    #[test]
+    fn traffic_profile_targeting_the_second_vehicles_device_resolves_as_a_device() {
+        let ws = r#"
+kind: experiment
+id: e
+vehicles: [car1, car2]
+network: { slices: [{ id: adas, mode: vlan, vlan: 101 }] }
+traffic_profiles:
+  cross: { source: car1dev, target: car2dev }
+---
+kind: vehicle
+id: car1
+devices: { car1dev: { role: zone-controller, backend: container } }
+---
+kind: vehicle
+id: car2
+devices: { car2dev: { role: zone-controller, backend: container } }
+"#;
+        let m = load_yaml(ws).expect("valid multi-vehicle workspace");
+        assert_eq!(
+            m.traffic[0].target,
+            TrafficEndpoint::Device("car2dev".into())
+        );
+    }
+
+    /// A safety classification silently read as "none declared" on a typo is the wrong failure
+    /// mode — §30's audit found `asil_of` doing exactly that.
+    #[test]
+    fn unknown_asil_is_refused_not_silently_dropped() {
+        let ws = r#"
+kind: experiment
+id: e
+vehicles: [veh]
+network: { slices: [] }
+---
+kind: vehicle
+id: veh
+devices: { zonefl: { role: zone-controller, backend: container } }
+functions:
+  adas: { deployed_on: zonefl, asil: E }
+"#;
+        match load_yaml(ws) {
+            Err(crate::model::LoadError::Model(ModelError::UnknownAsil { function, asil })) => {
+                assert_eq!(function, "adas");
+                assert_eq!(asil, "E");
+            }
+            other => panic!("expected UnknownAsil, got {other:?}"),
+        }
+        let good = ws.replace("asil: E", "asil: b");
+        let m = load_yaml(&good).expect("lowercase asil is accepted");
+        assert_eq!(m.entities[0].functions["adas"].asil, Some(Asil::B));
+    }
+
+    /// `channels[].protocol`/`qos` are part of the documented §6.0.1 schema but used to be
+    /// silently dropped: `ChannelDoc` had neither field (so serde ignored them with no
+    /// `deny_unknown_fields` to catch it) and the builder hardcoded `Protocol::Udp`/`qos: None`
+    /// regardless of what was declared.
+    const CHANNEL_BASE: &str = r#"
+kind: experiment
+id: e
+vehicles: [veh]
+network: { slices: [] }
+---
+kind: vehicle
+id: veh
+devices:
+  zonefl: { role: zone-controller, backend: container }
+  hpc1: { role: hpc, backend: container }
+functions:
+  adas: { deployed_on: zonefl }
+  percept: { deployed_on: hpc1 }
+links:
+  - { id: trunk, endpoints: [zonefl:eth0, hpc1:eth0] }
+channels:
+  - id: adas.object-list
+    from: percept
+    to: [adas]
+    protocol: dds
+    qos: { reliability: reliable, deadline_ms: 50 }
+    carried_by: [trunk]
+"#;
+
+    #[test]
+    fn channel_protocol_and_qos_are_read_not_hardcoded() {
+        let m = load_yaml(CHANNEL_BASE).expect("valid workspace");
+        let c = &m.entities[0].channels[0];
+        assert_eq!(c.protocol, Protocol::Dds);
+        let qos = c.qos.as_ref().expect("declared qos");
+        assert_eq!(qos.reliability, Some(Reliability::Reliable));
+        assert_eq!(qos.deadline_ms, Some(50));
+    }
+
+    #[test]
+    fn a_channel_omitting_protocol_still_defaults_to_udp() {
+        let ws = CHANNEL_BASE.replace(
+            "    protocol: dds\n    qos: { reliability: reliable, deadline_ms: 50 }\n",
+            "",
+        );
+        let m = load_yaml(&ws).expect("valid workspace");
+        assert_eq!(m.entities[0].channels[0].protocol, Protocol::Udp);
+        assert_eq!(m.entities[0].channels[0].qos, None);
+    }
+
+    #[test]
+    fn unknown_channel_protocol_is_refused() {
+        let bad = CHANNEL_BASE.replace("protocol: dds", "protocol: appletalk");
+        match load_yaml(&bad) {
+            Err(crate::model::LoadError::Model(ModelError::UnknownChannelProtocol {
+                channel,
+                protocol,
+            })) => {
+                assert_eq!(channel, "adas.object-list");
+                assert_eq!(protocol, "appletalk");
+            }
+            other => panic!("expected UnknownChannelProtocol, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_channel_reliability_is_refused() {
+        let bad = CHANNEL_BASE.replace("reliability: reliable", "reliability: eventually");
+        match load_yaml(&bad) {
+            Err(crate::model::LoadError::Model(ModelError::UnknownChannelReliability {
+                channel,
+                reliability,
+            })) => {
+                assert_eq!(channel, "adas.object-list");
+                assert_eq!(reliability, "eventually");
+            }
+            other => panic!("expected UnknownChannelReliability, got {other:?}"),
+        }
+    }
+
+    /// `LinkDoc`/`ChannelDoc`/`PartEntry` used to accept and silently discard any unrecognized
+    /// field — a typo'd `slise:` on a link, say — because they were the only workspace-document
+    /// structs without `#[serde(deny_unknown_fields)]` (every device/zone/function/harness/
+    /// impairment doc already had it). §30's audit found the inconsistency; these pin that a
+    /// typo is now a parse error instead of a silent no-op.
+    #[test]
+    fn a_typo_d_field_on_a_link_is_refused_not_silently_ignored() {
+        let bad = CHANNEL_BASE.replace(
+            "  - { id: trunk, endpoints: [zonefl:eth0, hpc1:eth0] }",
+            "  - { id: trunk, endpoints: [zonefl:eth0, hpc1:eth0], slise: adas }",
+        );
+        assert!(
+            matches!(load_yaml(&bad), Err(crate::model::LoadError::Workspace(_))),
+            "a typo'd link field should fail to parse"
+        );
+    }
+
+    #[test]
+    fn a_typo_d_field_on_a_channel_is_refused_not_silently_ignored() {
+        let bad = CHANNEL_BASE.replace("protocol: dds", "protokol: dds");
+        assert!(
+            matches!(load_yaml(&bad), Err(crate::model::LoadError::Workspace(_))),
+            "a typo'd channel field should fail to parse"
+        );
     }
 
     /// Every scaffolded template must satisfy every model invariant. If the generator can emit
