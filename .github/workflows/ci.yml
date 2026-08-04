@@ -51,6 +51,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install wireguard-tools
+        # tunnel_completes_a_real_handshake_between_two_simulated_hosts (network.tunnels
+        # kind: wireguard, docs/TASKS.md #16) drives the real `wg` CLI for key generation and
+        # peer configuration — rtnetlink covers device creation only, never wg's own
+        # configuration protocol (see gateway::netlink's own doc comment). Found missing here
+        # 2026-08-04: this was the first real CI run this test had ever gone through (verified
+        # only locally, where `wg` is installed, since it landed 2026-08-03).
+        run: sudo apt-get update && sudo apt-get install -y wireguard-tools
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Gateway netns tests
