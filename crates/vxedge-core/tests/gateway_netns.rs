@@ -955,9 +955,11 @@ links:
 /// interface exists" (`plan.rs`'s own unit tests already cover plan derivation) but that two
 /// independent gateways, simulated as two network namespaces connected only by a plain veth pair
 /// standing in for the internet between two real hosts (same `wanA`/`wanB` shape the WireGuard
-/// test above uses), actually join their bridges into one L2 domain: a real container zone on
+/// test above uses, own `vwanA`/`vwanB` names so the two tests' brief pre-move window in the
+/// host's default netns can't race each other under `cargo test`'s default parallelism), actually
+/// join their bridges into one L2 domain: a real container zone on
 /// site A reaches a real container zone on site B, over their shared `adas` slice, with the only
-/// path between the two netns being the VXLAN-encapsulated UDP traffic crossing `wanA`/`wanB`.
+/// path between the two netns being the VXLAN-encapsulated UDP traffic crossing `vwanA`/`vwanB`.
 /// Structurally different from the WireGuard test on purpose — a VXLAN tunnel joins the bridge
 /// as a trunk-like port rather than staying a routed L3 endpoint, so this can't be device-less
 /// the way that one is.
@@ -990,24 +992,29 @@ fn vxlan_tunnel_carries_slice_traffic_between_two_simulated_hosts() {
 
     // The "internet" between the two simulated hosts — identical shape to the WireGuard test's
     // own `wanA`/`wanB`, and for the same reason (`run_host`: a bind mount created from inside
-    // `ip netns exec` does not propagate).
+    // `ip netns exec` does not propagate). Own name pair (`vwanA`/`vwanB`), not `wanA`/`wanB`:
+    // both are created in the host's default netns for the brief window before the `ip link set
+    // ... netns` move below, so two tests sharing the same literal name race on that window when
+    // `cargo test` runs them concurrently (the default) — found live, 2026-08-06, as
+    // `RTNETLINK answers: File exists` on this test's own `link add`, unrelated to whatever
+    // change was actually being verified at the time.
     sh_a.run_host(
         "ip",
         &[
-            "link", "add", "wanA", "type", "veth", "peer", "name", "wanB",
+            "link", "add", "vwanA", "type", "veth", "peer", "name", "vwanB",
         ],
     )
     .unwrap();
-    sh_a.run_host("ip", &["link", "set", "wanA", "netns", &ns_a])
+    sh_a.run_host("ip", &["link", "set", "vwanA", "netns", &ns_a])
         .unwrap();
-    sh_a.run_host("ip", &["link", "set", "wanB", "netns", &ns_b])
+    sh_a.run_host("ip", &["link", "set", "vwanB", "netns", &ns_b])
         .unwrap();
-    sh_a.run("ip", &["addr", "add", "10.250.0.1/30", "dev", "wanA"])
+    sh_a.run("ip", &["addr", "add", "10.250.0.1/30", "dev", "vwanA"])
         .unwrap();
-    sh_a.run("ip", &["link", "set", "wanA", "up"]).unwrap();
-    sh_b.run("ip", &["addr", "add", "10.250.0.2/30", "dev", "wanB"])
+    sh_a.run("ip", &["link", "set", "vwanA", "up"]).unwrap();
+    sh_b.run("ip", &["addr", "add", "10.250.0.2/30", "dev", "vwanB"])
         .unwrap();
-    sh_b.run("ip", &["link", "set", "wanB", "up"]).unwrap();
+    sh_b.run("ip", &["link", "set", "vwanB", "up"]).unwrap();
 
     let model_a = vxedge_core::model::load_yaml(VXLAN_SITE_A_WORKSPACE).unwrap();
     let model_b = vxedge_core::model::load_yaml(VXLAN_SITE_B_WORKSPACE).unwrap();
@@ -1046,8 +1053,8 @@ fn vxlan_tunnel_carries_slice_traffic_between_two_simulated_hosts() {
 
     // The real proof: a ping from site A's container to site B's container, over their shared
     // `adas` slice — the *only* path between the two netns is the VXLAN-encapsulated UDP
-    // traffic crossing `wanA`/`wanB`, so this only succeeds if the tunnel is genuinely carrying
-    // the slice's L2 traffic, not merely present as an interface.
+    // traffic crossing `vwanA`/`vwanB`, so this only succeeds if the tunnel is genuinely
+    // carrying the slice's L2 traffic, not merely present as an interface.
     let node_b_addr = node_b
         .ip_cidr
         .as_deref()

@@ -18,6 +18,16 @@ fn nl(e: netlink::NetlinkError) -> NetOpsError {
     }
 }
 
+/// Same wrapping as [`nl`], for `tuntap::TunTapError` — a separate small function rather than a
+/// shared trait bound, matching how this file already keeps each backend-specific error type's
+/// crossing into `NetOpsError` as its own one-liner.
+fn tt(e: super::tuntap::TunTapError) -> NetOpsError {
+    NetOpsError::Command {
+        cmdline: "native tap device call".to_string(),
+        stderr: e.to_string(),
+    }
+}
+
 /// HTB minor of the default (unclassified traffic) class.
 const DEFAULT_CLASS: &str = "fffe";
 
@@ -183,15 +193,11 @@ fn ensure_endpoint_device(sh: &Shell, ep: &super::plan::EndpointPlan) -> Result<
         super::plan::EndpointKind::Veth => {
             netlink::ensure_veth_pair(sh.netns.as_deref(), &ep.name, &ep.peer).map_err(nl)
         }
-        // `ip tuntap add ... mode tap` is not an `RTM_NEWLINK` operation at all — tun/tap
-        // devices are created via `ioctl(TUNSETIFF)` on `/dev/net/tun`, a genuinely different
-        // kernel interface than the rest of this port. Deferred (`docs/TASKS.md` #16): not on
-        // H1's own path, which is container-backed (`Veth`), not VM-backed.
+        // `ip tuntap add ... mode tap` is not an `RTM_NEWLINK` operation — see `tuntap.rs`'s own
+        // module doc for why it's a separate kernel interface and a separate small module
+        // rather than an addition to `netlink.rs` (`docs/TASKS.md` #16, ported 2026-08-05).
         super::plan::EndpointKind::Tap => {
-            if !sh.link_exists(&ep.name) {
-                sh.run("ip", &["tuntap", "add", "dev", &ep.name, "mode", "tap"])?;
-            }
-            Ok(())
+            super::tuntap::ensure_tap(sh.netns.as_deref(), &ep.name).map_err(tt)
         }
     }
 }
@@ -979,34 +985,23 @@ impl DataPlane for KernelBridge {
 // ---------------------------------------------------------------------------
 
 /// Bridge + trunk uplink, via `ovs-vsctl` instead of `ip link add ... type bridge`. The veth
-/// pair itself is still plain `ip` — OVS attaches to netdevices, it doesn't create them — and
-/// `--may-exist` is `ovs-vsctl`'s own idempotent-create idiom, the direct parallel to
-/// `link_exists` guards elsewhere in this file.
+/// pair itself is a plain kernel link — OVS attaches to netdevices, it doesn't create them —
+/// so it goes through the same native [`netlink`] primitives the kernel-bridge path uses
+/// (`docs/TASKS.md` #16: "OVS's own link calls", ported 2026-08-05). `--may-exist` is
+/// `ovs-vsctl`'s own idempotent-create idiom for the OVSDB half, which stays a shell-out —
+/// OVSDB is a different protocol entirely, not something the rtnetlink port covers.
 fn ovs_apply_links(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
+    let ns = sh.netns.as_deref();
     sh.run("ovs-vsctl", &["--may-exist", "add-br", &plan.bridge])?;
-    sh.run("ip", &["link", "set", &plan.bridge, "up"])?;
+    netlink::link_up(ns, &plan.bridge).map_err(nl)?;
 
-    if !sh.link_exists(&plan.uplink) {
-        sh.run(
-            "ip",
-            &[
-                "link",
-                "add",
-                &plan.uplink,
-                "type",
-                "veth",
-                "peer",
-                "name",
-                &plan.uplink_peer,
-            ],
-        )?;
-    }
+    netlink::ensure_veth_pair(ns, &plan.uplink, &plan.uplink_peer).map_err(nl)?;
     sh.run(
         "ovs-vsctl",
         &["--may-exist", "add-port", &plan.bridge, &plan.uplink],
     )?;
-    sh.run("ip", &["link", "set", &plan.uplink, "up"])?;
-    sh.run("ip", &["link", "set", &plan.uplink_peer, "up"])?;
+    netlink::link_up(ns, &plan.uplink).map_err(nl)?;
+    netlink::link_up(ns, &plan.uplink_peer).map_err(nl)?;
     Ok(())
 }
 
@@ -1042,6 +1037,7 @@ fn ovs_apply_slices(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
 /// again, unconditionally, as a converging step of its own, the same reason `apply_slices`
 /// above uses `set` rather than trusting `add-port`'s one-shot value to stay correct forever.
 fn ovs_apply_endpoints(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
+    let ns = sh.netns.as_deref();
     for ep in &plan.endpoints {
         ensure_endpoint_device(sh, ep)?;
         sh.run(
@@ -1052,12 +1048,12 @@ fn ovs_apply_endpoints(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError
             "ovs-vsctl",
             &["set", "port", &ep.name, &format!("tag={}", ep.vlan)],
         )?;
-        sh.run("ip", &["link", "set", &ep.name, "up"])?;
+        netlink::link_up(ns, &ep.name).map_err(nl)?;
         // Same idempotency guard as the kernel bridge's own apply_endpoints: a running
         // container zone has already moved the peer into its own netns, so its absence here is
         // the converged state, not a failure.
-        if ep.kind == super::plan::EndpointKind::Veth && sh.link_exists(&ep.peer) {
-            sh.run("ip", &["link", "set", &ep.peer, "up"])?;
+        if ep.kind == super::plan::EndpointKind::Veth && netlink::link_exists(ns, &ep.peer) {
+            netlink::link_up(ns, &ep.peer).map_err(nl)?;
         }
         if let Some(imp) = &ep.impairment {
             apply_impairment(sh, &ep.name, imp)?;
@@ -1073,23 +1069,24 @@ fn ovs_apply_endpoints(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError
 /// `ovs-vsctl` calls themselves — only around the underlying `ip link del`, which still errors
 /// on an absent device the normal way.
 fn ovs_teardown(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
+    let ns = sh.netns.as_deref();
     for ep in &plan.endpoints {
         if let Some(imp) = &ep.impairment {
-            sh.run_tolerate_missing("ip", &["link", "del", &imp.ifb])?;
+            netlink::delete_link(ns, &imp.ifb).map_err(nl)?;
         }
         teardown_ingress_filter(sh, ep)?;
         sh.run(
             "ovs-vsctl",
             &["--if-exists", "del-port", &plan.bridge, &ep.name],
         )?;
-        sh.run_tolerate_missing("ip", &["link", "del", &ep.name])?;
+        netlink::delete_link(ns, &ep.name).map_err(nl)?;
     }
     teardown_tunnels(sh, plan)?;
     sh.run(
         "ovs-vsctl",
         &["--if-exists", "del-port", &plan.bridge, &plan.uplink],
     )?;
-    sh.run_tolerate_missing("ip", &["link", "del", &plan.uplink])?;
+    netlink::delete_link(ns, &plan.uplink).map_err(nl)?;
     sh.run("ovs-vsctl", &["--if-exists", "del-br", &plan.bridge])?;
     Ok(())
 }
@@ -1101,8 +1098,13 @@ fn ovs_teardown(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
 /// [`Shell::json`] parses it directly with no `--format=json` needed — confirmed live rather
 /// than assumed, since guessing wrong here would silently under- or over-report trunk state.
 fn ovs_observe(sh: &Shell, plan: &GatewayPlan) -> Result<GatewayObservation, NetOpsError> {
+    let ns = sh.netns.as_deref();
+    // `br-exists` stays a shell-out: it's an OVSDB-level query (does this bridge exist in
+    // OVSDB), not a link-existence check, so it's outside the rtnetlink port's scope even
+    // though the two usually agree. The link-presence checks below are plain kernel
+    // link-existence, which is exactly what #16's port covers.
     let bridge_present = sh.run("ovs-vsctl", &["br-exists", &plan.bridge]).is_ok();
-    let uplink_present = bridge_present && sh.link_exists(&plan.uplink);
+    let uplink_present = bridge_present && netlink::link_exists(ns, &plan.uplink);
 
     let class_handles: Vec<String> = if uplink_present {
         sh.run("tc", &["class", "show", "dev", &plan.uplink])?
@@ -1153,18 +1155,20 @@ fn ovs_observe(sh: &Shell, plan: &GatewayPlan) -> Result<GatewayObservation, Net
     let endpoints_present = plan
         .endpoints
         .iter()
-        .filter(|ep| bridge_ports.iter().any(|p| p == &ep.name) && sh.link_exists(&ep.name))
+        .filter(|ep| {
+            bridge_ports.iter().any(|p| p == &ep.name) && netlink::link_exists(ns, &ep.name)
+        })
         .count();
 
     let mut impairments = Vec::new();
     for ep in &plan.endpoints {
         let Some(imp) = &ep.impairment else { continue };
-        let egress_present = sh.link_exists(&ep.name)
+        let egress_present = netlink::link_exists(ns, &ep.name)
             && sh
                 .run("tc", &["qdisc", "show", "dev", &ep.name])?
                 .lines()
                 .any(|l| l.starts_with("qdisc netem "));
-        let ingress_present = sh.link_exists(&imp.ifb)
+        let ingress_present = netlink::link_exists(ns, &imp.ifb)
             && sh
                 .run("tc", &["qdisc", "show", "dev", &imp.ifb])?
                 .lines()

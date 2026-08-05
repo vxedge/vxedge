@@ -18,6 +18,7 @@ tokio = { workspace = true }
 rtnetlink = { workspace = true }
 futures-util = { workspace = true }
 nix = { workspace = true }
+tun = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

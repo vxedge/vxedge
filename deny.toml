@@ -29,6 +29,16 @@ allow = [
     "BSD-3-Clause",
     "Unicode-3.0",
     "Zlib",
+    # Added 2026-08-05 for `tun` (docs/TASKS.md #16, tap device creation — the vetted binding
+    # crate `rust-patterns` requires in place of hand-rolled `unsafe` ioctl code). Both are
+    # OSI-approved, FSF-free permissive licenses functionally equivalent in effect to MIT —
+    # no copyleft, no legal concern, checked before allowing rather than assumed:
+    #   - "ISC": pulled in by `libloading`, itself only reachable via `tun`'s optional
+    #     `wintun-bindings` (Windows-only backend) — never compiled for this Linux-only
+    #     workspace, but present in the full dependency graph cargo-deny checks regardless.
+    #   - "WTFPL": `tun` crate's own declared license.
+    "ISC",
+    "WTFPL",
 ]
 
 [bans]

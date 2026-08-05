@@ -559,11 +559,10 @@ exp-001 measurements).
       isolation. Live-verified: the full privileged `gateway_netns.rs` suite (5 tests) passes
       **unchanged**, plus a live smoke test through the real daemon/CLI against `exp-001-ws`
       (up/status/down/double-up-down), kernel state cross-checked directly against `ip -j link
-      show`/`bridge -j vlan show`. **Still open** (deferred, not silently folded in — zone netns
-      lifecycle, WireGuard device creation, and the fiveg host-attachment path, the first three
-      items, all closed the same day, see below): the `Ovs` `DataPlane`'s own link calls, tap
-      devices (`ioctl(TUNSETIFF)`, confirmed not an `RTM_NEWLINK` operation) — each a real,
-      separate, smaller follow-on.
+      show`/`bridge -j vlan show`. Deferred at this point, not silently folded in — zone netns
+      lifecycle, WireGuard device creation, and the fiveg host-attachment path closed the same
+      day (see below); the `Ovs` `DataPlane`'s own link calls and tap devices closed the
+      following day, slice 5 below.
 - [x] Port `zones::backend`'s container netns lifecycle to native rtnetlink — **slice 2 of
       the rtnetlink port, delivered 2026-08-04** (`docs/TASKS.md` #16, full account there).
       The highest-exposure code the port could touch: every container-backed zone in every
@@ -617,6 +616,40 @@ exp-001 measurements).
       exact same functions the test exercises directly — no separate code path. Could not run
       a full live daemon/CLI smoke test end-to-end (needs a real CN pod via podman) — a
       pre-existing environment limitation, not something skipped for this change.
+- [x] Port the `Ovs` `DataPlane`'s own link calls, and tap device creation, to native
+      primitives — **slice 5 of the rtnetlink port, delivered 2026-08-05** (`docs/TASKS.md`
+      #16, full account there), closing the item. `ovs_apply_links`/`ovs_apply_endpoints`/
+      `ovs_teardown`/`ovs_observe`'s `ip link` calls (veth creation, up, delete, existence)
+      swap onto the same `netlink` primitives the kernel-bridge path already used —
+      straightforward, since the two data planes were already sharing the tc/impairment code
+      on the same basis. `ovs-vsctl` itself stays a shell-out permanently (OVSDB, a different
+      protocol, never in scope here). Tap devices needed real new engineering: confirmed via
+      the actual kernel headers on this host (compiled a probe against `linux/if_tun.h` rather
+      than trusting memory) that `TUNSETIFF`/`TUNSETPERSIST` are a genuinely different kernel
+      interface (`ioctl` on `/dev/net/tun`, not `RTM_NEWLINK`) — as the module doc already
+      said. **Not hand-rolled**: `rust-patterns` treats `unsafe` as effectively forbidden (none
+      exists in the workspace) and requires FFI through a vetted binding crate, which a
+      hand-built `struct ifreq` + raw `ioctl(2)` would have violated. Added `tun` (crates.io,
+      `meh/rust-tun`, 2.35M downloads, last published 2026-07-21 — same diligence applied to
+      `rtnetlink` vs `nlink` for slice 1) instead; new `gateway::tuntap` module mirrors
+      `netlink.rs`'s own netns-entry/dedicated-thread shape rather than sharing its private
+      helper directly (same "a few duplicated lines beats risking proven code" call already
+      made for `run_blocking`). Two license additions to `deny.toml` (`ISC`, `WTFPL` — both
+      OSI/FSF permissive, no copyleft) for `tun`'s dependency tree, including a Windows-only
+      backend that's never compiled here but still walked by `cargo deny`. **Verified
+      unprivileged**: build/clippy/fmt/`cargo deny check` all green, 207 unit tests (was 206).
+      **Live-verified under sudo 2026-08-05, closing #16**: `gateway_netns`'s own fixture
+      already declares a `qemu-microvm`-backed node mapping to `EndpointKind::Tap`, so the
+      standard suite exercises the new tap code end to end with no new test file needed.
+      First run found one real bug, unrelated to this change: two other tests
+      (`tunnel_completes_a_real_handshake_between_two_simulated_hosts`,
+      `vxlan_tunnel_carries_slice_traffic_between_two_simulated_hosts`) both hard-code the
+      same `wanA`/`wanB` interface names for their own host-netns veth pair, racing on the
+      brief window both spend there before moving into their own netns — invisible in
+      isolation, real under `cargo test`'s default parallelism. Fixed by giving the VXLAN
+      test its own `vwanA`/`vwanB` names, found by running the exact verification loop this
+      item needed so fixed in the same pass. Re-run clean: all 7 `gateway_netns` tests +
+      `gateway_ovs`'s 1 pass, zero leftover state.
 - [x] Reconciler: converge partial state (up-after-partial-failure repairs deltas rather
       than failing verify) — **delivered 2026-08-03**. `GatewayService.Up`'s
       apply→apply→apply→observe→verify sequence is now a bounded retry loop (3 attempts,
