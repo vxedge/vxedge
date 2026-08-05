@@ -9,6 +9,7 @@ pub mod fiveg;
 pub mod gateway;
 pub mod model;
 pub mod package;
+pub mod registry;
 pub mod scaffold;
 pub mod services;
 pub mod sonic;

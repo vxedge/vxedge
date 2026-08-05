@@ -1689,22 +1689,56 @@ fn is_local_nos_check_ref(r: &str) -> bool {
     r.starts_with('.') || r.starts_with('/') || r.starts_with("local/")
 }
 
+/// Finds the single disk-image file inside a pulled `publish-vm-disk.sh`-shaped part
+/// directory (`vxparts/scripts/publish/publish-vm-disk.sh`'s own convention): the part's
+/// `meta.json` carries a `files` map of `{filename: digest}` with exactly one entry, since a
+/// single-disk-image part ships one disk and no more. Reading it back here rather than
+/// hardcoding a filename is what lets `sonic-vs.img`-shaped parts and any future single-disk
+/// part share this same resolution path without a naming convention neither side actually
+/// enforces.
+fn disk_file_in(dir: &std::path::Path) -> Result<PathBuf, String> {
+    let meta_path = dir.join("meta.json");
+    let text = std::fs::read_to_string(&meta_path)
+        .map_err(|e| format!("reading {}: {e}", meta_path.display()))?;
+    let meta: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("parsing {}: {e}", meta_path.display()))?;
+    let files = meta
+        .get("files")
+        .and_then(|f| f.as_object())
+        .ok_or_else(|| format!("{} has no `files` map", meta_path.display()))?;
+    match files.len() {
+        1 => Ok(dir.join(files.keys().next().unwrap())),
+        n => Err(format!(
+            "{} declares {n} file(s) in `files` — expected exactly 1 (a single-disk-image part)",
+            meta_path.display()
+        )),
+    }
+}
+
 pub struct NosCheckSvc {
     pub engine: JobEngine,
     pub audit: Arc<Audit>,
     pub runtime_dir: PathBuf,
     /// Local disk image used when a `network.nos_check` block omits `part_ref`/`digest` — the
-    /// "use the pinned default build" case §6.0.3 documents. No registry-fetch mechanism exists
-    /// yet (`docs/TASKS.md` #19), so this is the daemon operator's own pre-fetched copy, the
-    /// same convention `--vxota-bin`/`--vxtelemetry-bin` already use for "something vxedged
-    /// needs but does not itself provision."
+    /// "use the pinned default build" case §6.0.3 documents. Still useful even now that a
+    /// published `part_ref` is fetchable (`vxedge_core::registry`): it lets an operator on a
+    /// slow or offline link pre-stage the image once rather than have every experiment run
+    /// pull it, the same convention `--vxota-bin`/`--vxtelemetry-bin` already use for
+    /// "something vxedged needs but does not itself provision."
     pub default_image: Option<PathBuf>,
+    /// Where a published `part_ref` gets pulled to (`vxedge_core::registry::fetch`,
+    /// `docs/TASKS.md` #19). Content-addressed by digest, so this is shared across every
+    /// experiment that references the same pinned build — SONiC-VS is 6+ GB, and re-pulling it
+    /// per experiment would be its own reproducibility footgun (slow, and a mid-run network
+    /// blip becomes a flaky test failure instead of a one-time setup cost).
+    pub cache_dir: PathBuf,
 }
 
 impl NosCheckSvc {
     /// Resolves the experiment's declared `network.nos_check` to a local disk image this host
-    /// can boot. A published (non-local) `part_ref` is refused with a named, actionable error
-    /// rather than silently attempted and failing deep inside QEMU's own "file not found."
+    /// can boot: a local `part_ref` resolves directly, a published one is pulled through
+    /// `vxedge_core::registry::fetch` (cached by digest, `docs/TASKS.md` #19), and no
+    /// `part_ref` at all falls back to `default_image`.
     async fn resolve(
         &self,
         mref: Option<&ManifestRef>,
@@ -1733,12 +1767,32 @@ impl NosCheckSvc {
                 }
             }
             Some(r) => {
-                return Err(Status::unimplemented(format!(
-                    "`network.nos_check.part_ref` `{r}` is a published ref — vxedged does not \
-                     fetch from a registry yet (docs/TASKS.md #19); use a local part_ref \
-                     (`./…`) or omit part_ref/digest to use this daemon's configured default \
-                     image (`--sonic-vs-image`)"
-                )));
+                // `digest` is required alongside a non-local `part_ref` — enforced together in
+                // `model::build` (§13: a published ref with no digest isn't reproducible) — so
+                // this is reachable only with a real digest in hand, never `None` here.
+                let Some(digest) = nos_check.digest.clone() else {
+                    return Err(Status::invalid_argument(
+                        "`network.nos_check.part_ref` is a published ref but declares no \
+                         `digest` — published refs must be digest-pinned (§13)",
+                    ));
+                };
+                let reference = r.clone();
+                let cache_dir = self.cache_dir.clone();
+                let pulled_dir = tokio::task::spawn_blocking(move || {
+                    vxedge_core::registry::fetch(&reference, &digest, &cache_dir)
+                })
+                .await
+                .map_err(|e| Status::internal(format!("registry fetch task panicked: {e}")))?
+                .map_err(|e| {
+                    Status::unavailable(format!(
+                        "fetching `network.nos_check.part_ref` `{r}` failed: {e}"
+                    ))
+                })?;
+                disk_file_in(&pulled_dir).map_err(|e| {
+                    Status::internal(format!(
+                        "pulled `{r}` but could not identify its disk image: {e}"
+                    ))
+                })?
             }
             None => self.default_image.clone().ok_or_else(|| {
                 Status::failed_precondition(

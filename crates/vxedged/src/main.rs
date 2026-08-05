@@ -67,11 +67,18 @@ struct Args {
 
     /// Local disk image `NosCheckService` boots when an experiment's `network.nos_check`
     /// omits `part_ref`/`digest` (the "use the pinned default build" case,
-    /// `ARCHITECTURE.md` §6.0.3). No registry-fetch mechanism exists yet (`docs/TASKS.md`
-    /// #19), so this names a copy the daemon operator already has on disk — unset means
-    /// `nos_check` only works for experiments declaring a local `part_ref` themselves.
+    /// `ARCHITECTURE.md` §6.0.3) — unset means that case falls through to an error, though a
+    /// published `part_ref` (fetched via `--cache-dir`) or a local one both still work without
+    /// it.
     #[arg(long, env = "VXEDGE_SONIC_VS_IMAGE")]
     sonic_vs_image: Option<std::path::PathBuf>,
+
+    /// Where published part refs get pulled to (`vxedge_core::registry`, `docs/TASKS.md` #19),
+    /// content-addressed by digest. Defaults to `$XDG_CACHE_HOME/vxedge/parts` or
+    /// `$HOME/.cache/vxedge/parts` — deliberately not under `--runtime-dir` (tmpfs by default),
+    /// since a pulled artifact should survive a restart rather than re-pulling every time.
+    #[arg(long, env = "VXEDGE_CACHE_DIR")]
+    cache_dir: Option<std::path::PathBuf>,
 }
 
 #[tokio::main]
@@ -104,6 +111,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let _ = std::fs::create_dir_all(&args.runtime_dir);
 
+    // Falls back to `runtime_dir` only when even `$HOME` isn't set (no persistence guarantee
+    // in that case, but still functional rather than refusing to start) — see
+    // `registry::default_cache_dir`'s own doc comment for why this isn't just `runtime_dir`
+    // unconditionally.
+    let cache_dir = args
+        .cache_dir
+        .clone()
+        .or_else(vxedge_core::registry::default_cache_dir)
+        .unwrap_or_else(|| args.runtime_dir.join("cache/parts"));
+    let _ = std::fs::create_dir_all(&cache_dir);
+
     let bus = events::EventBus::new();
     let engine = jobs::JobEngine::new(bus.clone());
     let audit = Arc::new(audit::Audit::new(&args.runtime_dir));
@@ -121,7 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let listener = tokio::net::UnixListener::bind(path)?;
-    info!(socket = %path, runtime_dir = %args.runtime_dir.display(),
+    info!(socket = %path, runtime_dir = %args.runtime_dir.display(), cache_dir = %cache_dir.display(),
         "vxedged listening (vxAPI, package vxedge.v1)");
 
     let state: services::SharedState =
@@ -168,6 +186,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         audit: audit.clone(),
         runtime_dir: args.runtime_dir.clone(),
         default_image: args.sonic_vs_image.clone(),
+        cache_dir: cache_dir.clone(),
     });
 
     Server::builder()
