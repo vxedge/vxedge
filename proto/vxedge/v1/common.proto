@@ -14,6 +14,17 @@ message ManifestRef {
   // Optional expected SHA-256 of the manifest content; the daemon rejects
   // the call if the checksum does not match (reproducibility guard).
   string sha256 = 3;
+  // Internal orchestration hint, not part of the public contract: when a stage forwards an
+  // already-resolved workspace as `inline_yaml` (ExperimentService's own stages do this so
+  // every stage sees the identical document, rather than each re-reading the workspace from
+  // disk), this carries the workspace directory that document was read from, since
+  // `inline_yaml` alone has no directory to resolve local refs (bundles, baseline parts)
+  // against. Empty for a genuinely-inline manifest (no workspace) and for any external
+  // caller — those already send `path`, which resolves correctly without this field. Found
+  // necessary 2026-08-04: `ActiveExperiment.dir` silently fell back to "." for every
+  // experiment staged this way, so a local `kind: bundle` ref checked file existence
+  // relative to the daemon process's own cwd instead of the workspace.
+  string resolved_dir = 4;
 }
 
 // Identifies a zone, compute node, service, or other manifest-declared resource.

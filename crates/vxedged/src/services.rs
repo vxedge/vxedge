@@ -128,7 +128,15 @@ async fn resolve_manifest(
             })?;
             (yaml, PathBuf::from(path).parent().map(PathBuf::from))
         }
-        Some(Source::InlineYaml(yaml)) => (yaml.clone(), None),
+        Some(Source::InlineYaml(yaml)) => {
+            // See ManifestRef.resolved_dir's own doc comment (common.proto): set only by
+            // ExperimentService's own stage orchestration, carrying the workspace directory
+            // the inline document was actually read from. Without it, a local `kind: bundle`
+            // ref or baseline part resolves against the daemon process's own cwd instead —
+            // found live 2026-08-04, `zone up` after `experiment up --stage gateway`.
+            let dir = (!mref.resolved_dir.is_empty()).then(|| PathBuf::from(&mref.resolved_dir));
+            (yaml.clone(), dir)
+        }
         None => {
             return Err(Status::invalid_argument(
                 "manifest has no source (path or inline_yaml)",

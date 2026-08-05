@@ -90,10 +90,16 @@ async fn await_job(engine: &JobEngine, job: Job) -> Result<String, String> {
     }
 }
 
-fn inline(yaml: &str) -> Option<ManifestRef> {
+/// `dir` is the workspace `resolve_once` (or the caller's own preflight resolution) already
+/// read this document from — carried alongside the YAML so a sub-RPC can resolve local
+/// bundle/part refs against the real workspace instead of the daemon's own cwd (see
+/// `ManifestRef.resolved_dir`'s own doc comment, common.proto). `None` for a genuinely-inline
+/// manifest (no workspace to name).
+fn inline(yaml: &str, dir: Option<&std::path::Path>) -> Option<ManifestRef> {
     Some(ManifestRef {
         source: Some(Source::InlineYaml(yaml.to_string())),
         sha256: String::new(),
+        resolved_dir: dir.map(|d| d.display().to_string()).unwrap_or_default(),
     })
 }
 
@@ -113,7 +119,13 @@ async fn resolve_once(mref: Option<&ManifestRef>) -> Result<String, Status> {
 }
 
 impl Handles {
-    async fn stage_gateway(&self, yaml: &str, up: bool, p: &Progress) -> Result<String, String> {
+    async fn stage_gateway(
+        &self,
+        yaml: &str,
+        dir: Option<&std::path::Path>,
+        up: bool,
+        p: &Progress,
+    ) -> Result<String, String> {
         p.update(
             10,
             if up {
@@ -125,13 +137,13 @@ impl Handles {
         let job = if up {
             self.gateway
                 .up(Request::new(GatewayUpRequest {
-                    manifest: inline(yaml),
+                    manifest: inline(yaml, dir),
                 }))
                 .await
         } else {
             self.gateway
                 .down(Request::new(GatewayDownRequest {
-                    manifest: inline(yaml),
+                    manifest: inline(yaml, dir),
                 }))
                 .await
         }
@@ -193,6 +205,7 @@ impl Handles {
         &self,
         model: &vxedge_core::model::Experiment,
         yaml: &str,
+        dir: Option<&std::path::Path>,
         up: bool,
         p: &Progress,
     ) -> Result<String, String> {
@@ -210,14 +223,14 @@ impl Handles {
                 self.svcs
                     .up(Request::new(SvcUpRequest {
                         service_type: ty.clone(),
-                        experiment: inline(yaml),
+                        experiment: inline(yaml, dir),
                     }))
                     .await
             } else {
                 self.svcs
                     .down(Request::new(SvcDownRequest {
                         service_type: ty.clone(),
-                        experiment: inline(yaml),
+                        experiment: inline(yaml, dir),
                     }))
                     .await
             }
@@ -241,10 +254,18 @@ impl ExperimentService for ExperimentSvc {
     async fn up(&self, req: Request<ExperimentUpRequest>) -> Result<Response<Job>, Status> {
         // Host requirements first: refusing here costs nothing, and refusing halfway through
         // provisioning strands a partly-built topology on a host that was never going to run it.
-        if let Some(mref) = req.get_ref().manifest.as_ref() {
-            let dir = crate::services::resolve_manifest_dir(mref).await;
-            crate::services::preflight_requires(dir.as_deref())?;
-        }
+        // Also the one resolution of the workspace directory: carried into every stage below
+        // (`inline()`'s `resolved_dir`) so a local bundle/part ref resolves against the real
+        // workspace instead of the daemon's own cwd once the document is re-wrapped as inline
+        // YAML — found live 2026-08-04, `zone up` after `experiment up --stage gateway`.
+        let dir = match req.get_ref().manifest.as_ref() {
+            Some(mref) => {
+                let dir = crate::services::resolve_manifest_dir(mref).await;
+                crate::services::preflight_requires(dir.as_deref())?;
+                dir
+            }
+            None => None,
+        };
         let yaml = resolve_once(req.get_ref().manifest.as_ref()).await?;
         let model = vxedge_core::model::load_yaml(&yaml)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
@@ -261,14 +282,17 @@ impl ExperimentService for ExperimentSvc {
             .submit("experiment.up", move |p| async move {
                 let mut done: Vec<String> = Vec::new();
                 if wants(&stages, ExperimentStage::Gateway) {
-                    svc.stage_gateway(&yaml, true, &p).await?;
+                    svc.stage_gateway(&yaml, dir.as_deref(), true, &p).await?;
                     done.push("gateway".to_string());
                 }
                 if wants(&stages, ExperimentStage::Zones) {
                     done.push(svc.stage_zones(true, &p).await?);
                 }
                 if wants(&stages, ExperimentStage::Services) {
-                    done.push(svc.stage_services(&model, &yaml, true, &p).await?);
+                    done.push(
+                        svc.stage_services(&model, &yaml, dir.as_deref(), true, &p)
+                            .await?,
+                    );
                 }
                 // Said explicitly, because an engineer expecting `up` to have started the load
                 // would otherwise sit waiting for numbers that are not coming.
@@ -283,6 +307,13 @@ impl ExperimentService for ExperimentSvc {
     }
 
     async fn down(&self, req: Request<ExperimentDownRequest>) -> Result<Response<Job>, Status> {
+        // Same resolution `up` does (minus preflight, which only guards provisioning) — carried
+        // into every stage below for the same reason: a local bundle/part ref, or the audit
+        // sha256, should resolve against the real workspace, not the daemon's own cwd.
+        let dir = match req.get_ref().manifest.as_ref() {
+            Some(mref) => crate::services::resolve_manifest_dir(mref).await,
+            None => None,
+        };
         let yaml = resolve_once(req.get_ref().manifest.as_ref()).await?;
         let model = vxedge_core::model::load_yaml(&yaml)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
@@ -302,7 +333,9 @@ impl ExperimentService for ExperimentSvc {
                 // and report everything that went wrong.
                 let mut failures: Vec<String> = Vec::new();
                 if wants(&stages, ExperimentStage::Services)
-                    && let Err(e) = svc.stage_services(&model, &yaml, false, &p).await
+                    && let Err(e) = svc
+                        .stage_services(&model, &yaml, dir.as_deref(), false, &p)
+                        .await
                 {
                     failures.push(e);
                 }
@@ -312,7 +345,7 @@ impl ExperimentService for ExperimentSvc {
                     failures.push(e);
                 }
                 if wants(&stages, ExperimentStage::Gateway)
-                    && let Err(e) = svc.stage_gateway(&yaml, false, &p).await
+                    && let Err(e) = svc.stage_gateway(&yaml, dir.as_deref(), false, &p).await
                 {
                     failures.push(e);
                 }

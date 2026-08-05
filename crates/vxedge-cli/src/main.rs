@@ -428,6 +428,11 @@ fn manifest_ref(path: &Option<String>) -> Option<ManifestRef> {
         ManifestRef {
             source: Some(Source::Path(abs)),
             sha256: String::new(),
+            // Unused here: `Source::Path` already resolves its own directory daemon-side
+            // (services.rs::resolve_manifest); `resolved_dir` only matters for the
+            // daemon's own internal inline-YAML re-staging (ExperimentSvc), never for a
+            // path-based ref an external caller like this CLI sends.
+            resolved_dir: String::new(),
         }
     })
 }
