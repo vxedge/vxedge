@@ -105,4 +105,36 @@ mod tests {
     fn aggregate_resource_states_of_nothing_is_down() {
         assert_eq!(aggregate_resource_states(&[]), ResourceState::Down);
     }
+
+    #[test]
+    fn wire_state_maps_every_observed_state_distinctly() {
+        // Every arm, explicitly — a future accidental swap (e.g. Staging <-> Error) would
+        // otherwise go uncaught, since the other tests here only ever exercise Up/Down/
+        // Degraded.
+        assert_eq!(wire_state(ObservedState::Up), ResourceState::Up);
+        assert_eq!(wire_state(ObservedState::Down), ResourceState::Down);
+        assert_eq!(wire_state(ObservedState::Staging), ResourceState::Staging);
+        assert_eq!(wire_state(ObservedState::Degraded), ResourceState::Degraded);
+        assert_eq!(wire_state(ObservedState::Error), ResourceState::Error);
+    }
+
+    #[test]
+    fn aggregate_resource_states_round_trips_staging_and_error() {
+        // The reverse (wire ResourceState -> ObservedState) mapping inside
+        // aggregate_resource_states, exercised for the two states the other tests never
+        // touch: a lone Staging resource stays Staging, and Error still outranks Degraded in
+        // a mix (matches vxedge_core::status::aggregate's own severity rule).
+        let staging = resource_status("a", ResourceKind::Zone, &Fake(ObservedState::Staging), "");
+        assert_eq!(
+            aggregate_resource_states(&[staging]),
+            ResourceState::Staging
+        );
+
+        let degraded = resource_status("b", ResourceKind::Zone, &Fake(ObservedState::Degraded), "");
+        let error = resource_status("c", ResourceKind::Zone, &Fake(ObservedState::Error), "");
+        assert_eq!(
+            aggregate_resource_states(&[degraded, error]),
+            ResourceState::Error
+        );
+    }
 }

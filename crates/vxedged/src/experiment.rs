@@ -379,38 +379,155 @@ impl ExperimentService for ExperimentSvc {
             .into_inner();
         let gw_status = gw.status.clone().unwrap_or_default();
 
-        let mut resources: Vec<ResourceStatus> = vec![ResourceStatus {
-            vxid: "vxgateway".into(),
-            kind: ResourceKind::Gateway as i32,
-            state: gw_status.state,
-            detail: gw_status.detail.clone(),
-            since_unix_ms: gw_status.since_unix_ms,
-        }];
-        resources.extend(
-            self.handles
-                .zones
-                .list(Request::new(vxedge_api::v1::ZoneListRequest {}))
-                .await
-                .map(|r| r.into_inner().zones)
-                .unwrap_or_default(),
-        );
+        let zones = self
+            .handles
+            .zones
+            .list(Request::new(vxedge_api::v1::ZoneListRequest {}))
+            .await
+            .map(|r| r.into_inner().zones)
+            .unwrap_or_default();
 
-        // Composite pattern (`vxedge_core::status::aggregate`): the experiment's own state is
-        // *derived* from its components, never independently declared, so it can't silently
-        // disagree with what's actually running underneath it. Also fixes a real edge case the
-        // old hand-rolled `all_up` check got wrong: zero resources used to report `Degraded`
-        // (`!resources.is_empty() && ...` is false either way an empty list gets there) — now
-        // correctly `Down`, since nothing partially worked, nothing is declared at all.
-        let state = crate::status::aggregate_resource_states(&resources);
-        Ok(Response::new(ExperimentStatus {
-            status: Some(ResourceStatus {
-                vxid: model.id.clone(),
-                kind: ResourceKind::Experiment as i32,
-                state: state as i32,
-                detail: format!("{} resource(s)", resources.len()),
-                since_unix_ms: gw_status.since_unix_ms,
-            }),
-            components: resources,
-        }))
+        Ok(Response::new(build_experiment_status(
+            &model.id, gw_status, zones,
+        )))
+    }
+}
+
+/// Pure assembly of an `ExperimentStatus` from its already-fetched components — no I/O, so it
+/// unit-tests directly rather than only through a live gRPC call needing real `Handles`.
+/// Composite pattern (`vxedge_core::status::aggregate`): the experiment's own state is
+/// *derived* from its components, never independently declared, so it can't silently disagree
+/// with what's actually running underneath it. Also fixes a real edge case the old hand-rolled
+/// `all_up` check got wrong: zero resources used to report `Degraded`
+/// (`!resources.is_empty() && ...` is false either way an empty list gets there) — now
+/// correctly `Down`, since nothing partially worked, nothing is declared at all. (The gateway
+/// entry below is always present in the real handler, so that exact empty case can't occur
+/// through `status()` today — kept general here since this function has no way to know that,
+/// and testing the boundary directly is cheaper than trusting the caller's invariant.)
+fn build_experiment_status(
+    experiment_id: &str,
+    gw_status: ResourceStatus,
+    zones: Vec<ResourceStatus>,
+) -> ExperimentStatus {
+    let mut resources: Vec<ResourceStatus> = vec![ResourceStatus {
+        vxid: "vxgateway".into(),
+        kind: ResourceKind::Gateway as i32,
+        state: gw_status.state,
+        detail: gw_status.detail.clone(),
+        since_unix_ms: gw_status.since_unix_ms,
+    }];
+    resources.extend(zones);
+
+    let state = crate::status::aggregate_resource_states(&resources);
+    ExperimentStatus {
+        status: Some(ResourceStatus {
+            vxid: experiment_id.to_string(),
+            kind: ResourceKind::Experiment as i32,
+            state: state as i32,
+            detail: format!("{} resource(s)", resources.len()),
+            since_unix_ms: gw_status.since_unix_ms,
+        }),
+        components: resources,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status(
+        vxid: &str,
+        kind: ResourceKind,
+        state: vxedge_api::v1::ResourceState,
+    ) -> ResourceStatus {
+        ResourceStatus {
+            vxid: vxid.into(),
+            kind: kind as i32,
+            state: state as i32,
+            detail: String::new(),
+            since_unix_ms: 0,
+        }
+    }
+
+    #[test]
+    fn a_healthy_gateway_and_no_zones_is_up() {
+        let gw = status(
+            "vxgateway",
+            ResourceKind::Gateway,
+            vxedge_api::v1::ResourceState::Up,
+        );
+        let out = build_experiment_status("exp-a", gw, vec![]);
+        assert_eq!(
+            out.status.unwrap().state,
+            vxedge_api::v1::ResourceState::Up as i32
+        );
+    }
+
+    #[test]
+    fn a_down_zone_degrades_an_otherwise_healthy_experiment() {
+        let gw = status(
+            "vxgateway",
+            ResourceKind::Gateway,
+            vxedge_api::v1::ResourceState::Up,
+        );
+        let zone = status(
+            "node-a",
+            ResourceKind::Zone,
+            vxedge_api::v1::ResourceState::Down,
+        );
+        let out = build_experiment_status("exp-a", gw, vec![zone]);
+        assert_eq!(
+            out.status.unwrap().state,
+            vxedge_api::v1::ResourceState::Degraded as i32
+        );
+    }
+
+    #[test]
+    fn a_down_gateway_and_no_zones_is_down_not_degraded() {
+        // The exact bug this rollup used to have: zero-or-uniformly-down must report Down,
+        // never Degraded, since nothing partially worked.
+        let gw = status(
+            "vxgateway",
+            ResourceKind::Gateway,
+            vxedge_api::v1::ResourceState::Down,
+        );
+        let out = build_experiment_status("exp-a", gw, vec![]);
+        assert_eq!(
+            out.status.unwrap().state,
+            vxedge_api::v1::ResourceState::Down as i32
+        );
+    }
+
+    #[test]
+    fn the_gateway_entry_is_always_first_and_correctly_kinded() {
+        let gw = status(
+            "vxgateway",
+            ResourceKind::Gateway,
+            vxedge_api::v1::ResourceState::Up,
+        );
+        let zone = status(
+            "node-a",
+            ResourceKind::Zone,
+            vxedge_api::v1::ResourceState::Up,
+        );
+        let out = build_experiment_status("exp-a", gw, vec![zone]);
+        assert_eq!(out.components.len(), 2);
+        assert_eq!(out.components[0].vxid, "vxgateway");
+        assert_eq!(out.components[0].kind, ResourceKind::Gateway as i32);
+        assert_eq!(out.components[1].vxid, "node-a");
+        assert_eq!(out.components[1].kind, ResourceKind::Zone as i32);
+    }
+
+    #[test]
+    fn the_experiment_status_carries_the_supplied_id_and_kind() {
+        let gw = status(
+            "vxgateway",
+            ResourceKind::Gateway,
+            vxedge_api::v1::ResourceState::Up,
+        );
+        let out = build_experiment_status("exp-a", gw, vec![]);
+        let s = out.status.unwrap();
+        assert_eq!(s.vxid, "exp-a");
+        assert_eq!(s.kind, ResourceKind::Experiment as i32);
     }
 }
