@@ -1,6 +1,6 @@
 ---
 name: vxapi-protobuf-design
-description: Design and evolution rules for vxAPI (proto/vxedge/v1/, gRPC/Protobuf) — use when adding or changing any RPC, message, or service, or wiring a new frontend SDK. The API-first spine every frontend (CLI, Qt/QML, web, Electron) depends on identically.
+description: Design and evolution rules for vxAPI (proto/vxedge/v1/, gRPC/Protobuf) — use when adding or changing any RPC, message, or service, or wiring a new frontend SDK. The API-first spine every frontend (CLI, Qt/QML, web, Electron, vxmcp) depends on identically.
 ---
 
 # vxAPI design — the API-first spine
