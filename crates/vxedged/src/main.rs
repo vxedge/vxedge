@@ -161,6 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shell: shell.clone(),
         state: state.clone(),
         runtime_dir: args.runtime_dir.clone(),
+        cache_dir: cache_dir.clone(),
     });
     // Not part of `Handles`: `ComputeService` is a standalone RPC surface over the same
     // `EdgeState`/`NodePlan` machinery `zones` already uses, addressed by role rather than
@@ -171,6 +172,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shell: shell.clone(),
         state,
         runtime_dir: args.runtime_dir.clone(),
+        cache_dir: cache_dir.clone(),
     });
     let svcs = Arc::new(services::SvcSvc {
         engine: engine.clone(),

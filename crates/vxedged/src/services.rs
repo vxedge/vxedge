@@ -916,6 +916,10 @@ pub struct ZoneSvc {
     pub shell: Shell,
     pub state: SharedState,
     pub runtime_dir: PathBuf,
+    /// Digest-addressed cache dir for published parts, passed to `zones::node_up` — same
+    /// directory `NosCheckSvc` fetches into, so a part pulled via one path is cached for the
+    /// other too.
+    pub cache_dir: PathBuf,
 }
 
 impl ZoneSvc {
@@ -981,6 +985,7 @@ impl ZoneSvc {
         );
         let shell = self.shell.clone();
         let runtime_dir = self.runtime_dir.clone();
+        let cache_dir = self.cache_dir.clone();
         let events = self.engine.events().clone();
         let job = self
             .engine
@@ -1001,10 +1006,11 @@ impl ZoneSvc {
                     );
                     let sh = shell.clone();
                     let rd = runtime_dir.clone();
+                    let cd = cache_dir.clone();
                     let node = np.clone();
                     blocking(move || {
                         if up {
-                            zones::node_up(&sh, &node, &rd).map_err(|e| e.to_string())
+                            zones::node_up(&sh, &node, &rd, &cd).map_err(|e| e.to_string())
                         } else {
                             zones::node_down(&sh, &node, &rd).map_err(|e| e.to_string())
                         }
@@ -1161,6 +1167,9 @@ pub struct ComputeSvc {
     pub shell: Shell,
     pub state: SharedState,
     pub runtime_dir: PathBuf,
+    /// Digest-addressed cache dir for published parts, passed to `zones::node_up` — see
+    /// `ZoneSvc::cache_dir`'s own doc comment; `ComputeSvc` shares the exact same lifecycle.
+    pub cache_dir: PathBuf,
 }
 
 impl ComputeSvc {
@@ -1220,6 +1229,7 @@ impl ComputeSvc {
         );
         let shell = self.shell.clone();
         let runtime_dir = self.runtime_dir.clone();
+        let cache_dir = self.cache_dir.clone();
         let events = self.engine.events().clone();
         let job = self
             .engine
@@ -1240,10 +1250,11 @@ impl ComputeSvc {
                     );
                     let sh = shell.clone();
                     let rd = runtime_dir.clone();
+                    let cd = cache_dir.clone();
                     let node = np.clone();
                     blocking(move || {
                         if up {
-                            zones::node_up(&sh, &node, &rd).map_err(|e| e.to_string())
+                            zones::node_up(&sh, &node, &rd, &cd).map_err(|e| e.to_string())
                         } else {
                             zones::node_down(&sh, &node, &rd).map_err(|e| e.to_string())
                         }

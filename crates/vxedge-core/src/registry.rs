@@ -6,9 +6,11 @@
 //! of that rule could actually turn a published form into bytes on disk: every call site that
 //! received one (`NosCheckSvc::resolve`, `ZoneService`/`ComputeService`'s `PushImage`) refused
 //! it outright, naming `docs/TASKS.md` #19. This is the first implementation, wired into
-//! `NosCheckSvc::resolve` first because it is the one call site that already has a concrete,
+//! `NosCheckSvc::resolve` first because it was the one call site that already had a concrete,
 //! real published ref to pull (`ghcr.io/vxedge/parts/gw/nos/os/sonic-vs`) rather than a
-//! speculative one.
+//! speculative one. `zones::node_up` (`crates/vxedge-core/src/zones/backend.rs`) is the second:
+//! a `NodePlan.remote_bundle` (populated by `zones::plan_nodes_from_model` for a published,
+//! non-local bundle part) is fetched here immediately before boot, same mechanism, same cache.
 //!
 //! Shells out to `oras` rather than adding an OCI-registry crate dependency: `vxparts`' own
 //! publish scripts already use the `oras` CLI as this project's one registry client

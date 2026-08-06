@@ -121,9 +121,9 @@ fn gateway_and_container_zone_cycle_in_netns() {
         .find(|n| n.node_id == "node-info-01")
         .expect("container node planned");
 
-    node_up(&sh, container, &runtime).unwrap();
+    node_up(&sh, container, &runtime, &runtime).unwrap();
     assert_eq!(node_status(&sh, container, &runtime), NodeState::Up);
-    node_up(&sh, container, &runtime).unwrap(); // idempotent
+    node_up(&sh, container, &runtime, &runtime).unwrap(); // idempotent
     assert_eq!(node_status(&sh, container, &runtime), NodeState::Up);
 
     // The node's eth0 carries the manifest IP inside its namespace.
@@ -367,7 +367,7 @@ fn zone_traffic_reaches_the_access_port_not_loopback() {
         .iter()
         .find(|n| n.node_id == LOCALITY_DEVICE_ID)
         .expect("container node planned");
-    node_up(&sh, container, &runtime).unwrap();
+    node_up(&sh, container, &runtime, &runtime).unwrap();
 
     let endpoint = plan
         .endpoints
@@ -564,7 +564,7 @@ fn ingress_filter_drops_spoofed_source_but_allows_declared_one() {
         .iter()
         .find(|n| n.node_id == ANTISPOOF_DEVICE_ID)
         .expect("container node planned");
-    node_up(&sh, container, &runtime).unwrap();
+    node_up(&sh, container, &runtime, &runtime).unwrap();
 
     let slice = plan
         .slices
@@ -1048,8 +1048,8 @@ fn vxlan_tunnel_carries_slice_traffic_between_two_simulated_hosts() {
         .iter()
         .find(|n| n.node_id == "node-b")
         .expect("node-b planned");
-    node_up(&sh_a, node_a, &runtime_a).unwrap();
-    node_up(&sh_b, node_b, &runtime_b).unwrap();
+    node_up(&sh_a, node_a, &runtime_a, &runtime_a).unwrap();
+    node_up(&sh_b, node_b, &runtime_b, &runtime_b).unwrap();
 
     // The real proof: a ping from site A's container to site B's container, over their shared
     // `adas` slice — the *only* path between the two netns is the VXLAN-encapsulated UDP

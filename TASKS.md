@@ -1439,3 +1439,36 @@ scoped here (§3); sensor/actuator/virtual-ECU backends move up from phase 3 by 
 - [ ] TSN gateway variant: taprio/cbs qdisc rendering + gPTP time sync (linuxptp)
 - [ ] V2X groundwork: N vehicle manifests per experiment (V2V paths through vxgateway) +
       `type: rsu` node support in zone/gateway provisioning (V2I)
+- [x] Wire `vxedge_core::registry::fetch` into zone/compute plan resolution — **delivered
+      2026-08-06** (decided 2026-08-05, `docs/TASKS.md` — full rationale there). Planning stays
+      pure: `NodePlan` gained `remote_bundle: Option<(String, String)>` alongside the existing
+      `bundle: Option<PathBuf>`, and `plan_nodes_from_model` (`zones/plan.rs`) now branches on
+      `Part.local` — a local part resolves to `bundle` exactly as before, a published one
+      resolves to `remote_bundle` (intent only, no I/O). The fetch itself happens in
+      `zones::node_up` (`zones/backend.rs`, the plain dispatch function, not the `ZoneBackend`
+      trait or its three impls — none of them changed), immediately before dispatching to a
+      backend: when `remote_bundle` is `Some`, it calls `registry::fetch` and resolves a copy
+      of the plan with a real local `bundle` path before boot. Every caller of `node_up` already
+      ran it inside a `blocking(...)` closure (`ZoneSvc`/`ComputeSvc::lifecycle`), so no new
+      async plumbing was needed — same precedent `NosCheckSvc::resolve` already established for
+      this exact `registry::fetch` call. `ZoneSvc`/`ComputeSvc` gained a `cache_dir: PathBuf`
+      field, threaded from `main.rs`'s existing `cache_dir` resolution (same value
+      `NosCheckSvc` already used). Found and fixed one design simplification along the way: an
+      initially-added `ZonePlanError::UnpinnedPublishedPart` defensive check turned out to be
+      dead code — `WorkspaceValidationError::PublishedRefWithoutDigest` already refuses an
+      unpinned published part at `load_yaml`'s workspace-validation step, before an `Experiment`
+      (and therefore a `Part`) can even exist — removed in favor of a documented `.expect()` at
+      the point of use, matching `bundle_paths`' own existing idiom for a structurally-guaranteed
+      invariant. Verified: 208/208 `vxedge-core` unit tests pass (2 new, testing the
+      `remote_bundle` resolution path — the missing-digest case is provably unreachable here and
+      already covered by an existing workspace-level test, not duplicated), full workspace
+      `cargo test`/`clippy -D warnings`/`fmt --check` all clean, and a new opt-in integration
+      test (`crates/vxedge-core/tests/registry_fetch_boot.rs`, `--ignored` by default) proved it
+      live against the real, published `ghcr.io/vxedge/parts/zone/linux/stack/probe-bundle:0.1.0`
+      — a real `vmlinuz`/`initrd.img` fetched into the cache dir through `node_up` itself (not a
+      manual `oras pull`), and a second call confirmed to hit the cache rather than re-fetch.
+      Deliberately not run through a live `vxedge zone up` end-to-end (needs a real gateway/tap,
+      shared host state better left undisturbed while another session's own privileged network
+      work was in flight) — the integration test exercises the exact same `node_up` function
+      `ZoneSvc`/`ComputeSvc::lifecycle` call, just without the tap-attach step a live gateway
+      would provide.

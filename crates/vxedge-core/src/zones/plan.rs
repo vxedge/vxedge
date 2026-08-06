@@ -61,7 +61,16 @@ pub struct NodePlan {
     pub ip_cidr: Option<String>,
     /// For vm/rtimage kinds: guest bundle dir (vmlinuz + initrd.img),
     /// resolved against the manifest's directory when relative.
+    ///
+    /// Mutually exclusive with `remote_bundle`: planning records *intent* only, never fetches —
+    /// a local part resolves straight to `bundle`, a published one resolves to `remote_bundle`
+    /// for `zones::node_up` to fetch immediately before boot (see that function's doc comment).
     pub bundle: Option<PathBuf>,
+    /// `(reference, digest)` for a published, not-yet-fetched bundle part. Set instead of
+    /// `bundle` when the part is not local — `zones::node_up` resolves this into a real
+    /// `bundle` path via `registry::fetch` before dispatching to a backend, so backends never
+    /// see anything but an already-resolved local path.
+    pub remote_bundle: Option<(String, String)>,
     pub pinned_cpus: Vec<u32>,
 }
 
@@ -141,7 +150,13 @@ pub fn plan_nodes_from_model(
                 // A VM backend boots a bundle. A part that is a container image is not one, and
                 // saying so is the check §6.1 made through `image.kind` — losing it let a
                 // libvirt node pointed at a container image plan cleanly and fail at boot.
-                let bundle = match backend {
+                //
+                // A bundle part is either local (resolves to `bundle`, straight to a path, same
+                // as always) or published (resolves to `remote_bundle`, a `(reference, digest)`
+                // pair left for `zones::node_up` to fetch — planning performs no I/O and stays
+                // synchronous/testable, per the `ZoneBackend` trait's own "a backend takes a
+                // `NodePlan`; it does not compute one" contract).
+                let (bundle, remote_bundle) = match backend {
                     Backend::Libvirt | Backend::QemuMicrovm => {
                         let bundles: Vec<&crate::model::Part> = entity
                             .functions_on(&device.id)
@@ -154,18 +169,37 @@ pub fn plan_nodes_from_model(
                                 count: bundles.len(),
                             });
                         }
-                        bundles.first().map(|part| {
-                            let p = Path::new(&part.reference);
-                            if p.is_absolute() {
-                                p.to_path_buf()
-                            } else {
-                                workspace_dir.join(p)
+                        match bundles.first() {
+                            Some(part) if part.local => {
+                                let p = Path::new(&part.reference);
+                                let resolved = if p.is_absolute() {
+                                    p.to_path_buf()
+                                } else {
+                                    workspace_dir.join(p)
+                                };
+                                (Some(resolved), None)
                             }
-                        })
+                            Some(part) => {
+                                // Workspace validation (`WorkspaceValidationError::
+                                // PublishedRefWithoutDigest`) already refuses a published part
+                                // with no digest before an `Experiment` can exist — trusted
+                                // here, not re-checked, per this project's system-boundary
+                                // validation rule.
+                                let digest = part.digest.clone().expect(
+                                    "workspace validation guarantees a digest for every \
+                                     published (non-local) part",
+                                );
+                                (None, Some((part.reference.clone(), digest)))
+                            }
+                            None => (None, None),
+                        }
                     }
-                    Backend::Container => None,
+                    Backend::Container => (None, None),
                 };
-                if bundle.is_none() && matches!(backend, Backend::Libvirt | Backend::QemuMicrovm) {
+                if bundle.is_none()
+                    && remote_bundle.is_none()
+                    && matches!(backend, Backend::Libvirt | Backend::QemuMicrovm)
+                {
                     return Err(ZonePlanError::MissingBundle(device.id.clone(), backend));
                 }
 
@@ -181,6 +215,7 @@ pub fn plan_nodes_from_model(
                     slice: ep.slice.clone(),
                     ip_cidr: endpoint.ip_cidr.clone(),
                     bundle,
+                    remote_bundle,
                     pinned_cpus: device.pinned_cpus.clone(),
                 });
             }
@@ -314,5 +349,33 @@ parts:
             plan_nodes_from_model(&model, &gw, Path::new("/x")),
             Err(ZonePlanError::AmbiguousBundle { device, count: 2 }) if device == "node-a"
         ));
+    }
+
+    /// A published ref (not `./`, `/`, or `local/`) with no digest never reaches here at all —
+    /// `workspace::tests::published_refs_must_be_pinned_and_local_ones_need_not_be` already
+    /// covers that rejection at the actual system boundary (`load_yaml`'s workspace
+    /// validation, before an `Experiment`/`Part` can exist). Not re-tested at this layer.
+    ///
+    /// A published, digest-pinned bundle resolves to `remote_bundle` (intent), not `bundle` —
+    /// planning never fetches; `zones::node_up` is where that reference+digest actually turns
+    /// into bytes on disk, immediately before boot.
+    #[test]
+    fn a_published_bundle_with_a_digest_resolves_to_remote_bundle() {
+        let ws = WS.replace(
+            "  - { ref: ./images/linux-probe/bundle, kind: bundle, target_ids: fn-a }",
+            "  - { ref: ghcr.io/vxedge/parts/zone/aaos/os/example, kind: bundle, \
+                 digest: 'sha256:1111111111111111111111111111111111111111111111111111111111111111', \
+                 target_ids: fn-a }",
+        );
+        let plans = plans(&ws);
+        assert_eq!(plans[0].bundle, None);
+        assert_eq!(
+            plans[0].remote_bundle,
+            Some((
+                "ghcr.io/vxedge/parts/zone/aaos/os/example".to_string(),
+                "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                    .to_string()
+            ))
+        );
     }
 }

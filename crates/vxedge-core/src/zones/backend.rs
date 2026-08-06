@@ -34,6 +34,13 @@ pub enum ZoneBackendError {
     BundleFile { node: String, path: String },
     #[error("node `{node}`: {detail}")]
     Runtime { node: String, detail: String },
+    #[error("node `{node}`: fetching published bundle `{reference}` failed: {source}")]
+    Fetch {
+        node: String,
+        reference: String,
+        #[source]
+        source: crate::registry::RegistryFetchError,
+    },
 }
 
 /// Wraps a [`netlink::NetlinkError`] with the node this seam's callers actually need to act on
@@ -419,7 +426,37 @@ pub fn backend_for(kind: Backend) -> &'static dyn ZoneBackend {
 // dispatch
 // ---------------------------------------------------------------------------
 
-pub fn node_up(sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneBackendError> {
+/// Resolves `np.remote_bundle` (a published, not-yet-fetched part — see [`NodePlan`]'s own doc)
+/// into a real `bundle` path via [`crate::registry::fetch`] before dispatching to a backend, so
+/// no [`ZoneBackend`] implementation ever needs to know a bundle can come from a registry.
+/// Blocking (shells out to `oras pull`): every caller already runs this off the async runtime
+/// (`ZoneSvc`/`ComputeSvc::lifecycle`'s own `blocking(...)` wrapper), matching
+/// `NosCheckSvc::resolve`'s `tokio::task::spawn_blocking` precedent for the same fetch.
+pub fn node_up(
+    sh: &Shell,
+    np: &NodePlan,
+    runtime_dir: &Path,
+    cache_dir: &Path,
+) -> Result<(), ZoneBackendError> {
+    let resolved;
+    let np = if let Some((reference, digest)) = &np.remote_bundle {
+        let pulled_dir =
+            crate::registry::fetch(reference, digest, cache_dir).map_err(|source| {
+                ZoneBackendError::Fetch {
+                    node: np.node_id.clone(),
+                    reference: reference.clone(),
+                    source,
+                }
+            })?;
+        resolved = NodePlan {
+            bundle: Some(pulled_dir),
+            remote_bundle: None,
+            ..np.clone()
+        };
+        &resolved
+    } else {
+        np
+    };
     backend_for(np.backend).up(sh, np, runtime_dir)
 }
 
