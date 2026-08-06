@@ -1312,7 +1312,7 @@ exp-001 measurements).
       record of everything phase 2 originally scoped; not phase-2 remaining work.
 - [ ] ~~mTLS + OIDC auth path; viewer/operator/admin roles~~ — **moved to phase 5,
       2026-08-04** (`docs/TASKS.md`): deferred until a real remote consumer exists — every
-      frontend that would use it (web dashboard, Qt/QML, Electron, `vxmcp`) is itself deferred to
+      frontend that would use it (web dashboard, Electron, `vxmcp`) is itself deferred to
       phase 3/4, and the CLI only ever talks over the local Unix socket. Not new scope,
       just relocated to the right phase.
 - [x] Harness `impairments` rendering: tc netem per link (rate cap, latency/jitter, loss —
@@ -1423,7 +1423,11 @@ scoped here (§3); sensor/actuator/virtual-ECU backends move up from phase 3 by 
 ## 5. Phase 3
 
 - [ ] VehicleService: ordered composition (gateway→zones→compute→signal plane→services)
-- [ ] Qt/QML operator HMI (Qt GRPC ≥6.8): live slice metrics view
+- [ ] Live slice metrics view — web (TS SDK), not Qt. **Correction, 2026-08-06**: this line
+      previously said "Qt/QML operator HMI (Qt GRPC ≥6.8)" — there is no Qt/QML operator
+      dashboard; any monitoring view is web-based or the CLI. Qt/QML's two real roles
+      (embedded in-vehicle IVI/cluster loadable; future `vxmodels` MBSE frontend) are tracked in
+      `docs/TASKS.md`, not here — neither is an operator-monitoring surface.
 - [ ] vxedge-tray: Rust SNI (StatusNotifierItem) system tray — thin vxAPI client showing
       gateway/experiment state with quick up/down; no orchestration logic (hard rule)
 - [ ] vxedged systemd unit (+ socket activation where possible); packaging notes for the

@@ -1,6 +1,6 @@
 ---
 name: vxapi-protobuf-design
-description: Design and evolution rules for vxAPI (proto/vxedge/v1/, gRPC/Protobuf) — use when adding or changing any RPC, message, or service, or wiring a new frontend SDK. The API-first spine every frontend (CLI, Qt/QML, web, Electron, vxmcp) depends on identically.
+description: Design and evolution rules for vxAPI (proto/vxedge/v1/, gRPC/Protobuf) — use when adding or changing any RPC, message, or service, or wiring a new frontend SDK. The API-first spine every frontend (CLI, web, Electron, vxmcp) depends on identically.
 ---
 
 # vxAPI design — the API-first spine
@@ -44,11 +44,13 @@ comments before "fixing" a lint warning it silences:
   of an existing RPC — means a new `vxedge.v2` package, not a v1 mutation. This is what
   makes buf's `FILE`-level breaking-check meaningful instead of a check you route around.
 
-## SDKs are generated, never hand-written — in any of the three languages
+## SDKs are generated, never hand-written — in either language
 
-- Rust (`vxedge-api`, tonic), C++ (Qt GRPC), TypeScript (connect-es) are all generated
+- Rust (`vxedge-api`, tonic) and TypeScript (connect-es) are both generated
   from the same proto — that's the entire point of a single IDL (§5.2's rationale over
-  SOME/IP/bare REST). If a frontend needs a convenience wrapper, put it in that
+  SOME/IP/bare REST). No C++/Qt GRPC SDK: there is no Qt/QML vxAPI frontend (corrected
+  2026-08-06, `ARCHITECTURE.md` §5.1) — the embedded Qt/QML IVI loadable is a guest payload,
+  not a vxAPI client. If a frontend needs a convenience wrapper, put it in that
   frontend's own thin-client code, never by hand-editing generated bindings or adding
   fields to the generated types.
 - No second source of truth beside manifests: mutating RPCs carry manifest documents or
