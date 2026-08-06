@@ -18,6 +18,18 @@
 //! own `-netdev tap,ifname=...` attaches to an existing persistent device by name, it does not
 //! expect to be the one that created it.
 //!
+//! **Ownership, not just persistence.** The kernel refuses `TUNSETIFF` on an *existing*
+//! persistent device to any opener that is neither `CAP_NET_ADMIN`-capable nor the uid
+//! recorded by a prior `TUNSETOWNER` (`net/tun.c`'s own `tun_attach`) -- an unset owner
+//! means "root only," not "anyone." `Device::persist()` alone would leave qemu-microvm
+//! needing root just to attach to a tap this same (unprivileged, CAP_NET_ADMIN-carrying)
+//! process just created -- live-found 2026-08-06 chasing a "verification failed -- nodes
+//! not up" report that turned out to be a root-owned pidfile an unprivileged `vxedged`
+//! could no longer read back. `create_and_persist` below calls `TUNSETOWNER` with this
+//! process's own uid so the later, deliberately *unprivileged* qemu launch
+//! (`zones::backend::microvm_up`) can attach without `sudo` -- see that function's own
+//! comment for why running qemu privileged is the wrong fix, not a shortcut to this one.
+//!
 //! Netns handling mirrors [`super::netlink`]'s own `run_async`/`enter_netns` shape rather than
 //! reusing it directly: `enter_netns` there is private, small, and the module's own doc comment
 //! states a preference for a few duplicated lines over widening a proven function's callers —
@@ -34,6 +46,8 @@ pub enum TunTapError {
     Create { name: String, source: tun::Error },
     #[error("tap device `{name}`: persist failed: {source}")]
     Persist { name: String, source: tun::Error },
+    #[error("tap device `{name}`: set-owner failed: {source}")]
+    Owner { name: String, source: tun::Error },
     #[error("tap creation thread for `{name}` panicked: {detail}")]
     ThreadPanic { name: String, detail: String },
 }
@@ -70,6 +84,15 @@ fn create_and_persist(name: &str) -> Result<(), TunTapError> {
         source,
     })?;
     dev.persist().map_err(|source| TunTapError::Persist {
+        name: name.to_string(),
+        source,
+    })?;
+    // Owner uid, not just persistence — see the module doc's "Ownership, not just persistence"
+    // section: without this, only root (or a `CAP_NET_ADMIN` holder) can attach to the
+    // now-persistent device at all, which would force the unprivileged qemu-microvm launch this
+    // exists for right back onto `sudo`.
+    let uid = nix::unistd::getuid().as_raw() as i32;
+    dev.user(uid).map_err(|source| TunTapError::Owner {
         name: name.to_string(),
         source,
     })?;

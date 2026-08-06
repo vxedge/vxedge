@@ -70,6 +70,37 @@ pub fn aggregate_resource_states(statuses: &[ResourceStatus]) -> ResourceState {
     wire_state(vxedge_core::status::aggregate(&states))
 }
 
+/// Rolls a gateway status plus a set of already-built component statuses up into one parent
+/// `ResourceStatus` (state aggregated via [`aggregate_resource_states`]) and the full
+/// component list, gateway first. Shared by `ExperimentService::status` and
+/// `VehicleService::status` — same composite-rollup logic, differing only in which proto
+/// message (`ExperimentStatus`/`VehicleStatus`) and `ResourceKind` (`Experiment`/`Vehicle`)
+/// wrap the result, which is the caller's job, not this function's.
+pub fn composite_rollup(
+    id: &str,
+    kind: ResourceKind,
+    gw_status: ResourceStatus,
+    mut components: Vec<ResourceStatus>,
+) -> (ResourceStatus, Vec<ResourceStatus>) {
+    let mut resources = vec![ResourceStatus {
+        vxid: "vxgateway".into(),
+        kind: ResourceKind::Gateway as i32,
+        state: gw_status.state,
+        detail: gw_status.detail.clone(),
+        since_unix_ms: gw_status.since_unix_ms,
+    }];
+    resources.append(&mut components);
+    let state = aggregate_resource_states(&resources);
+    let top = ResourceStatus {
+        vxid: id.to_string(),
+        kind: kind as i32,
+        state: state as i32,
+        detail: format!("{} resource(s)", resources.len()),
+        since_unix_ms: gw_status.since_unix_ms,
+    };
+    (top, resources)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

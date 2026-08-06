@@ -204,7 +204,21 @@ fn microvm_up(sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneB
         args.push("-enable-kvm".into());
     }
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-    sh.run(argv[0], &argv[1..])?;
+    // Deliberately not `sh.run()` unchanged: qemu itself needs no privilege beyond `/dev/kvm`
+    // (granted via the `kvm` group, not root) and an already-owned tap
+    // (`tuntap::create_and_persist` sets `TUNSETOWNER` to this same process's uid) — running it
+    // under `sudo` only reintroduces the problem that ownership fix solves, a root-owned
+    // pidfile/serial log this same unprivileged process can no longer read back afterward
+    // (`read_pid`, `microvm_status`, `microvm_down`'s own `kill`). Live-found 2026-08-06: `zone
+    // up` reported "verification failed — nodes not up" for a node whose qemu process was
+    // genuinely running, because `read_pid`'s plain `std::fs::read_to_string` hit EACCES on a
+    // pidfile `sh.run`'s unconditional `sudo` had written as root. Escalation is still needed to
+    // *enter* a confined netns (`ip netns exec` requires `CAP_SYS_ADMIN`), so keep it only then.
+    let qemu_sh = Shell {
+        netns: sh.netns.clone(),
+        escalate: sh.escalate && sh.netns.is_some(),
+    };
+    qemu_sh.run(argv[0], &argv[1..])?;
     Ok(())
 }
 

@@ -10,6 +10,7 @@ mod experiment;
 mod jobs;
 mod services;
 mod status;
+mod vehicle;
 
 use clap::Parser;
 use std::sync::Arc;
@@ -25,6 +26,7 @@ use vxedge_api::v1::job_service_server::JobServiceServer;
 use vxedge_api::v1::nos_check_service_server::NosCheckServiceServer;
 use vxedge_api::v1::svc_service_server::SvcServiceServer;
 use vxedge_api::v1::traffic_service_server::TrafficServiceServer;
+use vxedge_api::v1::vehicle_service_server::VehicleServiceServer;
 use vxedge_api::v1::zone_service_server::ZoneServiceServer;
 
 #[derive(Parser, Debug)]
@@ -191,20 +193,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cache_dir: cache_dir.clone(),
     });
 
+    // Shared by `ExperimentSvc` and `VehicleSvc` — the same gateway/zones/services staging,
+    // whether the caller is `experiment up` or `vehicle up` (`vehicle.rs`'s own module doc
+    // explains why the latter reuses this type rather than a near-duplicate of its own).
+    let handles = experiment::Handles {
+        engine: engine.clone(),
+        gateway: gateway.clone(),
+        zones: zones.clone(),
+        svcs: svcs.clone(),
+    };
+
     Server::builder()
-        .add_service(GatewayServiceServer::from_arc(gateway.clone()))
-        .add_service(ZoneServiceServer::from_arc(zones.clone()))
+        .add_service(GatewayServiceServer::from_arc(gateway))
+        .add_service(ZoneServiceServer::from_arc(zones))
         .add_service(ComputeServiceServer::from_arc(compute))
-        .add_service(SvcServiceServer::from_arc(svcs.clone()))
+        .add_service(SvcServiceServer::from_arc(svcs))
         .add_service(NosCheckServiceServer::from_arc(nos_check))
         .add_service(ExperimentServiceServer::new(experiment::ExperimentSvc {
             audit: audit.clone(),
-            handles: experiment::Handles {
-                engine: engine.clone(),
-                gateway,
-                zones,
-                svcs,
-            },
+            handles: handles.clone(),
+        }))
+        .add_service(VehicleServiceServer::new(vehicle::VehicleSvc {
+            audit: audit.clone(),
+            handles,
         }))
         .add_service(TrafficServiceServer::new(services::TrafficSvc {
             engine: engine.clone(),

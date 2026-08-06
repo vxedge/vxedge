@@ -49,7 +49,10 @@ use std::collections::BTreeMap;
 
 pub mod build;
 
-pub use build::{LoadError, ModelError, build, load_dir, load_yaml};
+pub use build::{
+    LoadError, ModelError, build, load_dir, load_vehicle_yaml, load_yaml,
+    synthesize_vehicle_workspace,
+};
 
 /// A software-defined mobility entity. A car today; the class axis is what keeps an eVTOL,
 /// vessel or aircraft expressible without re-deriving the model.

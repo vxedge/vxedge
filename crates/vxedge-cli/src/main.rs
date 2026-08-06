@@ -30,13 +30,15 @@ use vxedge_api::v1::manifest_ref::Source;
 use vxedge_api::v1::nos_check_service_client::NosCheckServiceClient;
 use vxedge_api::v1::svc_service_client::SvcServiceClient;
 use vxedge_api::v1::traffic_service_client::TrafficServiceClient;
+use vxedge_api::v1::vehicle_service_client::VehicleServiceClient;
 use vxedge_api::v1::zone_service_client::ZoneServiceClient;
 use vxedge_api::v1::{
     ComputeDownRequest, ComputeListRequest, ComputeUpRequest, ExperimentDownRequest,
     ExperimentStatusRequest, ExperimentUpRequest, GatewayDownRequest, GatewayStatusRequest,
     GatewayUpRequest, Job, JobState, ManifestRef, NosCheckDownRequest, NosCheckStatusRequest,
     NosCheckUpRequest, NosCheckVerifyRequest, SvcDownRequest, SvcUpRequest, TrafficDownRequest,
-    TrafficUpRequest, VxidRef, WatchJobRequest, ZoneDownRequest, ZoneListRequest, ZoneUpRequest,
+    TrafficUpRequest, VehicleDownRequest, VehicleStatusRequest, VehicleUpRequest, VxidRef,
+    WatchJobRequest, ZoneDownRequest, ZoneListRequest, ZoneUpRequest,
 };
 
 #[derive(Parser, Debug)]
@@ -809,7 +811,47 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         },
         Command::Telemetry { .. } => scaffold_notice("telemetry"),
-        Command::Vehicle { .. } => scaffold_notice("vehicle"),
+        // Unlike `experiment` verbs, kept `--manifest`-addressed rather than cwd-discovered:
+        // that Terraform-style decision (`docs/TASKS.md`'s 2026-07-30 workspace-model note) is
+        // scoped to experiment verbs specifically, and root `CLAUDE.md`'s own CLI command table
+        // still shows `vxedge vehicle up|down|status --manifest <vehicle.yaml>`.
+        Command::Vehicle { cmd } => {
+            let channel = connect(&cli.endpoint).await?;
+            let mut veh = VehicleServiceClient::new(channel.clone());
+            match cmd {
+                ManifestLifecycleCmd::Status { manifest } => {
+                    let st = veh
+                        .status(VehicleStatusRequest {
+                            manifest: manifest_ref(&Some(manifest.clone())),
+                        })
+                        .await?
+                        .into_inner();
+                    let top = st.status.clone().unwrap_or_default();
+                    println!("{}: {}", top.vxid, top.detail);
+                    for c in &st.components {
+                        println!("  {} [{}] {}", c.vxid, c.state, c.detail);
+                    }
+                }
+                ManifestLifecycleCmd::Up { manifest } => {
+                    let job = veh
+                        .up(VehicleUpRequest {
+                            manifest: manifest_ref(&Some(manifest.clone())),
+                        })
+                        .await?
+                        .into_inner();
+                    watch_job(channel, job, cli.json).await?;
+                }
+                ManifestLifecycleCmd::Down { manifest } => {
+                    let job = veh
+                        .down(VehicleDownRequest {
+                            manifest: manifest_ref(&Some(manifest.clone())),
+                        })
+                        .await?
+                        .into_inner();
+                    watch_job(channel, job, cli.json).await?;
+                }
+            }
+        }
         Command::Experiment { cmd } => match cmd {
             ExperimentCmd::New {
                 name,

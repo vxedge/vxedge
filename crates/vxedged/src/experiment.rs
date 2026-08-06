@@ -119,7 +119,7 @@ async fn resolve_once(mref: Option<&ManifestRef>) -> Result<String, Status> {
 }
 
 impl Handles {
-    async fn stage_gateway(
+    pub(crate) async fn stage_gateway(
         &self,
         yaml: &str,
         dir: Option<&std::path::Path>,
@@ -161,7 +161,7 @@ impl Handles {
     /// meant to be provisioned. Addressing devices individually rather than by region also
     /// keeps `up` from starting several guests concurrently in one call — the concurrency that
     /// invalidated exp-002b's first campaign.
-    async fn stage_zones(&self, up: bool, p: &Progress) -> Result<String, String> {
+    pub(crate) async fn stage_zones(&self, up: bool, p: &Progress) -> Result<String, String> {
         let listed = match self.zones.list(Request::new(ZoneListRequest {})).await {
             Ok(r) => r.into_inner().zones,
             // No active experiment, or nothing plannable in it: both mean there is nothing to
@@ -201,7 +201,7 @@ impl Handles {
         Ok(format!("{total} zone(s)"))
     }
 
-    async fn stage_services(
+    pub(crate) async fn stage_services(
         &self,
         model: &vxedge_core::model::Experiment,
         yaml: &str,
@@ -409,25 +409,11 @@ fn build_experiment_status(
     gw_status: ResourceStatus,
     zones: Vec<ResourceStatus>,
 ) -> ExperimentStatus {
-    let mut resources: Vec<ResourceStatus> = vec![ResourceStatus {
-        vxid: "vxgateway".into(),
-        kind: ResourceKind::Gateway as i32,
-        state: gw_status.state,
-        detail: gw_status.detail.clone(),
-        since_unix_ms: gw_status.since_unix_ms,
-    }];
-    resources.extend(zones);
-
-    let state = crate::status::aggregate_resource_states(&resources);
+    let (status, components) =
+        crate::status::composite_rollup(experiment_id, ResourceKind::Experiment, gw_status, zones);
     ExperimentStatus {
-        status: Some(ResourceStatus {
-            vxid: experiment_id.to_string(),
-            kind: ResourceKind::Experiment as i32,
-            state: state as i32,
-            detail: format!("{} resource(s)", resources.len()),
-            since_unix_ms: gw_status.since_unix_ms,
-        }),
-        components: resources,
+        status: Some(status),
+        components,
     }
 }
 

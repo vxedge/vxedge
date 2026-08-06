@@ -29,7 +29,7 @@ sha2 = "0.10"
 tower = "0.5"
 rtnetlink = "0.21"
 futures-util = "0.3"
-nix = { version = "0.31", features = ["sched"] }
+nix = { version = "0.31", features = ["sched", "user"] }
 tun = "0.8"
 hyper-util = "0.1"
 clap = { version = "4", features = ["derive", "env"] }

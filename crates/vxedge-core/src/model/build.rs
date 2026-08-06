@@ -909,6 +909,19 @@ pub enum LoadError {
         .0.iter().map(|e| format!("  - {e}")).collect::<Vec<_>>().join("\n")
     )]
     Invariants(Vec<InvariantError>),
+    #[error(
+        "this workspace already has a `kind: experiment` document (`{0}`) — use `experiment \
+         up`, not `vehicle up`, for a workspace that defines its own network/traffic/telemetry"
+    )]
+    HasExperiment(String),
+    #[error("a bare vehicle workspace needs exactly one `kind: vehicle` document, found none")]
+    NoVehicle,
+    #[error("a bare vehicle workspace needs exactly one `kind: vehicle` document, found {0}: {1}")]
+    MultipleVehicles(usize, String),
+    #[error("a bare vehicle workspace needs exactly one `kind: baseline` document, found none")]
+    NoBaseline,
+    #[error("a bare vehicle workspace needs exactly one `kind: baseline` document, found {0}: {1}")]
+    MultipleBaselines(usize, String),
 }
 
 /// Workspace directory → checked model. The single entry point for provisioning.
@@ -927,6 +940,118 @@ pub fn load_yaml(text: &str) -> Result<Experiment, LoadError> {
         ));
     }
     checked(build(&ws)?)
+}
+
+/// A `kind: vehicle` + `kind: baseline` pair, no `kind: experiment` of its own — `vehicle up`'s
+/// whole reason to exist, since `build()` above hard-requires an experiment document and a
+/// vehicle standing on its own (no network slicing, no traffic, no measurement) legitimately
+/// has none.
+///
+/// Synthesizes a minimal `kind: experiment` document wrapping the vehicle and **appends it to
+/// `text` as YAML**, rather than injecting a struct into an already-parsed [`Workspace`]: every
+/// consumer downstream — `VehicleService`'s own early validation below, and its staging calls
+/// into `GatewayService`/`ZoneService`/`SvcService`, each of which re-parses the manifest text
+/// itself (`vxedged/src/services.rs`'s `resolve_manifest`) — sees an ordinary §6.0 workspace
+/// document and needs no separate vehicle-aware code path. One `mode: vlan` slice per distinct
+/// `link.slice` id the vehicle's own links reference, numbered deterministically (sorted slice
+/// id order, starting at 100) so `vehicle up` run twice reconciles to the same plan rather than
+/// a fresh set of VLANs each time.
+pub fn synthesize_vehicle_workspace(text: &str) -> Result<String, LoadError> {
+    let ws = Workspace::from_yaml(text)?;
+    if let Some(e) = ws.experiments.first() {
+        return Err(LoadError::HasExperiment(e.id.clone()));
+    }
+    let vehicle = match ws.vehicles.as_slice() {
+        [v] => v,
+        [] => return Err(LoadError::NoVehicle),
+        many => {
+            return Err(LoadError::MultipleVehicles(
+                many.len(),
+                many.iter()
+                    .map(|v| v.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ));
+        }
+    };
+    let baseline = match ws.baselines.as_slice() {
+        [b] => b,
+        [] => return Err(LoadError::NoBaseline),
+        many => {
+            return Err(LoadError::MultipleBaselines(
+                many.len(),
+                many.iter()
+                    .map(|b| b.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ));
+        }
+    };
+
+    #[derive(serde::Serialize)]
+    struct SynthSlice {
+        id: String,
+        mode: &'static str,
+        vlan: u16,
+    }
+    #[derive(serde::Serialize)]
+    struct SynthNetwork {
+        slices: Vec<SynthSlice>,
+    }
+    #[derive(serde::Serialize)]
+    struct SynthExperiment {
+        kind: &'static str,
+        id: String,
+        vehicles: Vec<String>,
+        baseline: String,
+        network: SynthNetwork,
+    }
+
+    let slice_ids: std::collections::BTreeSet<&str> = vehicle
+        .links
+        .iter()
+        .filter_map(|l| l.slice.as_deref())
+        .collect();
+    let synth = SynthExperiment {
+        kind: "experiment",
+        id: format!("vehicle-{}", vehicle.id),
+        vehicles: vec![vehicle.id.clone()],
+        baseline: baseline.id.clone(),
+        network: SynthNetwork {
+            slices: slice_ids
+                .iter()
+                .enumerate()
+                .map(|(i, id)| SynthSlice {
+                    id: id.to_string(),
+                    mode: "vlan",
+                    vlan: 100 + i as u16,
+                })
+                .collect(),
+        },
+    };
+    let doc = serde_yaml_ng::to_string(&synth).map_err(|source| {
+        LoadError::Workspace(crate::workspace::WorkspaceError::Parse {
+            path: std::path::PathBuf::from("<synthesized experiment>"),
+            source,
+        })
+    })?;
+
+    let mut out = text.to_string();
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str("---\n");
+    out.push_str(&doc);
+    Ok(out)
+}
+
+/// Bare-vehicle workspace YAML text → checked model. Round-trips through
+/// [`synthesize_vehicle_workspace`] and the *exact* same `Workspace::from_yaml → validate →
+/// build` pipeline [`load_yaml`] uses on the synthesized text, so this function's own notion of
+/// "valid" can never diverge from what `GatewayService`/`ZoneService` compute when
+/// `VehicleService` hands them that same text later.
+pub fn load_vehicle_yaml(text: &str) -> Result<Experiment, LoadError> {
+    load_yaml(&synthesize_vehicle_workspace(text)?)
 }
 
 fn checked(exp: Experiment) -> Result<Experiment, LoadError> {
@@ -2269,5 +2394,99 @@ devices: {}
             n.digest.as_deref(),
             Some("sha256:0a95ffa745e8e9871653d8605f372a2761edcef2ec53844a37651e343be7dda5")
         );
+    }
+
+    /// One device on one slice-bound link, one function, one local part — the minimum shape
+    /// `load_vehicle_yaml` accepts, no `kind: experiment` document anywhere in the text.
+    const BARE_VEHICLE: &str = "\
+kind: vehicle
+id: veh-a
+zones:
+  front-left: {}
+devices:
+  node-a: { role: ecu, zone: front-left, backend: container }
+functions:
+  fn-a: { deployed_on: node-a }
+links:
+  - id: link-a
+    endpoints: [{ node: node-a, port: eth0, ip: 10.101.0.11/24 }]
+    slice: adas
+---
+kind: baseline
+id: bl-a
+parts:
+  - ref: local/vxprobe:host-process
+    target_ids: fn-a
+";
+
+    #[test]
+    fn a_bare_vehicle_and_baseline_load_without_an_experiment_document() {
+        let m = load_vehicle_yaml(BARE_VEHICLE).expect("bare vehicle should load");
+        assert_eq!(m.entities.len(), 1);
+        assert_eq!(m.entities[0].id, "veh-a");
+        assert_eq!(m.slices.len(), 1);
+        assert_eq!(m.slices[0].id, "adas");
+        assert_eq!(m.slices[0].vlan, Some(100));
+    }
+
+    #[test]
+    fn loading_it_twice_synthesizes_the_same_vlan_both_times() {
+        let a = load_vehicle_yaml(BARE_VEHICLE).unwrap();
+        let b = load_vehicle_yaml(BARE_VEHICLE).unwrap();
+        assert_eq!(a.slices[0].vlan, b.slices[0].vlan);
+    }
+
+    #[test]
+    fn two_distinct_slice_ids_get_two_distinct_deterministic_vlans() {
+        let two_slices = BARE_VEHICLE
+            .replace(
+                "devices:\n  node-a: { role: ecu, zone: front-left, backend: container }",
+                "devices:\n  node-a: { role: ecu, zone: front-left, backend: container }\n  node-b: { role: ecu, zone: front-left, backend: container }",
+            )
+            .replace(
+                "functions:\n  fn-a: { deployed_on: node-a }",
+                "functions:\n  fn-a: { deployed_on: node-a }\n  fn-b: { deployed_on: node-b }",
+            )
+            .replace(
+                "    slice: adas\n",
+                "    slice: adas\n  - id: link-b\n    endpoints: [{ node: node-b, port: eth0, ip: 10.101.0.12/24 }]\n    slice: cockpit\n",
+            )
+            .replace(
+                "  - ref: local/vxprobe:host-process\n    target_ids: fn-a\n",
+                "  - ref: local/vxprobe:host-process\n    target_ids: [fn-a, fn-b]\n",
+            );
+        let m = load_vehicle_yaml(&two_slices).expect("two-slice vehicle should load");
+        let mut vlans: Vec<u16> = m.slices.iter().filter_map(|s| s.vlan).collect();
+        vlans.sort_unstable();
+        // Sorted slice-id order ("adas" < "cockpit"), not declaration order.
+        assert_eq!(vlans, vec![100, 101]);
+    }
+
+    #[test]
+    fn a_workspace_that_already_has_an_experiment_document_is_refused() {
+        let with_experiment = format!(
+            "{BARE_VEHICLE}---\nkind: experiment\nid: exp-a\nvehicles: [veh-a]\nbaseline: bl-a\n"
+        );
+        match load_vehicle_yaml(&with_experiment) {
+            Err(LoadError::HasExperiment(id)) => assert_eq!(id, "exp-a"),
+            other => panic!("expected HasExperiment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_workspace_with_no_vehicle_document_is_refused() {
+        match load_vehicle_yaml("kind: baseline\nid: bl-a\nparts: []\n") {
+            Err(LoadError::NoVehicle) => {}
+            other => panic!("expected NoVehicle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_workspace_with_no_baseline_document_is_refused() {
+        let vehicle_only = BARE_VEHICLE.split("---\n").next().unwrap();
+        match load_vehicle_yaml(vehicle_only) {
+            Err(LoadError::NoBaseline) => {}
+            other => panic!("expected NoBaseline, got {other:?}"),
+        }
     }
 }
