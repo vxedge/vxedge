@@ -1,6 +1,6 @@
 # TASKS.md — vxedge/vxedge (core)
 
-Ordered for the phase-1 critical path (see ../docs/TASKS.md). Each task should land with tests.
+Ordered for the phase-1 critical path (see ../docs/ROADMAP.md). Each task should land with tests.
 
 ## 0. Workspace model (Track D — `docs/ARCHITECTURE.md` §6.0)
 
@@ -106,8 +106,8 @@ because result archives are keyed to manifest SHA256.
       inert, so the unresolved GPU decision blocks nothing else.
 
       The probe checks what Tier 2 actually requires — compute capability **and** VRAM — not
-      merely that a GPU exists. Found live: this development host has a GT 1030, so a presence
-      check *passed* and would have let a Tier 2 experiment start and fail deep inside CARLA.
+      merely that a GPU exists. On an entry-level card such as a GT 1030, a presence
+      check *passes* and would let a Tier 2 experiment start and fail deep inside CARLA.
       Pascal at 2 GB fails on both counts, and compute capability is the binding half, since
       DeepStream/TensorRT need tensor cores and more VRAM within a pre-Turing generation does
       not help. A multi-GPU host qualifies on its most capable card.
@@ -321,7 +321,7 @@ None block the critical path; all are consistency debts this session created or 
       (`ghcr.io/vxedge/parts/agent/linux/app/probe`, not the bundle-named
       `.../zone/linux/stack/probe-bundle` this bullet originally flagged — confirmed by reading
       current `scaffold.rs`, 2026-08-01). This bullet was left unchecked after the fix landed —
-      a stale TODO for already-done work, tracked at the top level as `docs/TASKS.md` item
+      a stale TODO for already-done work, tracked at the top level as `docs/ROADMAP.md` item
       #13. Closed here rather than left to be rediscovered by the next reader.
 - [x] **`vxedge manifest validate` accepts only §6.0** (2026-07-31) — the old shapes went with
       `manifest.rs`, so "workspaces only" is enforced by there being nothing else to accept.
@@ -369,7 +369,7 @@ Tracked here so they are not rediscovered. None block the critical path.
       still open" gap, not reopened here. Whoever wires it should reuse
       `resolve_experiment_arg()`. `zone`/`compute`/`traffic` still address the daemon
       differently (vxid or an explicit `--manifest`) and were not re-checked in this pass — 
-      don't assume either is migrated or exempt. Tracked at the top level as `docs/TASKS.md`
+      don't assume either is migrated or exempt. Tracked at the top level as `docs/ROADMAP.md`
       item #26.
 - [ ] **(7) `vehicle up` from a §6.0 vehicle document** — the phase-3 gate itself. Needs (2).
 - [ ] Candidate, from Terraform's `init`: `experiment init` pre-pulls every part ref by digest
@@ -519,7 +519,7 @@ exp-001 measurements).
       on, not the integration;
       that remains open, tracked in §4 below.
 - [x] VXLAN inter-host links: **model + validation, then provisioning, both delivered
-      2026-08-04** (`docs/TASKS.md` #16, full account there) — fully closed, model
+      2026-08-04** (`docs/ROADMAP.md` #16, full account there) — fully closed, model
       through live-provisioned. `network.tunnels` `kind: vxlan` parses, validates
       (`vni`/`remote`/`dstport`/`slices`), and `GatewayPlan` now actually joins the
       bridge as a trunk-like port extending local `network.slices`' VLANs to a remote
@@ -539,12 +539,12 @@ exp-001 measurements).
       pre-existing WireGuard handshake test unchanged — zero regression despite the
       `TunnelPlan`/`TunnelObservation` restructuring.
 - [ ] ~~FRR config rendering (BGP optional path)~~ — **moved to phase 5, 2026-08-04**
-      (`docs/TASKS.md`): unlike VXLAN (extends the already-documented `network.tunnels`
+      (`docs/ROADMAP.md`): unlike VXLAN (extends the already-documented `network.tunnels`
       hook), FRR has no manifest schema field at all — one would need designing from
       scratch — and its only purpose (cloud interconnect) has no current consumer; every
       experiment today uses static routing. Not new scope, just relocated.
 - [x] Port NetOps from iproute2 argv exec to pure rtnetlink/netlink — **slice 1 delivered
-      2026-08-04** (`docs/TASKS.md` #16, full account there). Scope decided by research, not
+      2026-08-04** (`docs/ROADMAP.md` #16, full account there). Scope decided by research, not
       assumption: the mature `rtnetlink`/`netlink-packet-route` crates cover links/addresses/
       bridge-VLAN filtering (confirmed against the real v0.21.0 source) but **not** `tc`
       (confirmed `TcOption` has no `Htb`/`Netem` variant); the only crate that claims `tc`
@@ -564,7 +564,7 @@ exp-001 measurements).
       day (see below); the `Ovs` `DataPlane`'s own link calls and tap devices closed the
       following day, slice 5 below.
 - [x] Port `zones::backend`'s container netns lifecycle to native rtnetlink — **slice 2 of
-      the rtnetlink port, delivered 2026-08-04** (`docs/TASKS.md` #16, full account there).
+      the rtnetlink port, delivered 2026-08-04** (`docs/ROADMAP.md` #16, full account there).
       The highest-exposure code the port could touch: every container-backed zone in every
       experiment runs through `container_up`/`down`/`status`. Researched before
       implementing, same discipline as slice 1: `rtnetlink::NetworkNamespace::add`/`del`
@@ -584,7 +584,7 @@ exp-001 measurements).
       veth peer moved+renamed+addressed with the manifest's exact pinned CIDR, idempotent
       double-up, clean double-down).
 - [x] Port WireGuard tunnel device creation to native rtnetlink — **slice 3 of the
-      rtnetlink port, delivered 2026-08-04** (`docs/TASKS.md` #16, full account there).
+      rtnetlink port, delivered 2026-08-04** (`docs/ROADMAP.md` #16, full account there).
       `rtnetlink`'s `LinkWireguard` builder (confirmed present in v0.21.0) covers device
       creation (`IFLA_LINKINFO`/`INFO_KIND=wireguard`, no `INFO_DATA`) exactly. New
       `netlink::ensure_wireguard`, same idempotent-creation shape as `ensure_vxlan`.
@@ -599,7 +599,7 @@ exp-001 measurements).
       second `up` left the key **unchanged** (idempotency split intact), and `down` removed
       it completely.
 - [x] Port the fiveg host-attachment path to native rtnetlink — **slice 4 of the rtnetlink
-      port, delivered 2026-08-04** (`docs/TASKS.md` #16, full account there).
+      port, delivered 2026-08-04** (`docs/ROADMAP.md` #16, full account there).
       `apply_fiveg_uplink`/`apply_fiveg_ue_routes`/`teardown_fiveg_uplink` still shelled out
       for bridge-self VLAN membership, an 802.1q VLAN subinterface, and route creation.
       `rtnetlink`'s `LinkBridgeVlan::bridge_self()`, `LinkVlan`, and its `route()`
@@ -617,7 +617,7 @@ exp-001 measurements).
       a full live daemon/CLI smoke test end-to-end (needs a real CN pod via podman) — a
       pre-existing environment limitation, not something skipped for this change.
 - [x] Port the `Ovs` `DataPlane`'s own link calls, and tap device creation, to native
-      primitives — **slice 5 of the rtnetlink port, delivered 2026-08-05** (`docs/TASKS.md`
+      primitives — **slice 5 of the rtnetlink port, delivered 2026-08-05** (`docs/ROADMAP.md`
       #16, full account there), closing the item. `ovs_apply_links`/`ovs_apply_endpoints`/
       `ovs_teardown`/`ovs_observe`'s `ip link` calls (veth creation, up, delete, existence)
       swap onto the same `netlink` primitives the kernel-bridge path already used —
@@ -740,7 +740,7 @@ exp-001 measurements).
 ## 4. Phase 2
 
 - [x] Schema audit second pass: five silent-acceptance model bugs found and fixed —
-      **delivered 2026-08-04** (`docs/TASKS.md` #30, full account there). Went
+      **delivered 2026-08-04** (`docs/ROADMAP.md` #30, full account there). Went
       block-by-block through `traffic_profiles`, `functions.asil`, `channels`, and the
       `LinkDoc`/`ChannelDoc`/`PartEntry` document structs. Found: `traffic_profiles`
       silently dropped an entire profile on a missing `source`/`target` or an
@@ -759,7 +759,7 @@ exp-001 measurements).
       all) — closing that is real remaining #30 scope, not done here.
 - [x] Schema audit third pass: `ExperimentDoc`/`NetworkDoc`/`VehicleDoc`/`BaselineDoc`
       fully typed and `deny_unknown_fields`-protected — **delivered 2026-08-04**
-      (`docs/TASKS.md` #30, full account there). Closes the exact gap the second pass
+      (`docs/ROADMAP.md` #30, full account there). Closes the exact gap the second pass
       named as remaining. `ExperimentDoc` gained `kind`/`world`/`services`/`telemetry`/
       `results`/`method`/`traffic_profiles` as declared (mostly opaque `Value`) fields —
       not re-typed in full, since `model::build` already validates each with its own
@@ -779,7 +779,7 @@ exp-001 measurements).
       2026-07-31. 4 new tests; re-verified all six real workspaces *and* both
       `vxmodels`-CI-covered renders — zero regressions.
 - [x] Schema audit fourth pass: `SliceDoc` fully typed — **#30 CLOSED, 2026-08-04**
-      (`docs/TASKS.md` #30, full account there). The one struct the third pass left
+      (`docs/ROADMAP.md` #30, full account there). The one struct the third pass left
       untouched: now types `mode`/`vlan`/`qos`/`s_nssai` (the latter three deliberately
       kept as opaque `Value`s — `slices_of`'s own `narrow()`-based range checks already
       produce a named `ModelError::OutOfRange`, and a strict `u16` field here would
@@ -792,7 +792,7 @@ exp-001 measurements).
       workspace-document struct now has complete field coverage and
       `deny_unknown_fields` protection.
 - [x] `network.nos_check`: model + validation — **delivered 2026-08-04**
-      (`docs/TASKS.md` #31). `model::NosCheck`/`NosCheckKind`, parsed from
+      (`docs/ROADMAP.md` #31). `model::NosCheck`/`NosCheckKind`, parsed from
       `network.nos_check`, mirroring `Tunnel`/`TunnelKind`'s shape. Scoped to model +
       validation only — lifecycle wiring (booting the check, loading config, live
       verification) is a separate, larger follow-on, not rushed into this pass. Two-layer
@@ -813,7 +813,7 @@ exp-001 measurements).
       passes (human + `--json`), pre-existing cross-file errors still caught — additive,
       no regression.
 - [x] Status reporting: `Observable` trait + Composite `aggregate()` — **delivered
-      2026-08-04** (`docs/TASKS.md` #32). `vxedge_core::status`: `ObservedState` (`Up,
+      2026-08-04** (`docs/ROADMAP.md` #32). `vxedge_core::status`: `ObservedState` (`Up,
       Down, Staging, Degraded, Error`), `Observable` (just `fn state(&self)` — `detail()`
       deliberately not part of the trait, since detail is contextual/caller-supplied, not
       an entity property), and `aggregate()` (Composite pattern: no children → `Down`;
@@ -829,14 +829,14 @@ exp-001 measurements).
       construction — that code is what every frozen H1/H3/H4 number was measured through;
       not worth the risk to published numbers for a stylistic win.
 - [x] `sonic::lifecycle` + `sonic::config_check`: native process boot, serial console
-      driver, config-parity business logic — **delivered 2026-08-04** (`docs/TASKS.md`
+      driver, config-parity business logic — **delivered 2026-08-04** (`docs/ROADMAP.md`
       #33, full detail there). Replaces the Python/`pexpect` proof script
       (`vxparts/parts/gw/nos/os/sonic-vs/verify-config-parity.py`) as the mechanism
       `vxedged` would actually run, so the daemon needs no Python dependency at runtime —
       both proven correct independently via live boots against the real published image
       (disposable copies only, per the boot-mutates-the-disk discipline).
 - [x] `NosCheckService`: RPC + CLI wiring for `network.nos_check` — **delivered
-      2026-08-04** (`docs/TASKS.md` #33, full detail there), closing #33's last open
+      2026-08-04** (`docs/ROADMAP.md` #33, full detail there), closing #33's last open
       piece. A dedicated service, not folded into `GatewayService`/`ExperimentService`
       — §6.0.3 requires a missing or failed check to never affect provisioning, which a
       shared service could only guarantee by convention. `Up`/`Down` manage a long-lived
@@ -853,7 +853,7 @@ exp-001 measurements).
       `vxedge nos-check up|down|status|verify`, going through `NosCheckServiceClient`
       only. Live-verified end to end against the real published image: boot, status
       transitions, clean teardown, and a full verify run ("4/4 fields match") against a
-      scratch workspace — full account in `docs/TASKS.md`.
+      scratch workspace — full account in `docs/ROADMAP.md`.
 - [ ] Open5GS/UERANSIM driver: `mode: s-nssai` slice provisioning (H2). *In progress,
       major milestone reached 2026-07-14 — **end-to-end slice-differentiated PDU
       sessions proven live**:
@@ -1215,7 +1215,7 @@ exp-001 measurements).
       one's about a UE carrying multiple concurrent sessions with
       client-side traffic-class routing; this one's about the network side
       actually treating slices differently under contention, now
-      delivered and confirmed). Full account: `docs/STATUS.md`,
+      delivered and confirmed). Full account: `docs/RESULTS.md`,
       `vxmodels/models/requirements/verification.sysml`'s
       `Exp010RealSlicingVerification` (`campaign` → `htbFixRetest` →
       `finalRetest`).
@@ -1307,11 +1307,11 @@ exp-001 measurements).
       was stale phantom debt (checked 2026-08-03, same class as item #13's earlier one) — found
       while re-reading this section before starting #16, not a new issue.
 - [ ] TS SDK (connect-es) generation + tonic-web enablement; minimal web dashboard repo/dir —
-      **moved to phase 3/4** (`docs/TASKS.md`'s 2026-08-01 re-scope, "the CLI is the only
+      **moved to phase 3/4** (`docs/ROADMAP.md`'s 2026-08-01 re-scope, "the CLI is the only
       frontend any experiment uses"). Kept here, not deleted, so this section stays a complete
       record of everything phase 2 originally scoped; not phase-2 remaining work.
 - [ ] ~~mTLS + OIDC auth path; viewer/operator/admin roles~~ — **moved to phase 5,
-      2026-08-04** (`docs/TASKS.md`): deferred until a real remote consumer exists — every
+      2026-08-04** (`docs/ROADMAP.md`): deferred until a real remote consumer exists — every
       frontend that would use it (web dashboard, Electron, `vxmcp`) is itself deferred to
       phase 3/4, and the CLI only ever talks over the local Unix socket. Not new scope,
       just relocated to the right phase.
@@ -1358,7 +1358,7 @@ exp-001 measurements).
       test gained a second, impairment-specific case (both directions installed, redirect count
       pinned across a re-apply) but — like the cycle test it sits beside — has not yet run
       against a real kernel; this is the same standing item the board already tracks for #3/#5/#21.
-      **vxAPI gap found and closed 2026-08-03** (`docs/TASKS.md` #29): this delivery only
+      **vxAPI gap found and closed 2026-08-03** (`docs/ROADMAP.md` #29): this delivery only
       surfaced impairment health as free text folded into `GatewayStatus`'s aggregate `detail`
       string, not as a structured, addressable field — a `--json` client had no way to tell
       which link, on which access port, without parsing prose. Added
@@ -1402,7 +1402,7 @@ exp-001 measurements).
       and fmt clean.
 - [ ] Release binaries for vxedge/vxedged via cargo-dist (digest-recorded, §13)
 
-### Device/node provisioning layer (pulled forward from phase 3, `docs/TASKS.md` 2026-08-01)
+### Device/node provisioning layer (pulled forward from phase 3, `docs/ROADMAP.md` 2026-08-01)
 
 The API and backend surface for containers, VMs, microVMs, virtual ECUs, virtual sensors and
 virtual actuators. `ComputeService` and the container backend's OCI integration were already
@@ -1427,7 +1427,7 @@ scoped here (§3); sensor/actuator/virtual-ECU backends move up from phase 3 by 
       previously said "Qt/QML operator HMI (Qt GRPC ≥6.8)" — there is no Qt/QML operator
       dashboard; any monitoring view is web-based or the CLI. Qt/QML's two real roles
       (embedded in-vehicle IVI/cluster loadable; future `vxmodels` MBSE frontend) are tracked in
-      `docs/TASKS.md`, not here — neither is an operator-monitoring surface.
+      `docs/ROADMAP.md`, not here — neither is an operator-monitoring surface.
 - [ ] vxedge-tray: Rust SNI (StatusNotifierItem) system tray — thin vxAPI client showing
       gateway/experiment state with quick up/down; no orchestration logic (hard rule)
 - [ ] vxedged systemd unit (+ socket activation where possible); packaging notes for the
@@ -1440,7 +1440,7 @@ scoped here (§3); sensor/actuator/virtual-ECU backends move up from phase 3 by 
 - [ ] V2X groundwork: N vehicle manifests per experiment (V2V paths through vxgateway) +
       `type: rsu` node support in zone/gateway provisioning (V2I)
 - [x] Wire `vxedge_core::registry::fetch` into zone/compute plan resolution — **delivered
-      2026-08-06** (decided 2026-08-05, `docs/TASKS.md` — full rationale there). Planning stays
+      2026-08-06** (decided 2026-08-05, `docs/ROADMAP.md` — full rationale there). Planning stays
       pure: `NodePlan` gained `remote_bundle: Option<(String, String)>` alongside the existing
       `bundle: Option<PathBuf>`, and `plan_nodes_from_model` (`zones/plan.rs`) now branches on
       `Part.local` — a local part resolves to `bundle` exactly as before, a published one

@@ -75,7 +75,7 @@ struct Args {
     #[arg(long, env = "VXEDGE_SONIC_VS_IMAGE")]
     sonic_vs_image: Option<std::path::PathBuf>,
 
-    /// Where published part refs get pulled to (`vxedge_core::registry`, `docs/TASKS.md` #19),
+    /// Where published part refs get pulled to (`vxedge_core::registry`, `docs/ROADMAP.md` #19),
     /// content-addressed by digest. Defaults to `$XDG_CACHE_HOME/vxedge/parts` or
     /// `$HOME/.cache/vxedge/parts` — deliberately not under `--runtime-dir` (tmpfs by default),
     /// since a pulled artifact should survive a restart rather than re-pulling every time.

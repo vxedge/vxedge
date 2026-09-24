@@ -1,4 +1,4 @@
-//! Persistent tap device creation — the other half of `docs/TASKS.md` #16 the
+//! Persistent tap device creation — the other half of `docs/ROADMAP.md` #16 the
 //! [`super::netlink`] module doc explicitly deferred: `ip tuntap add ... mode tap` is not an
 //! `RTM_NEWLINK` operation at all. Tun/tap devices are created via `ioctl(TUNSETIFF)` on
 //! `/dev/net/tun`, a genuinely different kernel interface than the rest of the rtnetlink port,
@@ -141,7 +141,7 @@ mod tests {
 
     // No unprivileged tests here: both `link_exists` and tap creation itself need real kernel
     // access (creation additionally needs CAP_NET_ADMIN). Covered by the privileged
-    // `gateway_netns` suite instead (`docs/TASKS.md` #16's own verification note), the same
+    // `gateway_netns` suite instead (`docs/ROADMAP.md` #16's own verification note), the same
     // reason `netlink.rs`'s own primitives carry no unit tests of their own.
 
     #[test]

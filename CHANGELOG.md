@@ -6,6 +6,10 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- Open-source release preparation: `LICENSE` (Apache-2.0), `NOTICE`, rewritten `README.md`. Crate `license` metadata is now `Apache-2.0` (was `MIT OR Apache-2.0`).
+
 ### Changed
 
 - **BREAKING: host interface names derive from the device id, not from position.** `vz0`/`vzp0`
@@ -202,7 +206,7 @@ All notable changes to this repo are documented here. Format follows
 
 - `vxedge experiment new <id> [--template minimal|slicing]` — scaffolds an experiment
   workspace that is ready to edit, with no daemon, no network and no GPU. Generates the
-  folder-workspace shape from `docs/TASKS.md` Track D: every file declares its `kind`, and
+  folder-workspace shape from `docs/ROADMAP.md` Track D: every file declares its `kind`, and
   everything is referenced by unique id rather than by path, so the files can be renamed
   freely. `vxedge-core::scaffold` follows the house layering — `Workspace::plan` is pure data
   and unit-tested, `Workspace::write` is the only part that touches the filesystem, and it
@@ -218,7 +222,7 @@ All notable changes to this repo are documented here. Format follows
 ## [0.1.0] - 2026-07-13
 
 **Phase-1 gate passed**: H1, H3, and H4 all have reproducible numbers (`vxperiments`).
-Repos stay private for now — see `docs/STATUS.md` for the public-visibility punch list.
+Repositories were still private at this release.
 
 ### Added
 - vxAPI proto v1 (`proto/vxedge/v1/*`: common, jobs, events, telemetry, lifecycle) — the

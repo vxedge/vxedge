@@ -11,7 +11,7 @@
 //! `Shell` — this module covers `apply_links`, `apply_slices`'s trunk-VLAN half,
 //! `apply_endpoints`'s link+VLAN halves, `teardown`'s link deletes, `observe`'s link/VLAN
 //! queries, VXLAN link creation, zones' container netns lifecycle (netns create/delete/
-//! exists plus moving/renaming a link across namespaces, `docs/TASKS.md` #16), and (added
+//! exists plus moving/renaming a link across namespaces, `docs/ROADMAP.md` #16), and (added
 //! 2026-08-04) WireGuard tunnel **device creation only** — `nft`/`wg` genuinely stay on
 //! `Shell` even after this: `nft` has its own JSON-based CLI protocol with no netlink crate
 //! coverage here, and WireGuard peer/key configuration is a *different kernel protocol
@@ -21,7 +21,7 @@
 //! `apply_fiveg_ue_routes` in `provision.rs`) — bridge-self VLAN membership
 //! ([`bridge_vlan_add_self`]), an 802.1q VLAN subinterface ([`ensure_vlan_subif`]), resolving a
 //! link's current bridge master ([`link_master`]), and route creation ([`add_route`]). `tc`
-//! stays on `Shell` there too (`apply_fiveg_slice_qos`'s own HTB tree). `docs/TASKS.md` #16
+//! stays on `Shell` there too (`apply_fiveg_slice_qos`'s own HTB tree). `docs/ROADMAP.md` #16
 //! tracks the still-deferred remainder (OVS's own link calls, tap devices — confirmed not even
 //! netlink-portable at all) as separate, smaller follow-ons — not silently implied done by this
 //! module.
@@ -695,7 +695,7 @@ pub fn bridge_vlan_list(netns: Option<&str>, dev: &str) -> Result<Vec<u16>, Netl
 }
 
 // ---------------------------------------------------------------------------
-// Zone container netns lifecycle (`docs/TASKS.md` #16) — the second rtnetlink-port slice.
+// Zone container netns lifecycle (`docs/ROADMAP.md` #16) — the second rtnetlink-port slice.
 // ---------------------------------------------------------------------------
 
 fn netns_path(name: &str) -> std::path::PathBuf {

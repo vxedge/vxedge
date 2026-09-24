@@ -1,6 +1,6 @@
 //! Dev tool: render a manifest's VLAN slice intent to SONiC `config_db.json`, for validating
 //! it against a live SONiC-VS instance (`vxparts/parts/gw/nos/os/sonic-vs`,
-//! `docs/TASKS.md` #16). Trunk port is a required argument, not a default, for the same
+//! `docs/ROADMAP.md` #16). Trunk port is a required argument, not a default, for the same
 //! reason `SonicPlan` itself takes one: this codebase does not assume SONiC-VS's own virtual
 //! port naming without it being supplied explicitly.
 //!

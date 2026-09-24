@@ -812,7 +812,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         },
         Command::Telemetry { .. } => scaffold_notice("telemetry"),
         // Unlike `experiment` verbs, kept `--manifest`-addressed rather than cwd-discovered:
-        // that Terraform-style decision (`docs/TASKS.md`'s 2026-07-30 workspace-model note) is
+        // that Terraform-style decision (`docs/ROADMAP.md`'s 2026-07-30 workspace-model note) is
         // scoped to experiment verbs specifically, and root `CLAUDE.md`'s own CLI command table
         // still shows `vxedge vehicle up|down|status --manifest <vehicle.yaml>`.
         Command::Vehicle { cmd } => {

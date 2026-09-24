@@ -7,7 +7,7 @@
 //! Before this module existed, every RPC handler that needed to turn a domain observation
 //! (zones' `NodeState`, `GatewayObservation`, ...) into a status hand-rolled its own
 //! `if state == X { Up } else { Down }` conversion and its own "is everything up" rollup —
-//! `docs/TASKS.md` #16-adjacent work found this scattered, inconsistent, and in one place
+//! `docs/ROADMAP.md` #16-adjacent work found this scattered, inconsistent, and in one place
 //! (`ExperimentSvc::status`'s own hand-rolled `all_up` check) subtly wrong: it reported
 //! `Degraded` even when *every* child was down, rather than the more honest `Down`. [`Observable`]
 //! and [`aggregate`] exist so that logic is written once, correctly, and reused.

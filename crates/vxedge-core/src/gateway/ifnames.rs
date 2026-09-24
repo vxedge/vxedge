@@ -117,7 +117,7 @@ pub fn stem(device: &str, port: Option<&str>) -> String {
     shorten_to_budget(key, STEM_MAX)
 }
 
-/// Gateway-terminated WireGuard tunnel interface (`docs/TASKS.md` #16, "WireGuard link
+/// Gateway-terminated WireGuard tunnel interface (`docs/ROADMAP.md` #16, "WireGuard link
 /// setup"), derived from the tunnel's own id — the same pure-function contract as
 /// [`access_port`]: nothing but the id itself (declaration order, tunnel count) can move it.
 /// Its own prefix and budget, not `stem`'s: a tunnel has no `(device, port)` pair, only one id,
@@ -135,7 +135,7 @@ pub fn wireguard_tunnel(id: &str) -> String {
     format!("{WIREGUARD_PREFIX}{}", shorten_to_budget(key, WG_STEM_MAX))
 }
 
-/// Gateway-side VXLAN tunnel interface (`docs/TASKS.md` #16, VXLAN provisioning), derived from
+/// Gateway-side VXLAN tunnel interface (`docs/ROADMAP.md` #16, VXLAN provisioning), derived from
 /// the tunnel's own id — same pure-function contract, own prefix and budget, for the same
 /// reason [`wireguard_tunnel`]'s own doc comment gives.
 const VXLAN_PREFIX: &str = "vxln-";

@@ -360,7 +360,7 @@ pub enum SliceMode {
 /// A point-to-point tunnel the gateway itself terminates, reaching a *remote* peer (another
 /// site's gateway) — distinct from `Slice`/VLANs, which partition the *local* bridge fabric zone
 /// nodes attach to. Two kinds under one block (`network.tunnels`), each with only the fields it
-/// needs: `wireguard` (`docs/TASKS.md` #16, "WireGuard link setup" — §7's "WireGuard (in-kernel)
+/// needs: `wireguard` (`docs/ROADMAP.md` #16, "WireGuard link setup" — §7's "WireGuard (in-kernel)
 /// for secure telemetry and OTA transport") is a routed L3 endpoint, never enslaved to the
 /// bridge/OVS switch; `vxlan` (§7's "VXLAN for inter-host communication," delivered
 /// 2026-08-04) is the opposite shape — it *joins* the bridge as a trunk-like port, extending one
@@ -413,7 +413,7 @@ pub enum TunnelKind {
 
 /// Opts an experiment into checking its `network.slices` VLAN intent against a real production
 /// network OS, alongside — never instead of — the actual measured path (`network.data_plane`).
-/// (`docs/TASKS.md` #16/#31, schema settled 2026-08-04.)
+/// (`docs/ROADMAP.md` #16/#31, schema settled 2026-08-04.)
 ///
 /// Deliberately not named "twin": the whole testbed already is one, so reusing that word for
 /// one internal field would describe nothing. What this is: a **check** — boot a real instance

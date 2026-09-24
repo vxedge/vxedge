@@ -70,9 +70,8 @@ const TIER2_MIN_VRAM_MIB: u64 = 12_000;
 pub struct HostCapabilities {
     /// The best NVIDIA GPU the driver reports, as `(compute capability, VRAM MiB)`.
     ///
-    /// Both, not merely "a GPU is present": the development host this was first run on has a
-    /// GT 1030 — a real NVIDIA GPU, and a *Pascal* one with 2 GB, so it fails Tier 2 on both
-    /// counts. A presence check would have let `exp-011` start there and fail deep inside
+    /// Both, not merely "a GPU is present": an entry-level card such as a GT 1030 is a real
+    /// NVIDIA GPU, but a *Pascal* one with 2 GB, so it fails Tier 2 on both counts. A presence check would have let `exp-011` start there and fail deep inside
     /// CARLA, which is exactly what the preflight exists to prevent.
     pub gpu: Option<GpuCapability>,
 }
@@ -362,8 +361,8 @@ mod tests {
     /// that is the whole point of a preflight, and the reason exp-011 can be authored and
     /// committed while no such host exists.
     ///
-    /// The GT 1030 case is real: the development host has one, so a mere "is there an NVIDIA
-    /// GPU" probe passed and would have let exp-011 start and fail deep inside CARLA. Pascal,
+    /// The GT 1030 case: a mere "is there an NVIDIA GPU" probe passes on such a card and
+    /// would let exp-011 start and fail deep inside CARLA. Pascal,
     /// 2 GB — it fails Tier 2 on both compute capability and VRAM.
     #[test]
     fn a_tier2_workspace_is_refused_on_a_host_that_cannot_meet_it() {

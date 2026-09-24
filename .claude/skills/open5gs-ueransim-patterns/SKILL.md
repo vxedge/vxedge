@@ -5,7 +5,7 @@ description: Correctness patterns for the containerized 5G core and RAN (Open5GS
 
 # 5G core & RAN patterns (Open5GS / UERANSIM)
 
-Reference: `ARCHITECTURE.md` §7 (H2 real slicing), §15 phase 2; `docs/STATUS.md`'s dated
+Reference: `ARCHITECTURE.md` §7 (H2 real slicing), §15 phase 2; `docs/RESULTS.md`'s dated
 H2 entries are the primary source for the config-rendering lessons below — read them
 before extending `crates/vxedge-core/src/fiveg/` (plan.rs → render.rs → lifecycle.rs →
 subscriber.rs). The UE-netns networking lessons below are equally load-bearing for

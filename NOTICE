@@ -1,0 +1,19 @@
+vxedge — vxedge
+Copyright 2026 The vxedge Authors
+
+This product includes software developed as part of the vxedge project
+(https://github.com/vxedge).
+
+Source code is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+---
+
+Third-party notices
+
+This repository does not vendor or redistribute third-party source code or binaries.
+Third-party dependencies are consumed through their normal package channels (e.g. crates.io)
+under their own licences.
+
+vxedge provisions and orchestrates Open5GS and UERANSIM (both AGPL-3.0) as separate,
+unmodified upstream processes. vxedge does not link against, modify, or redistribute either
+project; configuration files it renders for them are vxedge's own output.

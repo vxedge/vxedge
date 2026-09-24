@@ -10,7 +10,7 @@ yanked = "deny"
 ignore = [
     # paste (proc-macro) is unmaintained upstream (archived by its author) — pulled in
     # transitively by netlink-packet-core 0.8.1, itself required by rtnetlink 0.21.0 (the
-    # rtnetlink port, docs/TASKS.md #16, delivered 2026-08-04). Both are already the latest
+    # rtnetlink port, docs/ROADMAP.md, delivered 2026-08-04). Both are already the latest
     # published versions (confirmed via `cargo search`/`cargo tree -i paste` before adding
     # this exception, 2026-08-04) — no upgrade removes the dependency, and the advisory
     # itself states no safe replacement exists for `paste`. It compiles away entirely (a
@@ -29,7 +29,7 @@ allow = [
     "BSD-3-Clause",
     "Unicode-3.0",
     "Zlib",
-    # Added 2026-08-05 for `tun` (docs/TASKS.md #16, tap device creation — the vetted binding
+    # Added 2026-08-05 for `tun` (docs/ROADMAP.md, tap device creation — the vetted binding
     # crate `rust-patterns` requires in place of hand-rolled `unsafe` ioctl code). Both are
     # OSI-approved, FSF-free permissive licenses functionally equivalent in effect to MIT —
     # no copyleft, no legal concern, checked before allowing rather than assumed:

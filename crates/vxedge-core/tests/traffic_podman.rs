@@ -1,5 +1,5 @@
 //! Privileged integration test: the *actual* H2-mechanism scenario proven
-//! live on 2026-07-17 (`docs/STATUS.md`'s "TrafficService live end to end"
+//! live on 2026-07-17 (`docs/RESULTS.md`'s "TrafficService live end to end"
 //! entry) — a manifest with two `mode: vlan` slices and one `mode: s-nssai`
 //! slice, all three `traffic_profiles` running *simultaneously* through the
 //! real production path (`gateway::provision::apply*` + `fiveg` +

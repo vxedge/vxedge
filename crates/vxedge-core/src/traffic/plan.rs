@@ -97,7 +97,7 @@ pub enum ProfileEndpoint {
     /// `mode: vlan` — this zone node's own gateway-side veth peer, the same
     /// host-visible interface `apply_endpoints` creates regardless of
     /// whether `zone up` ever ran (H1's own runner measures here directly,
-    /// not inside a live container — `docs/STATUS.md`'s H2-campaign entry).
+    /// not inside a live container — `docs/RESULTS.md`'s H2-campaign entry).
     /// `addr` is this endpoint's own address on it (`vlan_endpoint_addr`).
     VlanNodePeer {
         peer_iface: String,

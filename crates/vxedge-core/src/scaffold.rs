@@ -2,7 +2,7 @@
 //!
 //! A workspace is a folder: every file declares its `kind`, and everything is referenced by
 //! unique id rather than by path, so renaming or restructuring breaks nothing. See
-//! `docs/TASKS.md` Track D for the design and its rationale.
+//! `docs/ROADMAP.md` Track D for the design and its rationale.
 //!
 //! The generated files use the **proposed** ARCHITECTURE.md §6 shape, which is a breaking
 //! schema change still awaiting owner sign-off. Nothing in this crate parses it yet — the

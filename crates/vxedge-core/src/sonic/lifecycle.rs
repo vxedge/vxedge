@@ -1,5 +1,5 @@
 //! Boots a `nos_check` image under QEMU/KVM and talks to it over a serial console — the
-//! process-lifecycle half of `docs/TASKS.md` #16/#31, mirroring the pidfile-managed pattern
+//! process-lifecycle half of `docs/ROADMAP.md` #16/#31, mirroring the pidfile-managed pattern
 //! `zones::backend`'s `qemu-microvm` already proves (spawn, `-pidfile`, `-daemonize`,
 //! kill-with-grace teardown, `/proc/<pid>` existence for status) and `fiveg::lifecycle`'s own
 //! naming convention.
@@ -193,7 +193,7 @@ pub fn nos_check_down(
 ///
 /// Deliberately generic: it knows nothing about SONiC's own CLI, login flow, or config format —
 /// that is a caller concern. The actual "log in, clear a port, load a rendered config, read it
-/// back" sequence this exists to eventually support is `docs/TASKS.md`'s tracked follow-on, not
+/// back" sequence this exists to eventually support is `docs/ROADMAP.md`'s tracked follow-on, not
 /// built here.
 pub struct Console {
     stream: UnixStream,

@@ -710,7 +710,7 @@ fn slices_of(raw: &Value) -> Result<Vec<Slice>, ModelError> {
     Ok(out)
 }
 
-/// `network.tunnels` (`docs/TASKS.md` #16's WireGuard link setup, and the `vxlan` sibling
+/// `network.tunnels` (`docs/ROADMAP.md` #16's WireGuard link setup, and the `vxlan` sibling
 /// delivered 2026-08-04) — absent, like `slices`, means "no tunnels," not an error: most
 /// experiments (everything single-host today) have none.
 fn tunnels_of(raw: &Value) -> Result<Vec<Tunnel>, ModelError> {
@@ -825,7 +825,7 @@ fn tunnels_of(raw: &Value) -> Result<Vec<Tunnel>, ModelError> {
     Ok(out)
 }
 
-/// `network.nos_check` (`docs/TASKS.md` #16/#31) — absent, like `tunnels`, means "no check,"
+/// `network.nos_check` (`docs/ROADMAP.md` #16/#31) — absent, like `tunnels`, means "no check,"
 /// not an error: most experiments don't declare it.
 fn nos_check_of(raw: &Value) -> Result<Option<NosCheck>, ModelError> {
     let Some(n) = raw.get("network").and_then(|n| n.get("nos_check")) else {
@@ -2234,7 +2234,7 @@ devices: {}
     }
 
     /// A `kind: vxlan` tunnel's model builds *and* plans successfully end to end — provisioning
-    /// landed 2026-08-04 (`docs/TASKS.md` #16). `plan.rs`'s own
+    /// landed 2026-08-04 (`docs/ROADMAP.md` #16). `plan.rs`'s own
     /// `a_vxlan_tunnel_plans_successfully_extending_its_declared_slice` covers the plan's exact
     /// shape in detail; this test exercises the full `load_yaml` → `GatewayPlan::from_model`
     /// pipeline through `model/build.rs`'s own fixture, so a regression in either layer's own

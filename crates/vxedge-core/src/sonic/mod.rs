@@ -1,4 +1,4 @@
-//! SONiC-VS production-NOS twin (`docs/TASKS.md` #16): renders vxgateway's own slice/VLAN
+//! SONiC-VS production-NOS twin (`docs/ROADMAP.md` #16): renders vxgateway's own slice/VLAN
 //! intent onto SONiC's config schema, so the manifest that declares a slice topology can prove
 //! the same intent expresses identically on a real production NOS — `ARCHITECTURE.md` §7's own
 //! claim. **Not** a second data plane vxedge measures traffic through: the SONiC-VS data plane
@@ -26,7 +26,7 @@
 //!
 //! **Not yet delivered**: hooking any of this into `GatewayService`/`experiment up` — today it
 //! is a callable library, not wired into any RPC or CLI verb. A real, separately-scoped
-//! follow-on — `docs/TASKS.md` tracks it, not assumed done because the pieces underneath exist.
+//! follow-on — `docs/ROADMAP.md` tracks it, not assumed done because the pieces underneath exist.
 
 pub mod config_check;
 pub mod lifecycle;

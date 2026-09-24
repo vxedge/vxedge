@@ -1,4 +1,4 @@
-//! Experiment-workspace model and validator (Track D, `docs/TASKS.md`).
+//! Experiment-workspace model and validator (Track D, `docs/ROADMAP.md`).
 //!
 //! A workspace is a folder of YAML files. Each declares its `kind` and `id`; the loader
 //! indexes on that pair and every cross-reference is by id, never by path — so files can be
@@ -272,7 +272,7 @@ struct Header {
 /// `rxswin` is on `BaselineDoc`: `kind` is dispatched by `Header` before this struct is ever
 /// parsed (it must still be a *declared* field, or `deny_unknown_fields` would reject every
 /// real document's own `kind: experiment` line); `world` is documented in `ARCHITECTURE.md`
-/// §6.0.3 but nothing in this codebase reads it yet (§30's audit found it, `docs/TASKS.md`
+/// §6.0.3 but nothing in this codebase reads it yet (§30's audit found it, `docs/ROADMAP.md`
 /// tracks it as a documented-but-unimplemented gap, not a validation bug — there is nothing to
 /// misdeclare in a field nothing consumes).
 #[derive(Debug, Clone, Serialize, Deserialize)]

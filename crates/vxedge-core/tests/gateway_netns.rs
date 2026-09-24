@@ -324,7 +324,7 @@ links:
 /// from here, so renaming or reusing the fixture can't silently drift the two apart again.
 const LOCALITY_DEVICE_ID: &str = "node-locality-01";
 
-/// Regression test for docs/TASKS.md #24/#28: exp-001 and exp-003 measured their probe/
+/// Regression test for docs/ROADMAP.md#28: exp-001 and exp-003 measured their probe/
 /// reflector exchange over loopback for months, because both addresses lived in the same
 /// network namespace — the kernel's `local` routing table delivers to a same-netns local
 /// address directly, never touching the bridge, HTB tree, or VLAN filtering the manifest
@@ -511,7 +511,7 @@ links:
 "#;
 const ANTISPOOF_DEVICE_ID: &str = "node-spoof-01";
 
-/// Regression/acceptance test for docs/TASKS.md #16's nftables anti-spoof ingress filter: not
+/// Regression/acceptance test for docs/ROADMAP.md's nftables anti-spoof ingress filter: not
 /// just "the table exists" (the unprivileged unit tests already cover plan-building), but that
 /// a real kernel actually drops a packet whose source address doesn't match the endpoint's
 /// declared one, while a packet from the declared address still gets through. VLAN isolation
@@ -747,7 +747,7 @@ id: veh
 devices: {}
 "#;
 
-/// Regression/acceptance test for docs/TASKS.md #16's WireGuard link setup. Not just "the
+/// Regression/acceptance test for docs/ROADMAP.md's WireGuard link setup. Not just "the
 /// interface exists" — the unit tests in `plan.rs` already cover plan derivation — but that two
 /// independent gateways, simulated as two network namespaces connected only by a plain veth pair
 /// standing in for the internet between two real hosts, complete a **real WireGuard handshake**
@@ -951,7 +951,7 @@ links:
   - { id: l-b, endpoints: [{ node: node-b, port: eth0, ip: 10.113.0.3/24 }], slice: adas }
 "#;
 
-/// Regression/acceptance test for docs/TASKS.md #16's VXLAN tunnel provisioning. Not just "the
+/// Regression/acceptance test for docs/ROADMAP.md's VXLAN tunnel provisioning. Not just "the
 /// interface exists" (`plan.rs`'s own unit tests already cover plan derivation) but that two
 /// independent gateways, simulated as two network namespaces connected only by a plain veth pair
 /// standing in for the internet between two real hosts (same `wanA`/`wanB` shape the WireGuard
@@ -1093,7 +1093,7 @@ fn vxlan_tunnel_carries_slice_traffic_between_two_simulated_hosts() {
     let _ = std::fs::remove_dir_all(&runtime_b);
 }
 
-/// Regression/acceptance test for `docs/TASKS.md` #16's rtnetlink port slice 4
+/// Regression/acceptance test for `docs/ROADMAP.md` #16's rtnetlink port slice 4
 /// (`apply_fiveg_uplink`/`apply_fiveg_ue_routes`). The real 5G CN pod attachment
 /// (`fiveg_podman.rs`) is gated on podman + real vx5g-core images this environment doesn't
 /// have — this test proves the netlink mechanics those functions now use (bridge-self VLAN

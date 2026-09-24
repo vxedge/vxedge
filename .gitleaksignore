@@ -1,0 +1,2 @@
+# UERANSIM/Open5GS public test-SIM key (TEST_UE_KEY in fiveg/render.rs) — upstream example value, not a secret.
+65f3951dd321d6d1e418a55a71e69c88af44aac4:crates/vxedge-core/src/fiveg/render.rs:generic-api-key:215

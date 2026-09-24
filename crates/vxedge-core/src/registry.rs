@@ -5,7 +5,7 @@
 //! published form, resolved by shape — but until this module, nothing on the resolving side
 //! of that rule could actually turn a published form into bytes on disk: every call site that
 //! received one (`NosCheckSvc::resolve`, `ZoneService`/`ComputeService`'s `PushImage`) refused
-//! it outright, naming `docs/TASKS.md` #19. This is the first implementation, wired into
+//! it outright, naming `docs/ROADMAP.md` #19. This is the first implementation, wired into
 //! `NosCheckSvc::resolve` first because it was the one call site that already had a concrete,
 //! real published ref to pull (`ghcr.io/vxedge/parts/gw/nos/os/sonic-vs`) rather than a
 //! speculative one. `zones::node_up` (`crates/vxedge-core/src/zones/backend.rs`) is the second:

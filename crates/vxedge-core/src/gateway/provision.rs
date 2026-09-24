@@ -195,7 +195,7 @@ fn ensure_endpoint_device(sh: &Shell, ep: &super::plan::EndpointPlan) -> Result<
         }
         // `ip tuntap add ... mode tap` is not an `RTM_NEWLINK` operation — see `tuntap.rs`'s own
         // module doc for why it's a separate kernel interface and a separate small module
-        // rather than an addition to `netlink.rs` (`docs/TASKS.md` #16, ported 2026-08-05).
+        // rather than an addition to `netlink.rs` (`docs/ROADMAP.md` #16, ported 2026-08-05).
         super::plan::EndpointKind::Tap => {
             super::tuntap::ensure_tap(sh.netns.as_deref(), &ep.name).map_err(tt)
         }
@@ -350,7 +350,7 @@ fn ingress_filter_table(access_port: &str) -> String {
     format!("vxaf-{access_port}")
 }
 
-/// Per-access-port ingress anti-spoof filter (`docs/TASKS.md` #16, "nftables per VLAN/slice").
+/// Per-access-port ingress anti-spoof filter (`docs/ROADMAP.md` #16, "nftables per VLAN/slice").
 ///
 /// **What this is not**: a VLAN-filtering bridge already makes cross-slice traffic structurally
 /// impossible — a frame tagged for one VLAN cannot reach a port that isn't a member of it, with
@@ -408,7 +408,7 @@ fn teardown_ingress_filter(sh: &Shell, ep: &super::plan::EndpointPlan) -> Result
     sh.run_tolerate_missing("nft", &["delete", "table", "netdev", &table])
 }
 
-/// One gateway-terminated tunnel (`docs/TASKS.md` #16), applied or torn down identically
+/// One gateway-terminated tunnel (`docs/ROADMAP.md` #16), applied or torn down identically
 /// regardless of `network.data_plane` for both kinds: a WireGuard interface is a routed L3
 /// endpoint, never enslaved to the bridge/OVS switch itself; a VXLAN interface *does* enslave
 /// to the bridge, but as a trunk-like port the same way the uplink itself is — neither depends
@@ -434,7 +434,7 @@ fn apply_tunnel(
 /// `apply_impairment`'s own doc comment warns about for `tc filter add`, just on the
 /// "recreates instead of no-ops" side rather than the "duplicates" side.
 ///
-/// Device creation goes through `netlink::ensure_wireguard` (`docs/TASKS.md` #16, delivered
+/// Device creation goes through `netlink::ensure_wireguard` (`docs/ROADMAP.md` #16, delivered
 /// 2026-08-04) — everything after it (`wg genkey`/`wg set`, the address, bringing the link up)
 /// stays on `Shell`: `wg`'s own configuration is a generic-netlink protocol `rtnetlink` doesn't
 /// implement, not a deferred gap.
@@ -537,7 +537,7 @@ fn apply_tunnels(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
 
 /// Both kinds now tear down through `netlink::delete_link` — link deletion never cared what
 /// created the link, so once `apply_wireguard_tunnel` moved its own creation onto
-/// `netlink.rs` (`docs/TASKS.md` #16, delivered 2026-08-04) there was no remaining reason to
+/// `netlink.rs` (`docs/ROADMAP.md` #16, delivered 2026-08-04) there was no remaining reason to
 /// keep WireGuard's delete on the `ip` shell-out; the earlier doc comment here called that a
 /// "separate migration decision outside this change's scope" — this change is that migration.
 fn teardown_tunnel(sh: &Shell, t: &super::plan::TunnelPlan) -> Result<(), NetOpsError> {
@@ -661,7 +661,7 @@ fn observe_vxlan_tunnel(sh: &Shell, t: &super::plan::TunnelPlan) -> TunnelObserv
 /// found live the same day, one call deeper than this bug (see that
 /// function's own doc comment).
 ///
-/// Ported to `gateway::netlink` 2026-08-04 (`docs/TASKS.md` #16, rtnetlink port slice 4) —
+/// Ported to `gateway::netlink` 2026-08-04 (`docs/ROADMAP.md` #16, rtnetlink port slice 4) —
 /// every step here (bridge-VLAN membership, the bridge-self membership, the VLAN subinterface,
 /// its address, bringing it up) is netlink-portable; only [`apply_fiveg_slice_qos`]'s HTB tree
 /// on this same interface stays on `Shell`.
@@ -742,7 +742,7 @@ pub struct FiveGSliceQos {
 /// UPF in this deployment — confirmed live by patching a subscriber's
 /// session AMBR down to 20mbit and measuring the UE's own `uesimtun0`
 /// still receiving the full offered ~600mbit unconstrained (`docs/
-/// STATUS.md` has the full account). So real per-slice isolation for the
+/// docs/RESULTS.md` has the full account). So real per-slice isolation for the
 /// snssai arm needs a kernel-level guarantee, not 5G-core QoS signaling
 /// that isn't actually active here.
 ///
@@ -928,7 +928,7 @@ pub trait DataPlane {
 
     fn observe(&self, sh: &Shell, plan: &GatewayPlan) -> Result<GatewayObservation, NetOpsError>;
 
-    /// WireGuard tunnels the gateway terminates (`docs/TASKS.md` #16). Given a default
+    /// WireGuard tunnels the gateway terminates (`docs/ROADMAP.md` #16). Given a default
     /// implementation here, not per-backend: a tunnel is a routed L3 endpoint independent of
     /// which fabric backs the VLAN slices, so `KernelBridge` and `Ovs` share one implementation
     /// rather than each redeclaring it — see `apply_tunnels`'s own doc comment.
@@ -987,7 +987,7 @@ impl DataPlane for KernelBridge {
 /// Bridge + trunk uplink, via `ovs-vsctl` instead of `ip link add ... type bridge`. The veth
 /// pair itself is a plain kernel link — OVS attaches to netdevices, it doesn't create them —
 /// so it goes through the same native [`netlink`] primitives the kernel-bridge path uses
-/// (`docs/TASKS.md` #16: "OVS's own link calls", ported 2026-08-05). `--may-exist` is
+/// (`docs/ROADMAP.md` #16: "OVS's own link calls", ported 2026-08-05). `--may-exist` is
 /// `ovs-vsctl`'s own idempotent-create idiom for the OVSDB half, which stays a shell-out —
 /// OVSDB is a different protocol entirely, not something the rtnetlink port covers.
 fn ovs_apply_links(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
@@ -1395,7 +1395,7 @@ impl ImpairmentObservation {
     }
 }
 
-/// One endpoint's ingress anti-spoof filter, as it is actually installed (`docs/TASKS.md` #16).
+/// One endpoint's ingress anti-spoof filter, as it is actually installed (`docs/ROADMAP.md` #16).
 #[derive(Debug, Clone)]
 pub struct IngressFilterObservation {
     pub node: String,

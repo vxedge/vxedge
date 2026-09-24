@@ -20,7 +20,7 @@ pub struct SonicPlan {
     pub vlans: Vec<SonicVlan>,
     /// The trunk port carrying every VLAN, tagged. Supplied by the caller rather than guessed
     /// here: SONiC-VS's own interface naming for its virtual ports has never been confirmed
-    /// against a live boot by this codebase (`docs/TASKS.md` #16 tracks that verification as
+    /// against a live boot by this codebase (`docs/ROADMAP.md` #16 tracks that verification as
     /// the explicit next step), and a wrong hardcoded guess would silently misrender rather
     /// than fail loudly.
     pub trunk_port: String,

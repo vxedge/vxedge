@@ -292,7 +292,7 @@ impl GatewaySvc {
                         plan.summary()
                     )),
                     Verb::Up => {
-                        // Converging reconciler (`docs/TASKS.md` #16 / vxedge/TASKS.md §2):
+                        // Converging reconciler (`docs/ROADMAP.md` #16 / vxedge/TASKS.md §2):
                         // `apply_links`/`apply_slices`/`apply_endpoints` are each individually
                         // idempotent (the netns integration test proves double-apply is a
                         // no-op), but until now a single observed gap after one pass — a
@@ -631,7 +631,7 @@ impl GatewayService for GatewaySvc {
                 // names them rather than leaving the operator to infer a healthy gateway is an
                 // unimpaired one. A half-installed impairment already makes `fully_up` false;
                 // without this, the degraded line would not say which one. Addressable per-link
-                // (`docs/TASKS.md` #29) rather than folded only into the free-text `detail`
+                // (`docs/ROADMAP.md` #29) rather than folded only into the free-text `detail`
                 // string below — a `--json` client can now tell which link, not just how many.
                 let impairments: Vec<ImpairmentStatus> = obs
                     .impairments
@@ -1157,7 +1157,7 @@ impl ZoneService for ZoneSvc {
 /// hpc-role device in today's five frozen experiments is already provisioned by `zone up`. Adding
 /// a compute stage that also claims hpc-role devices would double-provision them, or require
 /// carving them out of the zones stage first — a real, separate design decision (`VehicleService`
-/// is where `docs/TASKS.md` already plans a real gateway→zones→compute→signal-plane→services
+/// is where `docs/ROADMAP.md` already plans a real gateway→zones→compute→signal-plane→services
 /// order) deliberately left for when that orchestration exists, not guessed at here. This
 /// service is additive and standalone: it gives compute nodes their own addressable verb without
 /// changing what `experiment up`/`zone up` already do to a single frozen experiment.
@@ -1746,7 +1746,7 @@ pub struct NosCheckSvc {
     /// "something vxedged needs but does not itself provision."
     pub default_image: Option<PathBuf>,
     /// Where a published `part_ref` gets pulled to (`vxedge_core::registry::fetch`,
-    /// `docs/TASKS.md` #19). Content-addressed by digest, so this is shared across every
+    /// `docs/ROADMAP.md` #19). Content-addressed by digest, so this is shared across every
     /// experiment that references the same pinned build — SONiC-VS is 6+ GB, and re-pulling it
     /// per experiment would be its own reproducibility footgun (slow, and a mid-run network
     /// blip becomes a flaky test failure instead of a one-time setup cost).
@@ -1756,7 +1756,7 @@ pub struct NosCheckSvc {
 impl NosCheckSvc {
     /// Resolves the experiment's declared `network.nos_check` to a local disk image this host
     /// can boot: a local `part_ref` resolves directly, a published one is pulled through
-    /// `vxedge_core::registry::fetch` (cached by digest, `docs/TASKS.md` #19), and no
+    /// `vxedge_core::registry::fetch` (cached by digest, `docs/ROADMAP.md` #19), and no
     /// `part_ref` at all falls back to `default_image`.
     async fn resolve(
         &self,
@@ -1838,7 +1838,7 @@ impl NosCheckSvc {
 /// Copies `image` into `instance_dir` if not already there, and boots it under `name`. Shared by
 /// `Up` and `Verify`: both need the same never-boot-the-shared-path-directly discipline (QEMU
 /// opens a qcow2 read-write, and SONiC's first-boot sequence writes to disk — found live,
-/// `docs/TASKS.md` #16).
+/// `docs/ROADMAP.md` #16).
 fn boot_disposable_copy(
     name: &str,
     image: &std::path::Path,

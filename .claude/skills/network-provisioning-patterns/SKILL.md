@@ -22,8 +22,7 @@ pure-rtnetlink port as an open, non-blocking phase-1 trailing item
   out safe here instead of a command-injection surface. If you're building a command
   string with `format!`, stop.
 - Reads use `-json` (`ip -json ...`) and get parsed, not scraped from human-readable
-  output — `tc`/iproute2 version drift across hosts is a known risk (`STATUS.md` risk
-  list), and JSON output is the mitigation. Any new observation path follows the same
+  output — `tc`/iproute2 version drift across hosts is a known risk, and JSON output is the mitigation. Any new observation path follows the same
   rule.
 - The `Shell` struct's `netns` field and `sudo` prefix flag are how privilege and
   isolation get threaded through — for CI (netns, unprivileged where possible) and for

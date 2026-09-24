@@ -90,7 +90,7 @@ pub struct EndpointPlan {
     /// carry it. See [`GatewayPlan::from_model`] for why exactly one endpoint per link does.
     pub impairment: Option<EndpointImpairment>,
     /// The link attachment's declared `ip_cidr` (`model::Endpoint::ip_cidr`), when pinned.
-    /// Renders as an ingress anti-spoof filter on this access port (`docs/TASKS.md` #16): a
+    /// Renders as an ingress anti-spoof filter on this access port (`docs/ROADMAP.md` #16): a
     /// VLAN-filtering bridge already makes cross-slice traffic structurally impossible, but
     /// nothing stops a compromised device on the *same* VLAN from spoofing a neighbor's
     /// address to borrow its trust — that's the actual gap this closes. `None` when the
@@ -110,7 +110,7 @@ pub struct EndpointImpairment {
     pub params: crate::model::Impairment,
 }
 
-/// A gateway-terminated tunnel, planned from `model::Tunnel` (`docs/TASKS.md` #16). Kind-
+/// A gateway-terminated tunnel, planned from `model::Tunnel` (`docs/ROADMAP.md` #16). Kind-
 /// conditional fields, the same shape `model::Tunnel` itself already uses — a `Wireguard`-kind
 /// plan never has a `vni`, a `Vxlan`-kind plan never has a `peer_public_key`. The local
 /// WireGuard private key is minted by `provision::apply_tunnel` on first `up` and never appears
@@ -609,7 +609,7 @@ parts:
     #[test]
     fn expected_source_is_derived_from_a_pinned_endpoint_ip() {
         // BASE's endpoints are bare `device:port` form — no IP pinned, so there is no
-        // anti-spoof filter to install (docs/TASKS.md #16's nftables ingress filter). Confirmed
+        // anti-spoof filter to install (docs/ROADMAP.md's nftables ingress filter). Confirmed
         // here rather than assumed, since a `None` is easy to get right by accident.
         let plan = GatewayPlan::from_model(&model(BASE)).unwrap();
         assert!(plan.endpoints.iter().all(|e| e.expected_source.is_none()));
