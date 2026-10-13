@@ -371,7 +371,12 @@ Tracked here so they are not rediscovered. None block the critical path.
       differently (vxid or an explicit `--manifest`) and were not re-checked in this pass — 
       don't assume either is migrated or exempt. Tracked at the top level as `docs/ROADMAP.md`
       item #26.
-- [ ] **(7) `vehicle up` from a §6.0 vehicle document** — the phase-3 gate itself. Needs (2).
+- [ ] **(7) `vehicle up` from a §6.0 vehicle document** — works for a bare vehicle
+      (`vxperiments/vehicles/vx-vehicle-01`: gateway + one qemu-microvm zone, `up|status|down`,
+      idempotent `up`, clean teardown; verified 2026-10-13 against a locally built probe
+      bundle, no registry login). **The phase-3 gate is NOT met**: that needs a full vehicle
+      end to end (several zones, services, central compute), and this one has a single zone
+      and no services. `manifest validate` accepts a bare vehicle too (same synthesis step).
 - [ ] Candidate, from Terraform's `init`: `experiment init` pre-pulls every part ref by digest
       into a local cache before `up`, so a run either has everything or fails before it starts.
       Fits the offline-first direction; not yet scheduled.
