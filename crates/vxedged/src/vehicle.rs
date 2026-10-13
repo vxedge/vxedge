@@ -95,6 +95,24 @@ impl VehicleService for VehicleSvc {
         // that function's own comment for why refusing here costs nothing but refusing halfway
         // through does not.
         crate::services::preflight_requires(dir.as_deref())?;
+        // A local bundle (e.g. `./bundle`) is built per host and absent on a fresh clone;
+        // refuse now, with the build command, rather than after the gateway is up.
+        if let Some(d) = dir.as_deref() {
+            let missing = vxedge_core::zones::missing_local_bundles(&model, d);
+            if !missing.is_empty() {
+                let list = missing
+                    .iter()
+                    .map(|p| format!("  {}", p.display()))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return Err(Status::failed_precondition(format!(
+                    "vehicle `{id}` boots a local guest bundle that has not been built on this host:\n{list}\n\
+                     A bundle embeds the host kernel, so it is built per host and never published. Build it with \
+                     `<vxparts>/parts/zone/linux/stack/probe-bundle/build.sh <dir above>` (needs busybox-static \
+                     and a readable /boot/vmlinuz-$(uname -r); see that part's README), then run `vehicle up` again."
+                )));
+            }
+        }
         self.audit
             .record("VehicleService.Up", serde_json::json!({ "vehicle": id }));
         let svc = self.handles.clone();

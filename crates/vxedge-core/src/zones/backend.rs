@@ -30,7 +30,10 @@ use crate::model::Backend;
 pub enum ZoneBackendError {
     #[error(transparent)]
     NetOps(#[from] NetOpsError),
-    #[error("node `{node}`: bundle file missing: {path}")]
+    #[error(
+        "node `{node}`: bundle file missing: {path} (a local bundle is built per host, since it \
+         embeds the host kernel: run the part's `build.sh <bundle-dir>`, see its README)"
+    )]
     BundleFile { node: String, path: String },
     #[error("node `{node}`: {detail}")]
     Runtime { node: String, detail: String },
