@@ -232,6 +232,35 @@ pub fn plan_nodes_from_model(
     Ok(plans)
 }
 
+/// Local bundle directories the plan will boot that are not on disk (or lack `vmlinuz` /
+/// `initrd.img`), resolved the same way [`plan_nodes_from_model`] resolves them. Lets a caller
+/// refuse *before* provisioning anything: a bundle built from a local recipe embeds the host
+/// kernel, so it is per-host and a fresh clone never has one.
+pub fn missing_local_bundles(exp: &crate::model::Experiment, workspace_dir: &Path) -> Vec<PathBuf> {
+    let mut missing: Vec<PathBuf> = Vec::new();
+    for entity in &exp.entities {
+        for device in entity.devices.values() {
+            for part in entity
+                .functions_on(&device.id)
+                .filter_map(|f| f.part.as_ref())
+                .filter(|p| p.kind == crate::model::PartKind::Bundle && p.local)
+            {
+                let p = Path::new(&part.reference);
+                let dir = if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    workspace_dir.join(p)
+                };
+                let complete = dir.join("vmlinuz").exists() && dir.join("initrd.img").exists();
+                if !complete && !missing.contains(&dir) {
+                    missing.push(dir);
+                }
+            }
+        }
+    }
+    missing
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,5 +406,28 @@ parts:
                     .to_string()
             ))
         );
+    }
+
+    #[test]
+    fn missing_local_bundles_reports_an_unbuilt_bundle_and_skips_a_complete_one() {
+        let model = crate::model::load_yaml(WS).expect("valid test workspace");
+        let dir =
+            std::env::temp_dir().join(format!("vxedge-missing-bundle-{}", std::process::id()));
+        let bundle = dir.join("images/linux-probe/bundle");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            missing_local_bundles(&model, &dir),
+            vec![dir.join("./images/linux-probe/bundle")]
+        );
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join("vmlinuz"), b"k").unwrap();
+        assert_eq!(
+            missing_local_bundles(&model, &dir).len(),
+            1,
+            "initrd.img still absent"
+        );
+        std::fs::write(bundle.join("initrd.img"), b"i").unwrap();
+        assert!(missing_local_bundles(&model, &dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
