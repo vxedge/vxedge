@@ -1092,16 +1092,38 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// A §6.0 workspace directory: every cross-file join, then every model invariant.
+/// A §6.0 workspace directory: every cross-file join, then every model invariant. A bare
+/// vehicle (no `kind: experiment`) is validated the way `vehicle up` loads it.
 fn validate_workspace_dir(root: &std::path::Path) -> Result<Summary, String> {
     let ws = vxedge_core::Workspace::load(root).map_err(|e| e.to_string())?;
+    if ws.is_bare_vehicle() {
+        let yaml = vxedge_core::Workspace::read_text(root).map_err(|e| e.to_string())?;
+        return validate_bare_vehicle(&yaml);
+    }
     finish_workspace(ws, || vxedge_core::model::load_dir(root))
 }
 
 /// The same checks over a workspace held in one file of `---`-separated documents.
 fn validate_workspace_yaml(yaml: &str) -> Result<Summary, String> {
     let ws = vxedge_core::Workspace::from_yaml(yaml).map_err(|e| e.to_string())?;
+    if ws.is_bare_vehicle() {
+        return validate_bare_vehicle(yaml);
+    }
     finish_workspace(ws, || vxedge_core::model::load_yaml(yaml))
+}
+
+/// `vehicle up` wraps a bare vehicle in a synthesized experiment before anything else sees it
+/// (`synthesize_vehicle_workspace`); validating the same synthesized text keeps "validate
+/// passes" and "up accepts" the same statement.
+fn validate_bare_vehicle(yaml: &str) -> Result<Summary, String> {
+    let synthesized =
+        vxedge_core::model::synthesize_vehicle_workspace(yaml).map_err(|e| e.to_string())?;
+    let ws = vxedge_core::Workspace::from_yaml(&synthesized).map_err(|e| e.to_string())?;
+    let (json, human) = finish_workspace(ws, || vxedge_core::model::load_yaml(&synthesized))?;
+    Ok((
+        json,
+        format!("bare vehicle workspace (experiment synthesized as for `vehicle up`): {human}"),
+    ))
 }
 
 /// Validating is not "does it parse": a workspace that passes its cross-file joins can still

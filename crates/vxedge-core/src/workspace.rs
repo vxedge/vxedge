@@ -796,6 +796,41 @@ impl Workspace {
         Ok(ws)
     }
 
+    /// Every `*.yaml` in `root` (non-recursive), sorted by path and joined with `---`: the
+    /// one-document form of a workspace directory. Same shape `vxedged` reads for a path
+    /// manifest, so a caller holding only a directory can hand the result to text-based entry
+    /// points such as [`crate::model::synthesize_vehicle_workspace`].
+    pub fn read_text(root: &Path) -> Result<String, WorkspaceError> {
+        let io = |path: &Path, source| WorkspaceError::Io {
+            path: path.to_path_buf(),
+            source,
+        };
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(root)
+            .map_err(|e| io(root, e))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("yaml"))
+            .collect();
+        paths.sort();
+        let mut out = String::new();
+        for path in paths {
+            let text = std::fs::read_to_string(&path).map_err(|e| io(&path, e))?;
+            if !out.is_empty() {
+                out.push_str("---\n");
+            }
+            out.push_str(&text);
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        Ok(out)
+    }
+
+    /// True for a workspace that holds a vehicle but no experiment: the shape `vehicle up`
+    /// accepts by synthesizing an experiment around it.
+    pub fn is_bare_vehicle(&self) -> bool {
+        self.experiments.is_empty() && !self.vehicles.is_empty()
+    }
+
     /// Read a workspace from YAML text rather than from a directory.
     ///
     /// One file can hold the whole workspace as `---`-separated documents. That works because
