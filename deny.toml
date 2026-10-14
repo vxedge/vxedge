@@ -17,6 +17,17 @@ ignore = [
     # proc-macro with no runtime presence), so this is a maintenance-signal risk, not a
     # supply-chain/security one. Re-check when rtnetlink/netlink-packet-core next release.
     "RUSTSEC-2024-0436",
+    # unsafe-libyaml is unmaintained upstream (repository archived 2024-03-25, last release
+    # 0.2.11) — an informational "unmaintained" advisory, not a vulnerability. It is reached
+    # only through serde_yaml_ng 0.10.0 (`cargo tree -i unsafe-libyaml`), which is the latest
+    # published release (checked with `cargo search`, 2026-10-14), so no bump removes it.
+    # serde_yaml_ng is the manifest parser (serde_yaml itself is deprecated; do not
+    # reintroduce it), so dropping the dependency means swapping the YAML parser across the
+    # manifest/CLI code — a change to how manifests parse that needs its own decision, not a
+    # CI side effect. EXPIRES 2027-01-14: cargo-deny does not enforce this date, so re-check
+    # then — a new serde_yaml_ng release, or a decision to move to a pure-Rust parser — and
+    # delete this entry if either lands.
+    "RUSTSEC-2024-0449",
 ]
 
 [licenses]
