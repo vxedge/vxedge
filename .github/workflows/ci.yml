@@ -27,6 +27,12 @@ jobs:
 
   proto:
     runs-on: ubuntu-latest
+    # buf-action posts/updates a summary comment on pull requests; without this the
+    # read-only default token fails with "Resource not accessible by integration".
+    # Job-scoped, so no other job gets write access.
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
       - uses: actions/checkout@v7
       - uses: bufbuild/buf-action@v1
