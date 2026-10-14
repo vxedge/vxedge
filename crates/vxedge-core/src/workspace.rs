@@ -1232,7 +1232,9 @@ impl Workspace {
             h.update(&bytes);
             h.update([0u8]);
         }
-        Ok(format!("{:x}", h.finalize()))
+        // sha2 0.11 returns a `hybrid_array::Array`, which has no `LowerHex`; spell the hex out.
+        let digest = h.finalize();
+        Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
     }
 
     /// Load and validate in one step, the shape a CLI wants.
