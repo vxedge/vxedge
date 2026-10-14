@@ -7,7 +7,7 @@ on:
 
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
       - name: Install protoc
@@ -26,7 +26,7 @@ jobs:
         run: cargo fmt --check
 
   proto:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
       - uses: bufbuild/buf-action@v1
@@ -38,7 +38,7 @@ jobs:
           push: false
 
   deny:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
@@ -48,7 +48,7 @@ jobs:
   # Privileged gateway integration tests: provisions bridge/VLAN/HTB inside a
   # network namespace. Hosted runners allow sudo; -E keeps rustup's HOME.
   netns-integration:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
       - name: Install wireguard-tools
