@@ -1,0 +1,122 @@
+name: Release
+
+# Pushing a tag vMAJOR.MINOR.PATCH builds, packages, attests and publishes a GitHub Release.
+# workflow_dispatch is a dry run: it builds and uploads the archives as workflow artifacts
+# but creates neither an attestation nor a release.
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  workflow_dispatch:
+
+# Nothing is granted by default; the publish job opts in to exactly what it needs.
+permissions: {}
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    # Native runners, no cross-compilation: each target is built and smoke-tested on its own
+    # architecture. Both are ubuntu-24.04, the oldest release the binaries must run on, so the
+    # glibc they link against (2.39) is the floor; 26.04 is newer and runs them unchanged.
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install protoc
+        # vxedge-api's build.rs (tonic-prost-build) needs it, as in ci.yml.
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Resolve version
+        id: version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          crate_version=$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "vxedge-cli") | .version')
+          if [ "$REF_TYPE" = tag ]; then
+            version="${REF_NAME#v}"
+            if [ "$version" != "$crate_version" ]; then
+              echo "error: tag $REF_NAME does not match the workspace version $crate_version" >&2
+              exit 1
+            fi
+          else
+            version="${crate_version}-dryrun"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Build
+        # rust-toolchain.toml pins the compiler; rustup installs it on first use.
+        run: cargo build --release --locked -p vxedge-cli -p vxedged
+      - name: Package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          name="vxedge-${VERSION}-${TARGET}"
+          mkdir -p "dist/$name"
+          install -m 0755 target/release/vxedge target/release/vxedged "dist/$name/"
+          cp LICENSE NOTICE "dist/$name/"
+          cat > "dist/$name/README.txt" <<README
+          vxedge ${VERSION} (${TARGET}). Run ./vxedge --version, then: ./vxedge manifest validate --manifest <workspace>.
+          Start the daemon with ./vxedged --listen unix:///tmp/vxedge.sock; see https://github.com/vxedge/vxedge.
+          README
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          "dist/$name/vxedge" --version
+          ldd "dist/$name/vxedge" "dist/$name/vxedged"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: archive-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: checksums, attestation, release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: archive-*
+          path: dist
+          merge-multiple: true
+      - name: SHA256SUMS
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum vxedge-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+      - name: Keep checksums with the dry-run artifacts
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: SHA256SUMS
+          path: dist/SHA256SUMS
+      - name: Attest build provenance
+        if: github.ref_type == 'tag'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/vxedge-*.tar.gz
+      - name: Create release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" dist/vxedge-*.tar.gz dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" \
+            --notes "Binaries for x86_64 and aarch64 Linux (glibc, built on Ubuntu 24.04). Verify with SHA256SUMS or gh attestation verify. See CHANGELOG.md for what changed."
