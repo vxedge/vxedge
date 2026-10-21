@@ -8,8 +8,8 @@ authors:
     affiliation: "Independent Researcher"
 repository-code: "https://github.com/vxedge/vxedge"
 url: "https://vxedge.dev"
-version: "0.1.0"
-date-released: "2026-07-13"
+version: "0.2.0"
+date-released: "2026-10-21"
 license: "Apache-2.0"
 keywords:
   - sdv
