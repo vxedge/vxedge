@@ -10,7 +10,7 @@ The control plane of vxedge, an open, all-software testbed that maps 5G network 
 
 This repo holds the `vxedged` daemon, the **vxAPI** gRPC/Protobuf contract, the thin `vxedge` command-line client, and vxgateway, the software-defined edge gateway (bridge or Open vSwitch, VLAN, `tc` HTB shaping, WireGuard, VXLAN, and the Open5GS and UERANSIM 5G lifecycle). Everything the platform does is declared in YAML manifests; the CLI only wraps vxAPI calls. Every published number ships with the manifest and image digests that produced it.
 
-Zone and compute images are not here; they live in [`vxparts`](https://github.com/vxedge/vxparts). Acronyms are defined in [`ACRONYMS.md`](https://github.com/vxedge/docs/blob/main/ACRONYMS.md).
+Zone and compute images are not here; they live in `vxparts`. Acronyms are defined in [`ACRONYMS.md`](https://github.com/vxedge/docs/blob/main/ACRONYMS.md).
 
 ## Install
 
