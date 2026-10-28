@@ -40,3 +40,6 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3"
+# Podman's Docker-compatible REST API over the rootless user socket (docs-internal
+# PROVISIONING.md §7.2, Track V1). Unix-socket transport only: no TLS stack, no HTTP/SSH remotes.
+bollard = { version = "0.21", default-features = false, features = ["pipe"] }
