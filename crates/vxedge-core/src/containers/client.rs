@@ -238,6 +238,21 @@ impl ContainerClient {
         self.remove_observed(&status).await
     }
 
+    /// Which of `names` are taken by a container carrying no group label: one this module would
+    /// create under that name but did not create itself, most likely left by an older vxedged
+    /// that drove the `podman` CLI. Label-filtered calls cannot see such a container, so without
+    /// this check `group_down` reports success over it and `up` stops halfway on
+    /// [`ContainerError::NameTaken`]. Never mutates.
+    pub async fn unlabelled(&self, names: &[String]) -> Result<Vec<String>, ContainerError> {
+        let opts = ListContainersOptionsBuilder::new().all(true).build();
+        let list = self
+            .docker
+            .list_containers(Some(opts))
+            .await
+            .map_err(api("list containers".to_string()))?;
+        Ok(unlabelled_names(names, &list))
+    }
+
     async fn remove_observed(&self, status: &GroupStatus) -> Result<usize, ContainerError> {
         let mut removed = 0;
         for c in status.members.iter().chain(status.infra.iter()) {
@@ -328,6 +343,42 @@ impl ContainerClient {
     }
 }
 
+/// One [`ContainerClient`] per process, connected on first use. A daemon that holds this starts
+/// fine on a host without the socket (most verbs never touch containers), and a failed connect
+/// is not cached, so enabling the socket later works without a restart. Clones share the client.
+#[derive(Debug, Clone, Default)]
+pub struct LazyClient {
+    /// `None`: this process's own rootless socket ([`ContainerClient::connect_user`]).
+    socket: Option<PathBuf>,
+    cell: std::sync::Arc<tokio::sync::OnceCell<ContainerClient>>,
+}
+
+impl LazyClient {
+    /// Connects to this process's own rootless socket on first use.
+    pub fn user() -> Self {
+        Self::default()
+    }
+
+    /// Connects to `socket` on first use.
+    pub fn at(socket: PathBuf) -> Self {
+        Self {
+            socket: Some(socket),
+            ..Self::default()
+        }
+    }
+
+    pub async fn get(&self) -> Result<&ContainerClient, ContainerError> {
+        self.cell
+            .get_or_try_init(|| async {
+                match &self.socket {
+                    Some(p) => ContainerClient::connect(p).await,
+                    None => ContainerClient::connect_user().await,
+                }
+            })
+            .await
+    }
+}
+
 fn api(op: String) -> impl FnOnce(bollard::errors::Error) -> ContainerError {
     move |source| ContainerError::Api { op, source }
 }
@@ -370,6 +421,28 @@ pub(crate) fn create_body(
         }),
         ..Default::default()
     }
+}
+
+/// The pure half of [`ContainerClient::unlabelled`], in the order `names` lists them.
+fn unlabelled_names(names: &[String], list: &[ContainerSummary]) -> Vec<String> {
+    names
+        .iter()
+        .filter(|wanted| {
+            list.iter().any(|s| {
+                let named = s
+                    .names
+                    .iter()
+                    .flatten()
+                    .any(|n| n.trim_start_matches('/') == wanted.as_str());
+                let labelled = s
+                    .labels
+                    .as_ref()
+                    .is_some_and(|l| l.contains_key(LABEL_GROUP));
+                named && !labelled
+            })
+        })
+        .cloned()
+        .collect()
 }
 
 fn observed_from_summary(s: ContainerSummary) -> ObservedContainer {
@@ -479,6 +552,22 @@ mod tests {
         assert!(o.is_running());
     }
 
+    #[test]
+    fn only_unlabelled_holders_of_the_exact_names_are_reported() {
+        let summary = |name: &str, group: Option<&str>| ContainerSummary {
+            names: Some(vec![format!("/{name}")]),
+            labels: group.map(|g| HashMap::from([(LABEL_GROUP.to_string(), g.to_string())])),
+            ..Default::default()
+        };
+        let list = [
+            summary("vx5g-nrf", None), // left by the podman CLI
+            summary("vx5g-ran-gnb", Some("vx5g-ran")),
+            summary("vx5g-nrf-old", None), // a longer name is not a match
+        ];
+        let names = ["vx5g-ran-gnb", "vx5g-nrf", "vx5g-mongo"].map(String::from);
+        assert_eq!(unlabelled_names(&names, &list), ["vx5g-nrf"]);
+    }
+
     #[tokio::test]
     async fn a_missing_socket_is_reported_with_the_fix() {
         let err = ContainerClient::connect(Path::new("/nonexistent/vxedge-test/podman.sock"))
@@ -489,6 +578,19 @@ mod tests {
             err.to_string()
                 .contains("systemctl --user enable --now podman.socket")
         );
+    }
+
+    #[tokio::test]
+    async fn a_lazy_client_does_not_cache_a_failed_connect() {
+        let lazy = LazyClient::at("/nonexistent/vxedge-test/podman.sock".into());
+        assert!(matches!(
+            lazy.get().await,
+            Err(ContainerError::SocketUnreachable { .. })
+        ));
+        // Tried again, not answered from a cached failure: a socket enabled after the daemon
+        // started must be picked up without a restart.
+        assert!(lazy.get().await.is_err());
+        assert!(lazy.cell.get().is_none());
     }
 
     /// A socket that exists but has no Podman behind it must fail at connect, not mid-`up`.

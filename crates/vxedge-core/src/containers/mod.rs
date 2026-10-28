@@ -28,7 +28,7 @@ pub mod spec;
 use std::ffi::OsStr;
 use std::path::PathBuf;
 
-pub use client::{ContainerClient, GroupHandle, Outcome};
+pub use client::{ContainerClient, GroupHandle, LazyClient, Outcome};
 pub use spec::{
     Bind, ContainerSpec, GroupSpec, GroupStatus, InfraAction, MemberAction, NameError,
     ObservedContainer, infra_action, member_action,
