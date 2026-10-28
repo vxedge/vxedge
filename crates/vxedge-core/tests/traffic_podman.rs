@@ -19,18 +19,24 @@
 //!
 //! **Do not run under `sudo`** — same reason as `fiveg_podman.rs`: it would
 //! switch `podman` to root's own separate rootless identity, which never
-//! built these images. Cache a sudo credential first so `Shell`'s internal
-//! escalated calls (bridge/vlan/route) don't block on a prompt.
+//! built these images. Privilege comes in two pieces instead, the same two
+//! `vxedged` needs (`docs/TESTBED-SETUP.md`): `CAP_NET_ADMIN` on the test
+//! binary itself, for the gateway's in-process netlink calls, and a cached
+//! sudo credential for the shell-outs `Shell` escalates (`tc`) and fiveg's
+//! `sudo ip`/`sudo nsenter`. Podman is reached over the user's API socket
+//! (`systemctl --user enable --now podman.socket`).
 //!
 //! Run with:
 //!   cd vxedge/containers/fiveg
 //!   podman build -t vx5g-core -f Containerfile.open5gs .
 //!   ./build-vx5g-ran.sh
 //!   cd ../../../vxagents && cargo build --release -p vxprobe -p vxtraffic
-//!   cd ../vxedge && sudo -v && \
-//!     VXPROBE_BIN=../vxagents/target/release/vxprobe \
-//!     VXTRAFFIC_BIN=../vxagents/target/release/vxtraffic \
-//!     cargo test -p vxedge-core --test traffic_podman -- --ignored --nocapture
+//!   cd ../vxedge && sudo -v
+//!   BIN=$(cargo test -p vxedge-core --test traffic_podman --no-run --message-format=json \
+//!     | jq -r 'select(.target.name=="traffic_podman" and .executable) | .executable')
+//!   sudo setcap cap_net_admin+ep "$BIN"   # again after every rebuild
+//!   VXPROBE_BIN=../vxagents/target/release/vxprobe \
+//!     VXTRAFFIC_BIN=../vxagents/target/release/vxtraffic "$BIN" --ignored --nocapture
 
 use vxedge_core::containers::{ContainerClient, LazyClient};
 use vxedge_core::fiveg::{self, FiveGLifecycleConfig, FiveGPlan};
@@ -131,7 +137,11 @@ async fn traffic_service_runs_vlan_and_snssai_profiles_simultaneously_through_th
     let traffic_plan = TrafficPlan::from_model(&model, &gateway_plan).expect("traffic plan");
     assert_eq!(traffic_plan.profiles.len(), 3);
 
-    let sh = Shell::default();
+    // Escalating, as vxedged's own Shell is: `tc` is still a shell-out.
+    let sh = Shell {
+        escalate: true,
+        ..Shell::default()
+    };
     let fiveg_cfg = FiveGLifecycleConfig::default();
     let runtime_dir = tempfile::tempdir().expect("tempdir");
 
@@ -234,7 +244,30 @@ async fn traffic_service_runs_vlan_and_snssai_profiles_simultaneously_through_th
     // not just "the process started", the actual proof this scenario
     // exists for: real packets round-tripped with 0% loss through the real
     // bridge, for both slice modes, at the same time.
-    tokio::time::sleep(std::time::Duration::from_secs(12)).await;
+    // Each sender writes its JSON summary only when it exits, and `vxtraffic` exits after
+    // sending pps x duration packets, not at a deadline: on a host that cannot sustain the
+    // load profile's ~195k pps (64-byte payloads at 100 Mbit/s) it runs past 12 s. So wait,
+    // bounded, until every log has content, instead of sleeping a fixed 12 s.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let all_written = traffic_plan.profiles.iter().all(|profile| {
+            let role = if profile.pps.is_some() {
+                "send"
+            } else {
+                "load"
+            };
+            std::fs::metadata(
+                runtime_dir
+                    .path()
+                    .join(format!("traffic-{}-{role}.log", profile.id)),
+            )
+            .is_ok_and(|m| m.len() > 0)
+        });
+        if all_written || std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
     for profile in &traffic_plan.profiles {
         let role = if profile.pps.is_some() {
             "send"
