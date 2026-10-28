@@ -93,12 +93,16 @@ async fn group_up_is_idempotent_shares_a_netns_and_tears_down_cleanly() {
     let second = c.run_to_completion(&g, &h, &netns).await.unwrap();
     assert!(first.trim().starts_with("net:["), "{first:?}");
     assert_eq!(first, second, "both one-shots joined one namespace");
-    if let Ok(infra) = std::fs::read_link(format!("/proc/{}/ns/net", h.infra_pid)) {
-        assert_eq!(
+    // On the user socket the daemon is this kernel's, so the check is required, not skipped.
+    let same_kernel = std::env::var_os("VXEDGE_PODMAN_SOCKET").is_none();
+    match std::fs::read_link(format!("/proc/{}/ns/net", h.infra_pid)) {
+        Ok(infra) => assert_eq!(
             first.trim(),
             infra.display().to_string(),
             "and it is the infra container's"
-        );
+        ),
+        Err(e) if same_kernel => panic!("cannot read infra PID {}'s netns: {e}", h.infra_pid),
+        Err(_) => eprintln!("infra PID is not on this kernel; netns identity not checked"),
     }
 
     // A failing one-shot is an error carrying its output, and leaves nothing behind.

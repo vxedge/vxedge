@@ -17,7 +17,8 @@
 //! one as root rather than silently pick root's store.
 //!
 //! What a group shares: the infra container's **network** namespace only
-//! (`NetworkMode: container:<id>`). A `podman pod` also shares IPC and UTS by default; nothing
+//! (`NetworkMode: container:<id>`), which starts out as a pod's does ([`spec::INFRA_NETWORK_MODE`],
+//! `pasta`). A `podman pod` also shares IPC and UTS by default; nothing
 //! this project runs in a pod relies on either (Open5GS NFs talk over loopback SBI), and V2's
 //! live run is where that is confirmed rather than assumed.
 

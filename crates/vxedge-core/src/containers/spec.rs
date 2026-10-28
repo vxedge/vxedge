@@ -24,6 +24,25 @@ pub const LABEL_SPEC: &str = "io.vxedge.spec-sha256";
 /// Member suffix reserved for the infra container.
 pub const INFRA_MEMBER: &str = "infra";
 
+/// Network mode of a group's infra container: `pasta`, which is what `podman pod create` gives a
+/// rootless pod's infra container, so a group's namespace starts out like the pod it replaces
+/// (loopback plus pasta's host-facing interface, whose default route the UE-netns `0.0.0.0` bug
+/// in `open5gs-ueransim-patterns` is about). Left unset, the Docker-compatible API defaults to
+/// `bridge` instead: a different namespace layout, joined to a rootless netns whose shared pasta
+/// process Podman must signal on teardown, which Ubuntu's AppArmor `pasta` profile refuses when
+/// the request comes through the API service (found live 2026-10-28: every `group_down` failed
+/// with "rootless netns: kill network process: permission denied").
+pub const INFRA_NETWORK_MODE: &str = "pasta";
+
+/// The `NetworkMode` a group container is created with: [`INFRA_NETWORK_MODE`] for the infra
+/// container (`netns_owner` is `None`), `container:<infra id>` for a member.
+pub fn network_mode(netns_owner: Option<&str>) -> String {
+    match netns_owner {
+        Some(id) => format!("container:{id}"),
+        None => INFRA_NETWORK_MODE.to_string(),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("invalid container name `{name}`: {reason}")]
 pub struct NameError {
@@ -179,16 +198,20 @@ pub fn member_name(group: &str, member: &str) -> String {
     format!("{group}-{member}")
 }
 
-/// Stable hash of everything a container was created from. Two specs that would create
-/// different containers hash differently; the same spec hashes the same on every run.
+/// Stable hash of everything a container was created from, its [`network_mode`] included. Two
+/// specs that would create different containers hash differently; the same spec hashes the same
+/// on every run.
 pub fn spec_hash(spec: &ContainerSpec, netns_owner: Option<&str>) -> String {
     #[derive(serde::Serialize)]
     struct Hashed<'a> {
         spec: &'a ContainerSpec,
-        netns_owner: Option<&'a str>,
+        network_mode: String,
     }
-    let bytes = serde_json::to_vec(&Hashed { spec, netns_owner })
-        .expect("invariant: ContainerSpec is plain strings, maps and bools, always serializable");
+    let bytes = serde_json::to_vec(&Hashed {
+        spec,
+        network_mode: network_mode(netns_owner),
+    })
+    .expect("invariant: ContainerSpec is plain strings, maps and bools, always serializable");
     let digest = Sha256::digest(&bytes);
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -419,6 +442,12 @@ mod tests {
             ..nrf()
         };
         assert_ne!(base, spec_hash(&with_env, Some("infra-1")));
+    }
+
+    #[test]
+    fn infra_gets_the_pod_network_mode_and_members_join_it() {
+        assert_eq!(network_mode(None), "pasta");
+        assert_eq!(network_mode(Some("abc")), "container:abc");
     }
 
     #[test]
