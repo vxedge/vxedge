@@ -763,18 +763,28 @@ pub async fn bridge_up(
     bridge: &str,
     cn_pid: u32,
 ) -> Result<(), FiveGLifecycleError> {
+    // Converges rather than creates, so a second `experiment up` over a
+    // running core is a no-op (it failed with `File exists` before):
+    // `fiveg_up` keeps an existing CN pod, and with it this veth pair,
+    // whose two ends live and die together.
     let (host_side, pod_side) = bridge_veth_names(&cfg.pod_name);
-    host_ip(&[
-        "link", "add", &host_side, "type", "veth", "peer", "name", &pod_side,
-    ])
-    .await?;
-    host_ip(&["link", "set", &pod_side, "netns", &cn_pid.to_string()]).await?;
+    if !host_link_exists(&host_side).await? {
+        host_ip(&[
+            "link", "add", &host_side, "type", "veth", "peer", "name", &pod_side,
+        ])
+        .await?;
+    }
+    // Still in the host namespace only if an earlier run stopped between
+    // creating the pair and moving this end.
+    if host_link_exists(&pod_side).await? {
+        host_ip(&["link", "set", &pod_side, "netns", &cn_pid.to_string()]).await?;
+    }
 
     host_ip(&["link", "set", &host_side, "master", bridge]).await?;
     host_ip(&["link", "set", &host_side, "up"]).await?;
 
     let cn_addr = format!("{BRIDGE_ATTACH_CN_ADDR}/24");
-    nsenter_ip(cn_pid, &["addr", "add", &cn_addr, "dev", &pod_side]).await?;
+    tolerate_exists(nsenter_ip(cn_pid, &["addr", "add", &cn_addr, "dev", &pod_side]).await)?;
     nsenter_ip(cn_pid, &["link", "set", &pod_side, "up"]).await?;
 
     // The CN pod's netns now has two interfaces a packet might need to
@@ -783,6 +793,34 @@ pub async fn bridge_up(
     // explicitly, same as any Linux router.
     nsenter_run(cn_pid, "sysctl", &["-w", "net.ipv4.ip_forward=1"]).await?;
     Ok(())
+}
+
+/// Whether `name` exists in the host's own network namespace. Reading
+/// links needs no privilege, so this runs `ip` directly, not through sudo.
+async fn host_link_exists(name: &str) -> Result<bool, FiveGLifecycleError> {
+    Command::new("ip")
+        .args(["link", "show", "dev", name])
+        .output()
+        .await
+        .map(|out| out.status.success())
+        .map_err(|source| FiveGLifecycleError::Spawn {
+            program: "ip".to_string(),
+            source,
+        })
+}
+
+/// An `ip addr add` that found the address already assigned has converged.
+/// Older iproute2 says "File exists", 6.19 "Address already assigned";
+/// `gateway::netops::Shell::run_tolerate_exists` matches the same two.
+fn tolerate_exists(result: Result<String, FiveGLifecycleError>) -> Result<(), FiveGLifecycleError> {
+    match result {
+        Err(FiveGLifecycleError::Command { stderr, .. })
+            if stderr.contains("File exists") || stderr.contains("already assigned") =>
+        {
+            Ok(())
+        }
+        other => other.map(|_| ()),
+    }
 }
 
 /// Remove the bridge attachment. Idempotent: deleting the host-side veth
@@ -1262,6 +1300,29 @@ devices: {}
         let (host, pod) = bridge_veth_names("a-very-long-custom-pod-name");
         assert!(host.len() <= 15, "{host} exceeds IFNAMSIZ");
         assert!(pod.len() <= 15, "{pod} exceeds IFNAMSIZ");
+    }
+
+    #[test]
+    fn an_address_already_assigned_counts_as_converged() {
+        let exists = || FiveGLifecycleError::Command {
+            cmdline: "sudo nsenter -t 1 -n -- ip addr add 10.98.0.1/24 dev vx5g-brp0".into(),
+            stderr: "RTNETLINK answers: File exists".into(),
+        };
+        assert!(tolerate_exists(Err(exists())).is_ok());
+        let assigned = FiveGLifecycleError::Command {
+            cmdline: "sudo nsenter -t 1 -n -- ip addr add 10.98.0.1/24 dev vx5g-brp0".into(),
+            stderr: "Error: ipv4: Address already assigned.".into(),
+        };
+        assert!(
+            tolerate_exists(Err(assigned)).is_ok(),
+            "iproute2 6.19 wording"
+        );
+        assert!(tolerate_exists(Ok(String::new())).is_ok());
+        let other = FiveGLifecycleError::Command {
+            cmdline: "ip".into(),
+            stderr: "Cannot find device \"vx5g-brp0\"".into(),
+        };
+        assert!(tolerate_exists(Err(other)).is_err());
     }
 
     #[test]
