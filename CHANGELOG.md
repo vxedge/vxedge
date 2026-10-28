@@ -24,6 +24,7 @@ All notable changes to this repo are documented here. Format follows
   Container names (`vx5g-nrf`, `vx5g-ran-gnb`, ...) are unchanged.
 - `fiveg` and `traffic::profile_up` are `async`; `vxedged` awaits them on its runtime instead of
   wrapping them in `spawn_blocking`.
+- `deny.toml`: removed the `RUSTSEC-2024-0436` (`paste`) ignore; the crate is no longer in the dependency tree.
 
 ### Fixed
 
@@ -31,6 +32,10 @@ All notable changes to this repo are documented here. Format follows
   attachment veth; it is now a no-op.
 - `containers` groups get the `pasta` network namespace `podman pod create` gives a pod. Left
   to the API default (`bridge`), teardown failed on Ubuntu's AppArmor `pasta` profile.
+
+### Security
+
+- Lockfile update `pulldown-cmark` 0.13.4 -> 0.13.5, which fixes RUSTSEC-2026-0414 (exponential event growth with `ENABLE_WIKILINKS`). It is a build-time dependency via `prost-build`.
 
 ### Migration
 

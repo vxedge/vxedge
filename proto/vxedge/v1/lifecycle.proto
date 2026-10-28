@@ -198,7 +198,8 @@ service ComputeService {
 // ---------------------------------------------------------------------------
 
 message SvcUpRequest {
-  // "ota" | "telemetry" (§8: only these two types for now).
+  // "ota" | "telemetry" (§8: only these two types for now). Up, Down and Status
+  // answer any other value, or none, with INVALID_ARGUMENT naming the accepted ones.
   string service_type = 1;
   ManifestRef experiment = 2;
 }

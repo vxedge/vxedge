@@ -8,15 +8,6 @@ all-features = true
 version = 2
 yanked = "deny"
 ignore = [
-    # paste (proc-macro) is unmaintained upstream (archived by its author) — pulled in
-    # transitively by netlink-packet-core 0.8.1, itself required by rtnetlink 0.21.0 (the
-    # rtnetlink port, docs/ROADMAP.md, delivered 2026-08-04). Both are already the latest
-    # published versions (confirmed via `cargo search`/`cargo tree -i paste` before adding
-    # this exception, 2026-08-04) — no upgrade removes the dependency, and the advisory
-    # itself states no safe replacement exists for `paste`. It compiles away entirely (a
-    # proc-macro with no runtime presence), so this is a maintenance-signal risk, not a
-    # supply-chain/security one. Re-check when rtnetlink/netlink-packet-core next release.
-    "RUSTSEC-2024-0436",
     # unsafe-libyaml is unmaintained upstream (repository archived 2024-03-25, last release
     # 0.2.11) — an informational "unmaintained" advisory, not a vulnerability. It is reached
     # only through serde_yaml_ng 0.10.0 (`cargo tree -i unsafe-libyaml`), which is the latest
