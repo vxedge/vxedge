@@ -18,9 +18,11 @@
 //!
 //! What a group shares: the infra container's **network** namespace only
 //! (`NetworkMode: container:<id>`), which starts out as a pod's does ([`spec::INFRA_NETWORK_MODE`],
-//! `pasta`). A `podman pod` also shares IPC and UTS by default; nothing
-//! this project runs in a pod relies on either (Open5GS NFs talk over loopback SBI), and V2's
-//! live run is where that is confirmed rather than assumed.
+//! `pasta`). A `podman pod` also shares IPC and UTS by default; nothing this project runs in a
+//! pod relies on either: Open5GS NFs talk over loopback SBI and no rendered config names a host.
+//! Confirmed live 2026-10-28 (V2, Ubuntu 26.04, Podman 5.7.0): `fiveg_podman` and
+//! `traffic_podman` pass unchanged on groups (NG Setup, PDU sessions on both slices, `vxprobe`
+//! round trips at 0% loss through the s-nssai path).
 
 pub mod client;
 pub mod spec;

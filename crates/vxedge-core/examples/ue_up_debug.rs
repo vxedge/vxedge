@@ -10,13 +10,15 @@
 //! Usage: cargo run -p vxedge-core --example ue_up_debug -- <manifest.yaml> <runtime-dir> <pod-name>
 
 use std::{env, fs, path::Path, process::ExitCode};
+use vxedge_core::containers::ContainerClient;
 use vxedge_core::fiveg::{
     FiveGLifecycleConfig, FiveGPlan, fiveg_up, pod_pid, ue_pod_name, ue_probe_up, ue_up,
 };
 
 const PROBE_PORT: u16 = 9800;
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     let (manifest_path, runtime_dir, pod_name) = match args.as_slice() {
         [_, m, r, p] => (m, r, p),
@@ -32,10 +34,18 @@ fn main() -> ExitCode {
         ran_pod_name: format!("{pod_name}-ran"),
         core_image: "vx5g-core".to_string(),
         ran_image: "vx5g-ran".to_string(),
+        ..FiveGLifecycleConfig::default()
+    };
+    let client = match ContainerClient::connect_user().await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
     };
     let runtime_path = std::path::Path::new(runtime_dir);
 
-    match fiveg_up(&plan, runtime_path, &cfg) {
+    match fiveg_up(&client, &plan, runtime_path, &cfg).await {
         Ok(msg) => println!("{msg}"),
         Err(e) => {
             eprintln!("fiveg_up error: {e}");
@@ -43,7 +53,7 @@ fn main() -> ExitCode {
         }
     }
 
-    let ran_pid = match pod_pid(&cfg.ran_pod_name) {
+    let ran_pid = match pod_pid(&client, &cfg.ran_pod_name).await {
         Ok(pid) => pid,
         Err(e) => {
             eprintln!("pod_pid error: {e}");
@@ -53,7 +63,7 @@ fn main() -> ExitCode {
     let cfg_dir = runtime_path.join("fiveg-config");
 
     for (i, session) in plan.sessions.iter().enumerate() {
-        match ue_up(&cfg, &cfg_dir, ran_pid, i, session) {
+        match ue_up(&client, &cfg, &cfg_dir, ran_pid, i, session).await {
             Ok(msg) => println!("{msg}"),
             Err(e) => {
                 eprintln!("ue_up error for `{}`: {e}", session.slice_id);
@@ -65,7 +75,7 @@ fn main() -> ExitCode {
             "  inspect: podman exec {container} ip rule show; podman exec {container} ip route show table 1000"
         );
 
-        match ue_probe_up(&cfg, &cfg_dir, session, PROBE_PORT) {
+        match ue_probe_up(&client, &cfg, &cfg_dir, session, PROBE_PORT).await {
             Ok(msg) => println!("  {msg}"),
             Err(e) => {
                 eprintln!("ue_probe_up error for `{}`: {e}", session.slice_id);

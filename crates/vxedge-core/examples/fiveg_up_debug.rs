@@ -6,9 +6,11 @@
 //! Usage: cargo run -p vxedge-core --example fiveg_up_debug -- <manifest.yaml> <runtime-dir> <pod-name>
 
 use std::{env, fs, path::Path, process::ExitCode};
+use vxedge_core::containers::ContainerClient;
 use vxedge_core::fiveg::{FiveGLifecycleConfig, FiveGPlan, fiveg_up};
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     let (manifest_path, runtime_dir, pod_name) = match args.as_slice() {
         [_, m, r, p] => (m, r, p),
@@ -24,8 +26,16 @@ fn main() -> ExitCode {
         ran_pod_name: format!("{pod_name}-ran"),
         core_image: "vx5g-core".to_string(),
         ran_image: "vx5g-ran".to_string(),
+        ..FiveGLifecycleConfig::default()
     };
-    match fiveg_up(&plan, std::path::Path::new(runtime_dir), &cfg) {
+    let client = match ContainerClient::connect_user().await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match fiveg_up(&client, &plan, std::path::Path::new(runtime_dir), &cfg).await {
         Ok(msg) => {
             println!("{msg}");
             println!("config dir: {runtime_dir}/fiveg-config");

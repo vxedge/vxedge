@@ -32,6 +32,7 @@
 //!     VXTRAFFIC_BIN=../vxagents/target/release/vxtraffic \
 //!     cargo test -p vxedge-core --test traffic_podman -- --ignored --nocapture
 
+use vxedge_core::containers::{ContainerClient, LazyClient};
 use vxedge_core::fiveg::{self, FiveGLifecycleConfig, FiveGPlan};
 use vxedge_core::gateway::{self, GatewayPlan, Shell};
 use vxedge_core::traffic::{TrafficPlan, profile_down, profile_up};
@@ -85,6 +86,7 @@ fn vxtraffic_bin() -> String {
 /// (UE pods -> 5G core/uplink attachment -> bridge/endpoints), even if an
 /// assertion panics mid-test.
 struct Guard {
+    client: ContainerClient,
     sh: Shell,
     gateway_plan: GatewayPlan,
     fiveg_cfg: FiveGLifecycleConfig,
@@ -92,24 +94,37 @@ struct Guard {
     profile_ids: Vec<String>,
     runtime_dir: std::path::PathBuf,
 }
+/// `Drop` cannot await, so it blocks this (multi-threaded) runtime's worker
+/// for the teardown.
 impl Drop for Guard {
     fn drop(&mut self) {
-        for id in &self.profile_ids {
-            profile_down(&self.runtime_dir, id);
-        }
-        for session in &self.five_g_plan.sessions {
-            let _ = fiveg::ue_down(&self.fiveg_cfg, session);
-        }
-        let _ = fiveg::bridge_down(&self.fiveg_cfg);
-        let _ = gateway::provision::teardown_fiveg_uplink(&self.sh, &self.gateway_plan.bridge);
-        let _ = fiveg::fiveg_down(&self.fiveg_cfg);
-        let _ = gateway::teardown(&self.sh, &self.gateway_plan);
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                for id in &self.profile_ids {
+                    profile_down(&self.runtime_dir, id);
+                }
+                for session in &self.five_g_plan.sessions {
+                    let _ = fiveg::ue_down(&self.client, &self.fiveg_cfg, session).await;
+                }
+                let _ = fiveg::bridge_down(&self.fiveg_cfg).await;
+                let _ =
+                    gateway::provision::teardown_fiveg_uplink(&self.sh, &self.gateway_plan.bridge);
+                let _ = fiveg::fiveg_down(&self.client, &self.fiveg_cfg).await;
+                let _ = gateway::teardown(&self.sh, &self.gateway_plan);
+            })
+        });
     }
 }
 
-#[test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs root + podman + vx5g-core/vx5g-ran images + built vxprobe/vxtraffic (see module docs)"]
-fn traffic_service_runs_vlan_and_snssai_profiles_simultaneously_through_the_real_bridge() {
+async fn traffic_service_runs_vlan_and_snssai_profiles_simultaneously_through_the_real_bridge() {
+    let containers = LazyClient::user();
+    let client = containers
+        .get()
+        .await
+        .expect("the rootless Podman API socket (see module docs)")
+        .clone();
     let model = vxedge_core::model::load_yaml(WORKSPACE).expect("workspace loads");
     let gateway_plan = GatewayPlan::from_model(&model).expect("gateway plan");
     let five_g_plan = FiveGPlan::from_model(&model).expect("fiveg plan");
@@ -121,6 +136,7 @@ fn traffic_service_runs_vlan_and_snssai_profiles_simultaneously_through_the_real
     let runtime_dir = tempfile::tempdir().expect("tempdir");
 
     let mut guard = Guard {
+        client: client.clone(),
         sh: sh.clone(),
         gateway_plan: gateway_plan.clone(),
         fiveg_cfg: fiveg_cfg.clone(),
@@ -139,9 +155,15 @@ fn traffic_service_runs_vlan_and_snssai_profiles_simultaneously_through_the_real
     // 2. 5G core up, attached to the real bridge — the exact sequence that
     // needed two extra real fixes (bridge `self` VLAN membership, UE
     // subnet routes) to actually work end to end.
-    fiveg::fiveg_up(&five_g_plan, runtime_dir.path(), &fiveg_cfg).expect("fiveg_up");
-    let cn_pid = fiveg::pod_pid(&fiveg_cfg.pod_name).expect("cn pod pid");
-    fiveg::bridge_up(&fiveg_cfg, &gateway_plan.bridge, cn_pid).expect("bridge_up");
+    fiveg::fiveg_up(&client, &five_g_plan, runtime_dir.path(), &fiveg_cfg)
+        .await
+        .expect("fiveg_up");
+    let cn_pid = fiveg::pod_pid(&client, &fiveg_cfg.pod_name)
+        .await
+        .expect("cn pod pid");
+    fiveg::bridge_up(&fiveg_cfg, &gateway_plan.bridge, cn_pid)
+        .await
+        .expect("bridge_up");
     let host_veth = fiveg::bridge_host_veth(&fiveg_cfg.pod_name);
     let host_iface =
         gateway::provision::apply_fiveg_uplink(&sh, &host_veth).expect("apply_fiveg_uplink");
@@ -153,10 +175,14 @@ fn traffic_service_runs_vlan_and_snssai_profiles_simultaneously_through_the_real
     gateway::provision::apply_fiveg_ue_routes(&sh, &host_iface, &ue_subnets)
         .expect("apply_fiveg_ue_routes");
 
-    let ran_pid = fiveg::pod_pid(&fiveg_cfg.ran_pod_name).expect("ran pod pid");
+    let ran_pid = fiveg::pod_pid(&client, &fiveg_cfg.ran_pod_name)
+        .await
+        .expect("ran pod pid");
     let cfg_dir = runtime_dir.path().join("fiveg-config");
     for (i, session) in five_g_plan.sessions.iter().enumerate() {
-        fiveg::ue_up(&fiveg_cfg, &cfg_dir, ran_pid, i, session).expect("ue_up");
+        fiveg::ue_up(&client, &fiveg_cfg, &cfg_dir, ran_pid, i, session)
+            .await
+            .expect("ue_up");
     }
 
     // 3. traffic up — all three profiles simultaneously, through the real
@@ -166,6 +192,7 @@ fn traffic_service_runs_vlan_and_snssai_profiles_simultaneously_through_the_real
     let vxtraffic = vxtraffic_bin();
     for profile in &traffic_plan.profiles {
         let msg = profile_up(
+            &containers,
             &sh,
             &fiveg_cfg,
             Some(&five_g_plan),
@@ -176,6 +203,7 @@ fn traffic_service_runs_vlan_and_snssai_profiles_simultaneously_through_the_real
             PROBE_PORT,
             12,
         )
+        .await
         .unwrap_or_else(|e| panic!("profile_up(`{}`) failed: {e}", profile.id));
         assert!(msg.contains("up"), "{msg}");
         guard.profile_ids.push(profile.id.clone());
@@ -185,6 +213,7 @@ fn traffic_service_runs_vlan_and_snssai_profiles_simultaneously_through_the_real
     // duplicate process.
     for profile in &traffic_plan.profiles {
         let msg = profile_up(
+            &containers,
             &sh,
             &fiveg_cfg,
             Some(&five_g_plan),
@@ -195,6 +224,7 @@ fn traffic_service_runs_vlan_and_snssai_profiles_simultaneously_through_the_real
             PROBE_PORT,
             12,
         )
+        .await
         .expect("profile_up idempotent");
         assert!(msg.contains("already up"), "{msg}");
     }
@@ -204,7 +234,7 @@ fn traffic_service_runs_vlan_and_snssai_profiles_simultaneously_through_the_real
     // not just "the process started", the actual proof this scenario
     // exists for: real packets round-tripped with 0% loss through the real
     // bridge, for both slice modes, at the same time.
-    std::thread::sleep(std::time::Duration::from_secs(12));
+    tokio::time::sleep(std::time::Duration::from_secs(12)).await;
     for profile in &traffic_plan.profiles {
         let role = if profile.pps.is_some() {
             "send"
