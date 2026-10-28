@@ -6,6 +6,14 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Security
+
+- Lockfile update `pulldown-cmark` 0.13.4 -> 0.13.5, which fixes RUSTSEC-2026-0414 (exponential event growth with `ENABLE_WIKILINKS`). It is a build-time dependency via `prost-build`.
+
+### Changed
+
+- `deny.toml`: removed the `RUSTSEC-2024-0436` (`paste`) ignore; the crate is no longer in the dependency tree.
+
 ## [0.2.0] - 2026-10-21
 
 ### Added
