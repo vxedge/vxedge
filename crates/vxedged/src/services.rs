@@ -1382,6 +1382,20 @@ impl ComputeService for ComputeSvc {
 // SvcService (ota, telemetry — §8)
 // ---------------------------------------------------------------------------
 
+/// `service_type` off the wire, parsed once at the RPC boundary against
+/// [`ServiceType::ALL`](vxedge_core::services::ServiceType::ALL). An unknown value is rejected
+/// rather than passed through: liveness is keyed on a pidfile named after the type, so an
+/// unparsed `bogus` would read as a stopped service instead of a nonexistent one.
+fn parse_service_type(raw: &str) -> Result<vxedge_core::services::ServiceType, Status> {
+    if raw.is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "service_type is required ({})",
+            vxedge_core::services::ServiceType::expected()
+        )));
+    }
+    raw.parse().map_err(Status::invalid_argument)
+}
+
 pub struct SvcSvc {
     pub engine: JobEngine,
     pub audit: Arc<Audit>,
@@ -1398,11 +1412,9 @@ impl SvcSvc {
         service_type: &str,
         experiment: Option<&ManifestRef>,
     ) -> Result<(vxedge_core::services::ServiceDef, String, PathBuf), Status> {
-        if service_type.is_empty() {
-            return Err(Status::invalid_argument(
-                "service_type is required (\"ota\" or \"telemetry\")",
-            ));
-        }
+        // Before the manifest: a typo'd type is the caller's mistake whatever the experiment
+        // declares, and saying so beats "no `bogus` service declared" or "a manifest is required".
+        let service_type = parse_service_type(service_type)?.as_str();
         let (yaml, sha256, dir) = resolve_manifest(experiment).await?;
         let model = parse_to_model(&yaml)
             .map_err(|e| Status::invalid_argument(format!("workspace invalid: {e}")))?;
@@ -1456,11 +1468,7 @@ impl SvcService for SvcSvc {
 
     async fn down(&self, req: Request<SvcDownRequest>) -> Result<Response<Job>, Status> {
         let req = req.into_inner();
-        if req.service_type.is_empty() {
-            return Err(Status::invalid_argument(
-                "service_type is required (\"ota\" or \"telemetry\")",
-            ));
-        }
+        parse_service_type(&req.service_type)?;
         self.audit.record(
             "SvcService.Down",
             serde_json::json!({ "service_type": req.service_type }),
@@ -1494,12 +1502,9 @@ impl SvcService for SvcSvc {
         &self,
         req: Request<SvcStatusRequest>,
     ) -> Result<Response<ResourceStatus>, Status> {
-        let service_type = req.into_inner().service_type;
-        if service_type.is_empty() {
-            return Err(Status::invalid_argument(
-                "service_type is required (\"ota\" or \"telemetry\")",
-            ));
-        }
+        let service_type = parse_service_type(&req.into_inner().service_type)?
+            .as_str()
+            .to_string();
         let runtime_dir = self.runtime_dir.clone();
         let st_for_task = service_type.clone();
         let state = tokio::task::spawn_blocking(move || {
@@ -2076,5 +2081,87 @@ impl NosCheckService for NosCheckSvc {
             })
             .await;
         Ok(Response::new(job))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `SvcSvc` whose runtime dir does not exist: every case here must be decided from the
+    /// request alone, before anything touches the filesystem (the audit log degrades to
+    /// tracing-only on its own).
+    fn svc() -> SvcSvc {
+        let runtime_dir = PathBuf::from("/nonexistent/vxedged-svc-test");
+        SvcSvc {
+            engine: JobEngine::new(EventBus::new()),
+            audit: Arc::new(Audit::new(&runtime_dir)),
+            runtime_dir,
+            bins: vxedge_core::services::ServiceBinaries {
+                vxota: "vxota".into(),
+                vxtelemetry: "vxtelemetry".into(),
+            },
+        }
+    }
+
+    /// An unknown type is a caller mistake, not a stopped service: the error says so and lists
+    /// what would have been accepted.
+    fn assert_rejects_unknown(status: Status) {
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+        let msg = status.message();
+        for needle in ["bogus", "\"ota\"", "\"telemetry\""] {
+            assert!(msg.contains(needle), "`{msg}` should mention {needle}");
+        }
+    }
+
+    #[tokio::test]
+    async fn status_rejects_an_unknown_service_type() {
+        let req = Request::new(SvcStatusRequest {
+            service_type: "bogus".into(),
+            ..Default::default()
+        });
+        assert_rejects_unknown(svc().status(req).await.unwrap_err());
+    }
+
+    #[tokio::test]
+    async fn up_rejects_an_unknown_service_type() {
+        let req = Request::new(SvcUpRequest {
+            service_type: "bogus".into(),
+            ..Default::default()
+        });
+        assert_rejects_unknown(svc().up(req).await.unwrap_err());
+    }
+
+    #[tokio::test]
+    async fn down_rejects_an_unknown_service_type() {
+        let req = Request::new(SvcDownRequest {
+            service_type: "bogus".into(),
+            ..Default::default()
+        });
+        assert_rejects_unknown(svc().down(req).await.unwrap_err());
+    }
+
+    #[tokio::test]
+    async fn an_empty_service_type_is_still_required() {
+        let status = svc()
+            .status(Request::new(SvcStatusRequest::default()))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            status.message(),
+            "service_type is required (\"ota\" or \"telemetry\")"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_known_service_type_that_is_not_running_reports_down() {
+        let req = Request::new(SvcStatusRequest {
+            service_type: "ota".into(),
+            ..Default::default()
+        });
+        let status = svc().status(req).await.unwrap().into_inner();
+        assert_eq!(status.state, ResourceState::Down as i32);
+        assert_eq!(status.vxid, "svc-ota");
     }
 }

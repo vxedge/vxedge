@@ -39,11 +39,33 @@ pub enum ServiceType {
 }
 
 impl ServiceType {
+    /// Every service type: the one list `SvcService` checks a wire `service_type` against and
+    /// names in its errors. A new variant goes here too, or the daemon will refuse it.
+    pub const ALL: [ServiceType; 2] = [ServiceType::Ota, ServiceType::Telemetry];
+
     pub fn as_str(self) -> &'static str {
         match self {
             ServiceType::Ota => "ota",
             ServiceType::Telemetry => "telemetry",
         }
+    }
+
+    /// [`Self::ALL`] as an error-message phrase: `"ota" or "telemetry"`.
+    pub fn expected() -> String {
+        Self::ALL
+            .map(|t| format!("\"{}\"", t.as_str()))
+            .join(" or ")
+    }
+}
+
+impl std::str::FromStr for ServiceType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|t| t.as_str() == s)
+            .ok_or_else(|| format!("unknown service_type `{s}` (expected {})", Self::expected()))
     }
 }
 
@@ -518,6 +540,22 @@ mod tests {
             std::fs::read_dir(tmp.path()).unwrap().count(),
             0,
             "command wrote something"
+        );
+    }
+
+    /// The wire name the daemon parses must be the name the manifest's `type:` uses, or a
+    /// service declared in YAML could never be reached over `SvcService`.
+    #[test]
+    fn every_service_type_parses_from_its_manifest_name() {
+        for t in ServiceType::ALL {
+            let yaml = serde_yaml_ng::to_string(&t).unwrap();
+            assert_eq!(yaml.trim(), t.as_str());
+            assert_eq!(t.as_str().parse::<ServiceType>(), Ok(t));
+        }
+        let err = "bogus".parse::<ServiceType>().unwrap_err();
+        assert_eq!(
+            err,
+            "unknown service_type `bogus` (expected \"ota\" or \"telemetry\")"
         );
     }
 }
