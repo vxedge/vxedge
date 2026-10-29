@@ -33,6 +33,11 @@ pub enum ZonePlanError {
     )]
     AmbiguousBundle { device: String, count: usize },
     #[error(
+        "device `{device}` hosts {count} published container images, and a container node runs \
+         one payload. Deploy the others on their own devices, or publish them as a single image."
+    )]
+    AmbiguousImage { device: String, count: usize },
+    #[error(
         "device `{0}` declares no `backend`, so there is no way to know whether it attaches by \
          veth or by tap. Add `backend: container|qemu-microvm|libvirt`."
     )]
@@ -71,6 +76,11 @@ pub struct NodePlan {
     /// `bundle` path via `registry::fetch` before dispatching to a backend, so backends never
     /// see anything but an already-resolved local path.
     pub remote_bundle: Option<(String, String)>,
+    /// For the `container` backend: the digest-pinned OCI image (`<reference>@<digest>`) the
+    /// node runs as its payload, from a published container part. `None` keeps the node a bare
+    /// network namespace whose payload the experiment runner execs in by name — what every
+    /// `local/…:host-process` part means, so no existing workspace changes behaviour.
+    pub image: Option<String>,
     pub pinned_cpus: Vec<u32>,
 }
 
@@ -196,6 +206,35 @@ pub fn plan_nodes_from_model(
                     }
                     Backend::Container => (None, None),
                 };
+                // A container node runs an OCI payload only when a *published* container part is
+                // deployed on it. A `local/…` part names a host process (or an image only this
+                // host has), which the runner starts itself inside the named netns — the
+                // contract every shipped workspace relies on, so it stays the default.
+                let image = match backend {
+                    Backend::Container => {
+                        let published: Vec<&crate::model::Part> = entity
+                            .functions_on(&device.id)
+                            .filter_map(|f| f.part.as_ref())
+                            .filter(|part| {
+                                part.kind == crate::model::PartKind::Container && !part.local
+                            })
+                            .collect();
+                        if published.len() > 1 {
+                            return Err(ZonePlanError::AmbiguousImage {
+                                device: device.id.clone(),
+                                count: published.len(),
+                            });
+                        }
+                        published.first().map(|part| {
+                            let digest = part.digest.as_deref().expect(
+                                "workspace validation guarantees a digest for every published \
+                                 (non-local) part",
+                            );
+                            format!("{}@{digest}", part.reference)
+                        })
+                    }
+                    Backend::Libvirt | Backend::QemuMicrovm => None,
+                };
                 if bundle.is_none()
                     && remote_bundle.is_none()
                     && matches!(backend, Backend::Libvirt | Backend::QemuMicrovm)
@@ -216,6 +255,7 @@ pub fn plan_nodes_from_model(
                     ip_cidr: endpoint.ip_cidr.clone(),
                     bundle,
                     remote_bundle,
+                    image,
                     pinned_cpus: device.pinned_cpus.clone(),
                 });
             }
@@ -406,6 +446,57 @@ parts:
                     .to_string()
             ))
         );
+    }
+
+    /// The default every shipped workspace relies on: a `local/…` container part keeps the node
+    /// a bare named netns, so nothing about how the runner reaches it changes.
+    #[test]
+    fn a_host_process_part_plans_no_image() {
+        assert_eq!(plans(WS)[1].image, None);
+    }
+
+    #[test]
+    fn a_published_container_part_plans_a_digest_pinned_image() {
+        let ws = WS.replace(
+            "  - { ref: 'local/vxprobe:host-process', target_ids: fn-b }",
+            "  - { ref: ghcr.io/vxedge/parts/zone/linux/app/probe, kind: container, \
+                 digest: 'sha256:2222222222222222222222222222222222222222222222222222222222222222', \
+                 target_ids: fn-b }",
+        );
+        assert_eq!(
+            plans(&ws)[1].image.as_deref(),
+            Some(
+                "ghcr.io/vxedge/parts/zone/linux/app/probe@sha256:\
+                 2222222222222222222222222222222222222222222222222222222222222222"
+            )
+        );
+    }
+
+    /// One payload per node, like one bundle per VM: picking one of two would run half the arm.
+    #[test]
+    fn a_container_device_hosting_two_published_images_is_refused() {
+        let pinned = |name: &str, d: char| {
+            format!(
+                "  - {{ ref: ghcr.io/vxedge/parts/zone/linux/app/{name}, kind: container, \
+                 digest: 'sha256:{}', target_ids: fn-{name} }}",
+                d.to_string().repeat(64)
+            )
+        };
+        let ws = WS
+            .replace(
+                "  fn-b: { deployed_on: node-b }",
+                "  fn-b: { deployed_on: node-b }\n  fn-c: { deployed_on: node-b }",
+            )
+            .replace(
+                "  - { ref: 'local/vxprobe:host-process', target_ids: fn-b }",
+                &format!("{}\n{}", pinned("b", '3'), pinned("c", '4')),
+            );
+        let model = crate::model::load_yaml(&ws).expect("valid test workspace");
+        let gw = GatewayPlan::from_model(&model).unwrap();
+        assert!(matches!(
+            plan_nodes_from_model(&model, &gw, Path::new("/x")),
+            Err(ZonePlanError::AmbiguousImage { device, count: 2 }) if device == "node-b"
+        ));
     }
 
     #[test]

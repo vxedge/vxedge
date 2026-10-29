@@ -21,26 +21,48 @@ pub const LABEL_MEMBER: &str = "io.vxedge.member";
 /// container that matches the manifest from one left behind by an older spec.
 pub const LABEL_SPEC: &str = "io.vxedge.spec-sha256";
 
+/// The infra image both callers use (the 5G groups and the zone `container` backend): the
+/// Kubernetes pause image, pinned by its multi-arch index digest (resolved from `registry.k8s.io`
+/// 2026-10-28; amd64 manifest `sha256:e5b941ef…`). It does nothing but hold the namespace, runs as uid 65535, and exits on SIGTERM at once — an infra
+/// container running `sleep infinity` instead ignores SIGTERM as PID 1 and costs every
+/// teardown Podman's 10 s stop timeout.
+pub const PAUSE_IMAGE: &str =
+    "registry.k8s.io/pause@sha256:278fb9dbcca9518083ad1e11276933a2e96f23de604a3a08cc3c80002767d24c";
+
 /// Member suffix reserved for the infra container.
 pub const INFRA_MEMBER: &str = "infra";
 
-/// Network mode of a group's infra container: `pasta`, which is what `podman pod create` gives a
-/// rootless pod's infra container, so a group's namespace starts out like the pod it replaces
-/// (loopback plus pasta's host-facing interface, whose default route the UE-netns `0.0.0.0` bug
-/// in `open5gs-ueransim-patterns` is about). Left unset, the Docker-compatible API defaults to
-/// `bridge` instead: a different namespace layout, joined to a rootless netns whose shared pasta
-/// process Podman must signal on teardown, which Ubuntu's AppArmor `pasta` profile refuses when
-/// the request comes through the API service (found live 2026-10-28: every `group_down` failed
-/// with "rootless netns: kill network process: permission denied").
-pub const INFRA_NETWORK_MODE: &str = "pasta";
+/// Network mode of a group's infra container, which every member then shares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InfraNetwork {
+    /// `pasta`, which is what `podman pod create` gives a rootless pod's infra container, so a
+    /// group's namespace starts out like the pod it replaces (loopback plus pasta's host-facing
+    /// interface, whose default route the UE-netns `0.0.0.0` bug in `open5gs-ueransim-patterns`
+    /// is about). The 5G groups use it. Left unset, the Docker-compatible API defaults to
+    /// `bridge` instead: a different namespace layout, joined to a rootless netns whose shared
+    /// pasta process Podman must signal on teardown, which Ubuntu's AppArmor `pasta` profile
+    /// refuses when the request comes through the API service (found live 2026-10-28: every
+    /// `group_down` failed with "rootless netns: kill network process: permission denied").
+    #[default]
+    Pasta,
+    /// `none`: loopback only. A zone node's one interface is the gateway port vxedge moves in,
+    /// exactly as in a bare named netns, so the container arm of an H3 comparison has no second
+    /// path to the host that the VM arms lack.
+    None,
+}
 
-/// The `NetworkMode` a group container is created with: [`INFRA_NETWORK_MODE`] for the infra
-/// container (`netns_owner` is `None`), `container:<infra id>` for a member.
-pub fn network_mode(netns_owner: Option<&str>) -> String {
-    match netns_owner {
-        Some(id) => format!("container:{id}"),
-        None => INFRA_NETWORK_MODE.to_string(),
+impl InfraNetwork {
+    pub fn mode(self) -> &'static str {
+        match self {
+            InfraNetwork::Pasta => "pasta",
+            InfraNetwork::None => "none",
+        }
     }
+}
+
+/// The `NetworkMode` a member is created with: joined to the infra container's namespace.
+pub fn member_network_mode(infra_id: &str) -> String {
+    format!("container:{infra_id}")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -135,6 +157,7 @@ pub struct ContainerSpec {
 pub struct GroupSpec {
     name: String,
     infra: ContainerSpec,
+    infra_network: InfraNetwork,
 }
 
 impl GroupSpec {
@@ -149,7 +172,29 @@ impl GroupSpec {
                 ..infra
             },
             name,
+            infra_network: InfraNetwork::default(),
         })
+    }
+
+    /// The infra container's network mode ([`InfraNetwork::Pasta`] unless set here).
+    pub fn with_infra_network(self, infra_network: InfraNetwork) -> Self {
+        Self {
+            infra_network,
+            ..self
+        }
+    }
+
+    pub fn infra_network(&self) -> InfraNetwork {
+        self.infra_network
+    }
+
+    /// The `NetworkMode` a container of this group is created with: the infra network for the
+    /// infra container (`netns_owner` is `None`), [`member_network_mode`] for a member.
+    pub fn network_mode(&self, netns_owner: Option<&str>) -> String {
+        match netns_owner {
+            Some(id) => member_network_mode(id),
+            None => self.infra_network.mode().to_string(),
+        }
     }
 
     pub fn name(&self) -> &str {
@@ -189,7 +234,10 @@ impl GroupSpec {
         BTreeMap::from([
             (LABEL_GROUP.to_string(), self.name.clone()),
             (LABEL_MEMBER.to_string(), spec.name.clone()),
-            (LABEL_SPEC.to_string(), spec_hash(spec, netns_owner)),
+            (
+                LABEL_SPEC.to_string(),
+                spec_hash(spec, &self.network_mode(netns_owner)),
+            ),
         ])
     }
 }
@@ -198,20 +246,17 @@ pub fn member_name(group: &str, member: &str) -> String {
     format!("{group}-{member}")
 }
 
-/// Stable hash of everything a container was created from, its [`network_mode`] included. Two
-/// specs that would create different containers hash differently; the same spec hashes the same
-/// on every run.
-pub fn spec_hash(spec: &ContainerSpec, netns_owner: Option<&str>) -> String {
+/// Stable hash of everything a container was created from, its network mode
+/// ([`GroupSpec::network_mode`]) included. Two specs that would create different containers hash
+/// differently; the same spec hashes the same on every run.
+pub fn spec_hash(spec: &ContainerSpec, network_mode: &str) -> String {
     #[derive(serde::Serialize)]
     struct Hashed<'a> {
         spec: &'a ContainerSpec,
-        network_mode: String,
+        network_mode: &'a str,
     }
-    let bytes = serde_json::to_vec(&Hashed {
-        spec,
-        network_mode: network_mode(netns_owner),
-    })
-    .expect("invariant: ContainerSpec is plain strings, maps and bools, always serializable");
+    let bytes = serde_json::to_vec(&Hashed { spec, network_mode })
+        .expect("invariant: ContainerSpec is plain strings, maps and bools, always serializable");
     let digest = Sha256::digest(&bytes);
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -300,7 +345,8 @@ pub fn infra_action(group: &GroupSpec, observed: Option<&ObservedContainer>) -> 
     match observed {
         Some(c)
             if c.is_running()
-                && c.spec_hash.as_deref() == Some(spec_hash(group.infra(), None).as_str()) =>
+                && c.spec_hash.as_deref()
+                    == Some(spec_hash(group.infra(), &group.network_mode(None)).as_str()) =>
         {
             InfraAction::Keep
         }
@@ -327,7 +373,7 @@ pub fn member_action(
     let Some(c) = observed else {
         return MemberAction::Create;
     };
-    if c.spec_hash.as_deref() != Some(spec_hash(spec, Some(infra_id)).as_str()) {
+    if c.spec_hash.as_deref() != Some(spec_hash(spec, &member_network_mode(infra_id)).as_str()) {
         MemberAction::Recreate
     } else if c.is_running() {
         MemberAction::Keep
@@ -424,30 +470,75 @@ mod tests {
 
     #[test]
     fn spec_hash_is_stable_and_sensitive_to_every_input() {
-        let base = spec_hash(&nrf(), Some("infra-1"));
-        assert_eq!(base, spec_hash(&nrf(), Some("infra-1")), "deterministic");
+        let base = spec_hash(&nrf(), &member_network_mode("infra-1"));
+        assert_eq!(
+            base,
+            spec_hash(&nrf(), &member_network_mode("infra-1")),
+            "deterministic"
+        );
         assert_eq!(base.len(), 64);
         let other_image = ContainerSpec {
             image: "vx5g-core:next".into(),
             ..nrf()
         };
-        assert_ne!(base, spec_hash(&other_image, Some("infra-1")));
         assert_ne!(
             base,
-            spec_hash(&nrf(), Some("infra-2")),
+            spec_hash(&other_image, &member_network_mode("infra-1"))
+        );
+        assert_ne!(
+            base,
+            spec_hash(&nrf(), &member_network_mode("infra-2")),
             "netns owner counts"
         );
         let with_env = ContainerSpec {
             env: BTreeMap::from([("A".into(), "1".into())]),
             ..nrf()
         };
-        assert_ne!(base, spec_hash(&with_env, Some("infra-1")));
+        assert_ne!(base, spec_hash(&with_env, &member_network_mode("infra-1")));
     }
 
     #[test]
     fn infra_gets_the_pod_network_mode_and_members_join_it() {
-        assert_eq!(network_mode(None), "pasta");
-        assert_eq!(network_mode(Some("abc")), "container:abc");
+        assert_eq!(group().network_mode(None), "pasta");
+        assert_eq!(group().network_mode(Some("abc")), "container:abc");
+        let isolated = group().with_infra_network(InfraNetwork::None);
+        assert_eq!(isolated.network_mode(None), "none");
+        assert_eq!(isolated.network_mode(Some("abc")), "container:abc");
+    }
+
+    /// The infra network is part of what the infra container was created from, so switching it
+    /// rebuilds the group instead of keeping a namespace with the wrong interfaces in it. And
+    /// the 5G groups' hashes must not move: an upgrade that recreated every running core would
+    /// be an outage nobody asked for.
+    #[test]
+    fn switching_the_infra_network_rebuilds_and_pasta_hashes_are_unchanged() {
+        let pasta = group();
+        let isolated = group().with_infra_network(InfraNetwork::None);
+        let pasta_hash = spec_hash(pasta.infra(), &pasta.network_mode(None));
+        assert_eq!(
+            infra_action(
+                &isolated,
+                Some(&observed("infra", Some(pasta_hash.clone()), "running"))
+            ),
+            InfraAction::Rebuild
+        );
+        let before = {
+            #[derive(serde::Serialize)]
+            struct Hashed<'a> {
+                spec: &'a ContainerSpec,
+                network_mode: String,
+            }
+            let bytes = serde_json::to_vec(&Hashed {
+                spec: pasta.infra(),
+                network_mode: "pasta".to_string(),
+            })
+            .unwrap();
+            Sha256::digest(&bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        assert_eq!(pasta_hash, before, "same bytes as the V2 hash");
     }
 
     #[test]
@@ -455,13 +546,16 @@ mod tests {
         let l = group().labels(&nrf(), Some("infra-1"));
         assert_eq!(l[LABEL_GROUP], "vx5g");
         assert_eq!(l[LABEL_MEMBER], "nrf");
-        assert_eq!(l[LABEL_SPEC], spec_hash(&nrf(), Some("infra-1")));
+        assert_eq!(
+            l[LABEL_SPEC],
+            spec_hash(&nrf(), &member_network_mode("infra-1"))
+        );
     }
 
     #[test]
     fn infra_is_kept_only_when_running_from_the_same_spec() {
         let g = group();
-        let good = spec_hash(g.infra(), None);
+        let good = spec_hash(g.infra(), "pasta");
         assert_eq!(infra_action(&g, None), InfraAction::Rebuild);
         assert_eq!(
             infra_action(&g, Some(&observed("infra", Some(good.clone()), "running"))),
@@ -486,7 +580,7 @@ mod tests {
     #[test]
     fn member_actions_converge_on_the_second_up() {
         let spec = nrf();
-        let good = spec_hash(&spec, Some("infra-1"));
+        let good = spec_hash(&spec, &member_network_mode("infra-1"));
         assert_eq!(member_action(&spec, "infra-1", None), MemberAction::Create);
         assert_eq!(
             member_action(

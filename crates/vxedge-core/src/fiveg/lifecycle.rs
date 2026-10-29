@@ -103,13 +103,7 @@ fn containers(op: impl Into<String>) -> impl FnOnce(ContainerError) -> FiveGLife
     }
 }
 
-/// The default infra image: the Kubernetes pause image, pinned by its multi-arch index digest
-/// (resolved from `registry.k8s.io` 2026-10-28; amd64 manifest `sha256:e5b941ef…`). It does
-/// nothing but hold the namespace, runs as uid 65535, and exits on SIGTERM at once — an infra
-/// container running `sleep infinity` instead ignores SIGTERM as PID 1 and costs every
-/// teardown Podman's 10 s stop timeout.
-pub const PAUSE_IMAGE: &str =
-    "registry.k8s.io/pause@sha256:278fb9dbcca9518083ad1e11276933a2e96f23de604a3a08cc3c80002767d24c";
+pub use crate::containers::PAUSE_IMAGE;
 
 /// Which pods + images to drive. Defaults match `containers/fiveg/`.
 #[derive(Debug, Clone)]

@@ -13,6 +13,13 @@ All notable changes to this repo are documented here. Format follows
   pod` was: an infra container owning a network namespace that members join. Membership is by
   label (`io.vxedge.group`), never by name prefix; `up` converges by a spec hash, so a second
   `up` keeps what matches and recreates only what changed. `LazyClient` connects on first use.
+- **Zone `container` nodes can run an OCI image** (Track V3). A container node with a published,
+  digest-pinned container part deployed on it runs that image: a container group named after
+  the node, whose infra container (loopback only) owns the node's network namespace; the
+  gateway port moves in as `eth0` by the infra PID, then the image starts as a member. `down`
+  removes the group, and the port with it. Nodes with `local/…` parts (every shipped
+  workspace) stay a named netns the runner execs into, unchanged. Entering the namespace needs
+  `CAP_SYS_ADMIN`, as it already did for the named-netns form.
 
 ### Changed
 
