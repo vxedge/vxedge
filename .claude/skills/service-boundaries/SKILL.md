@@ -46,9 +46,10 @@ fn backend_for(kind: Backend) -> &'static dyn ZoneBackend { … }
 ```
 
 Static enum dispatch is fine and often better; the load-bearing part is **one** decision site.
-The anti-pattern is what `zones/backend.rs` does today: `match np.backend { … }` repeated in
-`node_up`, `node_down` and `node_status`, so a fourth backend edits three functions and nothing
-in the code says they must agree. That is the shape to remove, not to imitate.
+The anti-pattern is what `zones/backend.rs` used to do: `match np.backend { … }` repeated in
+`node_up`, `node_down` and `node_status`, so a fourth backend edited three functions and nothing
+in the code said they must agree. `backend_for` replaced that with the one decision site above;
+keep it that way rather than letting a second `match` on the kind grow back.
 
 ## Plans stay pure; backends are the impure edge
 
