@@ -545,6 +545,13 @@ pub fn node_status(sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> NodeState {
 mod tests {
     use super::*;
 
+    #[test]
+    fn every_backend_kind_selects_the_implementation_it_names() {
+        assert_eq!(backend_for(Backend::Container).name(), "container");
+        assert_eq!(backend_for(Backend::QemuMicrovm).name(), "qemu-microvm");
+        assert_eq!(backend_for(Backend::Libvirt).name(), "libvirt");
+    }
+
     /// libvirt's wording decides the hint: socket refusal (not in the `libvirt` group), a guest
     /// file qemu cannot read, or neither. The first two forms are libvirt's own messages.
     #[test]
