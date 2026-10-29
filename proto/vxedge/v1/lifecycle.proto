@@ -271,6 +271,10 @@ message ExperimentUpRequest {
 }
 
 message ExperimentDownRequest {
+  // Must name the experiment active on this host (same id, and same workspace directory when
+  // both are known): any other answers FAILED_PRECONDITION naming the active one, since the
+  // zones and gateway stages act on the active experiment, not on this manifest. With nothing
+  // active, Down proceeds (idempotent).
   ManifestRef manifest = 1;
   // Restrict to specific stages (empty = all, in reverse dependency order).
   repeated ExperimentStage stages = 2;
