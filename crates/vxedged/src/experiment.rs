@@ -95,6 +95,46 @@ async fn await_job(engine: &JobEngine, job: Job) -> Result<String, String> {
 /// bundle/part refs against the real workspace instead of the daemon's own cwd (see
 /// `ManifestRef.resolved_dir`'s own doc comment, common.proto). `None` for a genuinely-inline
 /// manifest (no workspace to name).
+/// Refuse an `ExperimentService.Down` aimed at anything but the experiment active on this host.
+///
+/// Down's zones stage lists the *active* experiment's zones (`ZoneService.List` takes no
+/// workspace) and its gateway stage acts on the host's one gateway, so without this a Down
+/// naming workspace B tore down whatever A someone else had up. Matched on experiment id, and
+/// on the workspace directory too when both sides know it — two copies of one experiment in
+/// different directories are different runs. `"."` is what `gateway up` records for a genuinely
+/// inline manifest, i.e. no known directory. Nothing active means nothing to protect: Down
+/// proceeds, which keeps it idempotent.
+fn check_down_target(
+    active: Option<(&str, &std::path::Path)>,
+    requested_id: &str,
+    requested_dir: Option<&std::path::Path>,
+) -> Result<(), Status> {
+    let Some((active_id, active_dir)) = active else {
+        return Ok(());
+    };
+    let active_dir_known = active_dir != std::path::Path::new(".");
+    let same_dir = match requested_dir {
+        Some(dir) if active_dir_known => dir == active_dir,
+        _ => true,
+    };
+    if active_id == requested_id && same_dir {
+        return Ok(());
+    }
+    let requested_at = requested_dir
+        .map(|d| format!(" (workspace {})", d.display()))
+        .unwrap_or_default();
+    let active_at = if active_dir_known {
+        format!(" (workspace {})", active_dir.display())
+    } else {
+        String::new()
+    };
+    Err(Status::failed_precondition(format!(
+        "experiment `{active_id}`{active_at} is the one active on this host, not \
+         `{requested_id}`{requested_at}: `experiment down` only tears down the active \
+         experiment — run it from that workspace"
+    )))
+}
+
 fn inline(yaml: &str, dir: Option<&std::path::Path>) -> Option<ManifestRef> {
     Some(ManifestRef {
         source: Some(Source::InlineYaml(yaml.to_string())),
@@ -317,6 +357,14 @@ impl ExperimentService for ExperimentSvc {
         let yaml = resolve_once(req.get_ref().manifest.as_ref()).await?;
         let model = vxedge_core::model::load_yaml(&yaml)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        {
+            let st = self.handles.gateway.state.lock().await;
+            let active = st
+                .active
+                .as_ref()
+                .map(|a| (a.model.id.as_str(), a.dir.as_path()));
+            check_down_target(active, &model.id, dir.as_deref())?;
+        }
         self.audit.record(
             "ExperimentService.Down",
             serde_json::json!({ "experiment": model.id }),
@@ -515,5 +563,55 @@ mod tests {
         let s = out.status.unwrap();
         assert_eq!(s.vxid, "exp-a");
         assert_eq!(s.kind, ResourceKind::Experiment as i32);
+    }
+
+    // `ExperimentService.Down` used to stop every zone and the gateway of whichever experiment
+    // was active, whatever workspace it was asked to bring down. These pin the guard that
+    // refuses a Down aimed at anything but the active experiment.
+    use std::path::Path;
+
+    #[test]
+    fn down_with_nothing_active_proceeds() {
+        assert!(check_down_target(None, "exp-a", Some(Path::new("/ws/a"))).is_ok());
+    }
+
+    #[test]
+    fn down_of_the_active_experiment_proceeds() {
+        let active = Some(("exp-a", Path::new("/ws/a")));
+        assert!(check_down_target(active, "exp-a", Some(Path::new("/ws/a"))).is_ok());
+    }
+
+    #[test]
+    fn down_of_a_different_experiment_is_refused_naming_the_active_one() {
+        let active = Some(("exp-a", Path::new("/ws/a")));
+        let err = check_down_target(active, "exp-b", Some(Path::new("/ws/b"))).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("`exp-a`"), "{}", err.message());
+        assert!(err.message().contains("/ws/a"), "{}", err.message());
+        assert!(err.message().contains("`exp-b`"), "{}", err.message());
+    }
+
+    #[test]
+    fn down_of_the_same_id_from_another_workspace_is_refused() {
+        // Two copies of one experiment in different directories: only the one that was
+        // brought up is torn down from its own workspace.
+        let active = Some(("exp-a", Path::new("/ws/a")));
+        let err = check_down_target(active, "exp-a", Some(Path::new("/ws/copy-of-a"))).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("/ws/a"), "{}", err.message());
+    }
+
+    #[test]
+    fn an_inline_down_with_no_directory_is_matched_on_id_alone() {
+        let active = Some(("exp-a", Path::new("/ws/a")));
+        assert!(check_down_target(active, "exp-a", None).is_ok());
+        assert!(check_down_target(active, "exp-b", None).is_err());
+    }
+
+    #[test]
+    fn an_active_experiment_with_no_known_directory_is_matched_on_id_alone() {
+        // `gateway up` from a genuinely inline manifest records "." as the directory.
+        let active = Some(("exp-a", Path::new(".")));
+        assert!(check_down_target(active, "exp-a", Some(Path::new("/ws/a"))).is_ok());
     }
 }
