@@ -6,13 +6,43 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- `vxedge_core::containers` (Track V1, `docs-internal/PROVISIONING.md` §7.2): container groups
+  over Podman's REST API on the rootless user socket, via `bollard`. A group is what a `podman
+  pod` was: an infra container owning a network namespace that members join. Membership is by
+  label (`io.vxedge.group`), never by name prefix; `up` converges by a spec hash, so a second
+  `up` keeps what matches and recreates only what changed. `LazyClient` connects on first use.
+
+### Changed
+
+- **The 5G core, RAN and UE pods are driven through the Podman API, not the `podman` CLI**
+  (Track V2). Hosts need the rootless user socket (`systemctl --user enable --now
+  podman.socket`, plus `loginctl enable-linger` on a host you reach over SSH) and `passt`;
+  see `docs/TESTBED-SETUP.md` Tier 2. `vxedged` still starts without the socket and connects on
+  first 5G use. Each pod's infra container is the Kubernetes pause image, pinned by digest.
+  Container names (`vx5g-nrf`, `vx5g-ran-gnb`, ...) are unchanged.
+- `fiveg` and `traffic::profile_up` are `async`; `vxedged` awaits them on its runtime instead of
+  wrapping them in `spawn_blocking`.
+- `deny.toml`: removed the `RUSTSEC-2024-0436` (`paste`) ignore; the crate is no longer in the dependency tree.
+
+### Fixed
+
+- A second `vxedge experiment up` over a running 5G core failed with `File exists` on the bridge
+  attachment veth; it is now a no-op.
+- `containers` groups get the `pasta` network namespace `podman pod create` gives a pod. Left
+  to the API default (`bridge`), teardown failed on Ubuntu's AppArmor `pasta` profile.
+
 ### Security
 
 - Lockfile update `pulldown-cmark` 0.13.4 -> 0.13.5, which fixes RUSTSEC-2026-0414 (exponential event growth with `ENABLE_WIKILINKS`). It is a build-time dependency via `prost-build`.
 
-### Changed
+### Migration
 
-- `deny.toml`: removed the `RUSTSEC-2024-0436` (`paste`) ignore; the crate is no longer in the dependency tree.
+- Pods created by an older `vxedged` carry no `io.vxedge.group` label, so this version cannot
+  manage them. `vxedge experiment up` and `down` refuse to run over them and print the command
+  to remove them once: `podman pod rm -f vx5g vx5g-ran $(podman pod ps -q --filter
+  name=vx5g-ran-ue-)`.
 
 ## [0.2.0] - 2026-10-21
 

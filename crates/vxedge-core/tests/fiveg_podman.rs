@@ -1,5 +1,6 @@
 //! Privileged integration test: the fiveg lifecycle module driving real
-//! podman, across two pods (CN + RAN) joined by a transit veth. Needs the
+//! podman (its rootless user API socket, `systemctl --user enable --now
+//! podman.socket`), across two pods (CN + RAN) joined by a transit veth. Needs the
 //! `vx5g-core` and `vx5g-ran` images built (`containers/fiveg/`) and
 //! network access for the first `mongo:7` pull. Ignored by default.
 //!
@@ -15,10 +16,11 @@
 //! Run with:
 //!   cd vxedge/containers/fiveg
 //!   podman build -t vx5g-core -f Containerfile.open5gs .
-//!   podman build -t vx5g-ran -f Containerfile.ueransim .
+//!   ./build-vx5g-ran.sh   # bundles vxprobe from ../../../vxagents
 //!   cd ../.. && sudo -v && \
 //!     cargo test -p vxedge-core --test fiveg_podman -- --ignored --nocapture
 
+use vxedge_core::containers::ContainerClient;
 use vxedge_core::fiveg::{
     FiveGLifecycleConfig, FiveGPlan, SliceSession, fiveg_down, fiveg_status, fiveg_up, pod_exists,
     pod_pid, ue_down, ue_pod_name, ue_probe_up, ue_up,
@@ -41,23 +43,32 @@ devices: {}
 "#;
 
 /// Removes both test pods, plus any UE pods brought up, even if an
-/// assertion panics mid-test.
+/// assertion panics mid-test. `Drop` cannot await, so it blocks this
+/// (multi-threaded) runtime's worker for the teardown.
 struct PodGuard {
+    client: ContainerClient,
     cfg: FiveGLifecycleConfig,
     ue_sessions: Vec<SliceSession>,
 }
 impl Drop for PodGuard {
     fn drop(&mut self) {
-        for session in &self.ue_sessions {
-            let _ = ue_down(&self.cfg, session);
-        }
-        let _ = fiveg_down(&self.cfg);
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                for session in &self.ue_sessions {
+                    let _ = ue_down(&self.client, &self.cfg, session).await;
+                }
+                let _ = fiveg_down(&self.client, &self.cfg).await;
+            })
+        });
     }
 }
 
-#[test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs root + podman + the vx5g-core/vx5g-ran images (see module docs)"]
-fn fiveg_up_brings_cn_and_ran_pods_up_idempotently_then_tears_down() {
+async fn fiveg_up_brings_cn_and_ran_pods_up_idempotently_then_tears_down() {
+    let client = ContainerClient::connect_user()
+        .await
+        .expect("the rootless Podman API socket (see module docs)");
     let model = vxedge_core::model::load_yaml(WORKSPACE).expect("workspace loads");
     let plan = FiveGPlan::from_model(&model).expect("plans");
     let runtime_dir = tempfile::tempdir().expect("tempdir");
@@ -66,17 +77,21 @@ fn fiveg_up_brings_cn_and_ran_pods_up_idempotently_then_tears_down() {
         ran_pod_name: "vx5g-cargo-test-ran".to_string(),
         core_image: "vx5g-core".to_string(),
         ran_image: "vx5g-ran".to_string(),
+        ..FiveGLifecycleConfig::default()
     };
     let mut guard = PodGuard {
+        client: client.clone(),
         cfg: cfg.clone(),
         ue_sessions: vec![],
     };
 
-    let up_msg = fiveg_up(&plan, runtime_dir.path(), &cfg).expect("fiveg_up");
+    let up_msg = fiveg_up(&client, &plan, runtime_dir.path(), &cfg)
+        .await
+        .expect("fiveg_up");
     assert!(up_msg.contains("6 dependency phases"));
     assert!(up_msg.contains("2 subscribers"));
 
-    let status = fiveg_status(&cfg).expect("fiveg_status");
+    let status = fiveg_status(&client, &cfg).await.expect("fiveg_status");
     assert!(status.up, "CN pod should be up");
     assert!(status.ran_up, "RAN pod should be up");
     // CN: 8 core NFs + mongo + 2 slices x (smf, upf) = 13 containers.
@@ -96,7 +111,9 @@ fn fiveg_up_brings_cn_and_ran_pods_up_idempotently_then_tears_down() {
     );
 
     // Idempotent up: second call is a no-op, doesn't error or duplicate.
-    let second = fiveg_up(&plan, runtime_dir.path(), &cfg).expect("fiveg_up idempotent");
+    let second = fiveg_up(&client, &plan, runtime_dir.path(), &cfg)
+        .await
+        .expect("fiveg_up idempotent");
     assert!(second.contains("already up"));
 
     // Bring both UEs up, each in its own pod — the actual fix under test:
@@ -104,52 +121,68 @@ fn fiveg_up_brings_cn_and_ran_pods_up_idempotently_then_tears_down() {
     // share a netns, so proving each UE lands in its own pod (and that
     // fiveg_up's pre-existing RAN pod stays gNB-only) is the acceptance
     // bar here, not just "some container started".
-    let ran_pid = pod_pid(&cfg.ran_pod_name).expect("ran pod pid");
+    let ran_pid = pod_pid(&client, &cfg.ran_pod_name)
+        .await
+        .expect("ran pod pid");
     let cfg_dir = runtime_dir.path().join("fiveg-config");
     for (i, session) in plan.sessions.iter().enumerate() {
-        let msg = ue_up(&cfg, &cfg_dir, ran_pid, i, session).expect("ue_up");
+        let msg = ue_up(&client, &cfg, &cfg_dir, ran_pid, i, session)
+            .await
+            .expect("ue_up");
         assert!(msg.contains("up"));
         guard.ue_sessions.push(session.clone());
         let pod = ue_pod_name(&cfg.ran_pod_name, &session.slice_id);
         assert!(
-            pod_exists(&pod).expect("pod_exists"),
+            pod_exists(&client, &pod).await.expect("pod_exists"),
             "UE pod `{pod}` should exist after ue_up"
         );
     }
     // Idempotent ue_up: second call per UE is a no-op.
     for (i, session) in plan.sessions.iter().enumerate() {
-        let msg = ue_up(&cfg, &cfg_dir, ran_pid, i, session).expect("ue_up idempotent");
+        let msg = ue_up(&client, &cfg, &cfg_dir, ran_pid, i, session)
+            .await
+            .expect("ue_up idempotent");
         assert!(msg.contains("already up"));
     }
 
     // vxprobe reflector, inside each UE's own pod — the H2 probe data path.
     for session in &plan.sessions {
-        let msg = ue_probe_up(&cfg, &cfg_dir, session, PROBE_PORT).expect("ue_probe_up");
+        let msg = ue_probe_up(&client, &cfg, &cfg_dir, session, PROBE_PORT)
+            .await
+            .expect("ue_probe_up");
         assert!(msg.contains("up"));
     }
     // Idempotent ue_probe_up: second call per UE is a no-op.
     for session in &plan.sessions {
-        let msg = ue_probe_up(&cfg, &cfg_dir, session, PROBE_PORT).expect("ue_probe_up idempotent");
+        let msg = ue_probe_up(&client, &cfg, &cfg_dir, session, PROBE_PORT)
+            .await
+            .expect("ue_probe_up idempotent");
         assert!(msg.contains("already up"));
     }
 
     for session in &plan.sessions {
-        let msg = ue_down(&cfg, session).expect("ue_down");
+        let msg = ue_down(&client, &cfg, session).await.expect("ue_down");
         assert!(msg.contains("down"));
         let pod = ue_pod_name(&cfg.ran_pod_name, &session.slice_id);
         assert!(
-            !pod_exists(&pod).expect("pod_exists after ue_down"),
+            !pod_exists(&client, &pod)
+                .await
+                .expect("pod_exists after ue_down"),
             "UE pod `{pod}` should be gone after ue_down"
         );
     }
     guard.ue_sessions.clear();
 
-    let down_msg = fiveg_down(&cfg).expect("fiveg_down");
+    let down_msg = fiveg_down(&client, &cfg).await.expect("fiveg_down");
     assert!(down_msg.contains("down"));
-    let status_after = fiveg_status(&cfg).expect("fiveg_status after down");
+    let status_after = fiveg_status(&client, &cfg)
+        .await
+        .expect("fiveg_status after down");
     assert!(!status_after.up);
     assert!(!status_after.ran_up);
 
     // Idempotent down: tearing down already-absent pods doesn't error.
-    fiveg_down(&cfg).expect("fiveg_down idempotent on absent pods");
+    fiveg_down(&client, &cfg)
+        .await
+        .expect("fiveg_down idempotent on absent pods");
 }

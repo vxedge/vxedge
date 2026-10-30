@@ -23,7 +23,7 @@ tonic = "0.14"
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
 prost = "0.14"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "fs", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "fs", "sync", "process", "time"] }
 tokio-stream = { version = "0.1", features = ["net", "sync"] }
 sha2 = "0.11"
 tower = "0.5"
@@ -40,3 +40,6 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3"
+# Podman's Docker-compatible REST API over the rootless user socket (docs-internal
+# PROVISIONING.md §7.2, Track V1). Unix-socket transport only: no TLS stack, no HTTP/SSH remotes.
+bollard = { version = "0.21", default-features = false, features = ["pipe"] }
