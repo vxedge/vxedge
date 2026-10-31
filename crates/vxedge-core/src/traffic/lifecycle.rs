@@ -18,12 +18,17 @@
 //! children, pidfile-tracked per profile+role — mirrors `services.rs`'s own
 //! process backend exactly, including the "reap on a background thread so a
 //! killed child doesn't become a zombie forever" lesson recorded there.
+//!
+//! [`profile_up`] is async (the s-nssai paths await [`crate::containers`]);
+//! its synchronous `Shell` and spawn steps run in `spawn_blocking`, so it
+//! never blocks a runtime worker.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use super::plan::{ProfileEndpoint, ResolvedProfile};
+use crate::containers::{ContainerError, LazyClient};
 use crate::fiveg::{self, FiveGLifecycleConfig, FiveGPlan};
 use crate::gateway::{NetOpsError, Shell};
 
@@ -33,6 +38,8 @@ pub enum TrafficLifecycleError {
     Provision(String, #[source] NetOpsError),
     #[error("profile `{0}`: s-nssai UE reflector/discovery failed: {1}")]
     UeDiscovery(String, #[source] fiveg::FiveGLifecycleError),
+    #[error("profile `{0}`: s-nssai endpoints need the Podman API: {1}")]
+    Containers(String, #[source] Box<ContainerError>),
     #[error(
         "profile `{0}` targets the CN pod's bridge-attach address for a probe (`pps` set) — \
          that address is only a valid target for a one-directional load profile \
@@ -75,6 +82,18 @@ fn is_up(runtime_dir: &Path, profile_id: &str, role: &str) -> bool {
     read_pid(runtime_dir, profile_id, role)
         .map(alive)
         .unwrap_or(false)
+}
+
+/// Run a synchronous step (a `Shell` exec, a process spawn) off the async
+/// runtime. A panic in it is re-raised here, as if it had run inline.
+async fn off_runtime<T, F>(work: F) -> Result<T, TrafficLifecycleError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, TrafficLifecycleError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))
 }
 
 /// Idempotently provision a `mode: vlan` endpoint's interface + address —
@@ -135,7 +154,8 @@ fn ensure_endpoint(
 /// `vxtraffic` against — `mode: vlan` addresses are already known from the
 /// plan (deterministic); `mode: s-nssai` addresses need live discovery
 /// (UE) or a fixed constant (CN pod bridge-attach).
-fn transport_addr(
+async fn transport_addr(
+    containers: &LazyClient,
     fiveg_cfg: &FiveGLifecycleConfig,
     profile_id: &str,
     ep: &ProfileEndpoint,
@@ -145,9 +165,14 @@ fn transport_addr(
         | ProfileEndpoint::VlanUplinkFarSide { addr, .. } => Ok(addr.clone()),
         ProfileEndpoint::SnssaiUe { slice_id } => {
             let ue_pod = fiveg::ue_pod_name(&fiveg_cfg.ran_pod_name, slice_id);
-            let ue_pid = fiveg::pod_pid(&ue_pod)
+            let client = containers.get().await.map_err(|e| {
+                TrafficLifecycleError::Containers(profile_id.to_string(), Box::new(e))
+            })?;
+            let ue_pid = fiveg::pod_pid(client, &ue_pod)
+                .await
                 .map_err(|e| TrafficLifecycleError::UeDiscovery(profile_id.to_string(), e))?;
             fiveg::wait_for_ue_pdu_addr(ue_pid)
+                .await
                 .map_err(|e| TrafficLifecycleError::UeDiscovery(profile_id.to_string(), e))
         }
         ProfileEndpoint::SnssaiFarSide => Ok(fiveg::BRIDGE_ATTACH_CN_ADDR.to_string()),
@@ -205,7 +230,8 @@ fn spawn_tracked(
 /// [`transport_addr`] path rather than threading a second return value out
 /// of `fiveg`'s own function — cheap, since the address already exists by
 /// this point and the discovery poll returns on its first check.
-fn ensure_reflector(
+async fn ensure_reflector(
+    containers: &LazyClient,
     runtime_dir: &Path,
     fiveg_cfg: &FiveGLifecycleConfig,
     five_g_plan: Option<&FiveGPlan>,
@@ -229,28 +255,61 @@ fn ensure_reflector(
                     TrafficLifecycleError::MissingFiveGSession(profile.id.clone(), slice_id.clone())
                 })?;
             let cfg_dir = runtime_dir.join("fiveg-config");
-            fiveg::ue_probe_up(fiveg_cfg, &cfg_dir, session, port)
+            let client = containers
+                .get()
+                .await
+                .map_err(|e| TrafficLifecycleError::Containers(profile.id.clone(), Box::new(e)))?;
+            fiveg::ue_probe_up(client, fiveg_cfg, &cfg_dir, session, port)
+                .await
                 .map_err(|e| TrafficLifecycleError::UeDiscovery(profile.id.clone(), e))?;
-            transport_addr(fiveg_cfg, &profile.id, &profile.target)
+            transport_addr(containers, fiveg_cfg, &profile.id, &profile.target).await
         }
         ProfileEndpoint::VlanNodePeer { .. } | ProfileEndpoint::VlanUplinkFarSide { .. } => {
-            let target_addr = transport_addr(fiveg_cfg, &profile.id, &profile.target)?;
+            let target_addr =
+                transport_addr(containers, fiveg_cfg, &profile.id, &profile.target).await?;
             if !is_up(runtime_dir, &profile.id, "reflect") {
-                spawn_tracked(
+                spawn_off_runtime(
                     runtime_dir,
                     &profile.id,
                     "reflect",
                     vxprobe_bin,
-                    &[
+                    vec![
                         "reflect".to_string(),
                         "--listen".to_string(),
                         format!("{target_addr}:{port}"),
                     ],
-                )?;
+                )
+                .await?;
             }
             Ok(target_addr)
         }
     }
+}
+
+/// [`spawn_tracked`] in `spawn_blocking`: a fork+exec and a pidfile write.
+async fn spawn_off_runtime(
+    runtime_dir: &Path,
+    profile_id: &str,
+    role: &'static str,
+    bin: &str,
+    args: Vec<String>,
+) -> Result<u32, TrafficLifecycleError> {
+    let (dir, id, bin) = (
+        runtime_dir.to_path_buf(),
+        profile_id.to_string(),
+        bin.to_string(),
+    );
+    off_runtime(move || spawn_tracked(&dir, &id, role, &bin, &args)).await
+}
+
+/// [`ensure_endpoint`] in `spawn_blocking`: it execs `ip` through `Shell`.
+async fn ensure_endpoint_off_runtime(
+    sh: &Shell,
+    profile_id: &str,
+    ep: &ProfileEndpoint,
+) -> Result<(), TrafficLifecycleError> {
+    let (sh, id, ep) = (sh.clone(), profile_id.to_string(), ep.clone());
+    off_runtime(move || ensure_endpoint(&sh, &id, &ep)).await
 }
 
 /// Bring one resolved profile up: provision both endpoints, start a
@@ -269,7 +328,8 @@ fn ensure_reflector(
 /// args until now — a real, previously-silent gap since the live
 /// verification never needed non-default payload sizes.
 #[allow(clippy::too_many_arguments)]
-pub fn profile_up(
+pub async fn profile_up(
+    containers: &LazyClient,
     sh: &Shell,
     fiveg_cfg: &FiveGLifecycleConfig,
     five_g_plan: Option<&FiveGPlan>,
@@ -280,21 +340,23 @@ pub fn profile_up(
     port: u16,
     duration_s: u64,
 ) -> Result<String, TrafficLifecycleError> {
-    ensure_endpoint(sh, &profile.id, &profile.source)?;
-    ensure_endpoint(sh, &profile.id, &profile.target)?;
+    ensure_endpoint_off_runtime(sh, &profile.id, &profile.source).await?;
+    ensure_endpoint_off_runtime(sh, &profile.id, &profile.target).await?;
 
     if let Some(pps) = profile.pps {
         // Validates the reflector side (fails fast on a misconfigured
         // profile) *before* resolving/spawning the sender — see
         // ensure_reflector's own doc comment for why this ordering matters.
         let target_addr = ensure_reflector(
+            containers,
             runtime_dir,
             fiveg_cfg,
             five_g_plan,
             vxprobe_bin,
             profile,
             port,
-        )?;
+        )
+        .await?;
 
         if is_up(runtime_dir, &profile.id, "send") {
             return Ok(format!(
@@ -302,12 +364,12 @@ pub fn profile_up(
                 profile.id
             ));
         }
-        spawn_tracked(
+        spawn_off_runtime(
             runtime_dir,
             &profile.id,
             "send",
             vxprobe_bin,
-            &[
+            vec![
                 "send".to_string(),
                 "--target".to_string(),
                 format!("{target_addr}:{port}"),
@@ -318,13 +380,15 @@ pub fn profile_up(
                 "--duration-s".to_string(),
                 duration_s.to_string(),
             ],
-        )?;
+        )
+        .await?;
         Ok(format!(
             "traffic profile `{}` up (vxprobe send/reflect @ {target_addr}:{port}, {pps} pps, {duration_s}s)",
             profile.id
         ))
     } else {
-        let target_addr = transport_addr(fiveg_cfg, &profile.id, &profile.target)?;
+        let target_addr =
+            transport_addr(containers, fiveg_cfg, &profile.id, &profile.target).await?;
         let bandwidth = profile
             .bandwidth_mbps
             .expect("TrafficPlan guarantees pps or bandwidth_mbps is set");
@@ -334,12 +398,12 @@ pub fn profile_up(
                 profile.id
             ));
         }
-        spawn_tracked(
+        spawn_off_runtime(
             runtime_dir,
             &profile.id,
             "load",
             vxtraffic_bin,
-            &[
+            vec![
                 "--target".to_string(),
                 format!("{target_addr}:{port}"),
                 "--bandwidth-mbps".to_string(),
@@ -349,7 +413,8 @@ pub fn profile_up(
                 "--duration-s".to_string(),
                 duration_s.to_string(),
             ],
-        )?;
+        )
+        .await?;
         Ok(format!(
             "traffic profile `{}` up (vxtraffic @ {target_addr}:{port}, {bandwidth} mbit, {duration_s}s)",
             profile.id
@@ -403,8 +468,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn probe_targeting_bridge_attach_addr_is_rejected() {
+    #[tokio::test]
+    async fn probe_targeting_bridge_attach_addr_is_rejected() {
         // pps set (a round-trip probe) but the target is SnssaiFarSide (the
         // CN pod's own bridge-attach address) -- nothing reflects there,
         // only a real UE or a vlan endpoint does. Neither endpoint touches
@@ -415,6 +480,7 @@ mod tests {
         let fiveg_cfg = FiveGLifecycleConfig::default();
         let profile = snssai_profile("bad-probe", Some(1000), None);
         let err = profile_up(
+            &LazyClient::user(),
             &sh,
             &fiveg_cfg,
             None,
@@ -425,6 +491,7 @@ mod tests {
             9800,
             10,
         )
+        .await
         .unwrap_err();
         assert!(matches!(
             err,
@@ -432,8 +499,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn snssai_ue_target_without_a_fiveg_plan_is_rejected() {
+    #[tokio::test]
+    async fn snssai_ue_target_without_a_fiveg_plan_is_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         let sh = Shell::default();
         let fiveg_cfg = FiveGLifecycleConfig::default();
@@ -442,6 +509,7 @@ mod tests {
         let mut profile = snssai_profile("adas-probe", Some(1000), None);
         std::mem::swap(&mut profile.source, &mut profile.target);
         let err = profile_up(
+            &LazyClient::user(),
             &sh,
             &fiveg_cfg,
             None,
@@ -452,6 +520,7 @@ mod tests {
             9800,
             10,
         )
+        .await
         .unwrap_err();
         assert!(matches!(
             err,
@@ -459,8 +528,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn snssai_ue_target_with_a_plan_missing_the_session_is_rejected() {
+    #[tokio::test]
+    async fn snssai_ue_target_with_a_plan_missing_the_session_is_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         let sh = Shell::default();
         let fiveg_cfg = FiveGLifecycleConfig::default();
@@ -489,6 +558,7 @@ devices: {}
         // for "infotainment" only -- confirms the lookup misses cleanly.
         let plan = plan.unwrap_or_else(|e| panic!("expected a plan: {e:?}"));
         let err = profile_up(
+            &LazyClient::user(),
             &sh,
             &fiveg_cfg,
             Some(&plan),
@@ -499,6 +569,7 @@ devices: {}
             9800,
             10,
         )
+        .await
         .unwrap_err();
         assert!(matches!(
             err,
@@ -506,13 +577,14 @@ devices: {}
         ));
     }
 
-    #[test]
-    fn load_profile_reports_spawn_failure_for_missing_binary() {
+    #[tokio::test]
+    async fn load_profile_reports_spawn_failure_for_missing_binary() {
         let tmp = tempfile::tempdir().unwrap();
         let sh = Shell::default();
         let fiveg_cfg = FiveGLifecycleConfig::default();
         let profile = snssai_profile("load", None, Some(400));
         let err = profile_up(
+            &LazyClient::user(),
             &sh,
             &fiveg_cfg,
             None,
@@ -523,6 +595,7 @@ devices: {}
             9900,
             10,
         )
+        .await
         .unwrap_err();
         assert!(matches!(
             err,

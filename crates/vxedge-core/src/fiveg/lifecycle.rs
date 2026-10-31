@@ -1,9 +1,13 @@
 //! Podman-backed lifecycle for the containerized 5G core (track C, hybrid
 //! policy §15). Same shape as `services.rs`'s process backend: idempotent
 //! up/down, state observed rather than assumed. Where `services.rs` tracks
-//! one pidfile per process, this tracks **two pods** (podman's shared-netns
-//! container groups — `containers/fiveg/pod-up.sh` is the shell reference
-//! this module replaces with a tested, typed Rust path).
+//! one pidfile per process, this tracks **two pods**: shared-netns
+//! container groups, driven through [`crate::containers`] over the Podman
+//! API (Track V2; until then the `podman` CLI — `containers/fiveg/pod-up.sh`
+//! is the shell reference both replaced). "Pod" below means one such group:
+//! an infra container ([`FiveGLifecycleConfig::infra_image`]) owning a
+//! network namespace that every member joins, containers named
+//! `<pod>-<member>` as before.
 //!
 //! **Two pods plus one pod per UE** (found necessary live, 2026-07-17, in
 //! two rounds). Round one: the RAN (gNB) cannot share a network namespace
@@ -41,22 +45,29 @@
 //!
 //! Two-layer split for testability (rust-patterns: pure logic vs. I/O):
 //! [`core_run_specs`] (here) and [`super::subscriber::subscriber_insert_commands`]
-//! are pure — they describe *what* to run, unit-tested without touching
-//! podman. [`fiveg_up`] and friends are the thin, untested-except-by-the-
-//! ignored-integration-test layer that actually execs `podman`/`ip`/`nsenter`.
+//! are pure — they describe *what* to run, unit-tested without a container
+//! engine. [`fiveg_up`] and friends are the thin, untested-except-by-the-
+//! ignored-integration-test layer that drives the [`ContainerClient`] and
+//! execs `ip`/`nsenter`.
+//!
+//! Async throughout, and so is every host command here (`tokio::process`,
+//! `tokio::time::sleep`): these run directly on the daemon's runtime, not in
+//! `spawn_blocking`, so nothing in them may block a worker thread.
 
 use std::path::Path;
-use std::process::Command;
 use std::time::Duration;
+
+use tokio::process::Command;
 
 use super::plan::{CN_TRANSIT_ADDR, FiveGPlan, RAN_TRANSIT_ADDR, SliceSession};
 use super::render::write_all;
 use super::subscriber::subscriber_insert_commands;
+use crate::containers::{Bind, ContainerClient, ContainerError, ContainerSpec, GroupSpec};
 
 #[derive(Debug, thiserror::Error)]
 pub enum FiveGLifecycleError {
     #[error(
-        "cannot execute `{program}`: {source} (is podman/iproute2/util-linux installed? see containers/fiveg/README.md)"
+        "cannot execute `{program}`: {source} (is sudo/iproute2/util-linux installed? see docs/TESTBED-SETUP.md)"
     )]
     Spawn {
         program: String,
@@ -68,11 +79,31 @@ pub enum FiveGLifecycleError {
     Render { dir: String, source: std::io::Error },
     #[error("cannot parse `{cmdline}` output: {detail}")]
     Parse { cmdline: String, detail: String },
+    #[error("{op}: {source}")]
+    /// Boxed: the container error carries the API client's own, which is
+    /// large, and this enum is returned on every call here.
+    Containers {
+        op: String,
+        #[source]
+        source: Box<ContainerError>,
+    },
     #[error(
-        "pod `{0}` has no running infra container yet (needs `pod start` before its netns can be joined)"
+        "found {containers}, left by an older vxedged that drove the podman CLI: they carry no \
+         `io.vxedge.group` label, so this version can neither reuse nor remove them. Remove the \
+         old pods once, then re-run: `podman pod rm -f {pods}`"
     )]
-    NoInfraPid(String),
+    LegacyPods { containers: String, pods: String },
 }
+
+fn containers(op: impl Into<String>) -> impl FnOnce(ContainerError) -> FiveGLifecycleError {
+    let op = op.into();
+    move |source| FiveGLifecycleError::Containers {
+        op,
+        source: Box::new(source),
+    }
+}
+
+pub use crate::containers::PAUSE_IMAGE;
 
 /// Which pods + images to drive. Defaults match `containers/fiveg/`.
 #[derive(Debug, Clone)]
@@ -85,6 +116,9 @@ pub struct FiveGLifecycleConfig {
     /// which pairs `"vx5g"`/`"vx5g-ran"`.
     pub ran_pod_name: String,
     pub ran_image: String,
+    /// Image of every pod's namespace-owning infra container, digest-pinned
+    /// ([`PAUSE_IMAGE`] by default).
+    pub infra_image: String,
 }
 
 impl Default for FiveGLifecycleConfig {
@@ -95,8 +129,57 @@ impl Default for FiveGLifecycleConfig {
             pod_name,
             core_image: "vx5g-core".to_string(),
             ran_image: "vx5g-ran".to_string(),
+            infra_image: PAUSE_IMAGE.to_string(),
         }
     }
+}
+
+/// The group a pod name stands for.
+fn pod_group(cfg: &FiveGLifecycleConfig, pod: &str) -> Result<GroupSpec, FiveGLifecycleError> {
+    GroupSpec::new(
+        pod,
+        ContainerSpec {
+            image: cfg.infra_image.clone(),
+            ..Default::default()
+        },
+    )
+    .map_err(|e| containers(format!("pod `{pod}`"))(e.into()))
+}
+
+/// The rendered config set, mounted read-only into every long-running
+/// container (`-v <cfg>:/etc/vx5g:ro,Z`, as the CLI path passed it).
+fn config_bind(cfg_dir: &Path) -> Bind {
+    Bind {
+        host: cfg_dir.to_path_buf(),
+        container: "/etc/vx5g".to_string(),
+        read_only: true,
+        relabel: true,
+    }
+}
+
+/// Fail with the migration command if any of `names` is held by a container
+/// the podman-CLI code created ([`ContainerClient::unlabelled`]): label-based
+/// `down` cannot see those, and `up` would stop halfway on a name clash.
+async fn refuse_legacy(
+    client: &ContainerClient,
+    names: Vec<String>,
+    pods: String,
+) -> Result<(), FiveGLifecycleError> {
+    let found = client
+        .unlabelled(&names)
+        .await
+        .map_err(containers("look for containers left by the podman CLI"))?;
+    if found.is_empty() {
+        return Ok(());
+    }
+    Err(FiveGLifecycleError::LegacyPods {
+        containers: found
+            .iter()
+            .map(|n| format!("`{n}`"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        pods,
+    })
 }
 
 /// Interface names derived from the pod name, truncated to fit IFNAMSIZ
@@ -136,10 +219,11 @@ pub fn ue_pod_name(ran_pod_name: &str, slice_id: &str) -> String {
 /// gap in what's shipped today.
 const PHASE_SETTLE: Duration = Duration::from_secs(2);
 
-fn run(program: &str, args: &[String]) -> Result<String, FiveGLifecycleError> {
+async fn run(program: &str, args: &[String]) -> Result<String, FiveGLifecycleError> {
     let out = Command::new(program)
         .args(args)
         .output()
+        .await
         .map_err(|source| FiveGLifecycleError::Spawn {
             program: program.to_string(),
             source,
@@ -151,10 +235,6 @@ fn run(program: &str, args: &[String]) -> Result<String, FiveGLifecycleError> {
         cmdline: format!("{program} {}", args.join(" ")),
         stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
     })
-}
-
-fn podman(args: &[String]) -> Result<String, FiveGLifecycleError> {
-    run("podman", args)
 }
 
 /// Run `ip <args>` directly on the host (for creating the transit veth pair
@@ -169,11 +249,13 @@ fn podman(args: &[String]) -> Result<String, FiveGLifecycleError> {
 /// `nsenter` escalate, `podman` never does. Requires either a cached `sudo`
 /// credential (`sudo -v` beforehand) or passwordless `sudo` for `ip`/
 /// `nsenter` — the process itself must stay unprivileged for `podman` to
-/// keep resolving the invoking user's own image storage.
-fn host_ip(args: &[&str]) -> Result<String, FiveGLifecycleError> {
+/// keep resolving the invoking user's own image storage. (Since V2 podman is
+/// reached over the user's API socket, not exec'd, but the identity rule is
+/// the same: [`crate::containers`] refuses root's socket.)
+async fn host_ip(args: &[&str]) -> Result<String, FiveGLifecycleError> {
     let mut full = vec!["ip".to_string()];
     full.extend(args.iter().map(|s| s.to_string()));
-    run("sudo", &full)
+    run("sudo", &full).await
 }
 
 /// Run `<program> <args>` inside the *network* namespace of the process at
@@ -183,7 +265,11 @@ fn host_ip(args: &[&str]) -> Result<String, FiveGLifecycleError> {
 /// call, never `podman` itself. Podman pods aren't registered under
 /// `ip netns`'s named registry the way `zones::backend`'s raw netns zones
 /// are, hence `nsenter` by PID rather than `ip netns exec` by name.
-fn nsenter_run(pid: u32, program: &str, args: &[&str]) -> Result<String, FiveGLifecycleError> {
+async fn nsenter_run(
+    pid: u32,
+    program: &str,
+    args: &[&str],
+) -> Result<String, FiveGLifecycleError> {
     let mut full = vec![
         "nsenter".to_string(),
         "-t".to_string(),
@@ -193,102 +279,81 @@ fn nsenter_run(pid: u32, program: &str, args: &[&str]) -> Result<String, FiveGLi
         program.to_string(),
     ];
     full.extend(args.iter().map(|s| s.to_string()));
-    run("sudo", &full)
+    run("sudo", &full).await
 }
 
-fn nsenter_ip(pid: u32, args: &[&str]) -> Result<String, FiveGLifecycleError> {
-    nsenter_run(pid, "ip", args)
+async fn nsenter_ip(pid: u32, args: &[&str]) -> Result<String, FiveGLifecycleError> {
+    nsenter_run(pid, "ip", args).await
 }
 
 /// PID of a pod's infra container — the anchor for its network namespace.
-/// Requires the pod to have been started (`pod start`/`pod create` alone
-/// leaves the infra container's PID at 0 — found live, 2026-07-17).
-pub fn pod_pid(pod_name: &str) -> Result<u32, FiveGLifecycleError> {
-    let infra_id = podman(&[
-        "pod".to_string(),
-        "inspect".to_string(),
-        pod_name.to_string(),
-        "--format".to_string(),
-        "{{.InfraContainerID}}".to_string(),
-    ])?;
-    let pid_str = podman(&[
-        "inspect".to_string(),
-        infra_id.trim().to_string(),
-        "--format".to_string(),
-        "{{.State.Pid}}".to_string(),
-    ])?;
-    let pid: u32 = pid_str
-        .trim()
-        .parse()
-        .map_err(|_| FiveGLifecycleError::Parse {
-            cmdline: format!(
-                "podman inspect {} --format {{{{.State.Pid}}}}",
-                infra_id.trim()
-            ),
-            detail: format!("not a PID: {pid_str:?}"),
-        })?;
-    if pid == 0 {
-        return Err(FiveGLifecycleError::NoInfraPid(pod_name.to_string()));
-    }
-    Ok(pid)
+/// Fails with the group's own error ([`ContainerError::GroupNotUp`] or
+/// [`ContainerError::NoInfraPid`]) when the pod is absent or its infra
+/// container is not running.
+pub async fn pod_pid(client: &ContainerClient, pod_name: &str) -> Result<u32, FiveGLifecycleError> {
+    client
+        .handle(pod_name)
+        .await
+        .map(|h| h.infra_pid)
+        .map_err(containers(format!(
+            "find pod `{pod_name}`'s network namespace"
+        )))
 }
 
 /// True if the pod is up (any state) — the idempotency check for `up`, and
 /// the fast path for `status`/`down` on an already-absent pod.
-pub fn pod_exists(pod_name: &str) -> Result<bool, FiveGLifecycleError> {
-    match Command::new("podman")
-        .args(["pod", "exists", pod_name])
-        .status()
-    {
-        Ok(status) => Ok(status.success()),
-        Err(source) => Err(FiveGLifecycleError::Spawn {
-            program: "podman".to_string(),
-            source,
-        }),
-    }
-}
-
-/// One container to bring up inside the pod.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RunSpec {
-    /// Container name suffix; full name is `<pod>-<name>`.
-    pub name: String,
-    pub image: String,
-    /// Extra `podman run` flags before the image (e.g. capabilities/devices).
-    pub extra_flags: Vec<String>,
-    /// Command + args run inside the container.
-    pub cmd: Vec<String>,
+pub async fn pod_exists(
+    client: &ContainerClient,
+    pod_name: &str,
+) -> Result<bool, FiveGLifecycleError> {
+    client
+        .group_status(pod_name)
+        .await
+        .map(|s| s.exists())
+        .map_err(containers(format!("observe pod `{pod_name}`")))
 }
 
 /// The 8-NF Open5GS core + per-slice SMF/UPF, grouped into dependency
 /// phases: mongo → NRF → the SBI-plane NFs (independent NRF clients, any
 /// order within the phase) → AMF → per-slice SMF → per-slice UPF (needs
-/// NET_ADMIN + /dev/net/tun for its vxtun device). Pure — no podman calls —
-/// so the ordering and per-container flags are unit-testable directly.
-pub fn core_run_specs(plan: &FiveGPlan, core_image: &str) -> Vec<Vec<RunSpec>> {
-    let nf = |name: &str| RunSpec {
-        name: name.to_string(),
-        image: core_image.to_string(),
-        extra_flags: vec![],
-        cmd: vec![
-            format!("open5gs-{name}d"),
-            "-c".to_string(),
-            format!("/etc/vx5g/open5gs/{name}.yaml"),
-        ],
+/// NET_ADMIN + /dev/net/tun for its vxtun device). Every container mounts
+/// the rendered config set from `cfg_dir`. Pure — no container engine — so
+/// the ordering and per-container capabilities are unit-testable directly.
+pub fn core_run_specs(
+    plan: &FiveGPlan,
+    core_image: &str,
+    cfg_dir: &Path,
+) -> Vec<Vec<ContainerSpec>> {
+    let spec = |name: String, image: &str, cmd: Vec<String>| ContainerSpec {
+        name,
+        image: image.to_string(),
+        cmd,
+        binds: vec![config_bind(cfg_dir)],
+        ..Default::default()
+    };
+    let nf = |name: &str| {
+        spec(
+            name.to_string(),
+            core_image,
+            vec![
+                format!("open5gs-{name}d"),
+                "-c".to_string(),
+                format!("/etc/vx5g/open5gs/{name}.yaml"),
+            ],
+        )
     };
 
     vec![
-        vec![RunSpec {
-            name: "mongo".to_string(),
-            image: "docker.io/library/mongo:7".to_string(),
-            extra_flags: vec![],
-            cmd: vec![
+        vec![spec(
+            "mongo".to_string(),
+            "docker.io/library/mongo:7",
+            vec![
                 "mongod".to_string(),
                 "--bind_ip".to_string(),
                 "127.0.0.1".to_string(),
                 "--quiet".to_string(),
             ],
-        }],
+        )],
         vec![nf("nrf")],
         vec![
             nf("ausf"),
@@ -301,52 +366,90 @@ pub fn core_run_specs(plan: &FiveGPlan, core_image: &str) -> Vec<Vec<RunSpec>> {
         vec![nf("amf")],
         plan.sessions
             .iter()
-            .map(|s| RunSpec {
-                name: format!("smf-{}", s.slice_id),
-                image: core_image.to_string(),
-                extra_flags: vec![],
-                cmd: vec![
-                    "open5gs-smfd".to_string(),
-                    "-c".to_string(),
-                    format!("/etc/vx5g/open5gs/smf-{}.yaml", s.slice_id),
-                ],
+            .map(|s| {
+                spec(
+                    format!("smf-{}", s.slice_id),
+                    core_image,
+                    vec![
+                        "open5gs-smfd".to_string(),
+                        "-c".to_string(),
+                        format!("/etc/vx5g/open5gs/smf-{}.yaml", s.slice_id),
+                    ],
+                )
             })
             .collect(),
         plan.sessions
             .iter()
-            .map(|s| RunSpec {
-                name: format!("upf-{}", s.slice_id),
-                image: core_image.to_string(),
-                extra_flags: vec![
-                    "--cap-add=NET_ADMIN".to_string(),
-                    "--device".to_string(),
-                    "/dev/net/tun".to_string(),
-                ],
-                cmd: vec![
-                    "open5gs-upfd".to_string(),
-                    "-c".to_string(),
-                    format!("/etc/vx5g/open5gs/upf-{}.yaml", s.slice_id),
-                ],
+            .map(|s| ContainerSpec {
+                cap_add: vec!["NET_ADMIN".to_string()],
+                devices: vec!["/dev/net/tun".to_string()],
+                ..spec(
+                    format!("upf-{}", s.slice_id),
+                    core_image,
+                    vec![
+                        "open5gs-upfd".to_string(),
+                        "-c".to_string(),
+                        format!("/etc/vx5g/open5gs/upf-{}.yaml", s.slice_id),
+                    ],
+                )
             })
             .collect(),
     ]
 }
 
-fn run_detached(pod: &str, cfg_dir: &Path, spec: &RunSpec) -> Result<(), FiveGLifecycleError> {
-    let mut args: Vec<String> = vec![
-        "run".into(),
-        "-d".into(),
-        "--pod".into(),
-        pod.into(),
-        "--name".into(),
-        format!("{pod}-{}", spec.name),
-        "-v".into(),
-        format!("{}:/etc/vx5g:ro,Z", cfg_dir.display()),
-    ];
-    args.extend(spec.extra_flags.iter().cloned());
-    args.push(spec.image.clone());
-    args.extend(spec.cmd.iter().cloned());
-    podman(&args)?;
+/// The gNB, alone in the RAN pod.
+fn gnb_spec(cfg: &FiveGLifecycleConfig, cfg_dir: &Path) -> ContainerSpec {
+    ContainerSpec {
+        name: "gnb".to_string(),
+        image: cfg.ran_image.clone(),
+        cmd: vec![
+            "nr-gnb".to_string(),
+            "-c".to_string(),
+            "/etc/vx5g/ueransim/gnb.yaml".to_string(),
+        ],
+        binds: vec![config_bind(cfg_dir)],
+        ..Default::default()
+    }
+}
+
+/// One UE, alone in its own pod; needs NET_ADMIN + /dev/net/tun for its
+/// `uesimtun<i>` device, like a UPF.
+fn ue_spec(cfg: &FiveGLifecycleConfig, cfg_dir: &Path, session: &SliceSession) -> ContainerSpec {
+    ContainerSpec {
+        name: "ue".to_string(),
+        image: cfg.ran_image.clone(),
+        cmd: vec![
+            "nr-ue".to_string(),
+            "-c".to_string(),
+            format!("/etc/vx5g/ueransim/ue-{}.yaml", session.slice_id),
+        ],
+        binds: vec![config_bind(cfg_dir)],
+        cap_add: vec!["NET_ADMIN".to_string()],
+        devices: vec!["/dev/net/tun".to_string()],
+        ..Default::default()
+    }
+}
+
+/// Start each phase's containers in the pod, settling between phases.
+async fn start_phases(
+    client: &ContainerClient,
+    group: &GroupSpec,
+    handle: &crate::containers::GroupHandle,
+    phases: &[Vec<ContainerSpec>],
+) -> Result<(), FiveGLifecycleError> {
+    for phase in phases {
+        for spec in phase {
+            client
+                .ensure_member(group, handle, spec)
+                .await
+                .map_err(containers(format!(
+                    "start `{}-{}`",
+                    group.name(),
+                    spec.name
+                )))?;
+        }
+        tokio::time::sleep(PHASE_SETTLE).await;
+    }
     Ok(())
 }
 
@@ -365,7 +468,7 @@ fn run_detached(pod: &str, cfg_dir: &Path, spec: &RunSpec) -> Result<(), FiveGLi
 /// (`RAN_TRANSIT_ADDR`) reachable from an arbitrary number of separate
 /// peers, the same veth-into-bridge primitive used everywhere else in this
 /// codebase (`gateway::provision::apply_endpoints`, [`bridge_up`]).
-fn setup_transit_link(
+async fn setup_transit_link(
     cfg: &FiveGLifecycleConfig,
     cn_pid: u32,
     ran_pid: u32,
@@ -374,21 +477,22 @@ fn setup_transit_link(
     let bridge = ran_bridge_name(&cfg.ran_pod_name);
     host_ip(&[
         "link", "add", &cn_side, "type", "veth", "peer", "name", &ran_side,
-    ])?;
-    host_ip(&["link", "set", &cn_side, "netns", &cn_pid.to_string()])?;
-    host_ip(&["link", "set", &ran_side, "netns", &ran_pid.to_string()])?;
+    ])
+    .await?;
+    host_ip(&["link", "set", &cn_side, "netns", &cn_pid.to_string()]).await?;
+    host_ip(&["link", "set", &ran_side, "netns", &ran_pid.to_string()]).await?;
 
     let cn_addr = format!("{CN_TRANSIT_ADDR}/24");
-    nsenter_ip(cn_pid, &["addr", "add", &cn_addr, "dev", &cn_side])?;
-    nsenter_ip(cn_pid, &["link", "set", &cn_side, "up"])?;
+    nsenter_ip(cn_pid, &["addr", "add", &cn_addr, "dev", &cn_side]).await?;
+    nsenter_ip(cn_pid, &["link", "set", &cn_side, "up"]).await?;
 
-    nsenter_ip(ran_pid, &["link", "add", &bridge, "type", "bridge"])?;
-    nsenter_ip(ran_pid, &["link", "set", &bridge, "up"])?;
-    nsenter_ip(ran_pid, &["link", "set", &ran_side, "master", &bridge])?;
-    nsenter_ip(ran_pid, &["link", "set", &ran_side, "up"])?;
+    nsenter_ip(ran_pid, &["link", "add", &bridge, "type", "bridge"]).await?;
+    nsenter_ip(ran_pid, &["link", "set", &bridge, "up"]).await?;
+    nsenter_ip(ran_pid, &["link", "set", &ran_side, "master", &bridge]).await?;
+    nsenter_ip(ran_pid, &["link", "set", &ran_side, "up"]).await?;
 
     let ran_addr = format!("{RAN_TRANSIT_ADDR}/24");
-    nsenter_ip(ran_pid, &["addr", "add", &ran_addr, "dev", &bridge])?;
+    nsenter_ip(ran_pid, &["addr", "add", &ran_addr, "dev", &bridge]).await?;
     Ok(())
 }
 
@@ -399,10 +503,10 @@ fn setup_transit_link(
 /// `ue_subnet` a connected route in the CN pod's netns, which is how
 /// downlink traffic to a UE's IP finds its way back into the UPF's GTP-U
 /// tunnel.
-fn setup_upf_tun(cn_pid: u32, session: &SliceSession) -> Result<(), FiveGLifecycleError> {
+async fn setup_upf_tun(cn_pid: u32, session: &SliceSession) -> Result<(), FiveGLifecycleError> {
     let addr = format!("{}/16", session.ue_gateway);
-    nsenter_ip(cn_pid, &["addr", "add", &addr, "dev", &session.tun_dev])?;
-    nsenter_ip(cn_pid, &["link", "set", &session.tun_dev, "up"])?;
+    nsenter_ip(cn_pid, &["addr", "add", &addr, "dev", &session.tun_dev]).await?;
+    nsenter_ip(cn_pid, &["link", "set", &session.tun_dev, "up"]).await?;
     Ok(())
 }
 
@@ -422,7 +526,8 @@ fn setup_upf_tun(cn_pid: u32, session: &SliceSession) -> Result<(), FiveGLifecyc
 /// `index` is this session's position in `plan.sessions` (used only for
 /// IFNAMSIZ-safe veth naming, [`ue_veth_names`] — pod names use the slice
 /// id directly, unconstrained).
-pub fn ue_up(
+pub async fn ue_up(
+    client: &ContainerClient,
     cfg: &FiveGLifecycleConfig,
     cfg_dir: &Path,
     ran_pid: u32,
@@ -430,46 +535,37 @@ pub fn ue_up(
     session: &SliceSession,
 ) -> Result<String, FiveGLifecycleError> {
     let pod = ue_pod_name(&cfg.ran_pod_name, &session.slice_id);
-    if pod_exists(&pod)? {
+    refuse_legacy(client, vec![format!("{pod}-ue")], pod.clone()).await?;
+    if pod_exists(client, &pod).await? {
         return Ok(format!("UE pod `{pod}` already up (idempotent)"));
     }
-    podman(&["pod".into(), "create".into(), "--name".into(), pod.clone()])?;
-    podman(&["pod".into(), "start".into(), pod.clone()])?;
-    let ue_pid = pod_pid(&pod)?;
+    let group = pod_group(cfg, &pod)?;
+    let (handle, _) = client
+        .ensure_group(&group)
+        .await
+        .map_err(containers(format!("bring up UE pod `{pod}`")))?;
+    let ue_pid = handle.infra_pid;
 
     let (ran_side, ue_side) = ue_veth_names(&cfg.ran_pod_name, index);
     let bridge = ran_bridge_name(&cfg.ran_pod_name);
     host_ip(&[
         "link", "add", &ran_side, "type", "veth", "peer", "name", &ue_side,
-    ])?;
-    host_ip(&["link", "set", &ran_side, "netns", &ran_pid.to_string()])?;
-    host_ip(&["link", "set", &ue_side, "netns", &ue_pid.to_string()])?;
+    ])
+    .await?;
+    host_ip(&["link", "set", &ran_side, "netns", &ran_pid.to_string()]).await?;
+    host_ip(&["link", "set", &ue_side, "netns", &ue_pid.to_string()]).await?;
 
-    nsenter_ip(ran_pid, &["link", "set", &ran_side, "master", &bridge])?;
-    nsenter_ip(ran_pid, &["link", "set", &ran_side, "up"])?;
+    nsenter_ip(ran_pid, &["link", "set", &ran_side, "master", &bridge]).await?;
+    nsenter_ip(ran_pid, &["link", "set", &ran_side, "up"]).await?;
 
     let ue_addr = format!("{}/24", session.ue_ran_link_addr);
-    nsenter_ip(ue_pid, &["addr", "add", &ue_addr, "dev", &ue_side])?;
-    nsenter_ip(ue_pid, &["link", "set", &ue_side, "up"])?;
+    nsenter_ip(ue_pid, &["addr", "add", &ue_addr, "dev", &ue_side]).await?;
+    nsenter_ip(ue_pid, &["link", "set", &ue_side, "up"]).await?;
 
-    run_detached(
-        &pod,
-        cfg_dir,
-        &RunSpec {
-            name: "ue".to_string(),
-            image: cfg.ran_image.clone(),
-            extra_flags: vec![
-                "--cap-add=NET_ADMIN".to_string(),
-                "--device".to_string(),
-                "/dev/net/tun".to_string(),
-            ],
-            cmd: vec![
-                "nr-ue".to_string(),
-                "-c".to_string(),
-                format!("/etc/vx5g/ueransim/ue-{}.yaml", session.slice_id),
-            ],
-        },
-    )?;
+    client
+        .ensure_member(&group, &handle, &ue_spec(cfg, cfg_dir, session))
+        .await
+        .map_err(containers(format!("start `{pod}-ue`")))?;
 
     Ok(format!(
         "UE pod `{pod}` up, joined to gNB via {bridge} at {}",
@@ -477,21 +573,20 @@ pub fn ue_up(
     ))
 }
 
-/// Tear one UE's pod down. Idempotent (`podman pod rm --ignore`) — its
+/// Tear one UE's pod down. Idempotent (an absent pod is a no-op) — its
 /// veth is destroyed automatically with the pod's netns, same as
 /// [`fiveg_down`]'s transit link.
-pub fn ue_down(
+pub async fn ue_down(
+    client: &ContainerClient,
     cfg: &FiveGLifecycleConfig,
     session: &SliceSession,
 ) -> Result<String, FiveGLifecycleError> {
     let pod = ue_pod_name(&cfg.ran_pod_name, &session.slice_id);
-    podman(&[
-        "pod".into(),
-        "rm".into(),
-        "-f".into(),
-        "--ignore".into(),
-        pod.clone(),
-    ])?;
+    refuse_legacy(client, vec![format!("{pod}-ue")], pod.clone()).await?;
+    client
+        .group_down(&pod)
+        .await
+        .map_err(containers(format!("remove UE pod `{pod}`")))?;
     Ok(format!("UE pod `{pod}` down"))
 }
 
@@ -510,10 +605,10 @@ const UE_PDU_ADDR_TIMEOUT: Duration = Duration::from_secs(15);
 /// condition, not a magic number. `pub` so `traffic::lifecycle` can reuse
 /// this exact discovery for its own s-nssai targets rather than
 /// reimplementing it a second way.
-pub fn wait_for_ue_pdu_addr(ue_pid: u32) -> Result<String, FiveGLifecycleError> {
+pub async fn wait_for_ue_pdu_addr(ue_pid: u32) -> Result<String, FiveGLifecycleError> {
     let deadline = std::time::Instant::now() + UE_PDU_ADDR_TIMEOUT;
     loop {
-        if let Ok(out) = nsenter_ip(ue_pid, &["-4", "-o", "addr", "show", "uesimtun0"]) {
+        if let Ok(out) = nsenter_ip(ue_pid, &["-4", "-o", "addr", "show", "uesimtun0"]).await {
             let addr = out
                 .split_whitespace()
                 .skip_while(|w| *w != "inet")
@@ -532,7 +627,7 @@ pub fn wait_for_ue_pdu_addr(ue_pid: u32) -> Result<String, FiveGLifecycleError> 
                 ),
             });
         }
-        std::thread::sleep(Duration::from_millis(500));
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 
@@ -560,37 +655,44 @@ pub fn wait_for_ue_pdu_addr(ue_pid: u32) -> Result<String, FiveGLifecycleError> 
 /// Idempotent: an existing reflector container is left running. Torn down
 /// automatically by [`ue_down`] (destroys the whole pod, not addressed
 /// separately here).
-pub fn ue_probe_up(
+pub async fn ue_probe_up(
+    client: &ContainerClient,
     cfg: &FiveGLifecycleConfig,
     cfg_dir: &Path,
     session: &SliceSession,
     port: u16,
 ) -> Result<String, FiveGLifecycleError> {
     let pod = ue_pod_name(&cfg.ran_pod_name, &session.slice_id);
-    let (_, containers) = pod_containers(&pod)?;
+    let status = client
+        .group_status(&pod)
+        .await
+        .map_err(containers(format!("observe UE pod `{pod}`")))?;
     let probe_name = format!("{pod}-probe");
-    if containers.iter().any(|c| c.name == probe_name) {
+    if status.member(&probe_name).is_some() {
         return Ok(format!(
             "vxprobe reflector already up in UE pod `{pod}` (idempotent)"
         ));
     }
-    let ue_pid = pod_pid(&pod)?;
-    let ue_addr = wait_for_ue_pdu_addr(ue_pid)?;
-    run_detached(
-        &pod,
-        cfg_dir,
-        &RunSpec {
-            name: "probe".to_string(),
-            image: cfg.ran_image.clone(),
-            extra_flags: vec![],
-            cmd: vec![
-                "vxprobe".to_string(),
-                "reflect".to_string(),
-                "--listen".to_string(),
-                format!("{ue_addr}:{port}"),
-            ],
-        },
-    )?;
+    let handle = client.handle(&pod).await.map_err(containers(format!(
+        "find UE pod `{pod}`'s network namespace"
+    )))?;
+    let ue_addr = wait_for_ue_pdu_addr(handle.infra_pid).await?;
+    let probe = ContainerSpec {
+        name: "probe".to_string(),
+        image: cfg.ran_image.clone(),
+        cmd: vec![
+            "vxprobe".to_string(),
+            "reflect".to_string(),
+            "--listen".to_string(),
+            format!("{ue_addr}:{port}"),
+        ],
+        binds: vec![config_bind(cfg_dir)],
+        ..Default::default()
+    };
+    client
+        .ensure_member(&pod_group(cfg, &pod)?, &handle, &probe)
+        .await
+        .map_err(containers(format!("start `{probe_name}`")))?;
     Ok(format!(
         "vxprobe reflector up in UE pod `{pod}` on {ue_addr}:{port}"
     ))
@@ -650,39 +752,78 @@ pub const FIVEG_UPLINK_VLAN: u16 = 4000;
 /// this function does not do — that VLAN-membership decision belongs to
 /// the real GatewayService integration, tracked separately,
 /// `vxedge/TASKS.md` §4, not decided as a side effect here).
-pub fn bridge_up(
+pub async fn bridge_up(
     cfg: &FiveGLifecycleConfig,
     bridge: &str,
     cn_pid: u32,
 ) -> Result<(), FiveGLifecycleError> {
+    // Converges rather than creates, so a second `experiment up` over a
+    // running core is a no-op (it failed with `File exists` before):
+    // `fiveg_up` keeps an existing CN pod, and with it this veth pair,
+    // whose two ends live and die together.
     let (host_side, pod_side) = bridge_veth_names(&cfg.pod_name);
-    host_ip(&[
-        "link", "add", &host_side, "type", "veth", "peer", "name", &pod_side,
-    ])?;
-    host_ip(&["link", "set", &pod_side, "netns", &cn_pid.to_string()])?;
+    if !host_link_exists(&host_side).await? {
+        host_ip(&[
+            "link", "add", &host_side, "type", "veth", "peer", "name", &pod_side,
+        ])
+        .await?;
+    }
+    // Still in the host namespace only if an earlier run stopped between
+    // creating the pair and moving this end.
+    if host_link_exists(&pod_side).await? {
+        host_ip(&["link", "set", &pod_side, "netns", &cn_pid.to_string()]).await?;
+    }
 
-    host_ip(&["link", "set", &host_side, "master", bridge])?;
-    host_ip(&["link", "set", &host_side, "up"])?;
+    host_ip(&["link", "set", &host_side, "master", bridge]).await?;
+    host_ip(&["link", "set", &host_side, "up"]).await?;
 
     let cn_addr = format!("{BRIDGE_ATTACH_CN_ADDR}/24");
-    nsenter_ip(cn_pid, &["addr", "add", &cn_addr, "dev", &pod_side])?;
-    nsenter_ip(cn_pid, &["link", "set", &pod_side, "up"])?;
+    tolerate_exists(nsenter_ip(cn_pid, &["addr", "add", &cn_addr, "dev", &pod_side]).await)?;
+    nsenter_ip(cn_pid, &["link", "set", &pod_side, "up"]).await?;
 
     // The CN pod's netns now has two interfaces a packet might need to
     // cross between (this bridge-side veth and a UPF's vxtun<i>) — off by
     // default in a fresh netns, so forwarding between them needs enabling
     // explicitly, same as any Linux router.
-    nsenter_run(cn_pid, "sysctl", &["-w", "net.ipv4.ip_forward=1"])?;
+    nsenter_run(cn_pid, "sysctl", &["-w", "net.ipv4.ip_forward=1"]).await?;
     Ok(())
+}
+
+/// Whether `name` exists in the host's own network namespace. Reading
+/// links needs no privilege, so this runs `ip` directly, not through sudo.
+async fn host_link_exists(name: &str) -> Result<bool, FiveGLifecycleError> {
+    Command::new("ip")
+        .args(["link", "show", "dev", name])
+        .output()
+        .await
+        .map(|out| out.status.success())
+        .map_err(|source| FiveGLifecycleError::Spawn {
+            program: "ip".to_string(),
+            source,
+        })
+}
+
+/// An `ip addr add` that found the address already assigned has converged.
+/// Older iproute2 says "File exists", 6.19 "Address already assigned";
+/// `gateway::netops::Shell::run_tolerate_exists` matches the same two.
+fn tolerate_exists(result: Result<String, FiveGLifecycleError>) -> Result<(), FiveGLifecycleError> {
+    match result {
+        Err(FiveGLifecycleError::Command { stderr, .. })
+            if stderr.contains("File exists") || stderr.contains("already assigned") =>
+        {
+            Ok(())
+        }
+        other => other.map(|_| ()),
+    }
 }
 
 /// Remove the bridge attachment. Idempotent: deleting the host-side veth
 /// also destroys its pod-side peer, wherever it currently lives; a missing
 /// interface is tolerated (`ip link del` failing with "Cannot find device"
 /// means it's already gone, not an error worth surfacing).
-pub fn bridge_down(cfg: &FiveGLifecycleConfig) -> Result<(), FiveGLifecycleError> {
+pub async fn bridge_down(cfg: &FiveGLifecycleConfig) -> Result<(), FiveGLifecycleError> {
     let (host_side, _) = bridge_veth_names(&cfg.pod_name);
-    match host_ip(&["link", "del", &host_side]) {
+    match host_ip(&["link", "del", &host_side]).await {
         Ok(_) => Ok(()),
         Err(FiveGLifecycleError::Command { stderr, .. })
             if stderr.contains("Cannot find device") || stderr.contains("does not exist") =>
@@ -693,14 +834,31 @@ pub fn bridge_down(cfg: &FiveGLifecycleConfig) -> Result<(), FiveGLifecycleError
     }
 }
 
+/// Containers the podman-CLI code put in the CN and RAN pods, and the pods
+/// to remove (UE pods included, found by name) — see [`refuse_legacy`].
+fn legacy_core_check(cfg: &FiveGLifecycleConfig) -> (Vec<String>, String) {
+    let (cn, ran) = (&cfg.pod_name, &cfg.ran_pod_name);
+    (
+        vec![
+            format!("{cn}-mongo"),
+            format!("{cn}-nrf"),
+            format!("{ran}-gnb"),
+        ],
+        format!("{cn} {ran} $(podman pod ps -q --filter name={ran}-ue-)"),
+    )
+}
+
 /// Bring the 5G core up as a running pod. Idempotent: an already-existing
 /// pod is left untouched (matches `services.rs::svc_up`'s convention).
-pub fn fiveg_up(
+pub async fn fiveg_up(
+    client: &ContainerClient,
     plan: &FiveGPlan,
     runtime_dir: &Path,
     cfg: &FiveGLifecycleConfig,
 ) -> Result<String, FiveGLifecycleError> {
-    if pod_exists(&cfg.pod_name)? {
+    let (legacy, pods) = legacy_core_check(cfg);
+    refuse_legacy(client, legacy, pods).await?;
+    if pod_exists(client, &cfg.pod_name).await? {
         return Ok(format!("pod `{}` already up (idempotent)", cfg.pod_name));
     }
 
@@ -711,15 +869,13 @@ pub fn fiveg_up(
     })?;
 
     // CN pod: the 8-NF core + per-slice SMF/UPF, in dependency order.
-    podman(&[
-        "pod".into(),
-        "create".into(),
-        "--name".into(),
-        cfg.pod_name.clone(),
-    ])?;
-    podman(&["pod".into(), "start".into(), cfg.pod_name.clone()])?;
+    let cn = pod_group(cfg, &cfg.pod_name)?;
+    let (cn_handle, _) = client
+        .ensure_group(&cn)
+        .await
+        .map_err(containers(format!("bring up CN pod `{}`", cfg.pod_name)))?;
 
-    let phases = core_run_specs(plan, &cfg.core_image);
+    let phases = core_run_specs(plan, &cfg.core_image, &cfg_dir);
     let phase_count = phases.len();
     // Split before "amf" (phase index 3 — after [mongo],[nrf],[sbi-6]):
     // AMF and every per-slice UPF are deliberately started *after* the
@@ -736,31 +892,23 @@ pub fn fiveg_up(
     let (pre_transit_phases, post_transit_phases) = phases
         .split_at_checked(TRANSIT_DEPENDENT_PHASES_FROM)
         .expect("core_run_specs always returns at least 4 phases");
-    for phase in pre_transit_phases {
-        for spec in phase {
-            run_detached(&cfg.pod_name, &cfg_dir, spec)?;
-        }
-        std::thread::sleep(PHASE_SETTLE);
-    }
+    start_phases(client, &cn, &cn_handle, pre_transit_phases).await?;
 
     // RAN pod: gNB only — individual UEs are started per test run against
     // it (the vxprobe/vxtraffic pattern: provisioning here, traffic
     // driven separately).
-    podman(&[
-        "pod".into(),
-        "create".into(),
-        "--name".into(),
-        cfg.ran_pod_name.clone(),
-    ])?;
-    podman(&["pod".into(), "start".into(), cfg.ran_pod_name.clone()])?;
+    let ran = pod_group(cfg, &cfg.ran_pod_name)?;
+    let (ran_handle, _) = client.ensure_group(&ran).await.map_err(containers(format!(
+        "bring up RAN pod `{}`",
+        cfg.ran_pod_name
+    )))?;
 
     // Join the two pods (assigns CN_TRANSIT_ADDR — what AMF's NGAP server
     // binds to), then give each slice's UPF-to-be its own GTP-U address on
     // the CN side of the link too — everything the phases below need must
     // exist before they start.
-    let cn_pid = pod_pid(&cfg.pod_name)?;
-    let ran_pid = pod_pid(&cfg.ran_pod_name)?;
-    setup_transit_link(cfg, cn_pid, ran_pid)?;
+    let (cn_pid, ran_pid) = (cn_handle.infra_pid, ran_handle.infra_pid);
+    setup_transit_link(cfg, cn_pid, ran_pid).await?;
     let (cn_transit_dev, _) = transit_veth_names(&cfg.pod_name);
     for session in &plan.sessions {
         nsenter_ip(
@@ -772,47 +920,35 @@ pub fn fiveg_up(
                 "dev",
                 &cn_transit_dev,
             ],
-        )?;
+        )
+        .await?;
     }
 
     // Now amf, smf, and upf — their transit-subnet bind addresses all
     // exist, so every daemon starts and stays up this time.
-    for phase in post_transit_phases {
-        for spec in phase {
-            run_detached(&cfg.pod_name, &cfg_dir, spec)?;
-        }
-        std::thread::sleep(PHASE_SETTLE);
-    }
+    start_phases(client, &cn, &cn_handle, post_transit_phases).await?;
     for session in &plan.sessions {
-        setup_upf_tun(cn_pid, session)?;
+        setup_upf_tun(cn_pid, session).await?;
     }
 
-    run_detached(
-        &cfg.ran_pod_name,
-        &cfg_dir,
-        &RunSpec {
-            name: "gnb".to_string(),
-            image: cfg.ran_image.clone(),
-            extra_flags: vec![],
-            cmd: vec![
-                "nr-gnb".to_string(),
-                "-c".to_string(),
-                "/etc/vx5g/ueransim/gnb.yaml".to_string(),
-            ],
-        },
-    )?;
-    std::thread::sleep(PHASE_SETTLE);
+    start_phases(client, &ran, &ran_handle, &[vec![gnb_spec(cfg, &cfg_dir)]]).await?;
 
-    for cmd in subscriber_insert_commands(plan) {
-        let mut args: Vec<String> = vec![
-            "run".into(),
-            "--rm".into(),
-            "--pod".into(),
-            cfg.pod_name.clone(),
-            cfg.core_image.clone(),
-        ];
-        args.extend(cmd);
-        podman(&args)?;
+    // One-shots in the CN pod's namespace, where mongo listens on loopback
+    // (`podman run --rm --pod` before V2).
+    for (i, cmd) in subscriber_insert_commands(plan).into_iter().enumerate() {
+        let insert = ContainerSpec {
+            name: format!("subscriber-{i}"),
+            image: cfg.core_image.clone(),
+            cmd,
+            ..Default::default()
+        };
+        client
+            .run_to_completion(&cn, &cn_handle, &insert)
+            .await
+            .map_err(containers(format!(
+                "provision subscriber for slice `{}`",
+                plan.sessions[i].slice_id
+            )))?;
     }
 
     Ok(format!(
@@ -826,38 +962,25 @@ pub fn fiveg_up(
     ))
 }
 
-/// Tear both pods down. Idempotent: an already-absent pod is a no-op
-/// (`podman pod rm --ignore`). The transit veth is destroyed automatically
-/// when either end's netns is destroyed — no explicit cleanup needed.
-pub fn fiveg_down(cfg: &FiveGLifecycleConfig) -> Result<String, FiveGLifecycleError> {
-    podman(&[
-        "pod".into(),
-        "rm".into(),
-        "-f".into(),
-        "--ignore".into(),
-        cfg.ran_pod_name.clone(),
-    ])?;
-    podman(&[
-        "pod".into(),
-        "rm".into(),
-        "-f".into(),
-        "--ignore".into(),
-        cfg.pod_name.clone(),
-    ])?;
+/// Tear both pods down. Idempotent: an already-absent pod is a no-op. The
+/// transit veth is destroyed automatically when either end's netns is
+/// destroyed — no explicit cleanup needed.
+pub async fn fiveg_down(
+    client: &ContainerClient,
+    cfg: &FiveGLifecycleConfig,
+) -> Result<String, FiveGLifecycleError> {
+    let (legacy, pods) = legacy_core_check(cfg);
+    refuse_legacy(client, legacy, pods).await?;
+    for pod in [&cfg.ran_pod_name, &cfg.pod_name] {
+        client
+            .group_down(pod)
+            .await
+            .map_err(containers(format!("remove pod `{pod}`")))?;
+    }
     Ok(format!(
         "pods `{}` and `{}` down",
         cfg.pod_name, cfg.ran_pod_name
     ))
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-struct PsEntry {
-    #[serde(rename = "IsInfra")]
-    is_infra: bool,
-    #[serde(rename = "Names")]
-    names: Vec<String>,
-    #[serde(rename = "State")]
-    state: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -892,39 +1015,33 @@ impl FiveGStatus {
     }
 }
 
-fn pod_containers(pod_name: &str) -> Result<(bool, Vec<ContainerStatus>), FiveGLifecycleError> {
-    if !pod_exists(pod_name)? {
-        return Ok((false, vec![]));
-    }
-    let out = podman(&[
-        "ps".into(),
-        "--pod".into(),
-        "--filter".into(),
-        format!("pod={pod_name}"),
-        "--format".into(),
-        "json".into(),
-    ])?;
-    let entries: Vec<PsEntry> =
-        serde_json::from_str(&out).map_err(|e| FiveGLifecycleError::Parse {
-            cmdline: format!("podman ps --pod --filter pod={pod_name} --format json"),
-            detail: e.to_string(),
-        })?;
-    let containers = entries
-        .into_iter()
-        .filter(|e| !e.is_infra)
-        .map(|e| ContainerStatus {
-            name: e.names.into_iter().next().unwrap_or_default(),
-            state: e.state,
+async fn pod_containers(
+    client: &ContainerClient,
+    pod_name: &str,
+) -> Result<(bool, Vec<ContainerStatus>), FiveGLifecycleError> {
+    let status = client
+        .group_status(pod_name)
+        .await
+        .map_err(containers(format!("observe pod `{pod_name}`")))?;
+    let containers = status
+        .members
+        .iter()
+        .map(|c| ContainerStatus {
+            name: c.name.clone(),
+            state: c.state.clone(),
         })
         .collect();
-    Ok((true, containers))
+    Ok((status.exists(), containers))
 }
 
 /// Observe both pods' actual state — the reconciler's read side, mirroring
 /// `gateway::provision::observe`.
-pub fn fiveg_status(cfg: &FiveGLifecycleConfig) -> Result<FiveGStatus, FiveGLifecycleError> {
-    let (up, containers) = pod_containers(&cfg.pod_name)?;
-    let (ran_up, ran_containers) = pod_containers(&cfg.ran_pod_name)?;
+pub async fn fiveg_status(
+    client: &ContainerClient,
+    cfg: &FiveGLifecycleConfig,
+) -> Result<FiveGStatus, FiveGLifecycleError> {
+    let (up, containers) = pod_containers(client, &cfg.pod_name).await?;
+    let (ran_up, ran_containers) = pod_containers(client, &cfg.ran_pod_name).await?;
     Ok(FiveGStatus {
         pod_name: cfg.pod_name.clone(),
         up,
@@ -959,7 +1076,11 @@ devices: {}
 
     #[test]
     fn phases_are_ordered_mongo_nrf_sbi_amf_smf_upf() {
-        let phases = core_run_specs(&plan_two_slices(), "vx5g-core");
+        let phases = core_run_specs(
+            &plan_two_slices(),
+            "vx5g-core",
+            Path::new("/run/vx/fiveg-config"),
+        );
         assert_eq!(phases.len(), 6);
         assert_eq!(phases[0].len(), 1);
         assert_eq!(phases[0][0].name, "mongo");
@@ -976,21 +1097,22 @@ devices: {}
 
     #[test]
     fn upf_specs_carry_net_admin_and_tun_device_others_dont() {
-        let phases = core_run_specs(&plan_two_slices(), "vx5g-core");
+        let phases = core_run_specs(
+            &plan_two_slices(),
+            "vx5g-core",
+            Path::new("/run/vx/fiveg-config"),
+        );
         let upf_phase = phases.last().unwrap();
         for spec in upf_phase {
-            assert!(
-                spec.extra_flags
-                    .contains(&"--cap-add=NET_ADMIN".to_string())
-            );
-            assert!(spec.extra_flags.contains(&"/dev/net/tun".to_string()));
+            assert_eq!(spec.cap_add, ["NET_ADMIN"]);
+            assert_eq!(spec.devices, ["/dev/net/tun"]);
         }
         // mongo, nrf, and the SBI-plane NFs need neither.
         for phase in &phases[..4] {
             for spec in phase {
                 assert!(
-                    spec.extra_flags.is_empty(),
-                    "{} should have no extra flags",
+                    spec.cap_add.is_empty() && spec.devices.is_empty(),
+                    "{} should need no capability or device",
                     spec.name
                 );
             }
@@ -998,8 +1120,53 @@ devices: {}
     }
 
     #[test]
+    fn every_core_container_mounts_the_rendered_configs_read_only() {
+        let cfg_dir = Path::new("/run/vx/fiveg-config");
+        for spec in core_run_specs(&plan_two_slices(), "vx5g-core", cfg_dir)
+            .iter()
+            .flatten()
+        {
+            // `-v <cfg>:/etc/vx5g:ro,Z`, as the podman-CLI path passed it.
+            assert_eq!(spec.binds, [config_bind(cfg_dir)], "{}", spec.name);
+            assert_eq!(
+                spec.binds[0].to_bind_string(),
+                "/run/vx/fiveg-config:/etc/vx5g:ro,Z"
+            );
+        }
+    }
+
+    #[test]
+    fn gnb_and_ue_specs_match_what_the_cli_ran() {
+        let cfg = FiveGLifecycleConfig::default();
+        let cfg_dir = Path::new("/run/vx/fiveg-config");
+        let gnb = gnb_spec(&cfg, cfg_dir);
+        assert_eq!(gnb.image, "vx5g-ran");
+        assert_eq!(gnb.cmd, ["nr-gnb", "-c", "/etc/vx5g/ueransim/gnb.yaml"]);
+        assert!(gnb.cap_add.is_empty() && gnb.devices.is_empty());
+
+        let session = &plan_two_slices().sessions[0];
+        let ue = ue_spec(&cfg, cfg_dir, session);
+        assert_eq!(ue.name, "ue");
+        assert_eq!(ue.cmd, ["nr-ue", "-c", "/etc/vx5g/ueransim/ue-adas.yaml"]);
+        assert_eq!(ue.cap_add, ["NET_ADMIN"]);
+        assert_eq!(ue.devices, ["/dev/net/tun"]);
+    }
+
+    #[test]
+    fn legacy_check_names_exact_member_containers_and_every_pod() {
+        let (names, pods) = legacy_core_check(&FiveGLifecycleConfig::default());
+        assert_eq!(names, ["vx5g-mongo", "vx5g-nrf", "vx5g-ran-gnb"]);
+        assert!(pods.starts_with("vx5g vx5g-ran "), "{pods}");
+        assert!(pods.contains("name=vx5g-ran-ue-"), "UE pods too: {pods}");
+    }
+
+    #[test]
     fn nf_configs_point_at_their_own_rendered_file() {
-        let phases = core_run_specs(&plan_two_slices(), "vx5g-core");
+        let phases = core_run_specs(
+            &plan_two_slices(),
+            "vx5g-core",
+            Path::new("/run/vx/fiveg-config"),
+        );
         assert_eq!(
             phases[1][0].cmd,
             vec!["open5gs-nrfd", "-c", "/etc/vx5g/open5gs/nrf.yaml"]
@@ -1022,6 +1189,11 @@ devices: {}
         assert_eq!(cfg.core_image, "vx5g-core");
         assert_eq!(cfg.ran_pod_name, "vx5g-ran");
         assert_eq!(cfg.ran_image, "vx5g-ran");
+        assert_eq!(cfg.infra_image, PAUSE_IMAGE);
+        assert!(
+            PAUSE_IMAGE.contains("@sha256:"),
+            "the infra image is digest-pinned"
+        );
     }
 
     fn nrf_running() -> ContainerStatus {
@@ -1122,6 +1294,29 @@ devices: {}
         let (host, pod) = bridge_veth_names("a-very-long-custom-pod-name");
         assert!(host.len() <= 15, "{host} exceeds IFNAMSIZ");
         assert!(pod.len() <= 15, "{pod} exceeds IFNAMSIZ");
+    }
+
+    #[test]
+    fn an_address_already_assigned_counts_as_converged() {
+        let exists = || FiveGLifecycleError::Command {
+            cmdline: "sudo nsenter -t 1 -n -- ip addr add 10.98.0.1/24 dev vx5g-brp0".into(),
+            stderr: "RTNETLINK answers: File exists".into(),
+        };
+        assert!(tolerate_exists(Err(exists())).is_ok());
+        let assigned = FiveGLifecycleError::Command {
+            cmdline: "sudo nsenter -t 1 -n -- ip addr add 10.98.0.1/24 dev vx5g-brp0".into(),
+            stderr: "Error: ipv4: Address already assigned.".into(),
+        };
+        assert!(
+            tolerate_exists(Err(assigned)).is_ok(),
+            "iproute2 6.19 wording"
+        );
+        assert!(tolerate_exists(Ok(String::new())).is_ok());
+        let other = FiveGLifecycleError::Command {
+            cmdline: "ip".into(),
+            stderr: "Cannot find device \"vx5g-brp0\"".into(),
+        };
+        assert!(tolerate_exists(Err(other)).is_err());
     }
 
     #[test]

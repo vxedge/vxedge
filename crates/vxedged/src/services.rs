@@ -31,6 +31,7 @@ use vxedge_api::v1::{
     ZoneListRequest, ZoneListResponse, ZoneRemoveRequest, ZoneUpRequest,
 };
 use vxedge_core::Workspace;
+use vxedge_core::containers::LazyClient;
 use vxedge_core::fiveg::{self, FiveGLifecycleConfig, FiveGPlan};
 use vxedge_core::gateway::{self, GatewayPlan, Shell};
 use vxedge_core::traffic::{self, TrafficPlan};
@@ -260,6 +261,8 @@ pub struct GatewaySvc {
     /// 2026-07-17 running `sudo cargo test` (see `fiveg::lifecycle`'s module
     /// doc comment). `TESTBED-SETUP.md` documents the sudoers requirement.
     pub runtime_dir: PathBuf,
+    /// The daemon's one Podman API client, connected on first fiveg use.
+    pub containers: LazyClient,
 }
 
 impl GatewaySvc {
@@ -276,6 +279,7 @@ impl GatewaySvc {
         let shell = self.shell.clone();
         let state = self.state.clone();
         let runtime_dir = self.runtime_dir.clone();
+        let containers = self.containers.clone();
         let events = self.engine.events().clone();
         let job = self
             .engine
@@ -394,13 +398,11 @@ impl GatewaySvc {
                         } else {
                             p.update(93, "provisioning 5G core (fiveg)");
                             let fp = parse_and_fiveg_plan(&yaml)?;
-                            let rt = runtime_dir.clone();
-                            let fp2 = fp.clone();
-                            blocking(move || {
-                                fiveg::fiveg_up(&fp2, &rt, &FiveGLifecycleConfig::default())
-                                    .map_err(|e| e.to_string())
-                            })
-                            .await?;
+                            let client = containers.get().await.map_err(|e| e.to_string())?;
+                            let cfg = FiveGLifecycleConfig::default();
+                            fiveg::fiveg_up(client, &fp, &runtime_dir, &cfg)
+                                .await
+                                .map_err(|e| e.to_string())?;
 
                             p.update(97, "attaching 5G core to vxbr0");
                             let sh = shell.clone();
@@ -421,13 +423,14 @@ impl GatewaySvc {
                                 })
                                 .collect();
                             let root_rate_mbps = plan.root_rate_mbps;
+                            let cn_pid = fiveg::pod_pid(client, &cfg.pod_name)
+                                .await
+                                .map_err(|e| e.to_string())?;
+                            fiveg::bridge_up(&cfg, &bridge, cn_pid)
+                                .await
+                                .map_err(|e| e.to_string())?;
+                            let host_veth = fiveg::bridge_host_veth(&cfg.pod_name);
                             blocking(move || {
-                                let cfg = FiveGLifecycleConfig::default();
-                                let cn_pid =
-                                    fiveg::pod_pid(&cfg.pod_name).map_err(|e| e.to_string())?;
-                                fiveg::bridge_up(&cfg, &bridge, cn_pid)
-                                    .map_err(|e| e.to_string())?;
-                                let host_veth = fiveg::bridge_host_veth(&cfg.pod_name);
                                 let host_iface =
                                     gateway::provision::apply_fiveg_uplink(&sh, &host_veth)
                                         .map_err(|e| e.to_string())?;
@@ -448,20 +451,15 @@ impl GatewaySvc {
                             .await?;
 
                             p.update(99, "bringing up each slice's UE pod");
-                            let rt = runtime_dir.clone();
-                            let fp3 = fp.clone();
-                            blocking(move || {
-                                let cfg = FiveGLifecycleConfig::default();
-                                let ran_pid =
-                                    fiveg::pod_pid(&cfg.ran_pod_name).map_err(|e| e.to_string())?;
-                                let cfg_dir = rt.join("fiveg-config");
-                                for (i, session) in fp3.sessions.iter().enumerate() {
-                                    fiveg::ue_up(&cfg, &cfg_dir, ran_pid, i, session)
-                                        .map_err(|e| e.to_string())?;
-                                }
-                                Ok::<(), String>(())
-                            })
-                            .await?;
+                            let ran_pid = fiveg::pod_pid(client, &cfg.ran_pod_name)
+                                .await
+                                .map_err(|e| e.to_string())?;
+                            let cfg_dir = runtime_dir.join("fiveg-config");
+                            for (i, session) in fp.sessions.iter().enumerate() {
+                                fiveg::ue_up(client, &cfg, &cfg_dir, ran_pid, i, session)
+                                    .await
+                                    .map_err(|e| e.to_string())?;
+                            }
                             Some(fp)
                         };
 
@@ -510,32 +508,28 @@ impl GatewaySvc {
                         if !plan.snssai_slice_ids.is_empty() {
                             p.update(45, "removing UE pods");
                             let fp = parse_and_fiveg_plan(&yaml)?;
-                            blocking(move || {
-                                let cfg = FiveGLifecycleConfig::default();
-                                for session in &fp.sessions {
-                                    // Best-effort: an already-absent UE pod
-                                    // isn't a teardown failure (ue_down
-                                    // itself is idempotent), so don't let
-                                    // one missing pod abort the rest.
-                                    let _ = fiveg::ue_down(&cfg, session);
-                                }
-                                Ok::<(), String>(())
-                            })
-                            .await?;
+                            let client = containers.get().await.map_err(|e| e.to_string())?;
+                            let cfg = FiveGLifecycleConfig::default();
+                            for session in &fp.sessions {
+                                // Best-effort: an already-absent UE pod
+                                // isn't a teardown failure (ue_down
+                                // itself is idempotent), so don't let
+                                // one missing pod abort the rest.
+                                let _ = fiveg::ue_down(client, &cfg, session).await;
+                            }
 
                             p.update(50, "removing 5G core + uplink attachment");
+                            fiveg::bridge_down(&cfg).await.map_err(|e| e.to_string())?;
                             let sh = shell.clone();
                             let bridge = plan.bridge.clone();
                             blocking(move || {
-                                let cfg = FiveGLifecycleConfig::default();
-                                fiveg::bridge_down(&cfg).map_err(|e| e.to_string())?;
                                 gateway::provision::teardown_fiveg_uplink(&sh, &bridge)
-                                    .map_err(|e| e.to_string())?;
-                                fiveg::fiveg_down(&cfg)
-                                    .map(|_| ())
                                     .map_err(|e| e.to_string())
                             })
                             .await?;
+                            fiveg::fiveg_down(client, &cfg)
+                                .await
+                                .map_err(|e| e.to_string())?;
                         }
                         p.update(60, "removing endpoints, uplink, bridge");
                         let sh = shell.clone();
@@ -776,12 +770,14 @@ impl GatewayService for GatewaySvc {
         let mut slices = slices;
         let (mut state, mut detail) = (state, detail);
         if let Some(fp) = fiveg_plan {
-            let fstatus = tokio::task::spawn_blocking(|| {
-                fiveg::fiveg_status(&FiveGLifecycleConfig::default())
-            })
-            .await
-            .map_err(|e| Status::internal(format!("fiveg status task panicked: {e}")))?
-            .map_err(|e| Status::internal(e.to_string()))?;
+            let client = self
+                .containers
+                .get()
+                .await
+                .map_err(|e| Status::unavailable(e.to_string()))?;
+            let fstatus = fiveg::fiveg_status(client, &FiveGLifecycleConfig::default())
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
             let fiveg_state = if fstatus.all_running() {
                 ResourceState::Up
             } else {
@@ -1544,6 +1540,8 @@ pub struct TrafficSvc {
     pub runtime_dir: PathBuf,
     pub vxprobe_bin: String,
     pub vxtraffic_bin: String,
+    /// Shared with `GatewaySvc` (one client per daemon); s-nssai profiles use it.
+    pub containers: LazyClient,
 }
 
 impl TrafficSvc {
@@ -1617,6 +1615,7 @@ impl TrafficService for TrafficSvc {
         let runtime_dir = self.runtime_dir.clone();
         let vxprobe_bin = self.vxprobe_bin.clone();
         let vxtraffic_bin = self.vxtraffic_bin.clone();
+        let containers = self.containers.clone();
         let events = self.engine.events().clone();
         let job = self
             .engine
@@ -1628,29 +1627,23 @@ impl TrafficService for TrafficSvc {
                         ((i * 100) / total) as u32,
                         &format!("starting traffic profile `{}`", profile.id),
                     );
-                    let sh = shell.clone();
-                    let fiveg_cfg = FiveGLifecycleConfig::default();
-                    let five_g_plan = five_g_plan.clone();
-                    let runtime_dir = runtime_dir.clone();
-                    let vxprobe_bin = vxprobe_bin.clone();
-                    let vxtraffic_bin = vxtraffic_bin.clone();
-                    let profile_id = profile.id.clone();
-                    let msg = blocking(move || {
-                        traffic::profile_up(
-                            &sh,
-                            &fiveg_cfg,
-                            five_g_plan.as_ref(),
-                            &runtime_dir,
-                            &vxprobe_bin,
-                            &vxtraffic_bin,
-                            &profile,
-                            TRAFFIC_PORT,
-                            duration_s,
-                        )
-                        .map_err(|e| e.to_string())
-                    })
-                    .await?;
-                    events.emit(crate::events::EventKind::TrafficStarted, &profile_id, &msg);
+                    // Async: its shell and spawn steps leave the runtime
+                    // internally, its s-nssai steps await the Podman API.
+                    let msg = traffic::profile_up(
+                        &containers,
+                        &shell,
+                        &FiveGLifecycleConfig::default(),
+                        five_g_plan.as_ref(),
+                        &runtime_dir,
+                        &vxprobe_bin,
+                        &vxtraffic_bin,
+                        &profile,
+                        TRAFFIC_PORT,
+                        duration_s,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    events.emit(crate::events::EventKind::TrafficStarted, &profile.id, &msg);
                     messages.push(msg);
                 }
                 p.update(100, "all traffic profiles up");

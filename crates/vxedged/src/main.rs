@@ -150,12 +150,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // One instance of each service, shared between its own gRPC endpoint and `ExperimentSvc`,
     // which composes them. Two independent instances would each hold a handle to the same
     // `EdgeState` while looking unrelated — the kind of aliasing that is fine until it isn't.
+    // The one Podman API client (the user's rootless socket). Connected on first fiveg use, not
+    // here: most verbs never touch containers, so a host without the socket must still get a
+    // running daemon, and a socket enabled later must work without a restart.
+    let containers = vxedge_core::containers::LazyClient::user();
     let gateway = Arc::new(services::GatewaySvc {
         engine: engine.clone(),
         audit: audit.clone(),
         shell: shell.clone(),
         state: state.clone(),
         runtime_dir: args.runtime_dir.clone(),
+        containers: containers.clone(),
     });
     let zones = Arc::new(services::ZoneSvc {
         engine: engine.clone(),
@@ -224,6 +229,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             runtime_dir: args.runtime_dir.clone(),
             vxprobe_bin: args.vxprobe_bin.clone(),
             vxtraffic_bin: args.vxtraffic_bin.clone(),
+            containers,
         }))
         .add_service(JobServiceServer::new(services::JobSvc { engine }))
         .add_service(EventServiceServer::new(services::EventSvc { bus }))

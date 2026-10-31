@@ -58,6 +58,7 @@ fn remote_plan() -> NodePlan {
         ip_cidr: None,
         bundle: None,
         remote_bundle: Some((REFERENCE.to_string(), DIGEST.to_string())),
+        image: None,
         pinned_cpus: Vec::new(),
     }
 }

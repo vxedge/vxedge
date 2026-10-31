@@ -124,7 +124,7 @@ fn op_err(op: &str, source: rtnetlink::Error) -> NetlinkError {
 }
 
 fn enter_netns(name: &str) -> Result<(), NetlinkError> {
-    let path = format!("/var/run/netns/{name}");
+    let path = netns_path(name);
     let file = std::fs::File::open(&path).map_err(|source| NetlinkError::Namespace {
         netns: name.to_string(),
         detail: source.to_string(),
@@ -698,8 +698,17 @@ pub fn bridge_vlan_list(netns: Option<&str>, dev: &str) -> Result<Vec<u16>, Netl
 // Zone container netns lifecycle (`docs/ROADMAP.md` #16) — the second rtnetlink-port slice.
 // ---------------------------------------------------------------------------
 
+/// Where a namespace's file lives: `/run/netns/<name>` for a named one, or `name` itself when it
+/// is an absolute path. The second form is how a namespace outside `ip netns`'s registry is
+/// addressed, such as a container group's (`/proc/<infra pid>/ns/net`, the zone `container`
+/// backend's OCI payload), so every `netns: Option<&str>` here accepts either.
 fn netns_path(name: &str) -> std::path::PathBuf {
-    std::path::Path::new(rtnetlink::NETNS_PATH).join(name)
+    let p = std::path::Path::new(name);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::path::Path::new(rtnetlink::NETNS_PATH).join(name)
+    }
 }
 
 /// A plain file-existence check at `rtnetlink::NETNS_PATH` (`/run/netns/<name>`) — no netlink
@@ -870,6 +879,18 @@ mod tests {
     fn a_nonexistent_netns_reports_absent_without_erroring() {
         // Same "runs unprivileged" property as link_exists — a plain file-existence check.
         assert!(!netns_exists("vx-nonexist-ns"));
+    }
+
+    #[test]
+    fn a_netns_is_a_registry_name_or_an_absolute_path() {
+        assert_eq!(
+            netns_path("vx-node-b"),
+            std::path::Path::new(rtnetlink::NETNS_PATH).join("vx-node-b")
+        );
+        assert_eq!(
+            netns_path("/proc/4242/ns/net"),
+            std::path::Path::new("/proc/4242/ns/net")
+        );
     }
 
     #[test]

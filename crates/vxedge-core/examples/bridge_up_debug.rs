@@ -12,9 +12,11 @@
 //! tool's.
 
 use std::{env, process::ExitCode};
+use vxedge_core::containers::ContainerClient;
 use vxedge_core::fiveg::{FiveGLifecycleConfig, bridge_up, pod_pid};
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     let (pod_name, bridge) = match args.as_slice() {
         [_, p, b] => (p, b),
@@ -28,15 +30,23 @@ fn main() -> ExitCode {
         ran_pod_name: format!("{pod_name}-ran"),
         core_image: "vx5g-core".to_string(),
         ran_image: "vx5g-ran".to_string(),
+        ..FiveGLifecycleConfig::default()
     };
-    let cn_pid = match pod_pid(pod_name) {
+    let client = match ContainerClient::connect_user().await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let cn_pid = match pod_pid(&client, pod_name).await {
         Ok(pid) => pid,
         Err(e) => {
             eprintln!("error: {e}");
             return ExitCode::FAILURE;
         }
     };
-    match bridge_up(&cfg, bridge, cn_pid) {
+    match bridge_up(&cfg, bridge, cn_pid).await {
         Ok(()) => {
             println!("CN pod `{pod_name}` attached to bridge `{bridge}`");
             ExitCode::SUCCESS

@@ -2,9 +2,11 @@
 //! gateway port the same way; only the isolation mechanism differs — that is
 //! exactly the H3 variable.
 //!
-//! - `container`: named network namespace; the veth peer moves in, renamed
-//!   eth0, addressed from the manifest. The payload is exec'd into the netns
-//!   by the experiment runner (or a future OCI integration).
+//! - `container`: a network namespace; the veth peer moves in, renamed eth0,
+//!   addressed from the manifest. With no planned image (`local/…` parts) it is
+//!   a named netns and the experiment runner execs the payload into it. With a
+//!   planned OCI image (`NodePlan::image`) the namespace belongs to a container
+//!   group's infra container (loopback only) and the image runs as its member.
 //! - `qemu-microvm`: raw QEMU `microvm` machine, direct kernel boot from the
 //!   node's image bundle (vmlinuz + initrd.img), virtio-net on the tap.
 //!   Guest init reads `vx.ip=` from the kernel cmdline; payload autostarts.
@@ -22,6 +24,10 @@
 use std::path::Path;
 
 use super::plan::NodePlan;
+use crate::containers::{
+    ContainerClient, ContainerError, ContainerSpec, GroupHandle, GroupSpec, InfraNetwork,
+    PAUSE_IMAGE,
+};
 use crate::gateway::netlink;
 use crate::gateway::netops::{NetOpsError, Shell};
 use crate::model::Backend;
@@ -43,6 +49,12 @@ pub enum ZoneBackendError {
         reference: String,
         #[source]
         source: crate::registry::RegistryFetchError,
+    },
+    #[error("node `{node}`: container payload: {source}")]
+    Containers {
+        node: String,
+        #[source]
+        source: Box<ContainerError>,
     },
 }
 
@@ -103,36 +115,152 @@ fn bundle_paths(np: &NodePlan) -> Result<(String, String), ZoneBackendError> {
 // ---------------------------------------------------------------------------
 
 fn container_up(sh: &Shell, np: &NodePlan) -> Result<(), ZoneBackendError> {
-    let ns = np.runtime_name();
-    // Netns registry ops run in the HOST context — never nested inside another netns, since a
-    // bind mount created from inside one doesn't propagate; only the veth move targets where
-    // the interface currently lives. See `gateway::netlink`'s own module doc for why netns
-    // create/delete is `rtnetlink::NetworkNamespace`, not a hand-rolled unshare/mount.
-    netlink::ensure_netns(&ns).map_err(|e| nl(np, e))?;
+    let Some(image) = &np.image else {
+        let ns = np.runtime_name();
+        // Netns registry ops run in the HOST context — never nested inside another netns, since
+        // a bind mount created from inside one doesn't propagate; only the veth move targets
+        // where the interface currently lives. See `gateway::netlink`'s own module doc for why
+        // netns create/delete is `rtnetlink::NetworkNamespace`, not a hand-rolled unshare/mount.
+        netlink::ensure_netns(&ns).map_err(|e| nl(np, e))?;
+        return attach_port(sh, np, &ns);
+    };
+    // Order matters: the namespace exists (infra up), then the port is in it, then the payload
+    // starts — a payload started first would come up with nothing but loopback to bind to.
+    let group = payload_group(np)?;
+    let client = block_on(ContainerClient::connect_user()).map_err(|e| ct(np, e))?;
+    let (handle, _) = block_on(client.ensure_group(&group)).map_err(|e| ct(np, e))?;
+    attach_port(sh, np, &infra_netns(&handle))?;
+    block_on(client.ensure_member(&group, &handle, &payload_spec(image))).map_err(|e| ct(np, e))?;
+    Ok(())
+}
+
+/// Moves the node's gateway port into `ns` (a registry name or an absolute namespace path) as
+/// `eth0`, addresses it and brings it up. Idempotent: a port already moved is not looked for on
+/// the host again.
+fn attach_port(sh: &Shell, np: &NodePlan, ns: &str) -> Result<(), ZoneBackendError> {
     if netlink::link_exists(sh.netns.as_deref(), &np.peer) {
-        netlink::move_to_netns(sh.netns.as_deref(), &np.peer, &ns).map_err(|e| nl(np, e))?;
-        netlink::rename_link(Some(&ns), &np.peer, "eth0").map_err(|e| nl(np, e))?;
+        netlink::move_to_netns(sh.netns.as_deref(), &np.peer, ns).map_err(|e| nl(np, e))?;
+        netlink::rename_link(Some(ns), &np.peer, "eth0").map_err(|e| nl(np, e))?;
+    } else if !netlink::link_exists(Some(ns), "eth0") {
+        // Neither on the host nor in the namespace: the pair died with an earlier namespace
+        // (`zone down`, or an infra container that was replaced), and only the gateway makes
+        // ports.
+        return Err(ZoneBackendError::Runtime {
+            node: np.node_id.clone(),
+            detail: format!(
+                "gateway port `{}` is gone (it is destroyed with the namespace it was moved \
+                 into). Re-run `vxedge up` to recreate it, then bring the zone up again",
+                np.peer
+            ),
+        });
     }
-    netlink::link_up(Some(&ns), "lo").map_err(|e| nl(np, e))?;
+    netlink::link_up(Some(ns), "lo").map_err(|e| nl(np, e))?;
     if let Some(cidr) = &np.ip_cidr {
-        netlink::add_address(Some(&ns), "eth0", cidr).map_err(|e| nl(np, e))?;
+        netlink::add_address(Some(ns), "eth0", cidr).map_err(|e| nl(np, e))?;
     }
-    netlink::link_up(Some(&ns), "eth0").map_err(|e| nl(np, e))?;
+    netlink::link_up(Some(ns), "eth0").map_err(|e| nl(np, e))?;
     Ok(())
 }
 
 fn container_down(_sh: &Shell, np: &NodePlan) -> Result<(), ZoneBackendError> {
     // Destroys the moved veth peer (and thus the bridge-side pair);
     // `vxedge up` re-creates endpoints idempotently.
-    netlink::delete_netns(&np.runtime_name()).map_err(|e| nl(np, e))
+    netlink::delete_netns(&np.runtime_name()).map_err(|e| nl(np, e))?;
+    if np.image.is_some() {
+        // The group's namespace, and the port in it, go with its infra container.
+        let client = block_on(ContainerClient::connect_user()).map_err(|e| ct(np, e))?;
+        block_on(client.group_down(&np.runtime_name())).map_err(|e| ct(np, e))?;
+    }
+    Ok(())
 }
 
 fn container_status(_sh: &Shell, np: &NodePlan) -> NodeState {
-    let ns = np.runtime_name();
-    if netlink::netns_exists(&ns) && netlink::link_exists(Some(&ns), "eth0") {
+    let ns = match &np.image {
+        None => {
+            let ns = np.runtime_name();
+            if !netlink::netns_exists(&ns) {
+                return NodeState::Down;
+            }
+            ns
+        }
+        Some(_) => match payload_handle(np) {
+            Some(handle) => infra_netns(&handle),
+            None => return NodeState::Down,
+        },
+    };
+    if netlink::link_exists(Some(&ns), "eth0") {
         NodeState::Up
     } else {
         NodeState::Down
+    }
+}
+
+/// The running group's handle when infra and payload both run; any daemon error reads as down,
+/// since `status` reports and never fails.
+fn payload_handle(np: &NodePlan) -> Option<GroupHandle> {
+    block_on(async {
+        let client = ContainerClient::connect_user().await.ok()?;
+        let status = client.group_status(&np.runtime_name()).await.ok()?;
+        if !status.all_running() {
+            return None;
+        }
+        client.handle(&np.runtime_name()).await.ok()
+    })
+}
+
+/// The group a container node's payload runs in, named after the node's runtime name. Its infra
+/// container is on loopback only ([`InfraNetwork::None`]): the gateway port is the node's one
+/// interface, as in the named-netns form and as in the VM arms.
+fn payload_group(np: &NodePlan) -> Result<GroupSpec, ZoneBackendError> {
+    GroupSpec::new(
+        np.runtime_name(),
+        ContainerSpec {
+            image: PAUSE_IMAGE.to_string(),
+            ..Default::default()
+        },
+    )
+    .map(|g| g.with_infra_network(InfraNetwork::None))
+    .map_err(|e| ct(np, e.into()))
+}
+
+/// The payload: the planned image with its own default command. Nothing else is set, so what
+/// runs is exactly what was published under that digest.
+fn payload_spec(image: &str) -> ContainerSpec {
+    ContainerSpec {
+        name: "payload".to_string(),
+        image: image.to_string(),
+        ..Default::default()
+    }
+}
+
+fn infra_netns(handle: &GroupHandle) -> String {
+    format!("/proc/{}/ns/net", handle.infra_pid)
+}
+
+fn ct(np: &NodePlan, e: ContainerError) -> ZoneBackendError {
+    ZoneBackendError::Containers {
+        node: np.node_id.clone(),
+        source: Box::new(e),
+    }
+}
+
+/// Drives a container-client future from this synchronous seam. Every caller already runs the
+/// seam off the async runtime (`vxedged`'s `blocking(...)`/`spawn_blocking`), so the future runs
+/// on the caller's runtime through [`tokio::runtime::Handle::block_on`]; that call panics on a
+/// runtime worker thread, which is why the seam must never be called from one directly. With no
+/// runtime at all (a plain `#[test]`), a current-thread runtime is built for the call.
+///
+/// A client is connected per operation rather than held: the trait carries no state, a connect
+/// is one version request on a local socket, and a cached client would stay bound to whichever
+/// runtime first used it.
+fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle.block_on(f),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build a current-thread tokio runtime for a container call")
+            .block_on(f),
     }
 }
 
@@ -569,5 +697,62 @@ mod tests {
         );
         assert!(file.is_some_and(|h| h.contains("libvirt-qemu")));
         assert_eq!(virsh_hint("error: Domain not found"), None);
+    }
+
+    fn image_node() -> NodePlan {
+        NodePlan {
+            zone_id: "front-left".into(),
+            node_id: format!("node-never-{}", std::process::id()),
+            role: crate::model::DeviceRole::Ecu,
+            backend: Backend::Container,
+            endpoint: "vz-never".into(),
+            peer: "vzp-never".into(),
+            kind: crate::gateway::plan::EndpointKind::Veth,
+            vlan: 101,
+            slice: Some("adas".into()),
+            ip_cidr: Some("10.101.0.9/24".into()),
+            bundle: None,
+            remote_bundle: None,
+            image: Some(PAUSE_IMAGE.into()),
+            pinned_cpus: Vec::new(),
+        }
+    }
+
+    /// `status` reports and never fails: with no socket (CI) or no such group (a dev host), an
+    /// image node that was never started reads down, the same either way.
+    #[test]
+    fn an_image_node_never_started_reads_down_with_or_without_a_daemon() {
+        let sh = Shell {
+            netns: None,
+            escalate: false,
+        };
+        assert_eq!(
+            container_status(&sh, &image_node()),
+            NodeState::Down,
+            "no group, no namespace"
+        );
+    }
+
+    /// The seam's two calling contexts: no runtime at all (a plain test, a CLI), and a
+    /// `spawn_blocking` thread of the daemon's runtime, which is where `vxedged` calls it.
+    #[test]
+    fn block_on_drives_a_future_outside_and_off_a_runtime() {
+        assert_eq!(block_on(async { 7 }), 7);
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let got = rt.block_on(async {
+            tokio::task::spawn_blocking(|| {
+                block_on(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    8
+                })
+            })
+            .await
+            .unwrap()
+        });
+        assert_eq!(got, 8, "timers are driven by the caller's runtime");
     }
 }
