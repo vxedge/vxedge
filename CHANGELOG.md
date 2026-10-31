@@ -42,6 +42,11 @@ All notable changes to this repo are documented here. Format follows
 
 ### Security
 
+- The `libvirt` zone backend runs `virsh` as `vxedged`'s own user, no longer through `sudo`
+  (Track V0). `virsh` is a client of `libvirtd`, which authorizes callers by `libvirt` group
+  membership, so escalating it only widened what `vxedged` ran as root. Hosts need `vxedged`'s
+  user in the `libvirt` group (already a Tier 2 requirement); `vxedge doctor --tier 2` now checks
+  that `qemu:///system` answers it without `sudo`, and a refused `virsh` says how to fix it.
 - Lockfile update `pulldown-cmark` 0.13.4 -> 0.13.5, which fixes RUSTSEC-2026-0414 (exponential event growth with `ENABLE_WIKILINKS`). It is a build-time dependency via `prost-build`.
 
 ### Migration

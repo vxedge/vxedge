@@ -249,6 +249,28 @@ fn tier2() -> Vec<Check> {
         Some("apt install libvirt-daemon-system libvirt-clients"),
     ));
 
+    // vxedged runs `virsh` as its own user, never through sudo (zones::backend::virsh), so
+    // what counts is whether *this* user reaches `qemu:///system`. As root that proves nothing.
+    let libvirt_as_user = effective_uid() != 0
+        && Command::new("virsh")
+            .args(["-c", "qemu:///system", "uri"])
+            .output()
+            .is_ok_and(|o| o.status.success());
+    c.push(check(
+        2,
+        "libvirt reachable without sudo",
+        true,
+        libvirt_as_user,
+        if effective_uid() == 0 {
+            "not checked as root: run doctor as the user vxedged runs as".to_string()
+        } else if libvirt_as_user {
+            "qemu:///system answers this user".to_string()
+        } else {
+            "qemu:///system refuses this user".to_string()
+        },
+        Some("sudo usermod -aG libvirt $USER, then start a new login session"),
+    ));
+
     c.push(check(
         2,
         "Open vSwitch (optional variant)",

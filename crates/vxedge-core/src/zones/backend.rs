@@ -391,10 +391,57 @@ fn microvm_status(np: &NodePlan, runtime_dir: &Path) -> NodeState {
 
 const VIRSH: [&str; 2] = ["-c", "qemu:///system"];
 
-fn virsh(sh: &Shell, args: &[&str]) -> Result<String, NetOpsError> {
+/// `virsh` as vxedged's own user, never through `sudo` and never inside the gateway's netns
+/// (Track V0, `docs-internal/PROVISIONING.md` §10). `virsh` is only a client: `libvirtd` does
+/// the work, in the host namespace, and authorizes the caller by access to its socket, which
+/// membership in the `libvirt` group grants. So escalating it changed nothing it could create
+/// and only widened what vxedged runs as root; entering a netns changed nothing either. This is
+/// the same authorization the `virt` crate would have relied on, without its LGPL-2.1 code in
+/// the shipped binaries or a `libvirt-dev` build dependency.
+///
+/// Run directly, not through [`Shell`]: `Shell` reads any "Permission denied" as a missing
+/// `CAP_NET_ADMIN`, which for `virsh` hid libvirt's real error (found live 2026-10-29: qemu
+/// unable to read a guest kernel was reported as a netlink privilege problem). libvirt's own
+/// message is kept, with a hint for the two causes that have one.
+fn virsh(args: &[&str]) -> Result<String, NetOpsError> {
     let mut full: Vec<&str> = VIRSH.to_vec();
     full.extend_from_slice(args);
-    sh.run("virsh", &full)
+    let out = std::process::Command::new("virsh")
+        .args(&full)
+        .output()
+        .map_err(|source| NetOpsError::Spawn {
+            program: "virsh".to_string(),
+            source,
+        })?;
+    if out.status.success() {
+        return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    Err(NetOpsError::Command {
+        cmdline: format!("virsh {}", full.join(" ")),
+        stderr: match virsh_hint(&stderr) {
+            Some(hint) => format!("{stderr} ({hint})"),
+            None => stderr,
+        },
+    })
+}
+
+/// The fix for a `virsh` failure whose cause libvirt's wording identifies.
+fn virsh_hint(stderr: &str) -> Option<&'static str> {
+    if stderr.contains("libvirt-sock") || stderr.contains("authentication unavailable") {
+        Some(
+            "vxedged reaches libvirt as its own user, not through sudo: add that user to the \
+             `libvirt` group, `sudo usermod -aG libvirt <user>`, and start a new login session",
+        )
+    } else if stderr.contains("Permission denied") {
+        Some(
+            "the guest runs as libvirt's qemu user (`libvirt-qemu` on Debian/Ubuntu), which must \
+             be able to read the bundle's kernel and initrd and traverse every directory above \
+             them, e.g. `setfacl -m u:libvirt-qemu:x <each parent dir>`",
+        )
+    } else {
+        None
+    }
 }
 
 fn libvirt_domain_xml(np: &NodePlan, kernel: &str, initrd: &str) -> String {
@@ -438,8 +485,8 @@ fn libvirt_domain_xml(np: &NodePlan, kernel: &str, initrd: &str) -> String {
     )
 }
 
-fn libvirt_up(sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneBackendError> {
-    if libvirt_status(sh, np) == NodeState::Up {
+fn libvirt_up(np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneBackendError> {
+    if libvirt_status(np) == NodeState::Up {
         return Ok(()); // idempotent
     }
     let (kernel, initrd) = bundle_paths(np)?;
@@ -450,20 +497,23 @@ fn libvirt_up(sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneB
             detail: format!("cannot write domain xml: {e}"),
         }
     })?;
-    virsh(sh, &["define", &xml_path.display().to_string()])?;
-    virsh(sh, &["start", &np.runtime_name()])?;
+    // Not running, but possibly still defined: by an `up` whose start failed, or from an older
+    // spec. Clear it first, or `define` refuses with "already exists" and `up` never converges.
+    libvirt_down(np)?;
+    virsh(&["define", &xml_path.display().to_string()])?;
+    virsh(&["start", &np.runtime_name()])?;
     Ok(())
 }
 
-fn libvirt_down(sh: &Shell, np: &NodePlan) -> Result<(), ZoneBackendError> {
+fn libvirt_down(np: &NodePlan) -> Result<(), ZoneBackendError> {
     let name = np.runtime_name();
-    let _ = virsh(sh, &["destroy", &name]); // tolerate not-running
-    let _ = virsh(sh, &["undefine", &name]); // tolerate not-defined
+    let _ = virsh(&["destroy", &name]); // tolerate not-running
+    let _ = virsh(&["undefine", &name]); // tolerate not-defined
     Ok(())
 }
 
-fn libvirt_status(sh: &Shell, np: &NodePlan) -> NodeState {
-    match virsh(sh, &["domstate", &np.runtime_name()]) {
+fn libvirt_status(np: &NodePlan) -> NodeState {
+    match virsh(&["domstate", &np.runtime_name()]) {
         Ok(s) if s.trim() == "running" => NodeState::Up,
         _ => NodeState::Down,
     }
@@ -545,14 +595,20 @@ impl ZoneBackend for LibvirtBackend {
     fn name(&self) -> &'static str {
         "libvirt"
     }
-    fn up(&self, sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneBackendError> {
-        libvirt_up(sh, np, runtime_dir)
+    // The gateway's `Shell` is not used: see [`virsh`].
+    fn up(&self, _sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneBackendError> {
+        libvirt_up(np, runtime_dir)
     }
-    fn down(&self, sh: &Shell, np: &NodePlan, _runtime_dir: &Path) -> Result<(), ZoneBackendError> {
-        libvirt_down(sh, np)
+    fn down(
+        &self,
+        _sh: &Shell,
+        np: &NodePlan,
+        _runtime_dir: &Path,
+    ) -> Result<(), ZoneBackendError> {
+        libvirt_down(np)
     }
-    fn status(&self, sh: &Shell, np: &NodePlan, _runtime_dir: &Path) -> NodeState {
-        libvirt_status(sh, np)
+    fn status(&self, _sh: &Shell, np: &NodePlan, _runtime_dir: &Path) -> NodeState {
+        libvirt_status(np)
     }
 }
 
@@ -617,14 +673,30 @@ pub fn node_status(sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> NodeState {
 mod tests {
     use super::*;
 
-    /// The one match that remains has to be right — a mis-wired arm would run a node under the
-    /// wrong isolation mechanism, which is precisely the H3 variable, and every plan and every
-    /// interface name would still look correct.
     #[test]
     fn every_backend_kind_selects_the_implementation_it_names() {
         assert_eq!(backend_for(Backend::Container).name(), "container");
         assert_eq!(backend_for(Backend::QemuMicrovm).name(), "qemu-microvm");
         assert_eq!(backend_for(Backend::Libvirt).name(), "libvirt");
+    }
+
+    /// libvirt's wording decides the hint: socket refusal (not in the `libvirt` group), a guest
+    /// file qemu cannot read, or neither. The first two forms are libvirt's own messages.
+    #[test]
+    fn virsh_failures_get_the_hint_their_cause_needs() {
+        let socket = virsh_hint(
+            "error: failed to connect to the hypervisor\nerror: Failed to connect socket to \
+             '/var/run/libvirt/libvirt-sock': Permission denied",
+        );
+        assert!(socket.is_some_and(|h| h.contains("usermod -aG libvirt")));
+        let polkit = virsh_hint("error: authentication unavailable: no polkit agent available");
+        assert!(polkit.is_some_and(|h| h.contains("usermod -aG libvirt")));
+        let file = virsh_hint(
+            "error: Failed to start domain 'vx-node-libvirt-01'\nerror: internal error: qemu \
+             unexpectedly closed the monitor: Could not open '/srv/ws/vmlinuz': Permission denied",
+        );
+        assert!(file.is_some_and(|h| h.contains("libvirt-qemu")));
+        assert_eq!(virsh_hint("error: Domain not found"), None);
     }
 
     fn image_node() -> NodePlan {
