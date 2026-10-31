@@ -17,8 +17,9 @@
 //! one as root rather than silently pick root's store.
 //!
 //! What a group shares: the infra container's **network** namespace only
-//! (`NetworkMode: container:<id>`), which starts out as a pod's does ([`spec::INFRA_NETWORK_MODE`],
-//! `pasta`). A `podman pod` also shares IPC and UTS by default; nothing this project runs in a
+//! (`NetworkMode: container:<id>`), which starts out as a pod's does ([`InfraNetwork::Pasta`])
+//! unless the group asks for loopback only ([`InfraNetwork::None`], the zone `container`
+//! backend). A `podman pod` also shares IPC and UTS by default; nothing this project runs in a
 //! pod relies on either: Open5GS NFs talk over loopback SBI and no rendered config names a host.
 //! Confirmed live 2026-10-28 (V2, Ubuntu 26.04, Podman 5.7.0): `fiveg_podman` and
 //! `traffic_podman` pass unchanged on groups (NG Setup, PDU sessions on both slices, `vxprobe`
@@ -32,8 +33,8 @@ use std::path::PathBuf;
 
 pub use client::{ContainerClient, GroupHandle, LazyClient, Outcome};
 pub use spec::{
-    Bind, ContainerSpec, GroupSpec, GroupStatus, InfraAction, MemberAction, NameError,
-    ObservedContainer, infra_action, member_action,
+    Bind, ContainerSpec, GroupSpec, GroupStatus, InfraAction, InfraNetwork, MemberAction,
+    NameError, ObservedContainer, PAUSE_IMAGE, infra_action, member_action,
 };
 
 #[derive(Debug, thiserror::Error)]

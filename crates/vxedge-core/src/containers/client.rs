@@ -17,7 +17,6 @@ use super::ContainerError;
 use super::spec::{
     ContainerSpec, GroupSpec, GroupStatus, INFRA_MEMBER, InfraAction, LABEL_GROUP, LABEL_MEMBER,
     LABEL_SPEC, MemberAction, ObservedContainer, infra_action, member_action, member_name,
-    network_mode,
 };
 
 /// Per-request timeout. Generous because an image pull is one request, and `mongo:7` on a
@@ -282,7 +281,7 @@ impl ContainerClient {
         let body = create_body(
             spec,
             group.labels(spec, netns_owner),
-            Some(network_mode(netns_owner)),
+            Some(group.network_mode(netns_owner)),
         );
         let id = match self.create(name, body.clone()).await {
             Err(e) if status_code(&e) == Some(404) => {
