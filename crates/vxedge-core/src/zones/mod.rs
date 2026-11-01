@@ -7,7 +7,9 @@
 
 pub mod backend;
 mod cloud_hypervisor;
+pub mod foreign;
 pub mod plan;
 
 pub use backend::{member_down, member_status, member_up, node_down, node_status, node_up};
+pub use foreign::foreign_objects;
 pub use plan::{NodePlan, ZonePlanError, missing_local_bundles, plan_nodes_from_model};

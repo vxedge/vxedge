@@ -50,6 +50,8 @@ All notable changes to this repo are documented here. Format follows
 
 ### Fixed
 
+- `vehicle up`, `status` and `down` also read the host for gateway ports and guests the workspace does not declare, and refuse if they find any, so a vehicle started under a daemon with another runtime dir is protected too.
+- A microVM's status and `down` find the guest through `/proc` when the pidfile is another daemon's, so `down` no longer strands it. Cloud Hypervisor guests are not found this way: their kernel command line goes over the API.
 - `vehicle up` of a second vehicle over a running one took its bridge and left its nodes running without one, and `vehicle down` of the second vehicle then removed that bridge. `vehicle up`, `status` and `down` now refuse anything but the active workspace, and the record of what is active survives a daemon restart. `experiment down` uses the same record.
 - A microVM's status and `down` trust its pidfile only when that PID is this node's QEMU. A reused PID read as up, and `down` would have killed it.
 - `GatewayService.Status` reports a planned gateway with no bridge as down, not degraded.

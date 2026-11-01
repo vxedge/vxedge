@@ -466,13 +466,21 @@ fn read_pid(np: &NodePlan, runtime_dir: &Path) -> Option<i32> {
         .ok()
 }
 
-/// The pidfile's PID, only if that process is this node's QEMU. A pidfile outlives a host reboot
-/// or a crash, and the kernel reuses PIDs, so a live PID alone could be anything, and `down`
-/// would kill it.
+/// This node's QEMU. The pidfile's PID counts only if it is that process: a pidfile outlives a
+/// host reboot or a crash, and the kernel reuses PIDs, so a live PID alone could be anything, and
+/// `down` would kill it.
 fn guest_pid(np: &NodePlan, runtime_dir: &Path) -> Option<i32> {
-    let pid = read_pid(np, runtime_dir)?;
-    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-    is_guest_of(&cmdline, &np.node_id).then_some(pid)
+    let from_pidfile = read_pid(np, runtime_dir).filter(|pid| {
+        std::fs::read(format!("/proc/{pid}/cmdline"))
+            .is_ok_and(|cmdline| is_guest_of(&cmdline, &np.node_id))
+    });
+    // The pidfile belongs to the runtime dir of the daemon that booted the guest. Another daemon
+    // has none, and reading that as "down" removed the gateway from under a running guest.
+    from_pidfile.or_else(|| {
+        super::foreign::guests()
+            .find(|(_, node)| node == &np.node_id)
+            .map(|(pid, _)| pid)
+    })
 }
 
 /// Whether a NUL-separated `/proc/<pid>/cmdline` is QEMU booting `node`, which

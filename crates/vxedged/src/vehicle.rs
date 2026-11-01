@@ -165,12 +165,14 @@ async fn require_local_images(id: &str, images: &BTreeSet<String>) -> Result<(),
 
 impl VehicleSvc {
     /// Every verb acts on the host's one gateway, so each refuses a workspace other than the
-    /// active one.
+    /// active one. What is active comes from this daemon's memory and record first, and then from
+    /// the host, which also shows a vehicle brought up by a daemon with another runtime dir.
     async fn require_active(
         &self,
         verb: &str,
         model: &Experiment,
         dir: Option<&Path>,
+        nodes: &[NodePlan],
     ) -> Result<(), Status> {
         let active = self.handles.gateway.active_on_host().await;
         check_active_target(
@@ -180,8 +182,26 @@ impl VehicleSvc {
                 .map(|(id, dir)| (id.as_str(), dir.as_path())),
             &model.id,
             dir,
-        )
+        )?;
+        let plans = nodes.to_vec();
+        let foreign =
+            tokio::task::spawn_blocking(move || vxedge_core::zones::foreign_objects(&plans))
+                .await
+                .map_err(|e| Status::internal(format!("host scan panicked: {e}")))?;
+        refuse_foreign(verb, &model.id, &foreign)
     }
+}
+
+fn refuse_foreign(verb: &str, id: &str, foreign: &[String]) -> Result<(), Status> {
+    if foreign.is_empty() {
+        return Ok(());
+    }
+    Err(Status::failed_precondition(format!(
+        "this host is running what `{id}` does not declare: {}. Another vehicle is up, possibly \
+         under a daemon with a different runtime dir, and `{verb}` would act on its gateway. Run \
+         it from that workspace, or bring that vehicle down first",
+        foreign.join(", ")
+    )))
 }
 
 #[tonic::async_trait]
@@ -201,9 +221,9 @@ impl VehicleService for VehicleSvc {
         // that function's own comment for why refusing here costs nothing but refusing halfway
         // through does not.
         crate::services::preflight_requires(dir.as_deref())?;
-        self.require_active("vehicle up", &model, dir.as_deref())
-            .await?;
         let (_, nodes) = plan_vehicle(&model, dir.as_deref())?;
+        self.require_active("vehicle up", &model, dir.as_deref(), &nodes)
+            .await?;
         // A store that is missing would otherwise fail last, with the whole vehicle already up.
         for def in model.services.values().filter(|s| s.on.is_some()) {
             let workspace = dir.as_deref().unwrap_or_else(|| Path::new("."));
@@ -267,7 +287,7 @@ impl VehicleService for VehicleSvc {
             id,
         } = resolve_and_synthesize(req.get_ref().manifest.as_ref()).await?;
         let (gateway, nodes) = plan_vehicle(&model, dir.as_deref())?;
-        self.require_active("vehicle down", &model, dir.as_deref())
+        self.require_active("vehicle down", &model, dir.as_deref(), &nodes)
             .await?;
         self.audit.record(
             "VehicleService.Down",
@@ -332,7 +352,7 @@ impl VehicleService for VehicleSvc {
             ..
         } = resolve_and_synthesize(req.get_ref().manifest.as_ref()).await?;
         let (gateway, nodes) = plan_vehicle(&model, dir.as_deref())?;
-        self.require_active("vehicle status", &model, dir.as_deref())
+        self.require_active("vehicle status", &model, dir.as_deref(), &nodes)
             .await?;
 
         let gw = self.handles.gateway.observe(Some(gateway), None).await?;
@@ -503,6 +523,17 @@ parts:
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].vxid, "spare");
         assert_eq!(listed[0].state, ResourceState::Unspecified as i32);
+    }
+
+    #[test]
+    fn a_host_with_another_vehicle_is_refused_by_name() {
+        assert!(refuse_foreign("vehicle down", "vehicle-b", &[]).is_ok());
+        let err =
+            refuse_foreign("vehicle down", "vehicle-b", &["guest node-a".into()]).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        for needle in ["guest node-a", "`vehicle-b`", "`vehicle down`"] {
+            assert!(err.message().contains(needle), "{err:?}");
+        }
     }
 
     #[test]
