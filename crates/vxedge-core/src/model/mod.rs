@@ -657,6 +657,11 @@ impl Entity {
 /// fixture, an alternative frontend) cannot skip it.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum InvariantError {
+    #[error(
+        "service `{service}` runs `{image}`. A placed service needs `kind: container` and a \
+         `localhost/` image or a digest-pinned `<ref>@sha256:…` one."
+    )]
+    ServiceImageNotRunnable { service: String, image: String },
     #[error("service `{service}` is placed on device `{device}`, which no vehicle declares")]
     ServiceOnUnknownDevice { service: String, device: String },
     #[error(
@@ -785,7 +790,16 @@ impl Experiment {
                 errors.push(E::ServiceOnUnknownDevice { service, device });
                 continue;
             };
-            let (service, device_id) = names();
+            let (service_id, device_id) = names();
+            let url = &service.image.url;
+            let pinned = url.starts_with("localhost/") || url.contains("@sha256:");
+            if !pinned || service.image.kind != crate::services::ImageKind::Container {
+                errors.push(E::ServiceImageNotRunnable {
+                    service: service_id.clone(),
+                    image: url.clone(),
+                });
+            }
+            let service = service_id;
             if device.backend != Some(Backend::Container) {
                 errors.push(E::ServiceOnNonContainerDevice {
                     service,

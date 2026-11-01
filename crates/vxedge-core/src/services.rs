@@ -125,7 +125,10 @@ pub enum ServiceBackendError {
     },
     #[error("service `{0}`: {1}")]
     Runtime(String, String),
-    #[error("service `{svc}` is placed on device `{device}`, which only `vehicle up` can start")]
+    #[error(
+        "service `{svc}` is placed on device `{device}`, so it runs in that device's container \
+         group and never as a host process"
+    )]
     Placed { svc: String, device: String },
 }
 
@@ -339,6 +342,47 @@ fn typed_config<T: serde::de::DeserializeOwned>(
     serde_yaml_ng::from_value(value).map_err(|e| ServiceBackendError::BadConfig {
         svc: def.id.clone(),
         detail: format!("{e} ({missing})"),
+    })
+}
+
+/// Where `config.artifacts` is mounted inside a placed service's container.
+const PLACED_ARTIFACTS: &str = "/srv/vxedge/artifacts";
+
+/// The container a service placed with `on:` runs as. Takes the service's image with the
+/// arguments its host-process form would get, so its entrypoint is the service binary. The
+/// artifact store is on the host, so it is resolved here and mounted read-only.
+pub fn placed_spec(
+    def: &ServiceDef,
+    workspace_dir: &Path,
+) -> Result<crate::containers::ContainerSpec, ServiceBackendError> {
+    if def.service_type != ServiceType::Ota {
+        return Err(ServiceBackendError::Unsupported(def.id.clone()));
+    }
+    let cfg: OtaConfig = typed_config(def, "config.artifacts is required for an ota service")?;
+    let host = workspace_dir.join(&cfg.artifacts);
+    if !host.is_dir() {
+        return Err(ServiceBackendError::BadConfig {
+            svc: def.id.clone(),
+            detail: format!("artifact store {} is not a directory", host.display()),
+        });
+    }
+    Ok(crate::containers::ContainerSpec {
+        name: def.id.clone(),
+        image: def.image.url.clone(),
+        cmd: vec![
+            "serve".into(),
+            "--artifacts-dir".into(),
+            PLACED_ARTIFACTS.into(),
+            "--listen".into(),
+            cfg.listen,
+        ],
+        binds: vec![crate::containers::Bind {
+            host,
+            container: PLACED_ARTIFACTS.into(),
+            read_only: true,
+            relabel: false,
+        }],
+        ..Default::default()
     })
 }
 
@@ -581,6 +625,37 @@ mod tests {
         assert!(matches!(
             svc_up(&def, &bins(), dir.path(), dir.path()),
             Err(ServiceBackendError::Placed { device, .. }) if device == "hpc1"
+        ));
+    }
+
+    #[test]
+    fn a_placed_ota_service_mounts_its_store_and_keeps_its_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("store")).unwrap();
+        let mut def = ota_def("artifacts: ./store\nlisten: 0.0.0.0:9900\n");
+        def.on = Some("hpc1".into());
+        let spec = placed_spec(&def, dir.path()).unwrap();
+        assert_eq!(
+            spec.cmd,
+            [
+                "serve",
+                "--artifacts-dir",
+                PLACED_ARTIFACTS,
+                "--listen",
+                "0.0.0.0:9900"
+            ]
+        );
+        assert_eq!(spec.binds[0].host, dir.path().join("./store"));
+        assert!(spec.binds[0].read_only);
+    }
+
+    #[test]
+    fn a_placed_service_with_no_store_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let def = ota_def("artifacts: ./missing\n");
+        assert!(matches!(
+            placed_spec(&def, dir.path()),
+            Err(ServiceBackendError::BadConfig { .. })
         ));
     }
 }

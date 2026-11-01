@@ -261,6 +261,15 @@ impl ContainerClient {
         Ok(removed)
     }
 
+    /// Remove one member and leave the group running; already gone is success.
+    pub async fn member_down(
+        &self,
+        group: &GroupSpec,
+        spec: &ContainerSpec,
+    ) -> Result<(), ContainerError> {
+        self.remove(&group.member_container_name(spec)?).await
+    }
+
     /// Force-remove one container by name or id; already gone is success.
     async fn remove(&self, container: &str) -> Result<(), ContainerError> {
         let opts = RemoveContainerOptionsBuilder::new().force(true).build();

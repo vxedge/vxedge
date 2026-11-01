@@ -182,6 +182,12 @@ impl VehicleService for VehicleSvc {
         // through does not.
         crate::services::preflight_requires(dir.as_deref())?;
         let (_, nodes) = plan_vehicle(&model, dir.as_deref())?;
+        // A store that is missing would otherwise fail last, with the whole vehicle already up.
+        for def in model.services.values().filter(|s| s.on.is_some()) {
+            let workspace = dir.as_deref().unwrap_or_else(|| Path::new("."));
+            vxedge_core::services::placed_spec(def, workspace)
+                .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        }
         require_local_images(&id, &local_images(&model, &nodes)).await?;
         // A local bundle (e.g. `./bundle`) is built per host and absent on a fresh clone;
         // refuse now, with the build command, rather than after the gateway is up.

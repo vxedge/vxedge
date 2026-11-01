@@ -2620,6 +2620,16 @@ parts:
     }
 
     #[test]
+    fn a_placed_service_needs_an_image_that_cannot_move() {
+        let yaml = PLACED.replace("localhost/vxedge/ota:1", "ghcr.io/vxedge/ota:latest");
+        let errors = invariants(&yaml);
+        assert!(
+            errors.iter().any(|e| e.contains("digest-pinned")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
     fn a_service_on_a_device_with_no_slice_is_refused() {
         let yaml = PLACED.replace(
             "  - { id: l1, endpoints: [{ node: hpc1, port: eth0, ip: 10.1.0.2/24 }], slice: adas }\n",
