@@ -31,7 +31,7 @@ The daemon and the CLI talk over a Unix socket. This smoke test needs no privile
 
 Without root, `vxedged` logs a warning that `/run/vxedge` is missing and keeps going; add `--runtime-dir /tmp/vxrt` to silence it.
 
-Real provisioning (`vehicle up`, `zone up`) needs `CAP_NET_ADMIN`: run `vxedged` under sudo, or `sudo setcap cap_net_admin+ep vxedged`. Without it, `up` validates the manifest and then fails with an actionable message, by design. A vehicle with virtual-machine zones also needs a guest bundle built once on the host. The steps are in [GETTING-STARTED](https://github.com/vxedge/docs/blob/main/GETTING-STARTED.md), and per-verb usage is in the [USER-GUIDE](https://github.com/vxedge/docs/blob/main/USER-GUIDE.md).
+Real provisioning (`vehicle up`, `zone up`) needs `CAP_NET_ADMIN`, plus `CAP_SYS_ADMIN` to enter a node's network namespace: run `vxedged` under sudo, or `sudo setcap cap_net_admin,cap_sys_admin+ep vxedged`. Without it, `up` validates the manifest and then fails with an actionable message, by design. A vehicle with virtual-machine zones also needs a guest bundle built once on the host. The steps are in [GETTING-STARTED](https://github.com/vxedge/docs/blob/main/GETTING-STARTED.md), and per-verb usage is in the [USER-GUIDE](https://github.com/vxedge/docs/blob/main/USER-GUIDE.md).
 
 ## Build from source
 
