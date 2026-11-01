@@ -17,6 +17,29 @@ use serde_yaml_ng::Value;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ModelError {
+    #[error(
+        "vehicle `{vehicle}`: service `{service}` has no `on:`. A vehicle's service is placed on \
+         one of its devices."
+    )]
+    UnplacedVehicleService { vehicle: String, service: String },
+    #[error(
+        "experiment `{experiment}`: service `{service}` sets `on: {device}`. Only a vehicle \
+         places services; declare it there."
+    )]
+    PlacedExperimentService {
+        experiment: String,
+        service: String,
+        device: String,
+    },
+    #[error(
+        "service `{service}` of type `{service_type}` is declared twice: `{key}` already exists \
+         in this workspace, and one service type has one owner"
+    )]
+    ServiceDeclaredTwice {
+        service: String,
+        service_type: &'static str,
+        key: String,
+    },
     #[error("workspace has no `kind: experiment` document")]
     NoExperiment,
     #[error("experiment `{experiment}` names no vehicle")]
@@ -340,9 +363,10 @@ fn part_kind(
 
 /// What a reference says about itself — deliberately little.
 ///
-/// Only the `local/…` namespace is conclusive: it names a host process or a locally-built
-/// container image, never a guest bundle directory, and pointing a VM backend at one is exactly
-/// the mistake the exp-001 migration hit (it planned as a VM with no bundle to boot).
+/// Only the `local/…` and `localhost/…` namespaces are conclusive: they name a host process or
+/// a locally-built container image, never a guest bundle directory, and pointing a VM backend
+/// at one is exactly the mistake the exp-001 migration hit (it planned as a VM with no bundle to
+/// boot).
 ///
 /// A published vxparts ref is **not** used, though it looks like it should be: its class says
 /// what kind of *node* the part loads onto (`zone` = virtual ECU), not how the part is
@@ -350,8 +374,7 @@ fn part_kind(
 /// packaging out of the class would reject correct workspaces, which is worse than the gap.
 /// That is what `kind:` on the baseline entry is for.
 fn kind_from_reference(reference: &str) -> Option<PartKind> {
-    reference
-        .starts_with("local/")
+    (reference.starts_with("local/") || reference.starts_with("localhost/"))
         .then_some(PartKind::Container)
 }
 
@@ -1162,7 +1185,7 @@ pub fn build(ws: &Workspace) -> Result<Experiment, ModelError> {
 
     // Typed at build time, so a malformed block is one error against the document the author
     // wrote rather than a surprise at `svc up`. These were the last untyped blocks in the model.
-    let services: BTreeMap<String, crate::services::ServiceDef> = match raw.get("services") {
+    let mut services: BTreeMap<String, crate::services::ServiceDef> = match raw.get("services") {
         Some(v) => {
             serde_yaml_ng::from_value(v.clone()).map_err(|e| ModelError::MalformedBlock {
                 block: "services",
@@ -1171,6 +1194,36 @@ pub fn build(ws: &Workspace) -> Result<Experiment, ModelError> {
         }
         None => BTreeMap::new(),
     };
+    if let Some(def) = services.values().find(|d| d.on.is_some()) {
+        return Err(ModelError::PlacedExperimentService {
+            experiment: exp.id.clone(),
+            service: def.id.clone(),
+            device: def.on.clone().unwrap_or_default(),
+        });
+    }
+    // One map, so `SvcService` and `declared_types` read a vehicle's services the way they read
+    // an experiment's. `on` is what tells them apart.
+    for doc in ws.vehicles.iter().filter(|v| exp.vehicles.contains(&v.id)) {
+        for (key, def) in &doc.services {
+            if def.on.is_none() {
+                return Err(ModelError::UnplacedVehicleService {
+                    vehicle: doc.id.clone(),
+                    service: def.id.clone(),
+                });
+            }
+            let taken = services
+                .iter()
+                .find(|(k, d)| *k == key || d.service_type == def.service_type);
+            if let Some((k, _)) = taken {
+                return Err(ModelError::ServiceDeclaredTwice {
+                    service: def.id.clone(),
+                    service_type: def.service_type.as_str(),
+                    key: k.clone(),
+                });
+            }
+            services.insert(key.clone(), def.clone());
+        }
+    }
     let telemetry = match raw.get("telemetry").and_then(|t| t.get("prometheus")) {
         Some(p) => Telemetry {
             scrape_targets: string_list(p, "scrape_targets"),
@@ -2488,5 +2541,168 @@ parts:
             Err(LoadError::NoBaseline) => {}
             other => panic!("expected NoBaseline, got {other:?}"),
         }
+    }
+
+    const PLACED: &str = r#"
+kind: vehicle
+id: veh
+zones: { central: {} }
+devices:
+  hpc1: { role: hpc, zone: central, backend: container }
+  ecu1: { role: ecu, zone: central, backend: qemu-microvm }
+  idle: { role: ecu, zone: central, backend: container }
+functions:
+  f-hpc: { deployed_on: hpc1 }
+  f-ecu: { deployed_on: ecu1 }
+  f-idle: { deployed_on: idle }
+links:
+  - { id: l1, endpoints: [{ node: hpc1, port: eth0, ip: 10.1.0.2/24 }], slice: adas }
+  - { id: l2, endpoints: [{ node: ecu1, port: eth0, ip: 10.1.0.3/24 }], slice: adas }
+services:
+  ota:
+    id: ota-01
+    type: ota
+    image: { url: localhost/vxedge/ota:1, kind: container }
+    on: hpc1
+    config: { artifacts: ./store, listen: "0.0.0.0:9900" }
+---
+kind: baseline
+id: bl
+parts:
+  - { ref: localhost/vxedge/probe:1, target_ids: f-hpc }
+  - { ref: ./bundle, kind: bundle, target_ids: f-ecu }
+  - { ref: 'local/vxprobe:host-process', target_ids: f-idle }
+"#;
+
+    fn invariants(yaml: &str) -> Vec<String> {
+        match crate::model::load_vehicle_yaml(yaml) {
+            Err(crate::model::LoadError::Invariants(e)) => {
+                e.iter().map(ToString::to_string).collect()
+            }
+            other => panic!("expected invariant errors, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_vehicle_service_is_lifted_into_the_experiment_with_its_placement() {
+        let exp = crate::model::load_vehicle_yaml(PLACED).unwrap();
+        assert_eq!(exp.services["ota"].on.as_deref(), Some("hpc1"));
+        assert_eq!(
+            crate::services::ServiceDef::declared_types(&exp),
+            vec!["ota".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_vehicle_service_without_on_is_refused() {
+        let yaml = PLACED.replace("    on: hpc1\n", "");
+        assert!(matches!(
+            crate::model::load_vehicle_yaml(&yaml),
+            Err(crate::model::LoadError::Model(ModelError::UnplacedVehicleService { service, .. }))
+                if service == "ota-01"
+        ));
+    }
+
+    #[test]
+    fn a_placement_must_name_a_device_that_can_host_it() {
+        for (on, expected) in [
+            ("nope", "no vehicle declares"),
+            ("ecu1", "not `backend: container`"),
+            ("idle", "runs no container image"),
+        ] {
+            let yaml = PLACED.replace("    on: hpc1", &format!("    on: {on}"));
+            let errors = invariants(&yaml);
+            assert!(
+                errors.iter().any(|e| e.contains(expected)),
+                "{on}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_service_on_a_device_with_no_slice_is_refused() {
+        let yaml = PLACED.replace(
+            "  - { id: l1, endpoints: [{ node: hpc1, port: eth0, ip: 10.1.0.2/24 }], slice: adas }\n",
+            "  - { id: l1, endpoints: [{ node: hpc1, port: eth0 }] }\n",
+        );
+        let errors = invariants(&yaml);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("not attached to any slice")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn one_service_type_has_one_owner() {
+        let exp = r#"
+kind: experiment
+id: e
+vehicles: [veh]
+baseline: bl
+network: { slices: [{ id: adas, mode: vlan, vlan: 101 }] }
+services:
+  theirs:
+    id: ota-02
+    type: ota
+    image: { url: 'local/vxota:host-process', kind: container }
+---"#;
+        let yaml = format!("{exp}{PLACED}");
+        let ws = Workspace::from_yaml(&yaml).unwrap();
+        assert!(matches!(
+            build(&ws),
+            Err(ModelError::ServiceDeclaredTwice { service_type: "ota", key, .. }) if key == "theirs"
+        ));
+    }
+
+    #[test]
+    fn an_experiment_cannot_place_a_service() {
+        let exp = r#"
+kind: experiment
+id: e
+vehicles: [veh]
+baseline: bl
+network: { slices: [{ id: adas, mode: vlan, vlan: 101 }] }
+services:
+  ota:
+    id: ota-02
+    type: ota
+    image: { url: 'local/vxota:host-process', kind: container }
+    on: hpc1
+---"#;
+        let yaml = format!("{exp}{}", PLACED.split("services:\n").next().unwrap());
+        let yaml = format!("{yaml}---\nkind: baseline\nid: bl\nparts: []\n");
+        let ws = Workspace::from_yaml(&yaml).unwrap();
+        assert!(matches!(
+            build(&ws),
+            Err(ModelError::PlacedExperimentService { device, .. }) if device == "hpc1"
+        ));
+    }
+
+    #[test]
+    fn a_localhost_part_is_a_container_and_needs_no_digest() {
+        let exp = crate::model::load_vehicle_yaml(PLACED).unwrap();
+        let part = exp.entities[0]
+            .functions_on("hpc1")
+            .find_map(|f| f.part.as_ref())
+            .unwrap();
+        assert_eq!(part.kind, PartKind::Container);
+        assert!(part.local && part.is_oci_payload());
+        assert_eq!(part.image_ref(), "localhost/vxedge/probe:1");
+    }
+
+    #[test]
+    fn a_localhost_part_cannot_boot_a_vm() {
+        let yaml = PLACED.replace(
+            "  - { ref: ./bundle, kind: bundle, target_ids: f-ecu }",
+            "  - { ref: localhost/vxedge/probe:2, target_ids: f-ecu }",
+        );
+        assert!(matches!(
+            crate::model::load_vehicle_yaml(&yaml),
+            Err(crate::model::LoadError::Model(
+                ModelError::PartKindMismatch { .. }
+            ))
+        ));
     }
 }

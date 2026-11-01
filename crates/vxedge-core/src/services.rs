@@ -14,12 +14,12 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// One entry of an experiment's `services:` block: what to run, and how it is packaged.
+/// One entry of a `services:` block: what to run, and how it is packaged.
 ///
-/// Lives here rather than in a schema module because this is the only thing that reads it. The
-/// domain model owns the `services:` block — a service is a runtime descriptor rather than part
-/// of the vehicle under test, so it sits on the experiment beside `traffic` and `telemetry`,
-/// not on any entity. The type lives here because this module is what runs one.
+/// Lives here rather than in a schema module because this is the only thing that reads it. An
+/// experiment's services are runtime descriptors beside `traffic` and `telemetry`, and run as
+/// host processes. A vehicle's are part of what it hosts, each placed with `on` on one of its
+/// devices (`ARCHITECTURE.md` §6.0.1). The model holds both in one map.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceDef {
@@ -29,6 +29,9 @@ pub struct ServiceDef {
     pub image: Image,
     #[serde(default)]
     pub config: Option<serde_yaml_ng::Value>,
+    /// The device hosting this service. Required on a vehicle, refused on an experiment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +125,8 @@ pub enum ServiceBackendError {
     },
     #[error("service `{0}`: {1}")]
     Runtime(String, String),
+    #[error("service `{svc}` is placed on device `{device}`, which only `vehicle up` can start")]
+    Placed { svc: String, device: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -348,6 +353,14 @@ pub fn svc_up(
     workspace_dir: &Path,
     runtime_dir: &Path,
 ) -> Result<String, ServiceBackendError> {
+    // A host process cannot stand in for a placed service: it would answer on the host instead
+    // of the device's slice, and every reachability result would describe the wrong topology.
+    if let Some(device) = &def.on {
+        return Err(ServiceBackendError::Placed {
+            svc: def.id.clone(),
+            device: device.clone(),
+        });
+    }
     let backend = backend_for(def.service_type);
     let type_name = def.service_type.as_str();
 
@@ -432,6 +445,7 @@ mod tests {
                 kind: ImageKind::Container,
             },
             config: Some(serde_yaml_ng::from_str(config_yaml).unwrap()),
+            on: None,
         }
     }
 
@@ -557,5 +571,16 @@ mod tests {
             err,
             "unknown service_type `bogus` (expected \"ota\" or \"telemetry\")"
         );
+    }
+
+    #[test]
+    fn a_placed_service_never_starts_as_a_host_process() {
+        let mut def = ota_def("artifacts: /tmp/store\nlisten: 127.0.0.1:0\n");
+        def.on = Some("hpc1".into());
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            svc_up(&def, &bins(), dir.path(), dir.path()),
+            Err(ServiceBackendError::Placed { device, .. }) if device == "hpc1"
+        ));
     }
 }
