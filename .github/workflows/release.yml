@@ -89,6 +89,15 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # First, so a tag with no changelog section stops before anything is attested. A dry run
+      # checks the version in Cargo.toml the same way.
+      - name: Release notes from CHANGELOG.md
+        env:
+          TAG: ${{ github.ref_name }}
+        run: scripts/release-notes.sh "$TAG" > release-notes.md
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: archive-*
@@ -119,4 +128,4 @@ jobs:
         run: |
           gh release create "$TAG" dist/vxedge-*.tar.gz dist/SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" \
-            --notes "Binaries for x86_64 and aarch64 Linux (glibc, built on Ubuntu 24.04). Verify with SHA256SUMS or gh attestation verify. See CHANGELOG.md for what changed."
+            --notes-file release-notes.md
