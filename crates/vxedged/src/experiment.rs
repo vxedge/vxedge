@@ -30,20 +30,21 @@
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
+use vxedge_api::v1::compute_service_server::ComputeService;
 use vxedge_api::v1::experiment_service_server::ExperimentService;
 use vxedge_api::v1::gateway_service_server::GatewayService;
 use vxedge_api::v1::svc_service_server::SvcService;
 use vxedge_api::v1::zone_service_server::ZoneService;
 use vxedge_api::v1::{
-    ExperimentDownRequest, ExperimentStage, ExperimentStatus, ExperimentStatusRequest,
-    ExperimentUpRequest, GatewayDownRequest, GatewayStatusRequest, GatewayUpRequest, Job, JobState,
-    ManifestRef, ResourceKind, ResourceStatus, SvcDownRequest, SvcUpRequest, VxidRef,
-    ZoneDownRequest, ZoneListRequest, ZoneUpRequest, manifest_ref::Source,
+    ComputeDownRequest, ComputeUpRequest, ExperimentDownRequest, ExperimentStage, ExperimentStatus,
+    ExperimentStatusRequest, ExperimentUpRequest, GatewayDownRequest, GatewayStatusRequest,
+    GatewayUpRequest, Job, JobState, ManifestRef, ResourceKind, ResourceStatus, SvcDownRequest,
+    SvcUpRequest, VxidRef, ZoneDownRequest, ZoneListRequest, ZoneUpRequest, manifest_ref::Source,
 };
 
 use crate::audit::Audit;
 use crate::jobs::{JobEngine, Progress, is_terminal};
-use crate::services::{GatewaySvc, SvcSvc, ZoneSvc};
+use crate::services::{ComputeSvc, GatewaySvc, SvcSvc, ZoneSvc};
 
 pub struct ExperimentSvc {
     pub audit: Arc<Audit>,
@@ -61,21 +62,42 @@ pub struct Handles {
     pub engine: JobEngine,
     pub gateway: Arc<GatewaySvc>,
     pub zones: Arc<ZoneSvc>,
+    pub compute: Arc<ComputeSvc>,
     pub svcs: Arc<SvcSvc>,
 }
 
-/// Wait for a submitted sub-job to reach a terminal state.
+/// Which service addresses a node: `ComputeService` for an hpc device, `ZoneService` otherwise.
+/// They provision the same way and differ in what lands in the audit log and the event stream.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NodeStage {
+    Zones,
+    Compute,
+}
+
+/// Wait for a submitted sub-job to reach a terminal state, relaying its progress to the parent.
 ///
 /// Returns the job's own message on success and its error on failure, so the experiment job's
-/// failure text names what actually broke instead of "stage 2 failed".
-async fn await_job(engine: &JobEngine, job: Job) -> Result<String, String> {
+/// failure text names what actually broke instead of "stage 2 failed". The relay is what makes
+/// `JobService.Watch` on a composite job show each step rather than one line per stage.
+async fn await_job(
+    engine: &JobEngine,
+    job: Job,
+    parent: &Progress,
+    percent: u32,
+    label: &str,
+) -> Result<String, String> {
     let mut rx = engine
         .watch(&job.id)
         .await
         .ok_or_else(|| format!("job {} vanished before it could be watched", job.id))?;
+    let mut relayed = String::new();
     loop {
         {
             let current = rx.borrow_and_update();
+            if !current.message.is_empty() && current.message != relayed {
+                relayed.clone_from(&current.message);
+                parent.update(percent, &format!("{label}: {relayed}"));
+            }
             if is_terminal(current.state) {
                 return if current.state == JobState::Succeeded as i32 {
                     Ok(current.message.clone())
@@ -104,7 +126,8 @@ async fn await_job(engine: &JobEngine, job: Job) -> Result<String, String> {
 /// different directories are different runs. `"."` is what `gateway up` records for a genuinely
 /// inline manifest, i.e. no known directory. Nothing active means nothing to protect: Down
 /// proceeds, which keeps it idempotent.
-fn check_down_target(
+pub(crate) fn check_down_target(
+    noun: &str,
     active: Option<(&str, &std::path::Path)>,
     requested_id: &str,
     requested_dir: Option<&std::path::Path>,
@@ -129,9 +152,9 @@ fn check_down_target(
         String::new()
     };
     Err(Status::failed_precondition(format!(
-        "experiment `{active_id}`{active_at} is the one active on this host, not \
-         `{requested_id}`{requested_at}: `experiment down` only tears down the active \
-         experiment — run it from that workspace"
+        "`{active_id}`{active_at} is the one active on this host, not \
+         `{requested_id}`{requested_at}: `{noun} down` only tears down what is active — run it \
+         from that workspace"
     )))
 }
 
@@ -188,7 +211,7 @@ impl Handles {
                 .await
         }
         .map_err(|e| format!("gateway: {}", e.message()))?;
-        await_job(&self.engine, job.into_inner())
+        await_job(&self.engine, job.into_inner(), p, 30, "gateway")
             .await
             .map_err(|e| format!("gateway: {e}"))
     }
@@ -204,41 +227,87 @@ impl Handles {
     pub(crate) async fn stage_zones(&self, up: bool, p: &Progress) -> Result<String, String> {
         let listed = match self.zones.list(Request::new(ZoneListRequest {})).await {
             Ok(r) => r.into_inner().zones,
+            // A plan that cannot be made is a broken workspace, and reading it as "no zones"
+            // reported success with nothing provisioned.
+            Err(e) if e.code() == tonic::Code::Internal => {
+                return Err(format!("zones: {}", e.message()));
+            }
             // No active experiment, or nothing plannable in it: both mean there is nothing to
             // stage, which is not a failure.
             Err(_) => return Ok("no zones declared".into()),
         };
-        let total = listed.len();
-        if total == 0 {
+        if listed.is_empty() {
             return Ok("no zones declared".into());
         }
-        for (i, node) in listed.iter().enumerate() {
+        let ids: Vec<String> = listed.into_iter().map(|n| n.vxid).collect();
+        self.stage_nodes(NodeStage::Zones, &ids, up, p).await
+    }
+
+    /// Bring these nodes up or down, one RPC each. `up` stops at the first failure. `down` tries
+    /// every node and reports them all, because stopping would strand the ones after it.
+    pub(crate) async fn stage_nodes(
+        &self,
+        stage: NodeStage,
+        ids: &[String],
+        up: bool,
+        p: &Progress,
+    ) -> Result<String, String> {
+        let total = ids.len();
+        let (label, base, span) = match stage {
+            NodeStage::Zones => ("zone", 40, 20),
+            NodeStage::Compute => ("compute", 60, 15),
+        };
+        let mut failures = Vec::new();
+        for (i, id) in ids.iter().enumerate() {
+            let percent = base + (i as u32 * span) / total as u32;
+            let verb = if up { "up" } else { "down" };
             p.update(
-                40 + (i as u32 * 30) / total as u32,
-                &format!(
-                    "zone {}/{}: {} ({})",
-                    i + 1,
-                    total,
-                    node.vxid,
-                    if up { "up" } else { "down" }
-                ),
+                percent,
+                &format!("{label} {}/{total}: {id} ({verb})", i + 1),
             );
-            let r#ref = Some(VxidRef {
-                vxid: node.vxid.clone(),
-            });
-            let job = if up {
-                self.zones.up(Request::new(ZoneUpRequest { r#ref })).await
-            } else {
+            let step = format!("{label} {id}");
+            let result = match self.submit_node(stage, id, up).await {
+                Ok(job) => await_job(&self.engine, job, p, percent, &step).await,
+                Err(status) => Err(status.message().to_string()),
+            };
+            if let Err(e) = result {
+                let failure = format!("{label} `{id}`: {e}");
+                if up {
+                    return Err(failure);
+                }
+                failures.push(failure);
+            }
+        }
+        if failures.is_empty() {
+            Ok(format!("{total} {label}(s)"))
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+
+    async fn submit_node(&self, stage: NodeStage, id: &str, up: bool) -> Result<Job, Status> {
+        let r#ref = Some(VxidRef {
+            vxid: id.to_string(),
+        });
+        let job = match (stage, up) {
+            (NodeStage::Zones, true) => self.zones.up(Request::new(ZoneUpRequest { r#ref })).await,
+            (NodeStage::Zones, false) => {
                 self.zones
                     .down(Request::new(ZoneDownRequest { r#ref }))
                     .await
             }
-            .map_err(|e| format!("zone `{}`: {}", node.vxid, e.message()))?;
-            await_job(&self.engine, job.into_inner())
-                .await
-                .map_err(|e| format!("zone `{}`: {e}", node.vxid))?;
-        }
-        Ok(format!("{total} zone(s)"))
+            (NodeStage::Compute, true) => {
+                self.compute
+                    .up(Request::new(ComputeUpRequest { r#ref }))
+                    .await
+            }
+            (NodeStage::Compute, false) => {
+                self.compute
+                    .down(Request::new(ComputeDownRequest { r#ref }))
+                    .await
+            }
+        }?;
+        Ok(job.into_inner())
     }
 
     pub(crate) async fn stage_services(
@@ -275,9 +344,15 @@ impl Handles {
                     .await
             }
             .map_err(|e| format!("service `{ty}`: {}", e.message()))?;
-            await_job(&self.engine, job.into_inner())
-                .await
-                .map_err(|e| format!("service `{ty}`: {e}"))?;
+            await_job(
+                &self.engine,
+                job.into_inner(),
+                p,
+                90,
+                &format!("service {ty}"),
+            )
+            .await
+            .map_err(|e| format!("service `{ty}`: {e}"))?;
         }
         Ok(format!("{} service(s)", types.len()))
     }
@@ -363,7 +438,7 @@ impl ExperimentService for ExperimentSvc {
                 .active
                 .as_ref()
                 .map(|a| (a.model.id.as_str(), a.dir.as_path()));
-            check_down_target(active, &model.id, dir.as_deref())?;
+            check_down_target("experiment", active, &model.id, dir.as_deref())?;
         }
         self.audit.record(
             "ExperimentService.Down",
@@ -572,19 +647,20 @@ mod tests {
 
     #[test]
     fn down_with_nothing_active_proceeds() {
-        assert!(check_down_target(None, "exp-a", Some(Path::new("/ws/a"))).is_ok());
+        assert!(check_down_target("experiment", None, "exp-a", Some(Path::new("/ws/a"))).is_ok());
     }
 
     #[test]
     fn down_of_the_active_experiment_proceeds() {
         let active = Some(("exp-a", Path::new("/ws/a")));
-        assert!(check_down_target(active, "exp-a", Some(Path::new("/ws/a"))).is_ok());
+        assert!(check_down_target("experiment", active, "exp-a", Some(Path::new("/ws/a"))).is_ok());
     }
 
     #[test]
     fn down_of_a_different_experiment_is_refused_naming_the_active_one() {
         let active = Some(("exp-a", Path::new("/ws/a")));
-        let err = check_down_target(active, "exp-b", Some(Path::new("/ws/b"))).unwrap_err();
+        let err =
+            check_down_target("experiment", active, "exp-b", Some(Path::new("/ws/b"))).unwrap_err();
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
         assert!(err.message().contains("`exp-a`"), "{}", err.message());
         assert!(err.message().contains("/ws/a"), "{}", err.message());
@@ -596,7 +672,13 @@ mod tests {
         // Two copies of one experiment in different directories: only the one that was
         // brought up is torn down from its own workspace.
         let active = Some(("exp-a", Path::new("/ws/a")));
-        let err = check_down_target(active, "exp-a", Some(Path::new("/ws/copy-of-a"))).unwrap_err();
+        let err = check_down_target(
+            "experiment",
+            active,
+            "exp-a",
+            Some(Path::new("/ws/copy-of-a")),
+        )
+        .unwrap_err();
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
         assert!(err.message().contains("/ws/a"), "{}", err.message());
     }
@@ -604,14 +686,50 @@ mod tests {
     #[test]
     fn an_inline_down_with_no_directory_is_matched_on_id_alone() {
         let active = Some(("exp-a", Path::new("/ws/a")));
-        assert!(check_down_target(active, "exp-a", None).is_ok());
-        assert!(check_down_target(active, "exp-b", None).is_err());
+        assert!(check_down_target("experiment", active, "exp-a", None).is_ok());
+        assert!(check_down_target("experiment", active, "exp-b", None).is_err());
     }
 
     #[test]
     fn an_active_experiment_with_no_known_directory_is_matched_on_id_alone() {
         // `gateway up` from a genuinely inline manifest records "." as the directory.
         let active = Some(("exp-a", Path::new(".")));
-        assert!(check_down_target(active, "exp-a", Some(Path::new("/ws/a"))).is_ok());
+        assert!(check_down_target("experiment", active, "exp-a", Some(Path::new("/ws/a"))).is_ok());
+    }
+
+    /// The parent has to show a sub-job's step while that step is running, not after it.
+    #[tokio::test]
+    async fn await_job_relays_sub_job_progress_to_the_parent() {
+        let engine = JobEngine::new(crate::events::EventBus::new());
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        let sub = engine
+            .submit("sub", move |p| async move {
+                p.update(50, "moving port");
+                let _ = gate.await;
+                Ok("done".to_string())
+            })
+            .await;
+        let inner = engine.clone();
+        let parent = engine
+            .submit("parent", move |p| async move {
+                await_job(&inner, sub, &p, 30, "zone a").await
+            })
+            .await;
+        let mut rx = engine.watch(&parent.id).await.unwrap();
+        while rx.borrow_and_update().message != "zone a: moving port" {
+            rx.changed().await.unwrap();
+        }
+        release.send(()).unwrap();
+        while !is_terminal(rx.borrow_and_update().state) {
+            rx.changed().await.unwrap();
+        }
+        assert_eq!(rx.borrow().state, JobState::Succeeded as i32);
+    }
+
+    #[test]
+    fn a_down_refusal_names_the_verb_it_refused() {
+        let active = Some(("vehicle-a", Path::new("/ws/a")));
+        let err = check_down_target("vehicle", active, "vehicle-b", None).unwrap_err();
+        assert!(err.message().contains("`vehicle down`"), "{err:?}");
     }
 }

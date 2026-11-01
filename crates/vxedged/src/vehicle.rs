@@ -4,14 +4,17 @@
 //!
 //! # Composition, not reimplementation
 //!
-//! Same principle `ExperimentSvc` states for itself, and the same [`Handles`] type — reused
-//! directly, not duplicated, since gateway/zone/service provisioning for a vehicle is *exactly*
-//! `ExperimentSvc`'s own gateway/zones/services staging, run against a synthesized workspace.
-//! `stage_compute` does not exist here for the same reason it does not exist in
-//! `ExperimentSvc`: `ZoneService`'s own `list`/`up`/`down` already address every plannable
-//! device regardless of role (`ComputeSvc`'s own doc comment: "a standalone RPC surface over
-//! the same `EdgeState`/`NodePlan` machinery zones already uses, addressed by role"), so
-//! `stage_zones` alone already brings up HPC-role devices too.
+//! Same principle `ExperimentSvc` states for itself, and the same [`Handles`] type: each stage
+//! submits the existing service's job and waits for it, against a synthesized workspace. The
+//! order is §5.4's: gateway, zones, compute, services, and the reverse on `down`. Compute is its
+//! own stage because hpc devices go through `ComputeService`, so their audit lines and
+//! `compute.up` events say what they are. The signal plane has no stage until it exists.
+//!
+//! # The workspace decides, not the daemon's memory
+//!
+//! Both verbs plan every node from the workspace before touching the host. `up` therefore
+//! refuses a workspace that cannot provision before the gateway exists, and `down` still knows
+//! what to remove after a daemon restart has emptied `EdgeState`.
 //!
 //! # A vehicle has no network of its own
 //!
@@ -27,6 +30,8 @@
 //! (`GatewaySvc`/`ZoneSvc`/`SvcSvc`, via `crate::services::resolve_manifest`), sees an ordinary
 //! §6.0 workspace and needs no vehicle-aware code path of its own.
 
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
@@ -37,50 +42,126 @@ use vxedge_api::v1::{
     GatewayStatusRequest, ManifestRef, ResourceKind, VehicleDownRequest, VehicleStatus,
     VehicleStatusRequest, VehicleUpRequest,
 };
+use vxedge_core::containers::LazyClient;
+use vxedge_core::gateway::GatewayPlan;
+use vxedge_core::model::{DeviceRole, Experiment};
+use vxedge_core::zones::NodePlan;
 
 use crate::audit::Audit;
-use crate::experiment::Handles;
+use crate::experiment::{Handles, NodeStage, check_down_target};
 
 pub struct VehicleSvc {
     pub audit: Arc<Audit>,
     pub handles: Handles,
 }
 
-/// Resolve, synthesize and build once, so `up`/`down`/`status` share one code path for turning
-/// a `ManifestRef` into (augmented YAML text, workspace dir, the built model, the vehicle's own
-/// id). The model is returned alongside the YAML text it was built from — same reason
-/// `ExperimentSvc::up` builds its model once and hands the *document* to every stage rather
-/// than the model itself: `GatewaySvc`/`ZoneSvc`/`SvcSvc` each re-parse the text independently.
-async fn resolve_and_synthesize(
-    mref: Option<&ManifestRef>,
-) -> Result<
-    (
-        String,
-        Option<std::path::PathBuf>,
-        vxedge_core::model::Experiment,
-        String,
-    ),
-    Status,
-> {
+/// One workspace, resolved once, so `up`/`down`/`status` share one path from a `ManifestRef` to
+/// what they act on. Every stage gets `yaml` rather than `model`, because
+/// `GatewaySvc`/`ZoneSvc`/`SvcSvc` each parse their manifest independently.
+struct Resolved {
+    yaml: String,
+    dir: Option<PathBuf>,
+    sha256: String,
+    model: Experiment,
+    id: String,
+}
+
+async fn resolve_and_synthesize(mref: Option<&ManifestRef>) -> Result<Resolved, Status> {
     let mref = mref.ok_or_else(|| {
         Status::invalid_argument(
             "no vehicle to run: the daemon received no manifest or workspace reference",
         )
     })?;
-    let dir = crate::services::resolve_manifest_dir(mref).await;
-    let raw_yaml = crate::services::resolve_manifest_yaml(mref).await?;
+    let (raw_yaml, sha256, dir) = crate::services::resolve_manifest(Some(mref)).await?;
     let yaml = vxedge_core::model::synthesize_vehicle_workspace(&raw_yaml)
         .map_err(|e| Status::invalid_argument(e.to_string()))?;
     let model = vxedge_core::model::load_yaml(&yaml)
         .map_err(|e| Status::invalid_argument(e.to_string()))?;
     // Exactly one entity: `synthesize_vehicle_workspace` refuses anything but exactly one
     // `kind: vehicle` document, and the synthesized experiment names only that one.
-    let vehicle_id = model
+    let id = model
         .entities
         .first()
         .map(|e| e.id.clone())
         .ok_or_else(|| Status::internal("synthesized vehicle workspace built with no entity"))?;
-    Ok((yaml, dir, model, vehicle_id))
+    Ok(Resolved {
+        yaml,
+        dir,
+        sha256,
+        model,
+        id,
+    })
+}
+
+/// Every plan the vehicle needs, computed without touching the host.
+fn plan_vehicle(
+    model: &Experiment,
+    dir: Option<&Path>,
+) -> Result<(GatewayPlan, Vec<NodePlan>), Status> {
+    let refuse = |e: String| Status::failed_precondition(e);
+    let gateway = GatewayPlan::from_model(model).map_err(|e| refuse(e.to_string()))?;
+    let nodes = vxedge_core::zones::plan_nodes_from_model(
+        model,
+        &gateway,
+        dir.unwrap_or_else(|| Path::new(".")),
+    )
+    .map_err(|e| refuse(e.to_string()))?;
+    Ok((gateway, nodes))
+}
+
+/// Node ids by the service that addresses them: `(zones, compute)`.
+fn by_stage(nodes: &[NodePlan]) -> (Vec<String>, Vec<String>) {
+    let (compute, zones): (Vec<&NodePlan>, Vec<&NodePlan>) =
+        nodes.iter().partition(|n| n.role == DeviceRole::Hpc);
+    let ids = |plans: Vec<&NodePlan>| plans.iter().map(|n| n.node_id.clone()).collect();
+    (ids(zones), ids(compute))
+}
+
+/// The `localhost/` images this vehicle runs, payloads and placed services alike.
+fn local_images(model: &Experiment, nodes: &[NodePlan]) -> BTreeSet<String> {
+    let payloads = nodes.iter().filter_map(|n| n.image.as_deref());
+    let services = model
+        .services
+        .values()
+        .filter(|s| s.on.is_some())
+        .map(|s| s.image.url.as_str());
+    payloads
+        .chain(services)
+        .filter(|image| image.starts_with("localhost/"))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Refuse now, naming the images, rather than on a failed pull with the gateway already up.
+/// A vehicle with no local image never reaches Podman here.
+async fn require_local_images(id: &str, images: &BTreeSet<String>) -> Result<(), Status> {
+    if images.is_empty() {
+        return Ok(());
+    }
+    let containers = LazyClient::user();
+    let client = containers
+        .get()
+        .await
+        .map_err(|e| Status::failed_precondition(e.to_string()))?;
+    let mut missing = Vec::new();
+    for image in images {
+        let present = client
+            .image_present(image)
+            .await
+            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        if !present {
+            missing.push(format!("  {image}"));
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(Status::failed_precondition(format!(
+        "vehicle `{id}` runs local images that are not in this host's Podman store:\n{}\n\
+         A `localhost/` image is built per host. Build it with the workspace's build script, \
+         then run `vehicle up` again.",
+        missing.join("\n")
+    )))
 }
 
 #[tonic::async_trait]
@@ -89,12 +170,19 @@ impl VehicleService for VehicleSvc {
         &self,
         req: Request<VehicleUpRequest>,
     ) -> Result<Response<vxedge_api::v1::Job>, Status> {
-        let (yaml, dir, model, id) =
-            resolve_and_synthesize(req.get_ref().manifest.as_ref()).await?;
+        let Resolved {
+            yaml,
+            dir,
+            sha256,
+            model,
+            id,
+        } = resolve_and_synthesize(req.get_ref().manifest.as_ref()).await?;
         // Host requirements before anything is provisioned, same as `ExperimentSvc::up` — see
         // that function's own comment for why refusing here costs nothing but refusing halfway
         // through does not.
         crate::services::preflight_requires(dir.as_deref())?;
+        let (_, nodes) = plan_vehicle(&model, dir.as_deref())?;
+        require_local_images(&id, &local_images(&model, &nodes)).await?;
         // A local bundle (e.g. `./bundle`) is built per host and absent on a fresh clone;
         // refuse now, with the build command, rather than after the gateway is up.
         if let Some(d) = dir.as_deref() {
@@ -113,24 +201,27 @@ impl VehicleService for VehicleSvc {
                 )));
             }
         }
-        self.audit
-            .record("VehicleService.Up", serde_json::json!({ "vehicle": id }));
+        self.audit.record(
+            "VehicleService.Up",
+            serde_json::json!({ "vehicle": id, "workspace_sha256": sha256 }),
+        );
+        let (zones, compute) = by_stage(&nodes);
         let svc = self.handles.clone();
         let job = self
             .handles
             .engine
             .submit("vehicle.up", move |p| async move {
                 svc.stage_gateway(&yaml, dir.as_deref(), true, &p).await?;
-                let zones = svc.stage_zones(true, &p).await?;
-                // Always "no services declared" today: `kind: vehicle` has no `services:`
-                // block of its own in the current §6.0 schema (only experiments do), so the
-                // synthesized workspace never declares any — kept for parity with
-                // `ExperimentSvc::up` and to pick up vehicle-scoped services automatically if
-                // the schema grows one later, not because it does anything yet.
+                let zones = svc.stage_nodes(NodeStage::Zones, &zones, true, &p).await?;
+                let compute = svc
+                    .stage_nodes(NodeStage::Compute, &compute, true, &p)
+                    .await?;
                 let services = svc
                     .stage_services(&model, &yaml, dir.as_deref(), true, &p)
                     .await?;
-                Ok(format!("vehicle `{id}` up — gateway, {zones}, {services}"))
+                Ok(format!(
+                    "vehicle `{id}` up — gateway, {zones}, {compute}, {services}"
+                ))
             })
             .await;
         Ok(Response::new(job))
@@ -140,10 +231,31 @@ impl VehicleService for VehicleSvc {
         &self,
         req: Request<VehicleDownRequest>,
     ) -> Result<Response<vxedge_api::v1::Job>, Status> {
-        let (yaml, dir, model, id) =
-            resolve_and_synthesize(req.get_ref().manifest.as_ref()).await?;
-        self.audit
-            .record("VehicleService.Down", serde_json::json!({ "vehicle": id }));
+        let Resolved {
+            yaml,
+            dir,
+            sha256,
+            model,
+            id,
+        } = resolve_and_synthesize(req.get_ref().manifest.as_ref()).await?;
+        let (gateway, nodes) = plan_vehicle(&model, dir.as_deref())?;
+        {
+            let st = self.handles.gateway.state.lock().await;
+            let active = st
+                .active
+                .as_ref()
+                .map(|a| (a.model.id.as_str(), a.dir.as_path()));
+            check_down_target("vehicle", active, &model.id, dir.as_deref())?;
+        }
+        self.audit.record(
+            "VehicleService.Down",
+            serde_json::json!({ "vehicle": id, "workspace_sha256": sha256 }),
+        );
+        self.handles
+            .gateway
+            .adopt(model.clone(), gateway, dir.clone(), sha256)
+            .await;
+        let (zones, compute) = by_stage(&nodes);
         let svc = self.handles.clone();
         let job = self
             .handles
@@ -158,7 +270,13 @@ impl VehicleService for VehicleSvc {
                 {
                     failures.push(e);
                 }
-                if let Err(e) = svc.stage_zones(false, &p).await {
+                if let Err(e) = svc
+                    .stage_nodes(NodeStage::Compute, &compute, false, &p)
+                    .await
+                {
+                    failures.push(e);
+                }
+                if let Err(e) = svc.stage_nodes(NodeStage::Zones, &zones, false, &p).await {
                     failures.push(e);
                 }
                 if let Err(e) = svc.stage_gateway(&yaml, dir.as_deref(), false, &p).await {
@@ -182,8 +300,7 @@ impl VehicleService for VehicleSvc {
         &self,
         req: Request<VehicleStatusRequest>,
     ) -> Result<Response<VehicleStatus>, Status> {
-        let (_yaml, _dir, _model, id) =
-            resolve_and_synthesize(req.get_ref().manifest.as_ref()).await?;
+        let Resolved { id, .. } = resolve_and_synthesize(req.get_ref().manifest.as_ref()).await?;
 
         let gw = self
             .handles
@@ -207,5 +324,78 @@ impl VehicleService for VehicleSvc {
             status: Some(status),
             components,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const WS: &str = r#"
+kind: vehicle
+id: car
+zones: { front: {}, central: {} }
+devices:
+  ecu1: { role: zone-controller, zone: front, backend: container }
+  hpc1: { role: hpc, zone: central, backend: container }
+functions:
+  f-ecu: { deployed_on: ecu1 }
+  f-hpc: { deployed_on: hpc1 }
+links:
+  - { id: l1, endpoints: [{ node: ecu1, port: eth0, ip: 10.1.0.2/24 }], slice: adas }
+  - { id: l2, endpoints: [{ node: hpc1, port: eth0, ip: 10.1.0.3/24 }], slice: adas }
+services:
+  ota:
+    id: ota-01
+    type: ota
+    image: { url: localhost/vxedge/ota:1, kind: container }
+    on: hpc1
+---
+kind: baseline
+id: bl
+parts:
+  - { ref: 'local/vxprobe:host-process', target_ids: f-ecu }
+  - { ref: localhost/vxedge/probe:1, target_ids: f-hpc }
+"#;
+
+    fn model(yaml: &str) -> Experiment {
+        vxedge_core::model::load_vehicle_yaml(yaml).unwrap()
+    }
+
+    #[test]
+    fn hpc_devices_go_through_compute_and_the_rest_through_zones() {
+        let m = model(WS);
+        let (_, nodes) = plan_vehicle(&m, None).unwrap();
+        assert_eq!(
+            by_stage(&nodes),
+            (vec!["ecu1".to_string()], vec!["hpc1".to_string()])
+        );
+    }
+
+    #[test]
+    fn local_images_cover_payloads_and_placed_services_once_each() {
+        let m = model(WS);
+        let (_, nodes) = plan_vehicle(&m, None).unwrap();
+        assert_eq!(
+            local_images(&m, &nodes).into_iter().collect::<Vec<_>>(),
+            ["localhost/vxedge/ota:1", "localhost/vxedge/probe:1"]
+        );
+    }
+
+    /// Reaching `up`'s job body with this would bring the gateway up and strand it.
+    #[test]
+    fn a_workspace_that_cannot_plan_is_refused_before_the_host_is_touched() {
+        let yaml = WS.replace(
+            "  - { id: l2,",
+            "  - { id: l3, endpoints: [{ node: ecu1, port: eth1, ip: 10.2.0.2/24 }], slice: info }\n  - { id: l2,",
+        );
+        let err = plan_vehicle(&model(&yaml), None).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("ecu1"), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_vehicle_without_local_images_never_asks_podman() {
+        require_local_images("car", &BTreeSet::new()).await.unwrap();
     }
 }

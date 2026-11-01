@@ -205,6 +205,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         engine: engine.clone(),
         gateway: gateway.clone(),
         zones: zones.clone(),
+        compute: compute.clone(),
         svcs: svcs.clone(),
     };
 
