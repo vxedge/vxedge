@@ -33,10 +33,19 @@ pub enum ZonePlanError {
     )]
     AmbiguousBundle { device: String, count: usize },
     #[error(
-        "device `{device}` hosts {count} published container images, and a container node runs \
-         one payload. Deploy the others on their own devices, or publish them as a single image."
+        "device `{device}` hosts {count} container images, and a container node runs one payload. \
+         Deploy the others on their own devices, or publish them as a single image."
     )]
     AmbiguousImage { device: String, count: usize },
+    #[error(
+        "device `{device}` attaches to the gateway twice (slices `{first}` and `{second}`), and \
+         a node has one port today. Give each slice its own device."
+    )]
+    MultiHomed {
+        device: String,
+        first: String,
+        second: String,
+    },
     #[error(
         "device `{0}` declares no `backend`, so there is no way to know whether it attaches by \
          veth or by tap. Add `backend: container|qemu-microvm|libvirt`."
@@ -76,9 +85,9 @@ pub struct NodePlan {
     /// `bundle` path via `registry::fetch` before dispatching to a backend, so backends never
     /// see anything but an already-resolved local path.
     pub remote_bundle: Option<(String, String)>,
-    /// For the `container` backend: the digest-pinned OCI image (`<reference>@<digest>`) the
-    /// node runs as its payload, from a published container part. `None` keeps the node a bare
-    /// network namespace whose payload the experiment runner execs in by name — what every
+    /// For the `container` backend: the OCI image the node runs as its payload, digest-pinned
+    /// (`<reference>@<digest>`) when published, or a `localhost/` image from this host's Podman
+    /// store. `None` keeps the node a bare network namespace whose payload the experiment runner execs in by name — what every
     /// `local/…:host-process` part means, so no existing workspace changes behaviour.
     pub image: Option<String>,
     pub pinned_cpus: Vec<u32>,
@@ -114,7 +123,7 @@ pub fn plan_nodes_from_model(
     gateway: &GatewayPlan,
     workspace_dir: &Path,
 ) -> Result<Vec<NodePlan>, ZonePlanError> {
-    let mut plans = Vec::new();
+    let mut plans: Vec<NodePlan> = Vec::new();
     for entity in &exp.entities {
         for device in entity.devices.values() {
             for (link, endpoint) in entity.links_for(&device.id) {
@@ -206,32 +215,24 @@ pub fn plan_nodes_from_model(
                     }
                     Backend::Container => (None, None),
                 };
-                // A container node runs an OCI payload only when a *published* container part is
-                // deployed on it. A `local/…` part names a host process (or an image only this
-                // host has), which the runner starts itself inside the named netns — the
-                // contract every shipped workspace relies on, so it stays the default.
+                // A container node runs an OCI payload only when a published or `localhost/`
+                // image is deployed on it. A `local/…` part names a host process, which the
+                // runner starts itself inside the named netns — the contract every shipped
+                // workspace relies on, so it stays the default.
                 let image = match backend {
                     Backend::Container => {
-                        let published: Vec<&crate::model::Part> = entity
+                        let images: Vec<&crate::model::Part> = entity
                             .functions_on(&device.id)
                             .filter_map(|f| f.part.as_ref())
-                            .filter(|part| {
-                                part.kind == crate::model::PartKind::Container && !part.local
-                            })
+                            .filter(|part| part.is_oci_payload())
                             .collect();
-                        if published.len() > 1 {
+                        if images.len() > 1 {
                             return Err(ZonePlanError::AmbiguousImage {
                                 device: device.id.clone(),
-                                count: published.len(),
+                                count: images.len(),
                             });
                         }
-                        published.first().map(|part| {
-                            let digest = part.digest.as_deref().expect(
-                                "workspace validation guarantees a digest for every published \
-                                 (non-local) part",
-                            );
-                            format!("{}@{digest}", part.reference)
-                        })
+                        images.first().map(|part| part.image_ref())
                     }
                     Backend::Libvirt | Backend::QemuMicrovm => None,
                 };
@@ -240,6 +241,16 @@ pub fn plan_nodes_from_model(
                     && matches!(backend, Backend::Libvirt | Backend::QemuMicrovm)
                 {
                     return Err(ZonePlanError::MissingBundle(device.id.clone(), backend));
+                }
+
+                // Two plans for one node would share a netns and a `runtime_name`: the second
+                // port fails on `eth0` in a container and is silently absent from a microVM.
+                if let Some(first) = plans.iter().find(|p| p.node_id == device.id) {
+                    return Err(ZonePlanError::MultiHomed {
+                        device: device.id.clone(),
+                        first: first.slice.clone().unwrap_or_default(),
+                        second: ep.slice.clone().unwrap_or_default(),
+                    });
                 }
 
                 plans.push(NodePlan {
@@ -470,6 +481,38 @@ parts:
                  2222222222222222222222222222222222222222222222222222222222222222"
             )
         );
+    }
+
+    #[test]
+    fn a_localhost_container_part_plans_its_tag_unpinned() {
+        let ws = WS.replace(
+            "  - { ref: 'local/vxprobe:host-process', target_ids: fn-b }",
+            "  - { ref: localhost/vxedge/probe:1, target_ids: fn-b }",
+        );
+        assert_eq!(
+            plans(&ws)[1].image.as_deref(),
+            Some("localhost/vxedge/probe:1")
+        );
+    }
+
+    #[test]
+    fn a_device_on_two_slices_is_refused_by_name() {
+        let ws = WS
+            .replace(
+                "    - { id: adas, mode: vlan, vlan: 101,",
+                "    - { id: info, mode: vlan, vlan: 102 }\n    - { id: adas, mode: vlan, vlan: 101,",
+            )
+            .replace(
+                "  - { id: lb, endpoints: [{ node: node-b, port: eth0, ip: 10.101.0.3/24 }], slice: adas }",
+                "  - { id: lb, endpoints: [{ node: node-b, port: eth0, ip: 10.101.0.3/24 }], slice: adas }\n  \
+                 - { id: lc, endpoints: [{ node: node-b, port: eth1, ip: 10.102.0.3/24 }], slice: info }",
+            );
+        let model = crate::model::load_yaml(&ws).expect("valid test workspace");
+        let gw = GatewayPlan::from_model(&model).unwrap();
+        assert!(matches!(
+            plan_nodes_from_model(&model, &gw, Path::new("/x")),
+            Err(ZonePlanError::MultiHomed { device, .. }) if device == "node-b"
+        ));
     }
 
     /// One payload per node, like one bundle per VM: picking one of two would run half the arm.

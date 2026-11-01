@@ -8,6 +8,9 @@ All notable changes to this repo are documented here. Format follows
 
 ### Added
 
+- A `kind: vehicle` document can declare `services`, each placed on a container device with `on:`. Placement is checked at build; the same service type on a vehicle and its experiment is refused. Starting a placed service is not implemented yet, and `svc up` refuses one rather than running it as a host process.
+- `localhost/…` part refs name images in the host's Podman store: local, no digest, run as a container device's payload.
+
 - `vxedge_core::containers` (Track V1, `docs-internal/PROVISIONING.md` §7.2): container groups
   over Podman's REST API on the rootless user socket, via `bollard`. A group is what a `podman
   pod` was: an infra container owning a network namespace that members join. Membership is by
@@ -23,6 +26,7 @@ All notable changes to this repo are documented here. Format follows
 
 ### Changed
 
+- A device with two slice attachments is refused at plan time. It used to fail on `eth0` in a container and silently lose its second NIC in a microVM.
 - **The 5G core, RAN and UE pods are driven through the Podman API, not the `podman` CLI**
   (Track V2). Hosts need the rootless user socket (`systemctl --user enable --now
   podman.socket`, plus `loginctl enable-linger` on a host you reach over SSH) and `passt`;

@@ -388,6 +388,9 @@ pub struct VehicleDoc {
     pub links: Vec<LinkDoc>,
     #[serde(default)]
     pub channels: Vec<ChannelDoc>,
+    /// What the vehicle hosts, each placed on one of its devices (`ARCHITECTURE.md` §6.0.1).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub services: BTreeMap<String, crate::services::ServiceDef>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -719,7 +722,8 @@ impl PartEntry {
     /// Everything else must be digest-pinned — see
     /// [`WorkspaceValidationError::PublishedRefWithoutDigest`].
     ///
-    /// Three forms count as local: a relative path, an absolute path, and the **`local/`
+    /// Four forms count as local: a relative path, an absolute path, a `localhost/` image in
+    /// this host's Podman store, and the **`local/`
     /// namespace** the existing manifests use for a node that runs as a host process
     /// (`local/vxprobe:host-process` in exp-001). The last one was found by migrating exp-001:
     /// a container-backed node ignores `image.url` entirely, so `local/…` names no artifact at
@@ -729,6 +733,7 @@ impl PartEntry {
         self.reference.starts_with('.')
             || self.reference.starts_with('/')
             || self.reference.starts_with("local/")
+            || self.reference.starts_with("localhost/")
     }
 }
 

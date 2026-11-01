@@ -204,9 +204,27 @@ pub struct Part {
     /// first model port silently accepted.
     pub kind: PartKind,
     pub digest: Option<String>,
-    /// `local/…`, a relative path, or an absolute path — none of which name a registry artifact,
-    /// so none of which can be digest-pinned.
+    /// `local/…`, `localhost/…`, a relative path, or an absolute path — none of which name a
+    /// registry artifact, so none of which can be digest-pinned.
     pub local: bool,
+}
+
+impl Part {
+    /// Whether a `container` device runs this part as its OCI payload: a published image, or a
+    /// `localhost/` one from this host's Podman store. A `local/…` part names a host process
+    /// the experiment runner starts itself, and a bare path names nothing Podman can run.
+    pub fn is_oci_payload(&self) -> bool {
+        self.kind == PartKind::Container
+            && (!self.local || self.reference.starts_with("localhost/"))
+    }
+
+    /// The reference to hand Podman: digest-pinned whenever the part has a digest.
+    pub fn image_ref(&self) -> String {
+        match &self.digest {
+            Some(digest) => format!("{}@{digest}", self.reference),
+            None => self.reference.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -639,6 +657,23 @@ impl Entity {
 /// fixture, an alternative frontend) cannot skip it.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum InvariantError {
+    #[error("service `{service}` is placed on device `{device}`, which no vehicle declares")]
+    ServiceOnUnknownDevice { service: String, device: String },
+    #[error(
+        "service `{service}` is placed on device `{device}`, which is not `backend: container`. \
+         A placed service joins the device's container group, so a VM cannot host one yet."
+    )]
+    ServiceOnNonContainerDevice { service: String, device: String },
+    #[error(
+        "service `{service}` is placed on device `{device}`, which runs no container image. \
+         Deploy a published or `localhost/` container part on it, so it has a group to join."
+    )]
+    ServiceOnDeviceWithoutPayload { service: String, device: String },
+    #[error(
+        "service `{service}` is placed on device `{device}`, which is not attached to any slice, \
+         so nothing could reach it"
+    )]
+    ServiceOnUnattachedDevice { service: String, device: String },
     #[error(
         "entity `{entity}`: `{id}` is both a zone and a device — a reference to it would be ambiguous"
     )]
@@ -737,6 +772,46 @@ impl Experiment {
             }
         }
         let slice_ids: Vec<&str> = self.slices.iter().map(|s| s.id.as_str()).collect();
+
+        for service in self.services.values() {
+            let Some(on) = &service.on else { continue };
+            let names = || (service.id.clone(), on.clone());
+            let Some((entity, device)) = self
+                .entities
+                .iter()
+                .find_map(|e| e.devices.get(on).map(|d| (e, d)))
+            else {
+                let (service, device) = names();
+                errors.push(E::ServiceOnUnknownDevice { service, device });
+                continue;
+            };
+            let (service, device_id) = names();
+            if device.backend != Some(Backend::Container) {
+                errors.push(E::ServiceOnNonContainerDevice {
+                    service,
+                    device: device_id,
+                });
+                continue;
+            }
+            let has_payload = entity
+                .functions_on(on)
+                .filter_map(|f| f.part.as_ref())
+                .any(Part::is_oci_payload);
+            if !has_payload {
+                errors.push(E::ServiceOnDeviceWithoutPayload {
+                    service,
+                    device: device_id,
+                });
+                continue;
+            }
+            let attached = entity.links_for(on).any(|(link, _)| link.slice.is_some());
+            if !attached {
+                errors.push(E::ServiceOnUnattachedDevice {
+                    service,
+                    device: device_id,
+                });
+            }
+        }
 
         for t in &self.tunnels {
             for slice in &t.vxlan_slices {
