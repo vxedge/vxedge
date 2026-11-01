@@ -11,7 +11,7 @@ All notable changes to this repo are documented here. Format follows
 - `vehicle up` and `down` have a compute stage: hpc devices go through `ComputeService`, so audit lines and events name them, in §5.4's order.
 - `JobService.Watch` on a composite job shows each sub-job's steps, not one line per stage.
 - `VehicleService` audit lines carry the workspace sha256.
-- A `kind: vehicle` document can declare `services`, each placed on a container device with `on:`. Placement is checked at build; the same service type on a vehicle and its experiment is refused. Starting a placed service is not implemented yet, and `svc up` refuses one rather than running it as a host process.
+- A `kind: vehicle` document can declare `services`, each placed on a container device with `on:`. Placement is checked at build; the same service type on a vehicle and its experiment is refused. `svc up`, `down` and `status` run it as a member of that device's container group, so it answers on the device's slice only; `vehicle up` refuses a missing artifact store before provisioning.
 - `localhost/…` part refs name images in the host's Podman store: local, no digest, run as a container device's payload.
 
 - `vxedge_core::containers` (Track V1, `docs-internal/PROVISIONING.md` §7.2): container groups

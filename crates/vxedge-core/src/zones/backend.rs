@@ -229,6 +229,55 @@ fn port_netns(np: &NodePlan) -> Option<String> {
     }
 }
 
+/// Run `spec` as one more member of a running node's container group, in its namespace: a
+/// service placed on the device (`ARCHITECTURE.md` §6.0.1). Refuses a node that is not up,
+/// because a group brought up here would have no gateway port. Idempotent.
+pub fn member_up(
+    sh: &Shell,
+    np: &NodePlan,
+    runtime_dir: &Path,
+    spec: &ContainerSpec,
+) -> Result<(), ZoneBackendError> {
+    if node_status(sh, np, runtime_dir) != NodeState::Up {
+        return Err(ZoneBackendError::Runtime {
+            node: np.node_id.clone(),
+            detail: format!(
+                "`{}` cannot join a node that is not up. Bring the node up first",
+                spec.name
+            ),
+        });
+    }
+    let group = payload_group(np)?;
+    let client = block_on(ContainerClient::connect_user()).map_err(|e| ct(np, e))?;
+    let (handle, _) = block_on(client.ensure_group(&group)).map_err(|e| ct(np, e))?;
+    block_on(client.ensure_member(&group, &handle, spec)).map_err(|e| ct(np, e))?;
+    Ok(())
+}
+
+/// Stop one member of a node's group and leave the node running. Idempotent.
+pub fn member_down(np: &NodePlan, spec: &ContainerSpec) -> Result<(), ZoneBackendError> {
+    let group = payload_group(np)?;
+    let client = block_on(ContainerClient::connect_user()).map_err(|e| ct(np, e))?;
+    block_on(client.member_down(&group, spec)).map_err(|e| ct(np, e))
+}
+
+/// Whether that member is running, as Podman reports it. An unreachable Podman reads as down.
+pub fn member_status(np: &NodePlan, spec: &ContainerSpec) -> NodeState {
+    let running = payload_group(np).ok().and_then(|group| {
+        let name = group.member_container_name(spec).ok()?;
+        block_on(async {
+            let client = ContainerClient::connect_user().await.ok()?;
+            let status = client.group_status(group.name()).await.ok()?;
+            Some(status.member(&name).is_some_and(|c| c.is_running()))
+        })
+    });
+    if running == Some(true) {
+        NodeState::Up
+    } else {
+        NodeState::Down
+    }
+}
+
 fn container_status(_sh: &Shell, np: &NodePlan) -> NodeState {
     let ns = match &np.image {
         None => {

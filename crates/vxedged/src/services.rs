@@ -1416,6 +1416,8 @@ fn parse_service_type(raw: &str) -> Result<vxedge_core::services::ServiceType, S
 pub struct SvcSvc {
     pub engine: JobEngine,
     pub audit: Arc<Audit>,
+    /// Reaches a node's namespace to tell whether a placed service's device is up.
+    pub shell: Shell,
     pub runtime_dir: PathBuf,
     /// Binaries the process backend spawns (v1 co-locates every service with vxedged — see
     /// ARCHITECTURE.md §8). A struct rather than one path per service, so a new service type
@@ -1428,7 +1430,7 @@ impl SvcSvc {
         &self,
         service_type: &str,
         experiment: Option<&ManifestRef>,
-    ) -> Result<(vxedge_core::services::ServiceDef, String, PathBuf), Status> {
+    ) -> Result<DeclaredService, Status> {
         // Before the manifest: a typo'd type is the caller's mistake whatever the experiment
         // declares, and saying so beats "no `bogus` service declared" or "a manifest is required".
         let service_type = parse_service_type(service_type)?.as_str();
@@ -1447,32 +1449,92 @@ impl SvcSvc {
         // which one is active. An inline manifest has no directory; the runtime dir stands in,
         // and telemetry will fail honestly there rather than scrape a workspace that is not on
         // this host.
-        Ok((def, sha256, dir.unwrap_or_else(|| self.runtime_dir.clone())))
+        let workspace_dir = dir.unwrap_or_else(|| self.runtime_dir.clone());
+        let node = match &def.on {
+            None => None,
+            Some(on) => {
+                let refuse = |e: String| Status::failed_precondition(e);
+                let gateway = GatewayPlan::from_model(&model).map_err(|e| refuse(e.to_string()))?;
+                let plans = zones::plan_nodes_from_model(&model, &gateway, &workspace_dir)
+                    .map_err(|e| refuse(e.to_string()))?;
+                let node = plans.into_iter().find(|p| &p.node_id == on);
+                Some(node.ok_or_else(|| {
+                    refuse(format!("service placed on `{on}`, which has no node plan"))
+                })?)
+            }
+        };
+        Ok(DeclaredService {
+            def,
+            sha256,
+            workspace_dir,
+            node,
+        })
     }
+
+    /// The node and container of a service placed with `on:`, or `None` for a host process.
+    async fn placed(
+        &self,
+        service_type: &str,
+        experiment: Option<&ManifestRef>,
+    ) -> Option<(NodePlan, vxedge_core::containers::ContainerSpec)> {
+        experiment?;
+        let declared = self.service_def(service_type, experiment).await.ok()?;
+        let spec =
+            vxedge_core::services::placed_spec(&declared.def, &declared.workspace_dir).ok()?;
+        Some((declared.node?, spec))
+    }
+}
+
+/// A service as a workspace declares it, with the node it is placed on, if any.
+struct DeclaredService {
+    def: vxedge_core::services::ServiceDef,
+    sha256: String,
+    workspace_dir: PathBuf,
+    node: Option<NodePlan>,
 }
 
 #[tonic::async_trait]
 impl SvcService for SvcSvc {
     async fn up(&self, req: Request<SvcUpRequest>) -> Result<Response<Job>, Status> {
         let req = req.into_inner();
-        let (def, sha256, workspace_dir) = self
+        let declared = self
             .service_def(&req.service_type, req.experiment.as_ref())
             .await?;
         self.audit.record(
             "SvcService.Up",
-            serde_json::json!({ "service_type": req.service_type, "manifest_sha256": sha256 }),
+            serde_json::json!({ "service_type": req.service_type, "manifest_sha256": declared.sha256 }),
         );
         let bins = self.bins.clone();
         let runtime_dir = self.runtime_dir.clone();
+        let shell = self.shell.clone();
         let service_type = req.service_type.clone();
         let events = self.engine.events().clone();
         let job = self
             .engine
             .submit("svc.up", move |p| async move {
                 p.update(30, &format!("starting {service_type} service"));
-                let msg = blocking(move || {
-                    vxedge_core::services::svc_up(&def, &bins, &workspace_dir, &runtime_dir)
-                        .map_err(|e| e.to_string())
+                let DeclaredService {
+                    def,
+                    node,
+                    workspace_dir,
+                    ..
+                } = declared;
+                let msg = blocking(move || match node {
+                    Some(np) => {
+                        let spec = vxedge_core::services::placed_spec(&def, &workspace_dir)
+                            .map_err(|e| e.to_string())?;
+                        zones::member_up(&shell, &np, &runtime_dir, &spec)
+                            .map_err(|e| e.to_string())?;
+                        Ok(format!(
+                            "{} service up on `{}`, in its slice",
+                            def.service_type.as_str(),
+                            np.node_id
+                        ))
+                    }
+                    None => {
+                        vxedge_core::services::svc_up(&def, &bins, &workspace_dir, &runtime_dir)
+                            .map_err(|e| e.to_string())
+                    }
                 })
                 .await?;
                 events.emit(crate::events::EventKind::ServiceUp, &service_type, &msg);
@@ -1486,6 +1548,11 @@ impl SvcService for SvcSvc {
     async fn down(&self, req: Request<SvcDownRequest>) -> Result<Response<Job>, Status> {
         let req = req.into_inner();
         parse_service_type(&req.service_type)?;
+        // A workspace that no longer reads, or declares no such service, leaves the host path:
+        // `down` has to stay idempotent, and the node's own teardown removes a placed member.
+        let placed = self
+            .placed(&req.service_type, req.experiment.as_ref())
+            .await;
         self.audit.record(
             "SvcService.Down",
             serde_json::json!({ "service_type": req.service_type }),
@@ -1498,9 +1565,16 @@ impl SvcService for SvcSvc {
             .engine
             .submit("svc.down", move |p| async move {
                 p.update(50, &format!("stopping {service_type} service"));
-                let msg = blocking(move || {
-                    vxedge_core::services::svc_down(&service_type, &runtime_dir)
-                        .map_err(|e| e.to_string())
+                let msg = blocking(move || match placed {
+                    Some((np, spec)) => {
+                        zones::member_down(&np, &spec).map_err(|e| e.to_string())?;
+                        Ok(format!(
+                            "{service_type} service stopped on `{}`",
+                            np.node_id
+                        ))
+                    }
+                    None => vxedge_core::services::svc_down(&service_type, &runtime_dir)
+                        .map_err(|e| e.to_string()),
                 })
                 .await?;
                 events.emit(
@@ -1519,9 +1593,21 @@ impl SvcService for SvcSvc {
         &self,
         req: Request<SvcStatusRequest>,
     ) -> Result<Response<ResourceStatus>, Status> {
-        let service_type = parse_service_type(&req.into_inner().service_type)?
-            .as_str()
-            .to_string();
+        let req = req.into_inner();
+        let service_type = parse_service_type(&req.service_type)?.as_str().to_string();
+        if let Some((np, spec)) = self.placed(&service_type, req.experiment.as_ref()).await {
+            let member = np.clone();
+            let state = tokio::task::spawn_blocking(move || zones::member_status(&member, &spec))
+                .await
+                .map_err(|e| Status::internal(format!("status task panicked: {e}")))?;
+            let on = &np.node_id;
+            return Ok(Response::new(crate::status::resource_status(
+                format!("svc-{service_type}"),
+                ResourceKind::Service,
+                &state,
+                format!("{service_type} service on `{on}`: container {state:?}"),
+            )));
+        }
         let runtime_dir = self.runtime_dir.clone();
         let st_for_task = service_type.clone();
         let state = tokio::task::spawn_blocking(move || {
@@ -2110,6 +2196,10 @@ mod tests {
         SvcSvc {
             engine: JobEngine::new(EventBus::new()),
             audit: Arc::new(Audit::new(&runtime_dir)),
+            shell: Shell {
+                netns: None,
+                escalate: false,
+            },
             runtime_dir,
             bins: vxedge_core::services::ServiceBinaries {
                 vxota: "vxota".into(),

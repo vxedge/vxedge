@@ -184,6 +184,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let svcs = Arc::new(services::SvcSvc {
         engine: engine.clone(),
         audit: audit.clone(),
+        shell: shell.clone(),
         runtime_dir: args.runtime_dir.clone(),
         bins: vxedge_core::services::ServiceBinaries {
             vxota: args.vxota_bin.clone(),
