@@ -162,7 +162,10 @@ fn attach_port(sh: &Shell, np: &NodePlan, ns: &str) -> Result<(), ZoneBackendErr
     Ok(())
 }
 
-fn container_down(_sh: &Shell, np: &NodePlan) -> Result<(), ZoneBackendError> {
+fn container_down(sh: &Shell, np: &NodePlan) -> Result<(), ZoneBackendError> {
+    // Asked before anything is removed: a port still on the gateway side (a node never brought
+    // up) has no namespace to die with, so waiting for it would only time out.
+    let port_moved = port_netns(np).is_some_and(|ns| netlink::link_exists(Some(&ns), "eth0"));
     // Destroys the moved veth peer (and thus the bridge-side pair);
     // `vxedge up` re-creates endpoints idempotently.
     netlink::delete_netns(&np.runtime_name()).map_err(|e| nl(np, e))?;
@@ -171,7 +174,59 @@ fn container_down(_sh: &Shell, np: &NodePlan) -> Result<(), ZoneBackendError> {
         let client = block_on(ContainerClient::connect_user()).map_err(|e| ct(np, e))?;
         block_on(client.group_down(&np.runtime_name())).map_err(|e| ct(np, e))?;
     }
+    // The kernel tears a namespace down asynchronously, so the host side of the pair outlives
+    // the delete, usually by some milliseconds. Returning early lets an `up` straight after find the dying port, count it as already
+    // there, and be left with none (`gateway_netns` failed this way on 2026-10-31).
+    if port_moved
+        && !wait_until(PORT_GONE_TIMEOUT, || {
+            !netlink::link_exists(sh.netns.as_deref(), &np.endpoint)
+        })
+    {
+        return Err(ZoneBackendError::Runtime {
+            node: np.node_id.clone(),
+            detail: format!(
+                "gateway port `{}` still exists {} s after its namespace was removed. Something \
+                 may be holding the namespace open (`ip netns identify`, or a process still \
+                 inside it): stop it and re-run `zone down`",
+                np.endpoint,
+                PORT_GONE_TIMEOUT.as_secs()
+            ),
+        });
+    }
     Ok(())
+}
+
+/// How long `down` waits for the kernel to finish destroying a port.
+const PORT_GONE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Polls `done` until it holds or `timeout` passes; returns whether it held.
+fn wait_until(timeout: std::time::Duration, mut done: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if done() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// The namespace currently holding this node's port, if it has one: the registry name, or the
+/// group's infra namespace. Any daemon error reads as none.
+fn port_netns(np: &NodePlan) -> Option<String> {
+    match &np.image {
+        None => {
+            let ns = np.runtime_name();
+            netlink::netns_exists(&ns).then_some(ns)
+        }
+        Some(_) => block_on(async {
+            let client = ContainerClient::connect_user().await.ok()?;
+            client.handle(&np.runtime_name()).await.ok()
+        })
+        .map(|handle| infra_netns(&handle)),
+    }
 }
 
 fn container_status(_sh: &Shell, np: &NodePlan) -> NodeState {
@@ -731,6 +786,38 @@ mod tests {
             NodeState::Down,
             "no group, no namespace"
         );
+    }
+
+    #[test]
+    fn wait_until_stops_as_soon_as_the_condition_holds() {
+        let mut calls = 0;
+        assert!(wait_until(std::time::Duration::from_secs(5), || {
+            calls += 1;
+            calls == 3
+        }));
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn wait_until_gives_up_at_the_timeout() {
+        assert!(!wait_until(std::time::Duration::from_millis(30), || false));
+    }
+
+    /// `down` on a node never brought up has no namespace, so it must not wait for a port that
+    /// is staying on the gateway: that wait would time out and fail an idempotent call.
+    #[test]
+    fn down_on_a_node_never_started_does_not_wait_for_its_port() {
+        let sh = Shell {
+            netns: None,
+            escalate: false,
+        };
+        let np = NodePlan {
+            image: None,
+            ..image_node()
+        };
+        let started = std::time::Instant::now();
+        container_down(&sh, &np).unwrap();
+        assert!(started.elapsed() < PORT_GONE_TIMEOUT);
     }
 
     /// The seam's two calling contexts: no runtime at all (a plain test, a CLI), and a

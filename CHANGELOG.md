@@ -35,6 +35,9 @@ All notable changes to this repo are documented here. Format follows
 
 ### Fixed
 
+- `zone down` on a container node returned before the kernel had finished destroying its gateway
+  port, so a gateway `up` right after it could find the dying port, keep it, and end up with
+  none. `down` now waits for the port to go.
 - A second `vxedge experiment up` over a running 5G core failed with `File exists` on the bridge
   attachment veth; it is now a no-op.
 - `containers` groups get the `pasta` network namespace `podman pod create` gives a pod. Left
