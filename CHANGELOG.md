@@ -39,15 +39,15 @@ can boot under Cloud Hypervisor, and the `vehicle` verbs refuse to act on the wr
 
 - `backend: cloud-hypervisor`: a zone node can boot a guest bundle under Cloud Hypervisor, over its
   REST API on a per-node Unix socket. It adopts the gateway's tap without touching its addressing,
-  runs as `vxedged`'s own user, and reads liveness from the socket, so a killed VMM reads as down and
-  the next `up` recovers it. `qemu-microvm` is unchanged.
+  and reads liveness from the socket, so a killed VMM reads as down and the next `up` recovers it.
+  `qemu-microvm` remains available.
 - A zone `container` node can run an OCI image. A node with a digest-pinned or `localhost/` container
   part runs it in a container group named after the node: an infra container owns the network
   namespace, the gateway port moves in as `eth0`, and the image starts as a member. Nodes with
   `local/…` parts stay a named netns the runner execs into, so every existing workspace behaves as
   before.
 - `vxedge_core::containers`: container groups over Podman's REST API on the rootless user socket. A
-  group is what a `podman pod` was. Membership is by label and `up` converges by a spec hash, so a
+  group replaces a `podman pod` and shares only its network namespace. Membership is by label and `up` converges by a spec hash, so a
   second `up` keeps what matches and recreates only what changed.
 
 ### Changed
@@ -97,10 +97,10 @@ can boot under Cloud Hypervisor, and the `vehicle` verbs refuse to act on the wr
 - `GatewayService.Status` reports a planned gateway with no bridge as down, not degraded.
 - `experiment up` reported success with no zones when the zone plan failed. It now fails, naming the
   plan error.
+- `virsh` failures were reported as a missing `CAP_NET_ADMIN`, which hid libvirt's real error.
+- A `libvirt` `up` whose start failed never converged.
 - A second `vxedge experiment up` over a running 5G core failed with `File exists` on the bridge
   attachment veth; it is now a no-op.
-- `containers` groups get the `pasta` network namespace `podman pod create` gives a pod. Left to the
-  API default (`bridge`), teardown failed on Ubuntu's AppArmor `pasta` profile.
 
 ### Security
 
@@ -115,9 +115,10 @@ can boot under Cloud Hypervisor, and the `vehicle` verbs refuse to act on the wr
 
 - Under `setcap`, `vxedged` needs `cap_net_admin,cap_sys_admin`: container zones enter a network
   namespace, which is `setns(2)`.
-- 5G hosts need the rootless Podman socket (`systemctl --user enable --now podman.socket`, plus
-  `loginctl enable-linger` on a host you reach over SSH) and `passt`. See `docs/TESTBED-SETUP.md`
-  Tier 2. `vxedged` starts without the socket and connects on first use.
+- 5G hosts, OCI container nodes and placed services need the rootless Podman socket
+  (`systemctl --user enable --now podman.socket`, plus `loginctl enable-linger` on a host you reach
+  over SSH). 5G hosts also need `passt`. See `docs/TESTBED-SETUP.md` Tier 2. `vxedged` starts without
+  the socket and connects on first use.
 - `vxedged`'s user must be in the `libvirt` group for the `libvirt` backend.
 - Pods created by an older `vxedged` carry no `io.vxedge.group` label, so this version cannot manage
   them. `vxedge experiment up` and `down` refuse to run over them and print the command to remove
@@ -136,9 +137,19 @@ can boot under Cloud Hypervisor, and the `vehicle` verbs refuse to act on the wr
   published.
 - `experiment up` has no wrong-workspace check, and `experiment` verbs do not read the host. A
   container or Cloud Hypervisor guest is seen by the host check through its gateway port only.
-- Cloud Hypervisor is validated on the `linux-probe` bundle only. A node gets a stable MAC derived
-  from its id: unicast to the guest failed without one, and why is not yet understood. Traffic through
-  an unprivileged VMM is untested, and `vxedge doctor` does not check for the binary yet.
+- Another daemon cannot see a Cloud Hypervisor guest. Its kernel command line goes over the API, so
+  the `/proc` lookup that finds a microVM does not apply. A daemon with a different runtime dir on the
+  same workspace reads the guest as down, and `vehicle down` from there can remove the gateway from
+  under it. This comes from reading the code, not from a run. Use one runtime dir.
+- Cloud Hypervisor is validated on the `linux-probe` bundle and v54.0 only, and live-tested as root
+  in a network namespace; an unprivileged VMM booted separately, outside this backend, and traffic
+  through one is untested. CPU pinning is untested on this backend, which is not part of the phase-3
+  gate: `vx-vehicle-02` uses `container` and `qemu-microvm`.
+- A node under Cloud Hypervisor gets a stable MAC derived from its id: unicast to the guest failed
+  without one, and why is not yet understood.
+- `vehicle down` leaves a Cloud Hypervisor VMM that stopped answering still running, and the next `up`
+  then fails loudly. With `VXEDGE_NETNS` set, an unprivileged `vxedged` refuses to start one, and
+  `vxedge doctor` does not check for the binary yet.
 
 ## [0.2.0] - 2026-10-21
 
