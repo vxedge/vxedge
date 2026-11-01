@@ -8,6 +8,7 @@ All notable changes to this repo are documented here. Format follows
 
 ### Added
 
+- `VehicleStatus.gateway` (additive): per-slice, filter and impairment detail for `vehicle status`.
 - `vehicle up` and `down` have a compute stage: hpc devices go through `ComputeService`, so audit lines and events name them, in §5.4's order.
 - `JobService.Watch` on a composite job shows each sub-job's steps, not one line per stage.
 - `VehicleService` audit lines carry the workspace sha256.
@@ -29,6 +30,7 @@ All notable changes to this repo are documented here. Format follows
 
 ### Changed
 
+- `vehicle status` plans from the workspace and observes the host, so it stays right after a daemon restart. It reports zones, compute and services by kind, names states instead of printing numbers, lists declared devices nothing provisions, and refuses a workspace that is not the active one.
 - `vehicle up` plans every node and checks `localhost/` images before touching the host, so a workspace that cannot provision no longer leaves a gateway behind.
 - A device with two slice attachments is refused at plan time. It used to fail on `eth0` in a container and silently lose its second NIC in a microVM.
 - **The 5G core, RAN and UE pods are driven through the Podman API, not the `podman` CLI**
@@ -43,6 +45,8 @@ All notable changes to this repo are documented here. Format follows
 
 ### Fixed
 
+- A microVM's status and `down` trust its pidfile only when that PID is this node's QEMU. A reused PID read as up, and `down` would have killed it.
+- `GatewayService.Status` reports a planned gateway with no bridge as down, not degraded.
 - `vehicle down` after a daemon restart skipped every node and removed the gateway from under them. It now plans from the workspace.
 - `vehicle down` refuses a workspace that is not the active one. It used to tear down whatever was up.
 - `experiment up` reported success with no zones when the zone plan failed. It now fails, naming the plan error.

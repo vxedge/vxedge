@@ -35,12 +35,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
-use vxedge_api::v1::gateway_service_server::GatewayService;
+use vxedge_api::v1::svc_service_server::SvcService;
 use vxedge_api::v1::vehicle_service_server::VehicleService;
-use vxedge_api::v1::zone_service_server::ZoneService;
 use vxedge_api::v1::{
-    GatewayStatusRequest, ManifestRef, ResourceKind, VehicleDownRequest, VehicleStatus,
-    VehicleStatusRequest, VehicleUpRequest,
+    ManifestRef, ResourceKind, ResourceState, ResourceStatus, SvcStatusRequest, VehicleDownRequest,
+    VehicleStatus, VehicleStatusRequest, VehicleUpRequest,
 };
 use vxedge_core::containers::LazyClient;
 use vxedge_core::gateway::GatewayPlan;
@@ -48,7 +47,7 @@ use vxedge_core::model::{DeviceRole, Experiment};
 use vxedge_core::zones::NodePlan;
 
 use crate::audit::Audit;
-use crate::experiment::{Handles, NodeStage, check_down_target};
+use crate::experiment::{Handles, NodeStage, check_down_target, inline};
 
 pub struct VehicleSvc {
     pub audit: Arc<Audit>,
@@ -302,35 +301,112 @@ impl VehicleService for VehicleSvc {
         Ok(Response::new(job))
     }
 
+    /// What the host shows for this workspace, whatever the daemon remembers: planned from the
+    /// workspace and observed through netlink, nftables, `/proc` and Podman.
     async fn status(
         &self,
         req: Request<VehicleStatusRequest>,
     ) -> Result<Response<VehicleStatus>, Status> {
-        let Resolved { id, .. } = resolve_and_synthesize(req.get_ref().manifest.as_ref()).await?;
+        let Resolved {
+            yaml,
+            dir,
+            model,
+            id,
+            ..
+        } = resolve_and_synthesize(req.get_ref().manifest.as_ref()).await?;
+        let (gateway, nodes) = plan_vehicle(&model, dir.as_deref())?;
+        {
+            let st = self.handles.gateway.state.lock().await;
+            if let Some(active) = st.active.as_ref().filter(|a| a.model.id != model.id) {
+                return Err(Status::failed_precondition(format!(
+                    "`{}` is the one active on this host, not `{}`: run `vehicle status` from \
+                     that workspace",
+                    active.model.id, model.id
+                )));
+            }
+        }
 
-        let gw = self
-            .handles
-            .gateway
-            .status(Request::new(GatewayStatusRequest {}))
-            .await?
-            .into_inner();
+        let gw = self.handles.gateway.observe(Some(gateway), None).await?;
         let gw_status = gw.status.clone().unwrap_or_default();
 
-        let zones = self
-            .handles
-            .zones
-            .list(Request::new(vxedge_api::v1::ZoneListRequest {}))
-            .await
-            .map(|r| r.into_inner().zones)
-            .unwrap_or_default();
+        let unattached = unprovisioned(&model, &nodes);
+        let shell = self.handles.zones.shell.clone();
+        let runtime_dir = self.handles.zones.runtime_dir.clone();
+        let mut components = tokio::task::spawn_blocking(move || {
+            nodes
+                .iter()
+                .map(|n| {
+                    node_component(n, &vxedge_core::zones::node_status(&shell, n, &runtime_dir))
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|e| Status::internal(format!("status task panicked: {e}")))?;
 
-        let (status, components) =
-            crate::status::composite_rollup(&id, ResourceKind::Vehicle, gw_status, zones);
+        for service_type in vxedge_core::services::ServiceDef::declared_types(&model) {
+            let observed = self
+                .handles
+                .svcs
+                .status(Request::new(SvcStatusRequest {
+                    service_type,
+                    experiment: inline(&yaml, dir.as_deref()),
+                }))
+                .await?;
+            components.push(observed.into_inner());
+        }
+
+        let (status, mut components) =
+            crate::status::composite_rollup(&id, ResourceKind::Vehicle, gw_status, components);
+        // Listed after the rollup: declared but never provisioned is a fact about the workspace,
+        // not a failure of the host, and counting it would leave such a vehicle forever degraded.
+        components.extend(unattached);
         Ok(Response::new(VehicleStatus {
             status: Some(status),
             components,
+            gateway: Some(gw),
         }))
     }
+}
+
+fn node_component(
+    node: &NodePlan,
+    state: &vxedge_core::zones::backend::NodeState,
+) -> ResourceStatus {
+    let kind = if node.role == DeviceRole::Hpc {
+        ResourceKind::Compute
+    } else {
+        ResourceKind::Zone
+    };
+    crate::status::resource_status(
+        node.node_id.clone(),
+        kind,
+        state,
+        format!(
+            "zone={} backend={:?} port={} peer={} vlan={}",
+            node.zone_id, node.backend, node.endpoint, node.peer, node.vlan
+        ),
+    )
+}
+
+/// Declared devices with no node plan: no slice-bound link, so nothing provisions them.
+fn unprovisioned(model: &Experiment, nodes: &[NodePlan]) -> Vec<ResourceStatus> {
+    model
+        .entities
+        .iter()
+        .flat_map(|e| e.devices.values())
+        .filter(|d| !nodes.iter().any(|n| n.node_id == d.id))
+        .map(|d| ResourceStatus {
+            vxid: d.id.clone(),
+            kind: if d.role == DeviceRole::Hpc {
+                ResourceKind::Compute as i32
+            } else {
+                ResourceKind::Zone as i32
+            },
+            state: ResourceState::Unspecified as i32,
+            detail: "declared, not provisioned: no slice-bound link".to_string(),
+            since_unix_ms: crate::jobs::now_ms(),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -403,5 +479,30 @@ parts:
     #[tokio::test]
     async fn a_vehicle_without_local_images_never_asks_podman() {
         require_local_images("car", &BTreeSet::new()).await.unwrap();
+    }
+
+    #[test]
+    fn a_device_nothing_provisions_is_listed_and_left_out_of_the_plan() {
+        let yaml = WS.replace(
+            "  hpc1: { role: hpc, zone: central, backend: container }",
+            "  hpc1: { role: hpc, zone: central, backend: container }\n  \
+             spare: { role: ecu, zone: central, backend: container }",
+        );
+        let m = model(&yaml);
+        let (_, nodes) = plan_vehicle(&m, None).unwrap();
+        let listed = unprovisioned(&m, &nodes);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].vxid, "spare");
+        assert_eq!(listed[0].state, ResourceState::Unspecified as i32);
+    }
+
+    #[test]
+    fn hpc_nodes_report_as_compute() {
+        let m = model(WS);
+        let (_, nodes) = plan_vehicle(&m, None).unwrap();
+        let hpc = nodes.iter().find(|n| n.node_id == "hpc1").unwrap();
+        let c = node_component(hpc, &vxedge_core::zones::backend::NodeState::Up);
+        assert_eq!(c.kind, ResourceKind::Compute as i32);
+        assert_eq!(c.state, ResourceState::Up as i32);
     }
 }
