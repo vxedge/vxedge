@@ -6,83 +6,139 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-01
+
+`vxedge vehicle up` now brings up a full vehicle from one workspace: a gateway, zones on several
+backends, central compute and a service placed on a slice. This is the phase-3 gate, and it passed
+on `vx-vehicle-02`; the run is in
+[`vxperiments/results/phase-3-gate-2026-11-01`](https://github.com/vxedge/vxperiments/tree/main/results/phase-3-gate-2026-11-01).
+The guests in that run are probes, so it is a provisioning result, not a measurement.
+
+Also new: containers and 5G pods run over the Podman API, container zones can run an OCI image, zones
+can boot under Cloud Hypervisor, and the `vehicle` verbs refuse to act on the wrong vehicle.
+
 ### Added
 
-- `VehicleStatus.gateway` (additive): per-slice, filter and impairment detail for `vehicle status`.
-- `vehicle up` and `down` have a compute stage: hpc devices go through `ComputeService`, so audit lines and events name them, in §5.4's order.
+**Vehicles**
+
+- A `kind: vehicle` document can declare `services`, each placed on a container device with `on:`.
+  The service runs as a member of that device's container group, so it answers on the device's
+  slice only. Placement is checked when the workspace loads, a placed image must be `localhost/` or
+  digest-pinned, and one service type cannot be declared on both a vehicle and its experiment.
+  `svc up`, `down` and `status` handle placed services.
+- `localhost/…` part refs name an image in the host's Podman store: local, no digest needed, and run
+  as a container device's payload.
+- `vehicle up` and `down` have a compute stage. Hpc devices go through `ComputeService` in the order
+  `ARCHITECTURE.md` §5.4 gives, so audit lines and events name them as compute.
+- `VehicleStatus.gateway` (additive): per-slice, ingress filter and impairment detail for
+  `vehicle status`.
 - `JobService.Watch` on a composite job shows each sub-job's steps, not one line per stage.
 - `VehicleService` audit lines carry the workspace sha256.
-- A `kind: vehicle` document can declare `services`, each placed on a container device with `on:`. Placement is checked at build; the same service type on a vehicle and its experiment is refused. `svc up`, `down` and `status` run it as a member of that device's container group, so it answers on the device's slice only; `vehicle up` refuses a missing artifact store before provisioning.
-- `localhost/…` part refs name images in the host's Podman store: local, no digest, run as a container device's payload.
-- **`backend: cloud-hypervisor`** (Track V4): a zone node can boot a guest bundle under Cloud
-  Hypervisor, over its REST API on a per-node Unix socket, through `cloud-hypervisor-client`
-  (pinned exactly). It adopts the gateway's tap without touching its addressing, runs as
-  vxedged's own user, and reads liveness from the socket, so a killed VMM reads as down and the
-  next `up` recovers it. A node gets a stable MAC derived from its id. Validated on the
-  `linux-probe` bundle only. `qemu-microvm` is unchanged.
-- `vxedge_core::containers` (Track V1, `docs-internal/PROVISIONING.md` §7.2): container groups
-  over Podman's REST API on the rootless user socket, via `bollard`. A group is what a `podman
-  pod` was: an infra container owning a network namespace that members join. Membership is by
-  label (`io.vxedge.group`), never by name prefix; `up` converges by a spec hash, so a second
-  `up` keeps what matches and recreates only what changed. `LazyClient` connects on first use.
-- **Zone `container` nodes can run an OCI image** (Track V3). A container node with a published,
-  digest-pinned container part deployed on it runs that image: a container group named after
-  the node, whose infra container (loopback only) owns the node's network namespace; the
-  gateway port moves in as `eth0` by the infra PID, then the image starts as a member. `down`
-  removes the group, and the port with it. Nodes with `local/…` parts (every shipped
-  workspace) stay a named netns the runner execs into, unchanged. Entering the namespace needs
-  `CAP_SYS_ADMIN`, as it already did for the named-netns form.
+
+**Zones and containers**
+
+- `backend: cloud-hypervisor`: a zone node can boot a guest bundle under Cloud Hypervisor, over its
+  REST API on a per-node Unix socket. It adopts the gateway's tap without touching its addressing,
+  runs as `vxedged`'s own user, and reads liveness from the socket, so a killed VMM reads as down and
+  the next `up` recovers it. `qemu-microvm` is unchanged.
+- A zone `container` node can run an OCI image. A node with a digest-pinned or `localhost/` container
+  part runs it in a container group named after the node: an infra container owns the network
+  namespace, the gateway port moves in as `eth0`, and the image starts as a member. Nodes with
+  `local/…` parts stay a named netns the runner execs into, so every existing workspace behaves as
+  before.
+- `vxedge_core::containers`: container groups over Podman's REST API on the rootless user socket. A
+  group is what a `podman pod` was. Membership is by label and `up` converges by a spec hash, so a
+  second `up` keeps what matches and recreates only what changed.
 
 ### Changed
 
-- A GitHub Release now shows that version's changelog section, and a tag with no section fails before anything is attested.
-- `vehicle status` plans from the workspace and observes the host, so it stays right after a daemon restart. It reports zones, compute and services by kind, names states instead of printing numbers, lists declared devices nothing provisions, and refuses a workspace that is not the active one.
-- `vehicle up` plans every node and checks `localhost/` images before touching the host, so a workspace that cannot provision no longer leaves a gateway behind.
-- A device with two slice attachments is refused at plan time. It used to fail on `eth0` in a container and silently lose its second NIC in a microVM.
-- **The 5G core, RAN and UE pods are driven through the Podman API, not the `podman` CLI**
-  (Track V2). Hosts need the rootless user socket (`systemctl --user enable --now
-  podman.socket`, plus `loginctl enable-linger` on a host you reach over SSH) and `passt`;
-  see `docs/TESTBED-SETUP.md` Tier 2. `vxedged` still starts without the socket and connects on
-  first 5G use. Each pod's infra container is the Kubernetes pause image, pinned by digest.
-  Container names (`vx5g-nrf`, `vx5g-ran-gnb`, ...) are unchanged.
-- `fiveg` and `traffic::profile_up` are `async`; `vxedged` awaits them on its runtime instead of
-  wrapping them in `spawn_blocking`.
-- `deny.toml`: removed the `RUSTSEC-2024-0436` (`paste`) ignore; the crate is no longer in the dependency tree.
+- `vehicle status` plans from the workspace and observes the host, so it stays right after a daemon
+  restart. It reports zones, compute and services by kind, prints state names and the rolled-up
+  state, and lists declared devices nothing provisions.
+- `vehicle up` plans every node and checks `localhost/` images and artifact stores before touching the
+  host, so a workspace that cannot provision no longer leaves a gateway behind.
+- A device with two slice attachments is refused at plan time. It used to fail on `eth0` in a
+  container and silently lose its second NIC in a microVM.
+- The 5G core, RAN and UE pods are driven through the Podman API, not the `podman` CLI. Container
+  names (`vx5g-nrf`, `vx5g-ran-gnb`, ...) are unchanged, and each pod's infra container is the
+  Kubernetes pause image, pinned by digest.
+- `fiveg` and `traffic::profile_up` are `async`.
+- A GitHub Release now shows that version's changelog section, and a tag with no section fails before
+  anything is attested.
+- `deny.toml`: removed the `RUSTSEC-2024-0436` (`paste`) ignore; the crate is no longer in the
+  dependency tree.
 
 ### Fixed
 
-- `vehicle up`, `status` and `down` also read the host for gateway ports and guests the workspace does not declare, and refuse if they find any, so a vehicle started under a daemon with another runtime dir is protected too.
-- A microVM's status and `down` find the guest through `/proc` when the pidfile is another daemon's, so `down` no longer strands it. Cloud Hypervisor guests are not found this way: their kernel command line goes over the API.
-- `vehicle up` of a second vehicle over a running one took its bridge and left its nodes running without one, and `vehicle down` of the second vehicle then removed that bridge. `vehicle up`, `status` and `down` now refuse anything but the active workspace, and the record of what is active survives a daemon restart. `experiment down` uses the same record.
-- A microVM's status and `down` trust its pidfile only when that PID is this node's QEMU. A reused PID read as up, and `down` would have killed it.
-- `GatewayService.Status` reports a planned gateway with no bridge as down, not degraded.
-- `vehicle down` after a daemon restart skipped every node and removed the gateway from under them. It now plans from the workspace.
-- `vehicle down` refuses a workspace that is not the active one. It used to tear down whatever was up.
-- `experiment up` reported success with no zones when the zone plan failed. It now fails, naming the plan error.
+**The wrong vehicle**
+
+- `vehicle up` of a second vehicle over a running one took its bridge and left its nodes running
+  without one, and `vehicle down` of the second vehicle then removed that bridge. `vehicle up`,
+  `status` and `down` now refuse anything but the active workspace.
+- That check survives a daemon restart, and it reads the host for gateway ports and guests the
+  workspace does not declare, so a vehicle started under a daemon with another runtime dir is
+  protected too. `experiment down` uses the same record of what is active.
+- `vehicle status` reported the active vehicle under whatever id it was asked about.
+
+**Teardown**
+
+- `vehicle down` after a daemon restart skipped every node and removed the gateway from under them. It
+  now plans from the workspace.
 - A failing node in `down` no longer stops the nodes after it from being torn down.
-- `zone down` on a container node returned before the kernel had finished destroying its gateway
-  port, so a gateway `up` right after it could find the dying port, keep it, and end up with
-  none. `down` now waits for the port to go.
+- `zone down` on a container node returned before the kernel had finished destroying its gateway port,
+  so a gateway `up` right after it could keep the dying port and end up with none. `down` now waits
+  for the port to go.
+
+**Status and errors**
+
+- A microVM's status and `down` trust its pidfile only when that PID is this node's QEMU. A reused PID
+  read as up, and `down` would have killed it. When the pidfile is another daemon's, the guest is
+  found through `/proc`.
+- `GatewayService.Status` reports a planned gateway with no bridge as down, not degraded.
+- `experiment up` reported success with no zones when the zone plan failed. It now fails, naming the
+  plan error.
 - A second `vxedge experiment up` over a running 5G core failed with `File exists` on the bridge
   attachment veth; it is now a no-op.
-- `containers` groups get the `pasta` network namespace `podman pod create` gives a pod. Left
-  to the API default (`bridge`), teardown failed on Ubuntu's AppArmor `pasta` profile.
+- `containers` groups get the `pasta` network namespace `podman pod create` gives a pod. Left to the
+  API default (`bridge`), teardown failed on Ubuntu's AppArmor `pasta` profile.
 
 ### Security
 
-- The `libvirt` zone backend runs `virsh` as `vxedged`'s own user, no longer through `sudo`
-  (Track V0). `virsh` is a client of `libvirtd`, which authorizes callers by `libvirt` group
-  membership, so escalating it only widened what `vxedged` ran as root. Hosts need `vxedged`'s
-  user in the `libvirt` group (already a Tier 2 requirement); `vxedge doctor --tier 2` now checks
-  that `qemu:///system` answers it without `sudo`, and a refused `virsh` says how to fix it.
-- Lockfile update `pulldown-cmark` 0.13.4 -> 0.13.5, which fixes RUSTSEC-2026-0414 (exponential event growth with `ENABLE_WIKILINKS`). It is a build-time dependency via `prost-build`.
+- The `libvirt` zone backend runs `virsh` as `vxedged`'s own user, no longer through `sudo`. `virsh` is
+  a client of `libvirtd`, which authorizes callers by `libvirt` group membership, so escalating it
+  only widened what `vxedged` ran as root. `vxedge doctor --tier 2` checks that `qemu:///system`
+  answers without `sudo`.
+- Lockfile update `pulldown-cmark` 0.13.4 -> 0.13.5, which fixes RUSTSEC-2026-0414 (exponential event
+  growth with `ENABLE_WIKILINKS`). It is a build-time dependency via `prost-build`.
 
 ### Migration
 
-- Pods created by an older `vxedged` carry no `io.vxedge.group` label, so this version cannot
-  manage them. `vxedge experiment up` and `down` refuse to run over them and print the command
-  to remove them once: `podman pod rm -f vx5g vx5g-ran $(podman pod ps -q --filter
-  name=vx5g-ran-ue-)`.
+- Under `setcap`, `vxedged` needs `cap_net_admin,cap_sys_admin`: container zones enter a network
+  namespace, which is `setns(2)`.
+- 5G hosts need the rootless Podman socket (`systemctl --user enable --now podman.socket`, plus
+  `loginctl enable-linger` on a host you reach over SSH) and `passt`. See `docs/TESTBED-SETUP.md`
+  Tier 2. `vxedged` starts without the socket and connects on first use.
+- `vxedged`'s user must be in the `libvirt` group for the `libvirt` backend.
+- Pods created by an older `vxedged` carry no `io.vxedge.group` label, so this version cannot manage
+  them. `vxedge experiment up` and `down` refuse to run over them and print the command to remove
+  them once: `podman pod rm -f vx5g vx5g-ran $(podman pod ps -q --filter name=vx5g-ran-ue-)`.
+- A script that parses `vehicle status` needs updating: the output now has state names and kinds.
+- A script that brought one vehicle up over another now gets a refusal. Bring the first one down.
+
+### Known limits
+
+- A device takes one slice attachment. `role: gateway` devices run as ordinary nodes, and `resources`
+  is recorded but not enforced.
+- Only `ota` can be placed on a device. A placed service that dies makes its device read as down.
+- `vehicle down` takes about 15 s per container, waiting out the stop timeout of a payload that does
+  not handle SIGTERM.
+- `localhost/` images are per host, so a run using them reproduces for its author until they are
+  published.
+- `experiment up` has no wrong-workspace check, and `experiment` verbs do not read the host. A
+  container or Cloud Hypervisor guest is seen by the host check through its gateway port only.
+- Cloud Hypervisor is validated on the `linux-probe` bundle only. A node gets a stable MAC derived
+  from its id: unicast to the guest failed without one, and why is not yet understood. Traffic through
+  an unprivileged VMM is untested, and `vxedge doctor` does not check for the binary yet.
 
 ## [0.2.0] - 2026-10-21
 
