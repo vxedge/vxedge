@@ -350,12 +350,12 @@ Tracked here so they are not rediscovered. None block the critical path.
       exp-010 are checked against fixtures, not a recorded result. Migrating exp-010 is what
       improves it.
 
-- [ ] **(5d) Delete `lower.rs`** once no planner consumes §6.1, along with the workspace-directory
-      special case in `resolve_manifest` (the daemon builds the model directly instead).
+- [x] **(5d) Delete `lower.rs`** — done: no `lower.rs` remains and every planner takes the model
+      (`docs/ARCHITECTURE.md` §6.0.6).
 - [ ] **(5e) Execute `channels`** — the point of the exercise. Needs the messaging plane's own
       design (`docs/ARCHITECTURE.md` §7), so it lands after 5b.
-- [ ] **(5f) Delete `ExperimentManifest`/`VehicleManifest` and the adapter** — last, gated on the
-      exp-001/002/003 equivalence runs passing and every experiment being migrated.
+- [x] **(5f) Delete `ExperimentManifest`/`VehicleManifest` and the adapter** — done: neither type
+      remains (`docs/ARCHITECTURE.md` §6.0.6).
 - [x] **(Track D-6) Migrate `ota`/`telemetry` off `--manifest` onto workspace resolution** —
       done 2026-08-03 for `ota`: `SvcCmd::Up`/`Down`'s `--experiment` is now `Option<String>`,
       defaulting through a new `resolve_experiment_arg()` helper to
@@ -371,12 +371,12 @@ Tracked here so they are not rediscovered. None block the critical path.
       differently (vxid or an explicit `--manifest`) and were not re-checked in this pass — 
       don't assume either is migrated or exempt. Tracked at the top level as `docs/ROADMAP.md`
       item #26.
-- [ ] **(7) `vehicle up` from a §6.0 vehicle document** — works for a bare vehicle
-      (`vxperiments/vehicles/vx-vehicle-01`: gateway + one qemu-microvm zone, `up|status|down`,
-      idempotent `up`, clean teardown; verified 2026-10-13 against a locally built probe
-      bundle, no registry login). **The phase-3 gate is NOT met**: that needs a full vehicle
-      end to end (several zones, services, central compute), and this one has a single zone
-      and no services. `manifest validate` accepts a bare vehicle too (same synthesis step).
+- [x] **(7) `vehicle up` from a §6.0 vehicle document** — done 2026-11-01. The phase-3 gate
+      passed on `vxperiments/vehicles/vx-vehicle-02`: three zones on qemu-microvm and container,
+      central compute and an OTA service placed on a slice. Evidence:
+      `vxperiments/results/phase-3-gate-2026-11-01`. Guests are probes. Still open: multi-homed
+      devices, `role: gateway` devices and enforcing `resources`, all stated as limits in
+      `docs/ARCHITECTURE.md` §6.0.1.
 - [ ] Candidate, from Terraform's `init`: `experiment init` pre-pulls every part ref by digest
       into a local cache before `up`, so a run either has everything or fails before it starts.
       Fits the offline-first direction; not yet scheduled.
