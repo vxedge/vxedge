@@ -4,7 +4,7 @@
 //! addressed by role rather than by a difference in provisioning (see `ComputeSvc`'s own doc).
 
 use sha2::Digest;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
@@ -265,7 +265,39 @@ pub struct GatewaySvc {
     pub containers: LazyClient,
 }
 
+/// What `gateway up` leaves on disk: which workspace owns the host's gateway. A daemon restart
+/// empties `EdgeState` and leaves the gateway running, so this is how the next daemon knows.
+fn active_record(runtime_dir: &Path) -> PathBuf {
+    runtime_dir.join("active.json")
+}
+
+/// The record's `(id, workspace dir, bridge)`, if it is there and reads.
+fn read_active_record(runtime_dir: &Path) -> Option<(String, PathBuf, String)> {
+    let text = std::fs::read_to_string(active_record(runtime_dir)).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    Some((
+        v["id"].as_str()?.to_string(),
+        PathBuf::from(v["dir"].as_str()?),
+        v["bridge"].as_str()?.to_string(),
+    ))
+}
+
 impl GatewaySvc {
+    /// The workspace that owns the gateway on this host: `(id, workspace dir)`. Memory first, then
+    /// the record, which only counts while its bridge exists. A record that outlived its bridge
+    /// (a host reboot under a kept runtime dir) must not refuse every later `up`.
+    pub(crate) async fn active_on_host(&self) -> Option<(String, PathBuf)> {
+        if let Some(a) = &self.state.lock().await.active {
+            return Some((a.model.id.clone(), a.dir.clone()));
+        }
+        let (id, dir, bridge) = read_active_record(&self.runtime_dir)?;
+        let shell = self.shell.clone();
+        let present = tokio::task::spawn_blocking(move || shell.link_exists(&bridge))
+            .await
+            .unwrap_or(false);
+        present.then_some((id, dir))
+    }
+
     /// Register a workspace as active when nothing is. `EdgeState` does not survive a daemon
     /// restart and the host does, so `vehicle down` rebuilds it from the workspace; without
     /// this the zone stages saw nothing active and the gateway went down under running nodes.
@@ -496,6 +528,16 @@ impl GatewaySvc {
                                 "could not persist the active manifest");
                         }
 
+                        let dir = manifest_dir.clone().unwrap_or_else(|| PathBuf::from("."));
+                        let record = serde_json::json!({
+                            "id": model.id,
+                            "dir": dir,
+                            "bridge": plan.bridge,
+                        });
+                        tokio::fs::write(active_record(&runtime_dir), record.to_string())
+                            .await
+                            .map_err(|e| format!("cannot record the active workspace: {e}"))?;
+
                         let summary = plan.summary();
                         let mut st = state.lock().await;
                         st.gateway = Some(plan.clone());
@@ -562,6 +604,12 @@ impl GatewaySvc {
                         })
                         .await?;
                         *state.lock().await = EdgeState::default();
+                        match tokio::fs::remove_file(active_record(&runtime_dir)).await {
+                            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                                return Err(format!("cannot clear the active workspace: {e}"));
+                            }
+                            _ => {}
+                        }
                         events.emit(
                             crate::events::EventKind::GatewayDown,
                             "vxgateway",
@@ -2288,5 +2336,24 @@ mod tests {
         let status = svc().status(req).await.unwrap().into_inner();
         assert_eq!(status.state, ResourceState::Down as i32);
         assert_eq!(status.vxid, "svc-ota");
+    }
+
+    #[test]
+    fn the_active_record_reads_back_and_a_damaged_one_does_not() {
+        let dir = std::env::temp_dir().join(format!("vxedged-active-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(read_active_record(&dir).is_none());
+        std::fs::write(active_record(&dir), "not json").unwrap();
+        assert!(read_active_record(&dir).is_none());
+        std::fs::write(
+            active_record(&dir),
+            r#"{"id":"vehicle-a","dir":"/ws/a","bridge":"vxbr0"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_active_record(&dir),
+            Some(("vehicle-a".into(), "/ws/a".into(), "vxbr0".into()))
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
