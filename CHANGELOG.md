@@ -35,6 +35,7 @@ All notable changes to this repo are documented here. Format follows
 
 ### Changed
 
+- A GitHub Release now shows that version's changelog section, and a tag with no section fails before anything is attested.
 - `vehicle status` plans from the workspace and observes the host, so it stays right after a daemon restart. It reports zones, compute and services by kind, names states instead of printing numbers, lists declared devices nothing provisions, and refuses a workspace that is not the active one.
 - `vehicle up` plans every node and checks `localhost/` images before touching the host, so a workspace that cannot provision no longer leaves a gateway behind.
 - A device with two slice attachments is refused at plan time. It used to fail on `eth0` in a container and silently lose its second NIC in a microVM.
