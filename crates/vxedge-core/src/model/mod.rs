@@ -147,6 +147,7 @@ pub enum Backend {
     Container,
     QemuMicrovm,
     Libvirt,
+    CloudHypervisor,
 }
 
 /// What a device is *allocated*. Distinct from a part's `requires`, which is what the software

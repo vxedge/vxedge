@@ -48,7 +48,7 @@ pub enum ZonePlanError {
     },
     #[error(
         "device `{0}` declares no `backend`, so there is no way to know whether it attaches by \
-         veth or by tap. Add `backend: container|qemu-microvm|libvirt`."
+         veth or by tap. Add `backend: container|qemu-microvm|libvirt|cloud-hypervisor`."
     )]
     DeviceWithoutBackend(String),
 }
@@ -158,6 +158,7 @@ pub fn plan_nodes_from_model(
                     Some(crate::model::Backend::Container) => Backend::Container,
                     Some(crate::model::Backend::Libvirt) => Backend::Libvirt,
                     Some(crate::model::Backend::QemuMicrovm) => Backend::QemuMicrovm,
+                    Some(crate::model::Backend::CloudHypervisor) => Backend::CloudHypervisor,
                     // GatewayPlan::from_model refuses this too, so reaching it means the two
                     // plans came from different models. Reported as what it is: an
                     // "endpoint mismatch" here would point at plan joining and send someone
@@ -176,7 +177,7 @@ pub fn plan_nodes_from_model(
                 // synchronous/testable, per the `ZoneBackend` trait's own "a backend takes a
                 // `NodePlan`; it does not compute one" contract).
                 let (bundle, remote_bundle) = match backend {
-                    Backend::Libvirt | Backend::QemuMicrovm => {
+                    Backend::Libvirt | Backend::QemuMicrovm | Backend::CloudHypervisor => {
                         let bundles: Vec<&crate::model::Part> = entity
                             .functions_on(&device.id)
                             .filter_map(|f| f.part.as_ref())
@@ -234,11 +235,14 @@ pub fn plan_nodes_from_model(
                         }
                         images.first().map(|part| part.image_ref())
                     }
-                    Backend::Libvirt | Backend::QemuMicrovm => None,
+                    Backend::Libvirt | Backend::QemuMicrovm | Backend::CloudHypervisor => None,
                 };
                 if bundle.is_none()
                     && remote_bundle.is_none()
-                    && matches!(backend, Backend::Libvirt | Backend::QemuMicrovm)
+                    && matches!(
+                        backend,
+                        Backend::Libvirt | Backend::QemuMicrovm | Backend::CloudHypervisor
+                    )
                 {
                     return Err(ZonePlanError::MissingBundle(device.id.clone(), backend));
                 }

@@ -57,8 +57,8 @@ pub enum ModelError {
     NoPart { component: String },
     #[error(
         "`{component}`: part `{part}` is a {kind}, but the device it deploys onto runs the \
-         `{backend}` backend. A container backend boots a container image; libvirt and \
-         qemu-microvm boot a guest bundle. Point this target at the right part, or correct the \
+         `{backend}` backend. A container backend boots a container image; libvirt, \
+         qemu-microvm and cloud-hypervisor boot a guest bundle. Point this target at the right part, or correct the \
          device's `backend`."
     )]
     PartKindMismatch {
@@ -74,7 +74,7 @@ pub enum ModelError {
         kind: String,
     },
     #[error(
-        "device `{device}` declares backend `{backend}`, which is not container, qemu-microvm or libvirt"
+        "device `{device}` declares backend `{backend}`, which is not container, qemu-microvm, libvirt or cloud-hypervisor"
     )]
     UnknownBackend { device: String, backend: String },
     #[error(
@@ -213,6 +213,7 @@ fn backend_of(device: &str, spec: &Value) -> Result<Option<Backend>, ModelError>
         Some("container") => Ok(Some(Backend::Container)),
         Some("qemu-microvm") => Ok(Some(Backend::QemuMicrovm)),
         Some("libvirt") => Ok(Some(Backend::Libvirt)),
+        Some("cloud-hypervisor") => Ok(Some(Backend::CloudHypervisor)),
         Some(other) => Err(ModelError::UnknownBackend {
             device: device.to_string(),
             backend: other.to_string(),
@@ -339,7 +340,7 @@ fn part_kind(
             | (PartKind::Container, Some(Backend::Container))
             | (
                 PartKind::Bundle,
-                Some(Backend::Libvirt | Backend::QemuMicrovm)
+                Some(Backend::Libvirt | Backend::QemuMicrovm | Backend::CloudHypervisor)
             )
     );
     if !runnable {
@@ -354,6 +355,7 @@ fn part_kind(
                 Some(Backend::Container) => "container",
                 Some(Backend::QemuMicrovm) => "qemu-microvm",
                 Some(Backend::Libvirt) => "libvirt",
+                Some(Backend::CloudHypervisor) => "cloud-hypervisor",
                 None => "none",
             },
         });

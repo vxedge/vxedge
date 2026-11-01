@@ -1,10 +1,12 @@
 //! Zone backends (§9): compile manifest nodes into NodePlans joined with the
 //! gateway's endpoints, then run each node under its packaging backend —
 //! `container` (network namespace), `qemu-microvm` (raw QEMU, microvm machine
-//! type), or `libvirt` (full VM via virsh). The packaging choice is the H3
+//! type), `libvirt` (full VM via virsh), or `cloud-hypervisor` (microVM over a
+//! REST API). The packaging choice is the H3
 //! experimental variable; the payload and network attachment stay identical.
 
 pub mod backend;
+mod cloud_hypervisor;
 pub mod plan;
 
 pub use backend::{member_down, member_status, member_up, node_down, node_status, node_up};

@@ -511,8 +511,8 @@ fn parts_yaml(template: Template) -> String {
          # publishing is what makes it reproducible for anyone else.\n\
          #\n\
          # `kind:` says what a loadable *is*, and it is checked against the device's `backend:`\n\
-         # — a container backend boots a container image, libvirt and qemu-microvm boot a guest\n\
-         # bundle. State it wherever the ref does not: a published vxparts ref names the kind of\n\
+         # — a container backend boots a container image, libvirt, qemu-microvm and\n\
+         # cloud-hypervisor boot a guest bundle. State it wherever the ref does not: a published vxparts ref names the kind of\n\
          # node a part loads onto, not how it is packaged.\n\
          parts:\n\
          \x20 - ref: ghcr.io/vxedge/parts/agent/linux/app/probe:0.1.0\n\
