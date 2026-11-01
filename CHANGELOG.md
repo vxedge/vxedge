@@ -8,6 +8,9 @@ All notable changes to this repo are documented here. Format follows
 
 ### Added
 
+- `vehicle up` and `down` have a compute stage: hpc devices go through `ComputeService`, so audit lines and events name them, in §5.4's order.
+- `JobService.Watch` on a composite job shows each sub-job's steps, not one line per stage.
+- `VehicleService` audit lines carry the workspace sha256.
 - A `kind: vehicle` document can declare `services`, each placed on a container device with `on:`. Placement is checked at build; the same service type on a vehicle and its experiment is refused. Starting a placed service is not implemented yet, and `svc up` refuses one rather than running it as a host process.
 - `localhost/…` part refs name images in the host's Podman store: local, no digest, run as a container device's payload.
 
@@ -26,6 +29,7 @@ All notable changes to this repo are documented here. Format follows
 
 ### Changed
 
+- `vehicle up` plans every node and checks `localhost/` images before touching the host, so a workspace that cannot provision no longer leaves a gateway behind.
 - A device with two slice attachments is refused at plan time. It used to fail on `eth0` in a container and silently lose its second NIC in a microVM.
 - **The 5G core, RAN and UE pods are driven through the Podman API, not the `podman` CLI**
   (Track V2). Hosts need the rootless user socket (`systemctl --user enable --now
@@ -39,6 +43,10 @@ All notable changes to this repo are documented here. Format follows
 
 ### Fixed
 
+- `vehicle down` after a daemon restart skipped every node and removed the gateway from under them. It now plans from the workspace.
+- `vehicle down` refuses a workspace that is not the active one. It used to tear down whatever was up.
+- `experiment up` reported success with no zones when the zone plan failed. It now fails, naming the plan error.
+- A failing node in `down` no longer stops the nodes after it from being torn down.
 - `zone down` on a container node returned before the kernel had finished destroying its gateway
   port, so a gateway `up` right after it could find the dying port, keep it, and end up with
   none. `down` now waits for the port to go.

@@ -111,7 +111,7 @@ pub(crate) fn preflight_requires(dir: Option<&std::path::Path>) -> Result<(), St
         .map_err(|e| Status::failed_precondition(e.to_string()))
 }
 
-async fn resolve_manifest(
+pub(crate) async fn resolve_manifest(
     mref: Option<&ManifestRef>,
 ) -> Result<(String, String, Option<PathBuf>), Status> {
     let mref = mref.ok_or_else(|| {
@@ -266,6 +266,27 @@ pub struct GatewaySvc {
 }
 
 impl GatewaySvc {
+    /// Register a workspace as active when nothing is. `EdgeState` does not survive a daemon
+    /// restart and the host does, so `vehicle down` rebuilds it from the workspace; without
+    /// this the zone stages saw nothing active and the gateway went down under running nodes.
+    pub(crate) async fn adopt(
+        &self,
+        model: vxedge_core::model::Experiment,
+        plan: GatewayPlan,
+        dir: Option<PathBuf>,
+        sha256: String,
+    ) {
+        let mut st = self.state.lock().await;
+        if st.active.is_none() {
+            st.gateway = Some(plan);
+            st.active = Some(ActiveExperiment {
+                model,
+                dir: dir.unwrap_or_else(|| PathBuf::from(".")),
+                sha256,
+            });
+        }
+    }
+
     async fn lifecycle_job(
         &self,
         rpc: &'static str,

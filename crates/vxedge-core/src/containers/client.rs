@@ -317,6 +317,17 @@ impl ContainerClient {
         Ok(self.docker.create_container(Some(opts), body).await?.id)
     }
 
+    /// Whether `image` is in this store already. Pulls nothing: a `localhost/` image has no
+    /// registry to come from, so a caller can refuse before provisioning instead of failing on
+    /// a pull halfway through.
+    pub async fn image_present(&self, image: &str) -> Result<bool, ContainerError> {
+        match self.docker.inspect_image(image).await {
+            Ok(_) => Ok(true),
+            Err(e) if status_code(&e) == Some(404) => Ok(false),
+            Err(e) => Err(api(format!("inspect image `{image}`"))(e)),
+        }
+    }
+
     async fn pull(&self, image: &str) -> Result<(), ContainerError> {
         let opts = CreateImageOptionsBuilder::new().from_image(image).build();
         self.docker
