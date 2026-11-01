@@ -20,6 +20,7 @@ futures-util = { workspace = true }
 nix = { workspace = true }
 tun = { workspace = true }
 bollard = { workspace = true }
+cloud-hypervisor-client = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -62,7 +62,7 @@ pub struct Shell {
 /// Read from `/proc/self/status` rather than `geteuid(2)` because `unsafe` is effectively
 /// forbidden here and this needs no new dependency. Cached: a process's euid cannot change
 /// underneath us.
-fn children_are_privileged() -> bool {
+pub(crate) fn children_are_privileged() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
         std::fs::read_to_string("/proc/self/status")

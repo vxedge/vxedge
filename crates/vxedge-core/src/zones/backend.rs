@@ -23,6 +23,7 @@
 
 use std::path::Path;
 
+use super::cloud_hypervisor;
 use super::plan::NodePlan;
 use crate::containers::{
     ContainerClient, ContainerError, ContainerSpec, GroupHandle, GroupSpec, InfraNetwork,
@@ -84,7 +85,7 @@ impl crate::status::Observable for NodeState {
     }
 }
 
-fn kernel_cmdline(np: &NodePlan) -> String {
+pub(super) fn kernel_cmdline(np: &NodePlan) -> String {
     let ip = np.ip_cidr.as_deref().unwrap_or("");
     format!(
         "console=ttyS0 reboot=t panic=-1 quiet vx.ip={ip} vx.node={}",
@@ -92,7 +93,7 @@ fn kernel_cmdline(np: &NodePlan) -> String {
     )
 }
 
-fn bundle_paths(np: &NodePlan) -> Result<(String, String), ZoneBackendError> {
+pub(super) fn bundle_paths(np: &NodePlan) -> Result<(String, String), ZoneBackendError> {
     let dir = np
         .bundle
         .as_deref()
@@ -200,7 +201,7 @@ fn container_down(sh: &Shell, np: &NodePlan) -> Result<(), ZoneBackendError> {
 const PORT_GONE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Polls `done` until it holds or `timeout` passes; returns whether it held.
-fn wait_until(timeout: std::time::Duration, mut done: impl FnMut() -> bool) -> bool {
+pub(super) fn wait_until(timeout: std::time::Duration, mut done: impl FnMut() -> bool) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if done() {
@@ -357,7 +358,7 @@ fn ct(np: &NodePlan, e: ContainerError) -> ZoneBackendError {
 /// A client is connected per operation rather than held: the trait carries no state, a connect
 /// is one version request on a local socket, and a cached client would stay bound to whichever
 /// runtime first used it.
-fn block_on<F: std::future::Future>(f: F) -> F::Output {
+pub(super) fn block_on<F: std::future::Future>(f: F) -> F::Output {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => handle.block_on(f),
         Err(_) => tokio::runtime::Builder::new_current_thread()
@@ -683,6 +684,7 @@ pub trait ZoneBackend {
 struct ContainerBackend;
 struct QemuMicrovmBackend;
 struct LibvirtBackend;
+struct CloudHypervisorBackend;
 
 impl ZoneBackend for ContainerBackend {
     fn name(&self) -> &'static str {
@@ -735,6 +737,21 @@ impl ZoneBackend for LibvirtBackend {
     }
 }
 
+impl ZoneBackend for CloudHypervisorBackend {
+    fn name(&self) -> &'static str {
+        "cloud-hypervisor"
+    }
+    fn up(&self, sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneBackendError> {
+        cloud_hypervisor::up(sh, np, runtime_dir)
+    }
+    fn down(&self, _sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneBackendError> {
+        cloud_hypervisor::down(np, runtime_dir)
+    }
+    fn status(&self, _sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> NodeState {
+        cloud_hypervisor::status(np, runtime_dir)
+    }
+}
+
 /// **The only place a backend kind is matched.** Everything downstream holds a
 /// `&dyn ZoneBackend`, so adding a fourth backend is one impl and one arm here — it used to be
 /// three matches in three functions with nothing saying they had to agree.
@@ -743,6 +760,7 @@ pub fn backend_for(kind: Backend) -> &'static dyn ZoneBackend {
         Backend::Container => &ContainerBackend,
         Backend::QemuMicrovm => &QemuMicrovmBackend,
         Backend::Libvirt => &LibvirtBackend,
+        Backend::CloudHypervisor => &CloudHypervisorBackend,
     }
 }
 
@@ -801,6 +819,10 @@ mod tests {
         assert_eq!(backend_for(Backend::Container).name(), "container");
         assert_eq!(backend_for(Backend::QemuMicrovm).name(), "qemu-microvm");
         assert_eq!(backend_for(Backend::Libvirt).name(), "libvirt");
+        assert_eq!(
+            backend_for(Backend::CloudHypervisor).name(),
+            "cloud-hypervisor"
+        );
     }
 
     /// libvirt's wording decides the hint: socket refusal (not in the `libvirt` group), a guest

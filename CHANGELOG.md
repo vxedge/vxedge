@@ -14,7 +14,12 @@ All notable changes to this repo are documented here. Format follows
 - `VehicleService` audit lines carry the workspace sha256.
 - A `kind: vehicle` document can declare `services`, each placed on a container device with `on:`. Placement is checked at build; the same service type on a vehicle and its experiment is refused. `svc up`, `down` and `status` run it as a member of that device's container group, so it answers on the device's slice only; `vehicle up` refuses a missing artifact store before provisioning.
 - `localhost/…` part refs name images in the host's Podman store: local, no digest, run as a container device's payload.
-
+- **`backend: cloud-hypervisor`** (Track V4): a zone node can boot a guest bundle under Cloud
+  Hypervisor, over its REST API on a per-node Unix socket, through `cloud-hypervisor-client`
+  (pinned exactly). It adopts the gateway's tap without touching its addressing, runs as
+  vxedged's own user, and reads liveness from the socket, so a killed VMM reads as down and the
+  next `up` recovers it. A node gets a stable MAC derived from its id. Validated on the
+  `linux-probe` bundle only. `qemu-microvm` is unchanged.
 - `vxedge_core::containers` (Track V1, `docs-internal/PROVISIONING.md` §7.2): container groups
   over Podman's REST API on the rootless user socket, via `bollard`. A group is what a `podman
   pod` was: an infra container owning a network namespace that members join. Membership is by
