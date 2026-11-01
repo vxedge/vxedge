@@ -158,7 +158,7 @@ pub(crate) fn check_down_target(
     )))
 }
 
-fn inline(yaml: &str, dir: Option<&std::path::Path>) -> Option<ManifestRef> {
+pub(crate) fn inline(yaml: &str, dir: Option<&std::path::Path>) -> Option<ManifestRef> {
     Some(ManifestRef {
         source: Some(Source::InlineYaml(yaml.to_string())),
         sha256: String::new(),

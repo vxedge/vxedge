@@ -239,6 +239,9 @@ message VehicleStatusRequest {
 message VehicleStatus {
   ResourceStatus status = 1;
   repeated ResourceStatus components = 2;
+  // The gateway as observed for this vehicle's workspace: per-slice VLANs and queues, ingress
+  // filters, impairments and tunnels, which one line in `components` cannot carry.
+  GatewayStatus gateway = 3;
 }
 
 service VehicleService {

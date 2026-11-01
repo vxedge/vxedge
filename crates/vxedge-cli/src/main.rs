@@ -826,11 +826,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         })
                         .await?
                         .into_inner();
-                    let top = st.status.clone().unwrap_or_default();
-                    println!("{}: {}", top.vxid, top.detail);
-                    for c in &st.components {
-                        println!("  {} [{}] {}", c.vxid, c.state, c.detail);
-                    }
+                    print_vehicle_status(&st);
                 }
                 ManifestLifecycleCmd::Up { manifest } => {
                     let job = veh
@@ -1094,6 +1090,71 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 /// A §6.0 workspace directory: every cross-file join, then every model invariant. A bare
 /// vehicle (no `kind: experiment`) is validated the way `vehicle up` loads it.
+/// `RESOURCE_STATE_UP` as `up`, and `not provisioned` for a device nothing brings up.
+fn resource_state_name(state: i32) -> String {
+    match vxedge_api::v1::ResourceState::try_from(state) {
+        Ok(vxedge_api::v1::ResourceState::Unspecified) | Err(_) => "not provisioned".to_string(),
+        Ok(s) => s
+            .as_str_name()
+            .trim_start_matches("RESOURCE_STATE_")
+            .to_lowercase(),
+    }
+}
+
+fn kind_name(kind: i32) -> String {
+    vxedge_api::v1::ResourceKind::try_from(kind)
+        .map(|k| {
+            k.as_str_name()
+                .trim_start_matches("RESOURCE_KIND_")
+                .to_lowercase()
+        })
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+fn print_vehicle_status(st: &vxedge_api::v1::VehicleStatus) {
+    let top = st.status.clone().unwrap_or_default();
+    println!(
+        "vehicle {}: {} ({})",
+        top.vxid,
+        resource_state_name(top.state),
+        top.detail
+    );
+    for c in &st.components {
+        println!(
+            "  {:<8} {:<16} {:<16} {}",
+            kind_name(c.kind),
+            c.vxid,
+            resource_state_name(c.state),
+            c.detail
+        );
+    }
+    let Some(gw) = &st.gateway else { return };
+    for s in &gw.slices {
+        println!(
+            "  slice    {:<16} {:<16} {}",
+            s.slice_id,
+            resource_state_name(s.state),
+            s.detail
+        );
+    }
+    for f in &gw.ingress_filters {
+        println!(
+            "  filter   {:<16} {:<16} {}",
+            f.access_port,
+            resource_state_name(f.state),
+            f.detail
+        );
+    }
+    for i in &gw.impairments {
+        println!(
+            "  impaired {:<16} {:<16} {}",
+            i.link,
+            resource_state_name(i.state),
+            i.detail
+        );
+    }
+}
+
 fn validate_workspace_dir(root: &std::path::Path) -> Result<Summary, String> {
     let ws = vxedge_core::Workspace::load(root).map_err(|e| e.to_string())?;
     if ws.is_bare_vehicle() {

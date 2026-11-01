@@ -465,8 +465,27 @@ fn read_pid(np: &NodePlan, runtime_dir: &Path) -> Option<i32> {
         .ok()
 }
 
+/// The pidfile's PID, only if that process is this node's QEMU. A pidfile outlives a host reboot
+/// or a crash, and the kernel reuses PIDs, so a live PID alone could be anything, and `down`
+/// would kill it.
+fn guest_pid(np: &NodePlan, runtime_dir: &Path) -> Option<i32> {
+    let pid = read_pid(np, runtime_dir)?;
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    is_guest_of(&cmdline, &np.node_id).then_some(pid)
+}
+
+/// Whether a NUL-separated `/proc/<pid>/cmdline` is QEMU booting `node`, which
+/// [`kernel_cmdline`] marks with `vx.node=`.
+fn is_guest_of(cmdline: &[u8], node: &str) -> bool {
+    let cmdline = String::from_utf8_lossy(cmdline);
+    let mut args = cmdline.split('\0');
+    let marker = format!("vx.node={node}");
+    args.next().is_some_and(|bin| bin.contains("qemu"))
+        && args.any(|arg| arg.split(' ').any(|word| word == marker))
+}
+
 fn microvm_down(np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneBackendError> {
-    if let Some(pid) = read_pid(np, runtime_dir) {
+    if let Some(pid) = guest_pid(np, runtime_dir) {
         // TERM, brief grace, then KILL; both are fine for a stateless guest.
         let _ = std::process::Command::new("kill")
             .arg(pid.to_string())
@@ -483,9 +502,9 @@ fn microvm_down(np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneBackendErro
 }
 
 fn microvm_status(np: &NodePlan, runtime_dir: &Path) -> NodeState {
-    match read_pid(np, runtime_dir) {
-        Some(pid) if Path::new(&format!("/proc/{pid}")).exists() => NodeState::Up,
-        _ => NodeState::Down,
+    match guest_pid(np, runtime_dir) {
+        Some(_) => NodeState::Up,
+        None => NodeState::Down,
     }
 }
 
@@ -867,6 +886,17 @@ mod tests {
         let started = std::time::Instant::now();
         container_down(&sh, &np).unwrap();
         assert!(started.elapsed() < PORT_GONE_TIMEOUT);
+    }
+
+    #[test]
+    fn a_reused_pid_is_not_mistaken_for_the_guest() {
+        let qemu = b"qemu-system-x86_64\0-append\0console=ttyS0 vx.node=zone-fl\0";
+        assert!(is_guest_of(qemu, "zone-fl"));
+        assert!(!is_guest_of(qemu, "zone-f"), "another node's id");
+        assert!(!is_guest_of(
+            b"/usr/bin/bash\0-c\0vx.node=zone-fl\0",
+            "zone-fl"
+        ));
     }
 
     /// The seam's two calling contexts: no runtime at all (a plain test, a CLI), and a

@@ -616,6 +616,18 @@ impl GatewayService for GatewaySvc {
             let st = self.state.lock().await;
             (st.gateway.clone(), st.fiveg.clone())
         };
+        self.observe(plan, fiveg_plan).await.map(Response::new)
+    }
+}
+
+impl GatewaySvc {
+    /// The gateway as the host shows it for `plan`. `None` means no plan is known, which still
+    /// has to notice a bridge left by a daemon that restarted.
+    pub(crate) async fn observe(
+        &self,
+        plan: Option<GatewayPlan>,
+        fiveg_plan: Option<FiveGPlan>,
+    ) -> Result<GatewayStatus, Status> {
         let (state, detail, slices, impairments, ingress_filters, tunnels) = match plan {
             Some(plan) => {
                 let snssai_count = plan.snssai_slice_ids.len();
@@ -726,7 +738,16 @@ impl GatewayService for GatewaySvc {
                         kind: crate::status::wire_tunnel_kind(t.kind) as i32,
                     })
                     .collect();
-                if obs.fully_up() {
+                if !obs.bridge_present {
+                    (
+                        ResourceState::Down,
+                        "no gateway provisioned".to_string(),
+                        vec![],
+                        vec![],
+                        vec![],
+                        vec![],
+                    )
+                } else if obs.fully_up() {
                     (
                         ResourceState::Up,
                         format!(
@@ -832,7 +853,7 @@ impl GatewayService for GatewaySvc {
             }
         }
 
-        Ok(Response::new(GatewayStatus {
+        Ok(GatewayStatus {
             status: Some(ResourceStatus {
                 vxid: "vxgateway".into(),
                 kind: ResourceKind::Gateway as i32,
@@ -844,7 +865,7 @@ impl GatewayService for GatewaySvc {
             impairments,
             ingress_filters,
             tunnels,
-        }))
+        })
     }
 }
 
