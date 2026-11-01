@@ -117,17 +117,16 @@ async fn await_job(
 /// bundle/part refs against the real workspace instead of the daemon's own cwd (see
 /// `ManifestRef.resolved_dir`'s own doc comment, common.proto). `None` for a genuinely-inline
 /// manifest (no workspace to name).
-/// Refuse an `ExperimentService.Down` aimed at anything but the experiment active on this host.
+/// Refuse a verb aimed at anything but what is active on this host.
 ///
-/// Down's zones stage lists the *active* experiment's zones (`ZoneService.List` takes no
-/// workspace) and its gateway stage acts on the host's one gateway, so without this a Down
-/// naming workspace B tore down whatever A someone else had up. Matched on experiment id, and
-/// on the workspace directory too when both sides know it — two copies of one experiment in
-/// different directories are different runs. `"."` is what `gateway up` records for a genuinely
-/// inline manifest, i.e. no known directory. Nothing active means nothing to protect: Down
-/// proceeds, which keeps it idempotent.
-pub(crate) fn check_down_target(
-    noun: &str,
+/// The host has one gateway, so without this a Down naming workspace B tore down whatever A
+/// someone else had up, and an Up naming B took A's bridge and left A's nodes running without
+/// it. Matched on id, and on the workspace directory too when both sides know it — two copies
+/// of one workspace in different directories are different runs. `"."` is what `gateway up`
+/// records for a genuinely inline manifest, i.e. no known directory. Nothing active means
+/// nothing to protect: the verb proceeds, which keeps `down` idempotent.
+pub(crate) fn check_active_target(
+    verb: &str,
     active: Option<(&str, &std::path::Path)>,
     requested_id: &str,
     requested_dir: Option<&std::path::Path>,
@@ -153,8 +152,8 @@ pub(crate) fn check_down_target(
     };
     Err(Status::failed_precondition(format!(
         "`{active_id}`{active_at} is the one active on this host, not \
-         `{requested_id}`{requested_at}: `{noun} down` only tears down what is active — run it \
-         from that workspace"
+         `{requested_id}`{requested_at}: `{verb}` only acts on what is active — run it from that \
+         workspace, or bring it down first"
     )))
 }
 
@@ -432,14 +431,15 @@ impl ExperimentService for ExperimentSvc {
         let yaml = resolve_once(req.get_ref().manifest.as_ref()).await?;
         let model = vxedge_core::model::load_yaml(&yaml)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        {
-            let st = self.handles.gateway.state.lock().await;
-            let active = st
-                .active
+        let active = self.handles.gateway.active_on_host().await;
+        check_active_target(
+            "experiment down",
+            active
                 .as_ref()
-                .map(|a| (a.model.id.as_str(), a.dir.as_path()));
-            check_down_target("experiment", active, &model.id, dir.as_deref())?;
-        }
+                .map(|(id, dir)| (id.as_str(), dir.as_path())),
+            &model.id,
+            dir.as_deref(),
+        )?;
         self.audit.record(
             "ExperimentService.Down",
             serde_json::json!({ "experiment": model.id }),
@@ -647,20 +647,25 @@ mod tests {
 
     #[test]
     fn down_with_nothing_active_proceeds() {
-        assert!(check_down_target("experiment", None, "exp-a", Some(Path::new("/ws/a"))).is_ok());
+        assert!(
+            check_active_target("experiment down", None, "exp-a", Some(Path::new("/ws/a"))).is_ok()
+        );
     }
 
     #[test]
     fn down_of_the_active_experiment_proceeds() {
         let active = Some(("exp-a", Path::new("/ws/a")));
-        assert!(check_down_target("experiment", active, "exp-a", Some(Path::new("/ws/a"))).is_ok());
+        assert!(
+            check_active_target("experiment down", active, "exp-a", Some(Path::new("/ws/a")))
+                .is_ok()
+        );
     }
 
     #[test]
     fn down_of_a_different_experiment_is_refused_naming_the_active_one() {
         let active = Some(("exp-a", Path::new("/ws/a")));
-        let err =
-            check_down_target("experiment", active, "exp-b", Some(Path::new("/ws/b"))).unwrap_err();
+        let err = check_active_target("experiment down", active, "exp-b", Some(Path::new("/ws/b")))
+            .unwrap_err();
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
         assert!(err.message().contains("`exp-a`"), "{}", err.message());
         assert!(err.message().contains("/ws/a"), "{}", err.message());
@@ -672,8 +677,8 @@ mod tests {
         // Two copies of one experiment in different directories: only the one that was
         // brought up is torn down from its own workspace.
         let active = Some(("exp-a", Path::new("/ws/a")));
-        let err = check_down_target(
-            "experiment",
+        let err = check_active_target(
+            "experiment down",
             active,
             "exp-a",
             Some(Path::new("/ws/copy-of-a")),
@@ -686,15 +691,18 @@ mod tests {
     #[test]
     fn an_inline_down_with_no_directory_is_matched_on_id_alone() {
         let active = Some(("exp-a", Path::new("/ws/a")));
-        assert!(check_down_target("experiment", active, "exp-a", None).is_ok());
-        assert!(check_down_target("experiment", active, "exp-b", None).is_err());
+        assert!(check_active_target("experiment down", active, "exp-a", None).is_ok());
+        assert!(check_active_target("experiment down", active, "exp-b", None).is_err());
     }
 
     #[test]
     fn an_active_experiment_with_no_known_directory_is_matched_on_id_alone() {
         // `gateway up` from a genuinely inline manifest records "." as the directory.
         let active = Some(("exp-a", Path::new(".")));
-        assert!(check_down_target("experiment", active, "exp-a", Some(Path::new("/ws/a"))).is_ok());
+        assert!(
+            check_active_target("experiment down", active, "exp-a", Some(Path::new("/ws/a")))
+                .is_ok()
+        );
     }
 
     /// The parent has to show a sub-job's step while that step is running, not after it.
@@ -729,7 +737,9 @@ mod tests {
     #[test]
     fn a_down_refusal_names_the_verb_it_refused() {
         let active = Some(("vehicle-a", Path::new("/ws/a")));
-        let err = check_down_target("vehicle", active, "vehicle-b", None).unwrap_err();
-        assert!(err.message().contains("`vehicle down`"), "{err:?}");
+        for verb in ["vehicle up", "vehicle status", "vehicle down"] {
+            let err = check_active_target(verb, active, "vehicle-b", None).unwrap_err();
+            assert!(err.message().contains(&format!("`{verb}`")), "{err:?}");
+        }
     }
 }

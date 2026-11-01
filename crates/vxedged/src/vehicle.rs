@@ -47,7 +47,7 @@ use vxedge_core::model::{DeviceRole, Experiment};
 use vxedge_core::zones::NodePlan;
 
 use crate::audit::Audit;
-use crate::experiment::{Handles, NodeStage, check_down_target, inline};
+use crate::experiment::{Handles, NodeStage, check_active_target, inline};
 
 pub struct VehicleSvc {
     pub audit: Arc<Audit>,
@@ -163,6 +163,27 @@ async fn require_local_images(id: &str, images: &BTreeSet<String>) -> Result<(),
     )))
 }
 
+impl VehicleSvc {
+    /// Every verb acts on the host's one gateway, so each refuses a workspace other than the
+    /// active one.
+    async fn require_active(
+        &self,
+        verb: &str,
+        model: &Experiment,
+        dir: Option<&Path>,
+    ) -> Result<(), Status> {
+        let active = self.handles.gateway.active_on_host().await;
+        check_active_target(
+            verb,
+            active
+                .as_ref()
+                .map(|(id, dir)| (id.as_str(), dir.as_path())),
+            &model.id,
+            dir,
+        )
+    }
+}
+
 #[tonic::async_trait]
 impl VehicleService for VehicleSvc {
     async fn up(
@@ -180,6 +201,8 @@ impl VehicleService for VehicleSvc {
         // that function's own comment for why refusing here costs nothing but refusing halfway
         // through does not.
         crate::services::preflight_requires(dir.as_deref())?;
+        self.require_active("vehicle up", &model, dir.as_deref())
+            .await?;
         let (_, nodes) = plan_vehicle(&model, dir.as_deref())?;
         // A store that is missing would otherwise fail last, with the whole vehicle already up.
         for def in model.services.values().filter(|s| s.on.is_some()) {
@@ -244,14 +267,8 @@ impl VehicleService for VehicleSvc {
             id,
         } = resolve_and_synthesize(req.get_ref().manifest.as_ref()).await?;
         let (gateway, nodes) = plan_vehicle(&model, dir.as_deref())?;
-        {
-            let st = self.handles.gateway.state.lock().await;
-            let active = st
-                .active
-                .as_ref()
-                .map(|a| (a.model.id.as_str(), a.dir.as_path()));
-            check_down_target("vehicle", active, &model.id, dir.as_deref())?;
-        }
+        self.require_active("vehicle down", &model, dir.as_deref())
+            .await?;
         self.audit.record(
             "VehicleService.Down",
             serde_json::json!({ "vehicle": id, "workspace_sha256": sha256 }),
@@ -315,16 +332,8 @@ impl VehicleService for VehicleSvc {
             ..
         } = resolve_and_synthesize(req.get_ref().manifest.as_ref()).await?;
         let (gateway, nodes) = plan_vehicle(&model, dir.as_deref())?;
-        {
-            let st = self.handles.gateway.state.lock().await;
-            if let Some(active) = st.active.as_ref().filter(|a| a.model.id != model.id) {
-                return Err(Status::failed_precondition(format!(
-                    "`{}` is the one active on this host, not `{}`: run `vehicle status` from \
-                     that workspace",
-                    active.model.id, model.id
-                )));
-            }
-        }
+        self.require_active("vehicle status", &model, dir.as_deref())
+            .await?;
 
         let gw = self.handles.gateway.observe(Some(gateway), None).await?;
         let gw_status = gw.status.clone().unwrap_or_default();
