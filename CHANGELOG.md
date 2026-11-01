@@ -6,7 +6,7 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
-## [0.3.0] - 2026-11-01
+## [0.3.0] - 2026-11-02
 
 `vxedge vehicle up` now brings up a full vehicle from one workspace: a gateway, zones on several
 backends, central compute and a service placed on a slice. This is the phase-3 gate, and it passed
