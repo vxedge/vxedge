@@ -6,31 +6,58 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-02
+
+A fifth zone backend, and every backend proven in one vehicle. `backend: wasm-capsule` runs a
+WebAssembly component as a sensor or ECU node, for parts simulable as a sandboxed control loop rather
+than a full guest kernel. `vx-vehicle-03` brings up six zones on qemu-microvm, cloud-hypervisor,
+wasm-capsule and container from one workspace; the run is in
+[`vxperiments/results/all-backends-2026-11-02`](https://github.com/vxedge/vxperiments/tree/main/results/all-backends-2026-11-02).
+Its guests are probes, so it shows the backends provisioning and isolating together, and it is not
+a measurement. The phase-3 gate on `vx-vehicle-02` was repeated on this code and still holds.
+
 ### Added
 
+- `backend: wasm-capsule`: a zone node can run a WASI 0.2 command component, a `kind: wasm` part that
+  is a local file or published by digest. Its network is a container node's: a named namespace with
+  the gateway port as `eth0`. The new `vxcapsule` binary runs it inside that namespace, unprivileged
+  and with no filesystem access, and ships beside `vxedged`. It runs as a separate process, so a stop
+  reaches an idle capsule and a capsule outlives a `vxedged` restart.
 - `vxedge doctor --tier 2` reports Cloud Hypervisor, as an optional check.
-- **`backend: wasm-capsule`**: a zone node can run a WASI 0.2 command component, a
-  `kind: wasm` part that is a local file or published by digest, for a sensor or ECU simulable as a sandboxed control loop. Its network is a
-  container node's: a named namespace with the gateway port as `eth0`. The new `vxcapsule` binary
-  runs it inside that namespace, unprivileged and with no filesystem access, and ships beside
-  `vxedged`. Validated on the `reflector-capsule` part only.
 
 ### Fixed
 
-- `vxedge experiment new` named a part that was never published, carrying another part's digest, so
-  a generated workspace could not pull it. It now uses the local `vxprobe`, as the shipped experiments
-  do.
 - A Cloud Hypervisor guest is seen from a daemon with another runtime dir, through its VMM's API
   socket. It used to read as down there, so `up` could start a second VMM and `vehicle down` could
   remove the gateway from under it. The host check for a vehicle this workspace does not declare
   names these guests too. Both daemons must run as the same user.
-- Under `setcap`, `vxedged` could not create a node's named namespace, because `/run/netns` is
-  root's. Creating and removing one now uses the `ip` sudo entry when `vxedged` is unprivileged.
+- Under `setcap`, `vxedged` could not create a node's named namespace, because `/run/netns` is root's.
+  Creating and removing one now uses the `ip` sudo entry when `vxedged` is unprivileged.
+- `vxedge experiment new` named a part that was never published, carrying another part's digest, so a
+  generated workspace could not pull it. It now uses the local `vxprobe`, as the shipped experiments
+  do.
 
 ### Security
 
 - Lockfile update `pulldown-cmark` 0.13.5 -> 0.13.6, which fixes RUSTSEC-2026-0433 (quadratic parsing
   with `ENABLE_WIKILINKS`). It is a build-time dependency via `prost-build`.
+
+### Migration
+
+- A `wasm-capsule` node needs `vxcapsule` beside `vxedged`, on `PATH`, or named by
+  `VXEDGE_CAPSULE_BIN`. The release archive carries it. Nothing else changes for existing workspaces.
+
+### Known limits
+
+- `wasm-capsule` is validated on the `reflector-capsule` part only, and that published package is
+  private for now, so a public run builds it from `vxparts`.
+- Cloud Hypervisor CPU pinning is untested, and why a guest needs a stable MAC is still not
+  understood.
+- `vxedged`'s runtime dir must be short: a Cloud Hypervisor node's API socket lives there, and a Unix
+  socket path has a length limit. `up` fails naming the path, after earlier nodes have started, and
+  `down` then cleans up.
+- `experiment up` has no wrong-workspace check, and `experiment` verbs do not read the host.
+- The limits in 0.3.0 on device attachments, `role: gateway`, `resources` and placed services stand.
 
 ## [0.3.0] - 2026-11-02
 
