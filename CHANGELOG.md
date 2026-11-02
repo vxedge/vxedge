@@ -6,6 +6,13 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-02
+
+A vehicle now outlives its daemon. Zone and compute verbs keep working after a daemon restart, a placed
+service reads correctly however it is asked for, and `experiment status` answers only for what is
+active. A live run on `vx-vehicle-02` covered a `kill -9` of the daemon: a new daemon read the real
+vehicle, all 8 flow checks passed, and `vehicle down` left nothing behind.
+
 ### Added
 
 - `vxedge ota status`, the CLI verb for `SvcService.Status`.
@@ -30,6 +37,13 @@ All notable changes to this repo are documented here. Format follows
   was still up. The daemon now rebuilds its state from the active record, and refuses a workspace
   edited since `up`.
 - `ZoneService.List` reported hpc devices as zones. They now report as compute.
+
+### Known limits
+
+- `zone up` on a container node after `zone down` fails, because the gateway port is destroyed with
+  the namespace. The error says so, and `vehicle up` recovers it.
+- A workspace with no directory, such as an inline manifest, cannot be restored after a restart.
+- The limits in 0.4.0 stand.
 
 ## [0.4.0] - 2026-11-02
 
