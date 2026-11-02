@@ -18,6 +18,11 @@ use serde_yaml_ng::Value;
 #[derive(Debug, thiserror::Error)]
 pub enum ModelError {
     #[error(
+        "experiment `{experiment}`: vehicle `{vehicle}` declares a second `signal_plane`, and one \
+         gateway carries one"
+    )]
+    TwoSignalPlanes { experiment: String, vehicle: String },
+    #[error(
         "vehicle `{vehicle}`: service `{service}` has no `on:`. A vehicle's service is placed on \
          one of its devices."
     )]
@@ -1235,6 +1240,18 @@ pub fn build(ws: &Workspace) -> Result<Experiment, ModelError> {
             services.insert(key.clone(), def.clone());
         }
     }
+    let mut planes = ws
+        .vehicles
+        .iter()
+        .filter(|v| exp.vehicles.contains(&v.id))
+        .filter(|v| v.signal_plane.is_some());
+    let signal_plane = planes.next().and_then(|v| v.signal_plane.clone());
+    if let Some(second) = planes.next() {
+        return Err(ModelError::TwoSignalPlanes {
+            experiment: exp.id.clone(),
+            vehicle: second.id.clone(),
+        });
+    }
     let telemetry = match raw.get("telemetry").and_then(|t| t.get("prometheus")) {
         Some(p) => Telemetry {
             scrape_targets: string_list(p, "scrape_targets"),
@@ -1268,6 +1285,7 @@ pub fn build(ws: &Workspace) -> Result<Experiment, ModelError> {
         traffic,
         method,
         services,
+        signal_plane,
         telemetry,
         results,
     })
@@ -2628,6 +2646,83 @@ parts:
                 "{on}: {errors:?}"
             );
         }
+    }
+
+    const PLANE: &str = "signal_plane:
+  kuksa:
+    image: { url: 'ghcr.io/eclipse-kuksa/kuksa-databroker@sha256:9ace', kind: container }
+    on: hpc1
+---
+kind: baseline";
+
+    fn with_plane(plane: &str) -> String {
+        PLACED.replace("---\nkind: baseline", plane)
+    }
+
+    #[test]
+    fn a_signal_plane_is_placed_like_a_service() {
+        let exp = crate::model::load_vehicle_yaml(&with_plane(PLANE)).unwrap();
+        let plane = exp.signal_plane.as_ref().unwrap();
+        assert_eq!(plane.kuksa.on, "hpc1");
+        assert_eq!(plane.kuksa.config.listen, "0.0.0.0:55555");
+        let placed: Vec<&str> = exp.placements().map(|p| p.id).collect();
+        assert_eq!(placed, ["ota-01", "kuksa-databroker"]);
+        // Its own stage: `SvcService` must not start it.
+        assert_eq!(crate::services::ServiceDef::declared_types(&exp), ["ota"]);
+    }
+
+    /// The rules are the placed service's, not a copy of them.
+    #[test]
+    fn a_signal_plane_follows_the_placement_rules() {
+        for (on, expected) in [
+            ("nope", "no vehicle declares"),
+            ("ecu1", "not `backend: container`"),
+            ("idle", "runs no container image"),
+        ] {
+            let yaml =
+                with_plane(PLANE).replace("    on: hpc1\n---", &format!("    on: {on}\n---"));
+            let errors = invariants(&yaml);
+            assert!(
+                errors.iter().any(|e| e.contains(expected)),
+                "{on}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_signal_plane_image_cannot_move() {
+        let yaml = with_plane(PLANE).replace(
+            "ghcr.io/eclipse-kuksa/kuksa-databroker@sha256:9ace",
+            "ghcr.io/eclipse-kuksa/kuksa-databroker:latest",
+        );
+        let errors = invariants(&yaml);
+        assert!(
+            errors.iter().any(|e| e.contains("digest-pinned")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_signal_plane_that_cannot_start_is_refused_at_build() {
+        let yaml = with_plane(PLANE).replace(
+            "    on: hpc1\n---",
+            "    on: hpc1\n    config: { listen: 'hpc1:55555' }\n---",
+        );
+        let errors = invariants(&yaml);
+        assert!(
+            errors.iter().any(|e| e.contains("config.listen")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_service_cannot_take_the_databrokers_name() {
+        let yaml = with_plane(PLANE).replace("id: ota-01", "id: kuksa-databroker");
+        let errors = invariants(&yaml);
+        assert!(
+            errors.iter().any(|e| e.contains("placed twice")),
+            "{errors:?}"
+        );
     }
 
     #[test]
