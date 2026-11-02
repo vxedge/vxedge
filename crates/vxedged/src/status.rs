@@ -56,6 +56,7 @@ pub fn resource_status(
         state: wire_state(o.state()) as i32,
         detail: detail.into(),
         since_unix_ms: now_ms(),
+        ..Default::default()
     }
 }
 
@@ -69,7 +70,9 @@ pub fn aggregate_resource_states(statuses: &[ResourceStatus]) -> ResourceState {
         .map(
             |s| match ResourceState::try_from(s.state).unwrap_or(ResourceState::Unspecified) {
                 ResourceState::Up => ObservedState::Up,
-                ResourceState::Down | ResourceState::Unspecified => ObservedState::Down,
+                ResourceState::Down | ResourceState::Unspecified | ResourceState::Unprovisioned => {
+                    ObservedState::Down
+                }
                 ResourceState::Staging => ObservedState::Staging,
                 ResourceState::Degraded => ObservedState::Degraded,
                 ResourceState::Error => ObservedState::Error,
@@ -97,6 +100,7 @@ pub fn composite_rollup(
         state: gw_status.state,
         detail: gw_status.detail.clone(),
         since_unix_ms: gw_status.since_unix_ms,
+        ..Default::default()
     }];
     resources.append(&mut components);
     let state = aggregate_resource_states(&resources);
@@ -106,6 +110,7 @@ pub fn composite_rollup(
         state: state as i32,
         detail: format!("{} resource(s)", resources.len()),
         since_unix_ms: gw_status.since_unix_ms,
+        ..Default::default()
     };
     (top, resources)
 }

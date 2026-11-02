@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package vxedge.v1;
+
+import "vxedge/v1/common.proto";
+
+// A run is one provisioned workspace on this host. It starts when the gateway comes up, survives a
+// repeated `up` and a daemon restart, and ends when the gateway goes down. The host runs one at a
+// time today, so `List` returns zero or one.
+message Run {
+  string id = 1;
+  // RESOURCE_KIND_VEHICLE or RESOURCE_KIND_EXPERIMENT.
+  ResourceKind kind = 2;
+  // The workspace's id.
+  string target_id = 3;
+  // The workspace identity (`ARCHITECTURE.md` §13).
+  string workspace_sha256 = 4;
+  ResourceState state = 5;
+  int64 started_unix_ms = 6;
+}
+
+message RunGetRequest {
+  RunRef run = 1;
+}
+
+message RunListRequest {}
+
+message RunListResponse {
+  repeated Run runs = 1;
+}
+
+service RunService {
+  rpc Get(RunGetRequest) returns (Run);
+  rpc List(RunListRequest) returns (RunListResponse);
+}

@@ -8,7 +8,15 @@ All notable changes to this repo are documented here. Format follows
 
 ### Added
 
+- The agent surface in the vxAPI contract, additive to `vxedge.v1`: `RunService`, `WorkspaceService`,
+  `HostService`, `JobService.List` and `Cancel`, `TrafficService.Status`, typed `NodeStatus`,
+  `ErrorReason`, and event resume. These are not built yet: the RPCs answer `UNIMPLEMENTED`, and new
+  fields read as unset.
 - A `kind: vehicle` document can declare `signal_plane.kuksa`, the Kuksa databroker placed on a container device with `on:`, under the same rules as a placed service. Its placement is checked when the workspace loads. `vehicle up` does not start it yet.
+
+### Deprecated
+
+- `Apply`, `Remove` and `PushImage` on `ZoneService` and `ComputeService`, which were never built.
 
 ## [0.4.1] - 2026-11-02
 

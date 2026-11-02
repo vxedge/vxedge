@@ -6,18 +6,21 @@ package vxedge.v1;
 // (or references to them) and never introduces a second source of truth.
 message ManifestRef {
   oneof source {
-    // Path to a manifest file readable by the daemon.
+    // A workspace directory, or a manifest file inside one, readable by the daemon. The daemon's
+    // own filesystem, not the caller's.
     string path = 1;
     // Full manifest document inlined as YAML.
     string inline_yaml = 2;
   }
-  // Optional expected SHA-256 of the manifest content; the daemon rejects
-  // the call if the checksum does not match (reproducibility guard).
+  // Optional expected workspace identity; the daemon answers FAILED_PRECONDITION if it does not
+  // match (reproducibility guard). For `path`, or `inline_yaml` with `resolved_dir`, this is the
+  // SHA-256 over every file in the workspace (`ARCHITECTURE.md` §13), not the hash of one
+  // document. For a genuinely inline manifest it is the SHA-256 of `inline_yaml`.
   string sha256 = 3;
   // Internal orchestration hint, not part of the public contract: when a stage forwards an
-  // already-resolved workspace as `inline_yaml` (ExperimentService's own stages do this so
-  // every stage sees the identical document, rather than each re-reading the workspace from
-  // disk), this carries the workspace directory that document was read from, since
+  // already-resolved workspace as `inline_yaml` (ExperimentService's and VehicleService's stages
+  // do this so every stage sees the identical document, rather than each re-reading the workspace
+  // from disk), this carries the workspace directory that document was read from, since
   // `inline_yaml` alone has no directory to resolve local refs (bundles, baseline parts)
   // against. Empty for a genuinely-inline manifest (no workspace) and for any external
   // caller — those already send `path`, which resolves correctly without this field. Found
@@ -42,6 +45,7 @@ enum ResourceKind {
   RESOURCE_KIND_EXPERIMENT = 6;
   RESOURCE_KIND_TRAFFIC = 7;
   RESOURCE_KIND_NOS_CHECK = 8;
+  RESOURCE_KIND_SIGNAL_PLANE = 9;
 }
 
 enum ResourceState {
@@ -51,6 +55,106 @@ enum ResourceState {
   RESOURCE_STATE_UP = 3;
   RESOURCE_STATE_DEGRADED = 4;
   RESOURCE_STATE_ERROR = 5;
+  // Declared by the workspace, and nothing provisions it: for example a device with no
+  // slice-bound link. A fact about the workspace, not a fault, so it stays out of any rollup.
+  RESOURCE_STATE_UNPROVISIONED = 6;
+}
+
+// Why a call was refused or a job failed. A client branches on this, never on message text.
+// Refusals carry `google.rpc.ErrorInfo`: its `reason` is one of these value names, and its `domain`
+// is `vxedge.v1`. A failed `Job` carries the same value in `error_reason`.
+enum ErrorReason {
+  ERROR_REASON_UNSPECIFIED = 0;
+  // The caller named a workspace that is not the active one.
+  ERROR_REASON_WRONG_WORKSPACE = 1;
+  // The host is running something this workspace does not declare.
+  ERROR_REASON_FOREIGN_WORKLOAD = 2;
+  // The verb acts on what is active, and nothing is.
+  ERROR_REASON_NO_ACTIVE_RUN = 3;
+  // `RunRef` does not name the active run.
+  ERROR_REASON_RUN_MISMATCH = 4;
+  // The active workspace was edited since `up`, so its plans would not describe what is running.
+  ERROR_REASON_WORKSPACE_CHANGED = 5;
+  // The workspace does not load: a parse, cross-reference or invariant failure.
+  ERROR_REASON_WORKSPACE_INVALID = 6;
+  // `ManifestRef.sha256` does not match the workspace.
+  ERROR_REASON_CHECKSUM_MISMATCH = 7;
+  // `service_type` is empty or not one the daemon knows.
+  ERROR_REASON_UNKNOWN_SERVICE_TYPE = 8;
+  // The workspace declares a host requirement this host does not meet.
+  ERROR_REASON_HOST_REQUIREMENT_UNMET = 9;
+  // A `localhost/` image is not in this host's Podman store.
+  ERROR_REASON_LOCAL_IMAGE_MISSING = 10;
+  // A local guest bundle has not been built on this host.
+  ERROR_REASON_LOCAL_BUNDLE_MISSING = 11;
+  // A capsule's WebAssembly module is not on this host.
+  ERROR_REASON_CAPSULE_MODULE_MISSING = 12;
+  // A placed service's artifact store is missing.
+  ERROR_REASON_ARTIFACT_STORE_MISSING = 13;
+  // `vxedged`'s runtime dir is too long for a Cloud Hypervisor API socket.
+  ERROR_REASON_RUNTIME_DIR_TOO_LONG = 14;
+  // A container node's gateway port went with its namespace after `zone down`. Run the vehicle or
+  // experiment `up` again to recreate it.
+  ERROR_REASON_NODE_PORT_GONE = 15;
+  // Another lifecycle operation is running on this host.
+  ERROR_REASON_BUSY = 16;
+  // The job id is unknown: it never existed, aged out, or predates a daemon restart. Re-read
+  // `RunService`.
+  ERROR_REASON_JOB_UNKNOWN = 17;
+  // A subscriber fell behind, or its `after_id` left the bounded history, so events were lost.
+  // Re-read status, then subscribe again.
+  ERROR_REASON_EVENTS_LOST = 18;
+  // This job cannot be cancelled, for example a `down`.
+  ERROR_REASON_NOT_CANCELLABLE = 19;
+}
+
+// Names one run. See `RunService`.
+message RunRef {
+  string run_id = 1;
+}
+
+// How a node runs. The manifest's `backend:` values.
+enum NodeBackend {
+  NODE_BACKEND_UNSPECIFIED = 0;
+  NODE_BACKEND_CONTAINER = 1;
+  NODE_BACKEND_QEMU_MICROVM = 2;
+  NODE_BACKEND_LIBVIRT = 3;
+  NODE_BACKEND_CLOUD_HYPERVISOR = 4;
+  NODE_BACKEND_WASM_CAPSULE = 5;
+}
+
+// What a node runs.
+enum PayloadKind {
+  PAYLOAD_KIND_UNSPECIFIED = 0;
+  // A host process in the node's namespace: a `local/...` part.
+  PAYLOAD_KIND_HOST_PROCESS = 1;
+  PAYLOAD_KIND_CONTAINER = 2;
+  PAYLOAD_KIND_GUEST_BUNDLE = 3;
+  PAYLOAD_KIND_WASM = 4;
+}
+
+message NodePayload {
+  PayloadKind kind = 1;
+  // The part reference, or the local path of a local part.
+  string reference = 2;
+  // `sha256:...` of a published part. Empty for a local one.
+  string digest = 3;
+}
+
+// One node as the workspace plans it. The typed form of what `ResourceStatus.detail` holds as text.
+message NodeSpec {
+  string vxid = 1;
+  string zone = 2;
+  // The device's `role:`, as the manifest spells it (`hpc`, `ecu`, `sensor`, ...).
+  string role = 3;
+  NodeBackend backend = 4;
+  // Bridge access port.
+  string port = 5;
+  // The peer end: the veth moved into a container namespace, or the port itself for a tap.
+  string peer = 6;
+  uint32 vlan = 7;
+  string slice = 8;
+  NodePayload payload = 9;
 }
 
 // Observed status of a single resource, as reported by the reconciler.
@@ -59,5 +163,15 @@ message ResourceStatus {
   ResourceKind kind = 2;
   ResourceState state = 3;
   string detail = 4;
+  // When the resource entered this state, or 0 if that is not known. The daemon keeps no history,
+  // so after a restart it usually is not.
   int64 since_unix_ms = 5;
+  // When this status was read.
+  int64 observed_unix_ms = 6;
+}
+
+// A node's observed state and what the workspace plans for it.
+message NodeStatus {
+  ResourceStatus status = 1;
+  NodeSpec spec = 2;
 }

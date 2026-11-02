@@ -23,12 +23,13 @@ use vxedge_api::v1::{
     ComputeApplyRequest, ComputeDownRequest, ComputeListRequest, ComputeListResponse,
     ComputeRemoveRequest, ComputeUpRequest, Event, GatewayApplyRequest, GatewayDownRequest,
     GatewayStatus, GatewayStatusRequest, GatewayUpRequest, GetJobRequest, ImagePushRequest,
-    ImagePushResponse, ImpairmentStatus, IngressFilterStatus, Job, ManifestRef,
-    NosCheckDownRequest, NosCheckStatus, NosCheckStatusRequest, NosCheckUpRequest,
-    NosCheckVerifyRequest, ResourceKind, ResourceState, ResourceStatus, SliceStatus,
-    SubscribeRequest, SvcDownRequest, SvcStatusRequest, SvcUpRequest, TrafficDownRequest,
-    TrafficUpRequest, TunnelStatus, WatchJobRequest, ZoneApplyRequest, ZoneDownRequest,
-    ZoneListRequest, ZoneListResponse, ZoneRemoveRequest, ZoneUpRequest,
+    ImagePushResponse, ImpairmentStatus, IngressFilterStatus, Job, JobCancelRequest,
+    JobListRequest, JobListResponse, ManifestRef, NosCheckDownRequest, NosCheckStatus,
+    NosCheckStatusRequest, NosCheckUpRequest, NosCheckVerifyRequest, ResourceKind, ResourceState,
+    ResourceStatus, SliceStatus, SubscribeRequest, SvcDownRequest, SvcStatusRequest, SvcUpRequest,
+    TrafficDownRequest, TrafficStatus, TrafficStatusRequest, TrafficUpRequest, TunnelStatus,
+    WatchJobRequest, ZoneApplyRequest, ZoneDownRequest, ZoneListRequest, ZoneListResponse,
+    ZoneRemoveRequest, ZoneUpRequest,
 };
 use vxedge_core::Workspace;
 use vxedge_core::containers::LazyClient;
@@ -991,6 +992,7 @@ impl GatewaySvc {
                 state: state as i32,
                 detail,
                 since_unix_ms: now_ms(),
+                ..Default::default()
             }),
             slices,
             impairments,
@@ -1007,6 +1009,14 @@ pub struct JobSvc {
 #[tonic::async_trait]
 impl JobService for JobSvc {
     type WatchStream = Pin<Box<dyn Stream<Item = Result<Job, Status>> + Send>>;
+
+    async fn list(&self, _: Request<JobListRequest>) -> Result<Response<JobListResponse>, Status> {
+        Err(Status::unimplemented("JobService.List: not built yet"))
+    }
+
+    async fn cancel(&self, _: Request<JobCancelRequest>) -> Result<Response<Job>, Status> {
+        Err(Status::unimplemented("JobService.Cancel: not built yet"))
+    }
 
     async fn get(&self, req: Request<GetJobRequest>) -> Result<Response<Job>, Status> {
         let id = &req.get_ref().id;
@@ -1291,7 +1301,10 @@ impl ZoneService for ZoneSvc {
         })
         .await
         .map_err(|e| Status::internal(format!("status task panicked: {e}")))?;
-        Ok(Response::new(ZoneListResponse { zones: statuses }))
+        Ok(Response::new(ZoneListResponse {
+            zones: statuses,
+            ..Default::default()
+        }))
     }
 
     async fn remove(&self, _: Request<ZoneRemoveRequest>) -> Result<Response<Job>, Status> {
@@ -1527,7 +1540,10 @@ impl ComputeService for ComputeSvc {
         })
         .await
         .map_err(|e| Status::internal(format!("status task panicked: {e}")))?;
-        Ok(Response::new(ComputeListResponse { nodes: statuses }))
+        Ok(Response::new(ComputeListResponse {
+            nodes: statuses,
+            ..Default::default()
+        }))
     }
 
     async fn remove(&self, _: Request<ComputeRemoveRequest>) -> Result<Response<Job>, Status> {
@@ -1813,6 +1829,7 @@ impl SvcService for SvcSvc {
             state: state as i32,
             detail,
             since_unix_ms: now_ms(),
+            ..Default::default()
         }))
     }
 }
@@ -1891,6 +1908,15 @@ fn select_profiles(
 
 #[tonic::async_trait]
 impl TrafficService for TrafficSvc {
+    async fn status(
+        &self,
+        _: Request<TrafficStatusRequest>,
+    ) -> Result<Response<TrafficStatus>, Status> {
+        Err(Status::unimplemented(
+            "TrafficService.Status: not built yet",
+        ))
+    }
+
     async fn up(&self, req: Request<TrafficUpRequest>) -> Result<Response<Job>, Status> {
         let req = req.into_inner();
         let (traffic_plan, five_g_plan, sha256, duration_s) =

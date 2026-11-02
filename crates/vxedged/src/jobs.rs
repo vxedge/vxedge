@@ -89,6 +89,7 @@ impl JobEngine {
             error: String::new(),
             created_unix_ms: now_ms(),
             updated_unix_ms: now_ms(),
+            ..Default::default()
         };
         let (tx, _) = watch::channel(job.clone());
         self.inner.jobs.lock().await.insert(id.clone(), tx.clone());
