@@ -48,11 +48,6 @@ pub enum ZonePlanError {
     )]
     AmbiguousModule { device: String, count: usize },
     #[error(
-        "device `{device}`: wasm part `{reference}` is not a local file, and a capsule runs one \
-         from this workspace only. Point `ref` at a path such as `./parts/sensor.wasm`."
-    )]
-    PublishedModule { device: String, reference: String },
-    #[error(
         "device `{device}` attaches to the gateway twice (slices `{first}` and `{second}`), and \
          a node has one port today. Give each slice its own device."
     )]
@@ -95,7 +90,8 @@ pub struct NodePlan {
     /// a local part resolves straight to `bundle`, a published one resolves to `remote_bundle`
     /// for `zones::node_up` to fetch immediately before boot (see that function's doc comment).
     pub bundle: Option<PathBuf>,
-    /// For `wasm-capsule`: the local module file a `vxcapsule` runner loads.
+    /// For `wasm-capsule`: the module file a `vxcapsule` runner loads. A published module is
+    /// left to `zones::node_up` to fetch, through `remote_bundle`.
     pub module: Option<PathBuf>,
     /// `(reference, digest)` for a published, not-yet-fetched bundle part. Set instead of
     /// `bundle` when the part is not local — `zones::node_up` resolves this into a real
@@ -258,9 +254,22 @@ pub fn plan_nodes_from_model(
                     | Backend::CloudHypervisor
                     | Backend::WasmCapsule => None,
                 };
-                let module = match backend {
-                    Backend::WasmCapsule => Some(capsule_module(entity, device, workspace_dir)?),
-                    _ => None,
+                // A capsule's module is a local file, or a published part `zones::node_up`
+                // fetches, the same split a VM bundle has.
+                let (module, remote_bundle) = match backend {
+                    Backend::WasmCapsule => match capsule_module(entity, device)? {
+                        part if part.local => {
+                            (Some(local_path(&part.reference, workspace_dir)), None)
+                        }
+                        part => {
+                            let digest = part.digest.clone().expect(
+                                "workspace validation guarantees a digest for every published \
+                                 (non-local) part",
+                            );
+                            (None, Some((part.reference.clone(), digest)))
+                        }
+                    },
+                    _ => (None, remote_bundle),
                 };
                 if bundle.is_none()
                     && remote_bundle.is_none()
@@ -317,12 +326,11 @@ pub fn plan_nodes_from_model(
 /// `initrd.img`), resolved the same way [`plan_nodes_from_model`] resolves them. Lets a caller
 /// refuse *before* provisioning anything: a bundle built from a local recipe embeds the host
 /// kernel, so it is per-host and a fresh clone never has one.
-/// The one local module a `wasm-capsule` device runs, resolved against the workspace.
-fn capsule_module(
-    entity: &crate::model::Entity,
-    device: &crate::model::Device,
-    workspace_dir: &Path,
-) -> Result<PathBuf, ZonePlanError> {
+/// The one module a `wasm-capsule` device runs.
+fn capsule_module<'a>(
+    entity: &'a crate::model::Entity,
+    device: &'a crate::model::Device,
+) -> Result<&'a crate::model::Part, ZonePlanError> {
     let modules: Vec<&crate::model::Part> = entity
         .functions_on(&device.id)
         .filter_map(|f| f.part.as_ref())
@@ -332,11 +340,7 @@ fn capsule_module(
         [] => Err(ZonePlanError::MissingModule {
             device: device.id.clone(),
         }),
-        [part] if part.local => Ok(local_path(&part.reference, workspace_dir)),
-        [part] => Err(ZonePlanError::PublishedModule {
-            device: device.id.clone(),
-            reference: part.reference.clone(),
-        }),
+        [part] => Ok(part),
         many => Err(ZonePlanError::AmbiguousModule {
             device: device.id.clone(),
             count: many.len(),
@@ -626,6 +630,58 @@ parts:
             plan_nodes_from_model(&model, &gw, Path::new("/x")),
             Err(ZonePlanError::AmbiguousImage { device, count: 2 }) if device == "node-b"
         ));
+    }
+
+    const CAPSULE_WS: &str = r#"
+kind: experiment
+id: exp
+vehicles: [veh]
+baseline: bl
+network:
+  slices:
+    - { id: adas, mode: vlan, vlan: 101 }
+---
+kind: vehicle
+id: veh
+devices:
+  sensor-01: { role: sensor, backend: wasm-capsule }
+functions:
+  f: { deployed_on: sensor-01 }
+links:
+  - { id: l1, endpoints: [sensor-01:eth0], slice: adas }
+---
+kind: baseline
+id: bl
+parts:
+  - PART
+"#;
+
+    fn capsule_plan(part: &str) -> Result<NodePlan, ZonePlanError> {
+        let model = crate::model::load_yaml(&CAPSULE_WS.replace("PART", part)).unwrap();
+        let gateway = GatewayPlan::from_model(&model).unwrap();
+        plan_nodes_from_model(&model, &gateway, Path::new("/ws")).map(|mut p| p.remove(0))
+    }
+
+    #[test]
+    fn a_local_module_resolves_against_the_workspace() {
+        let node = capsule_plan("{ ref: ./parts/s.wasm, kind: wasm, target_ids: f }").unwrap();
+        assert_eq!(node.module, Some(PathBuf::from("/ws/./parts/s.wasm")));
+        assert_eq!(node.remote_bundle, None);
+    }
+
+    #[test]
+    fn a_published_module_is_left_for_node_up_to_fetch() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let node = capsule_plan(&format!(
+            "{{ ref: ghcr.io/vxedge/parts/zone/wasm/app/c, digest: '{digest}', kind: wasm, \
+             target_ids: f }}"
+        ))
+        .unwrap();
+        assert_eq!(node.module, None);
+        assert_eq!(
+            node.remote_bundle,
+            Some(("ghcr.io/vxedge/parts/zone/wasm/app/c".to_string(), digest))
+        );
     }
 
     #[test]

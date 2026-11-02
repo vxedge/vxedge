@@ -843,10 +843,17 @@ pub fn node_up(
                     source,
                 }
             })?;
-        resolved = NodePlan {
-            bundle: Some(pulled_dir),
-            remote_bundle: None,
-            ..np.clone()
+        resolved = match np.backend {
+            Backend::WasmCapsule => NodePlan {
+                module: Some(wasm_capsule::module_in(np, &pulled_dir)?),
+                remote_bundle: None,
+                ..np.clone()
+            },
+            _ => NodePlan {
+                bundle: Some(pulled_dir),
+                remote_bundle: None,
+                ..np.clone()
+            },
         };
         &resolved
     } else {
