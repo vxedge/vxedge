@@ -17,6 +17,9 @@ All notable changes to this repo are documented here. Format follows
 
 ### Fixed
 
+- `vxedge experiment new` named a part that was never published, carrying another part's digest, so
+  a generated workspace could not pull it. It now uses the local `vxprobe`, as the shipped experiments
+  do.
 - A Cloud Hypervisor guest is seen from a daemon with another runtime dir, through its VMM's API
   socket. It used to read as down there, so `up` could start a second VMM and `vehicle down` could
   remove the gateway from under it. The host check for a vehicle this workspace does not declare
