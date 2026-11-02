@@ -50,7 +50,7 @@ use std::collections::BTreeMap;
 pub mod build;
 
 pub use build::{
-    LoadError, ModelError, build, load_dir, load_vehicle_yaml, load_yaml,
+    LoadError, ModelError, build, load_dir, load_vehicle_yaml, load_workspace_yaml, load_yaml,
     synthesize_vehicle_workspace,
 };
 

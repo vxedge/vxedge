@@ -36,9 +36,9 @@ use vxedge_api::v1::{
     ComputeDownRequest, ComputeListRequest, ComputeUpRequest, ExperimentDownRequest,
     ExperimentStatusRequest, ExperimentUpRequest, GatewayDownRequest, GatewayStatusRequest,
     GatewayUpRequest, Job, JobState, ManifestRef, NosCheckDownRequest, NosCheckStatusRequest,
-    NosCheckUpRequest, NosCheckVerifyRequest, SvcDownRequest, SvcUpRequest, TrafficDownRequest,
-    TrafficUpRequest, VehicleDownRequest, VehicleStatusRequest, VehicleUpRequest, VxidRef,
-    WatchJobRequest, ZoneDownRequest, ZoneListRequest, ZoneUpRequest,
+    NosCheckUpRequest, NosCheckVerifyRequest, SvcDownRequest, SvcStatusRequest, SvcUpRequest,
+    TrafficDownRequest, TrafficUpRequest, VehicleDownRequest, VehicleStatusRequest,
+    VehicleUpRequest, VxidRef, WatchJobRequest, ZoneDownRequest, ZoneListRequest, ZoneUpRequest,
 };
 
 #[derive(Parser, Debug)]
@@ -238,6 +238,11 @@ enum SvcCmd {
         experiment: Option<String>,
     },
     Down {
+        #[arg(long)]
+        experiment: Option<String>,
+    },
+    /// Report the service, wherever the workspace runs it.
+    Status {
         #[arg(long)]
         experiment: Option<String>,
     },
@@ -746,6 +751,30 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .into_inner();
                 watch_job(channel, job, cli.json).await?;
             }
+            SvcCmd::Status { experiment } => {
+                let workspace = resolve_experiment_arg(experiment)?;
+                let channel = connect(&cli.endpoint).await?;
+                let status = SvcServiceClient::new(channel)
+                    .status(SvcStatusRequest {
+                        service_type: "ota".to_string(),
+                        experiment: manifest_ref(&Some(workspace)),
+                    })
+                    .await?
+                    .into_inner();
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&JsonResource::from(&status))?
+                    );
+                } else {
+                    println!(
+                        "{}: {} ({})",
+                        status.vxid,
+                        resource_state_name(status.state),
+                        status.detail
+                    );
+                }
+            }
         },
         Command::NosCheck { cmd } => match cmd {
             NosCheckCmd::Up { experiment } => {
@@ -826,7 +855,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         })
                         .await?
                         .into_inner();
-                    print_vehicle_status(&st);
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&JsonVehicleStatus::from(&st))?
+                        );
+                    } else {
+                        print_vehicle_status(&st);
+                    }
                 }
                 ManifestLifecycleCmd::Up { manifest } => {
                     let job = veh
@@ -1255,6 +1291,43 @@ struct JsonTunnelStatus {
     kind: i32,
 }
 
+/// One resource, with its kind and state as words, like `vehicle status` prints them.
+#[derive(serde::Serialize)]
+struct JsonResource {
+    vxid: String,
+    kind: String,
+    state: String,
+    detail: String,
+}
+
+impl From<&vxedge_api::v1::ResourceStatus> for JsonResource {
+    fn from(s: &vxedge_api::v1::ResourceStatus) -> Self {
+        Self {
+            vxid: s.vxid.clone(),
+            kind: kind_name(s.kind),
+            state: resource_state_name(s.state),
+            detail: s.detail.clone(),
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct JsonVehicleStatus {
+    status: JsonResource,
+    components: Vec<JsonResource>,
+    gateway: Option<JsonStatus>,
+}
+
+impl From<&vxedge_api::v1::VehicleStatus> for JsonVehicleStatus {
+    fn from(v: &vxedge_api::v1::VehicleStatus) -> Self {
+        Self {
+            status: JsonResource::from(&v.status.clone().unwrap_or_default()),
+            components: v.components.iter().map(JsonResource::from).collect(),
+            gateway: v.gateway.as_ref().map(JsonStatus::from),
+        }
+    }
+}
+
 #[derive(serde::Serialize)]
 struct JsonStatus {
     vxid: String,
@@ -1338,5 +1411,37 @@ impl From<&Job> for JsonJob {
             message: j.message.clone(),
             error: j.error.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vxedge_api::v1::{ResourceKind, ResourceState, ResourceStatus, VehicleStatus};
+
+    #[test]
+    fn vehicle_status_json_keeps_every_part_of_the_reply() {
+        let status = VehicleStatus {
+            status: Some(ResourceStatus {
+                vxid: "car".into(),
+                kind: ResourceKind::Vehicle as i32,
+                state: ResourceState::Up as i32,
+                ..Default::default()
+            }),
+            components: vec![ResourceStatus {
+                vxid: "ecu2".into(),
+                kind: ResourceKind::Zone as i32,
+                state: ResourceState::Unspecified as i32,
+                detail: "declared, not provisioned: no slice-bound link".into(),
+                ..Default::default()
+            }],
+            gateway: Some(Default::default()),
+        };
+        let json = serde_json::to_value(JsonVehicleStatus::from(&status)).unwrap();
+        assert_eq!(json["status"]["vxid"], "car");
+        assert_eq!(json["status"]["state"], "up");
+        assert_eq!(json["components"][0]["kind"], "zone");
+        assert_eq!(json["components"][0]["state"], "not provisioned");
+        assert!(json["gateway"]["slices"].is_array());
     }
 }

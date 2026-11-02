@@ -31,6 +31,15 @@ pub fn wire_tunnel_kind(k: vxedge_core::model::TunnelKind) -> vxedge_api::v1::Tu
     }
 }
 
+/// The kind a device reports as: the role an OEM engineer thinks in, whichever service addressed it.
+pub fn node_kind(role: vxedge_core::model::DeviceRole) -> ResourceKind {
+    if role == vxedge_core::model::DeviceRole::Hpc {
+        ResourceKind::Compute
+    } else {
+        ResourceKind::Zone
+    }
+}
+
 /// Builds one `ResourceStatus` from anything `Observable`, plus the identity/kind vxedged
 /// itself always knows. An `Observable` domain type never carries its own `vxid`/`kind` — those
 /// are routing information the daemon owns (which node, which resource kind), not something
