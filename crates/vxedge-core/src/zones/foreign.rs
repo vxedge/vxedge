@@ -12,6 +12,7 @@ use super::plan::NodePlan;
 const ACCESS_PREFIX: &str = "vz-";
 const GUEST_MARKER: &str = "vx.node=";
 const CH_BINARY: &str = "cloud-hypervisor";
+const CAPSULE_BINARY: &str = "vxcapsule";
 const CH_SOCKET_SUFFIX: &str = ".ch.sock";
 
 /// Host objects belonging to no node in `nodes`, named for an error message. Sorted, and empty
@@ -95,6 +96,12 @@ fn guest_node(cmdline: &[u8]) -> Option<String> {
     let cmdline = String::from_utf8_lossy(cmdline);
     let mut args = cmdline.split('\0');
     let bin = args.next()?;
+    if Path::new(bin).file_name()?.to_str()? == CAPSULE_BINARY {
+        return args
+            .skip_while(|arg| *arg != "--node")
+            .nth(1)
+            .map(str::to_owned);
+    }
     if !bin.contains("qemu") {
         return None;
     }
@@ -176,6 +183,15 @@ parts:
         assert_eq!(guest_node(qemu).as_deref(), Some("zone-fl"));
         assert_eq!(guest_node(b"/bin/bash\0-c\0grep vx.node=zone-fl\0"), None);
         assert_eq!(guest_node(b"qemu-system-x86_64\0-m\x00128m\0"), None);
+    }
+
+    #[test]
+    fn a_capsule_runner_counts_as_a_guest_of_its_node() {
+        let runner = b"/opt/vxedge/vxcapsule\0--node\0sensor-01\0/parts/s.wasm\0";
+        assert_eq!(guest_node(runner).as_deref(), Some("sensor-01"));
+        assert_eq!(guest_node(b"/opt/vxedge/vxcapsule\0--version\0"), None);
+        let shell = b"/bin/bash\0-c\0vxcapsule --node sensor-01 s.wasm\0";
+        assert_eq!(guest_node(shell), None);
     }
 
     #[test]

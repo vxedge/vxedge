@@ -10,9 +10,9 @@ const MAX_SLICES: usize = 200;
 pub enum PlanError {
     #[error(
         "device `{0}` is attached to a slice but declares no `backend` — the planner has to know \
-         whether to build a veth (container) or a tap (qemu-microvm/libvirt/cloud-hypervisor), and guessing is \
+         whether to build a veth (container/wasm-capsule) or a tap (qemu-microvm/libvirt/cloud-hypervisor), and guessing is \
          what produced a manifest that validated and then could not boot. Add \
-         `backend: container|qemu-microvm|libvirt|cloud-hypervisor`."
+         `backend: container|qemu-microvm|libvirt|cloud-hypervisor|wasm-capsule`."
     )]
     DeviceWithoutBackend(String),
     #[error("no `network.slices` at all — nothing to provision")]
@@ -337,7 +337,9 @@ impl GatewayPlan {
                         .backend
                         .ok_or_else(|| PlanError::DeviceWithoutBackend(device.id.clone()))?;
                     let kind = match backend {
-                        crate::model::Backend::Container => EndpointKind::Veth,
+                        crate::model::Backend::Container | crate::model::Backend::WasmCapsule => {
+                            EndpointKind::Veth
+                        }
                         crate::model::Backend::Libvirt
                         | crate::model::Backend::QemuMicrovm
                         | crate::model::Backend::CloudHypervisor => EndpointKind::Tap,

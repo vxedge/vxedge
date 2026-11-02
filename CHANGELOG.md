@@ -9,6 +9,11 @@ All notable changes to this repo are documented here. Format follows
 ### Added
 
 - `vxedge doctor --tier 2` reports Cloud Hypervisor, as an optional check.
+- **`backend: wasm-capsule`** (prototype): a zone node can run a local WASI 0.2 command component,
+  a `kind: wasm` part, for a sensor or ECU simulable as a sandboxed control loop. Its network is a
+  container node's: a named namespace with the gateway port as `eth0`. The new `vxcapsule` binary
+  runs it inside that namespace, unprivileged and with no filesystem access, and ships beside
+  `vxedged`. Validated on a UDP reflector capsule only; published modules are refused for now.
 
 ### Fixed
 
@@ -16,6 +21,13 @@ All notable changes to this repo are documented here. Format follows
   socket. It used to read as down there, so `up` could start a second VMM and `vehicle down` could
   remove the gateway from under it. The host check for a vehicle this workspace does not declare
   names these guests too. Both daemons must run as the same user.
+- Under `setcap`, `vxedged` could not create a node's named namespace, because `/run/netns` is
+  root's. Creating and removing one now uses the `ip` sudo entry when `vxedged` is unprivileged.
+
+### Security
+
+- Lockfile update `pulldown-cmark` 0.13.5 -> 0.13.6, which fixes RUSTSEC-2026-0433 (quadratic parsing
+  with `ENABLE_WIKILINKS`). It is a build-time dependency via `prost-build`.
 
 ## [0.3.0] - 2026-11-02
 

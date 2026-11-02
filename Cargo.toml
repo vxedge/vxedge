@@ -5,6 +5,7 @@ members = [
     "crates/vxedge-core",
     "crates/vxedged",
     "crates/vxedge-cli",
+    "crates/vxcapsule",
 ]
 
 [workspace.package]

@@ -249,6 +249,20 @@ impl VehicleService for VehicleSvc {
                 )));
             }
         }
+        if let Some(d) = dir.as_deref() {
+            let missing = vxedge_core::zones::missing_local_modules(&model, d);
+            if !missing.is_empty() {
+                let list = missing
+                    .iter()
+                    .map(|p| format!("  {}", p.display()))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return Err(Status::failed_precondition(format!(
+                    "vehicle `{id}` runs a capsule module that is not on this host:\n{list}\n\
+                     Build the module, or correct the part's `ref`, then run `vehicle up` again."
+                )));
+            }
+        }
         self.audit.record(
             "VehicleService.Up",
             serde_json::json!({ "vehicle": id, "workspace_sha256": sha256 }),
