@@ -359,6 +359,7 @@ impl From<TemplateArg> for vxedge_core::Template {
 enum StageArg {
     Gateway,
     Zones,
+    SignalPlane,
     Services,
 }
 
@@ -367,6 +368,7 @@ impl StageArg {
         match self {
             StageArg::Gateway => vxedge_api::v1::ExperimentStage::Gateway as i32,
             StageArg::Zones => vxedge_api::v1::ExperimentStage::Zones as i32,
+            StageArg::SignalPlane => vxedge_api::v1::ExperimentStage::SignalPlane as i32,
             StageArg::Services => vxedge_api::v1::ExperimentStage::Services as i32,
         }
     }
@@ -639,6 +641,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let job = zc
                     .up(ZoneUpRequest {
                         r#ref: Some(VxidRef { vxid: vxid.clone() }),
+                        ..Default::default()
                     })
                     .await?
                     .into_inner();
@@ -650,6 +653,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let job = zc
                     .down(ZoneDownRequest {
                         r#ref: Some(VxidRef { vxid: vxid.clone() }),
+                        ..Default::default()
                     })
                     .await?
                     .into_inner();
@@ -658,7 +662,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             ZoneCmd::List => {
                 let channel = connect(&cli.endpoint).await?;
                 let mut zc = ZoneServiceClient::new(channel);
-                let resp = zc.list(ZoneListRequest {}).await?.into_inner();
+                let resp = zc.list(ZoneListRequest::default()).await?.into_inner();
                 if cli.json {
                     let rows: Vec<serde_json::Value> = resp
                         .zones
@@ -685,6 +689,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let job = cc
                     .up(ComputeUpRequest {
                         r#ref: Some(VxidRef { vxid: vxid.clone() }),
+                        ..Default::default()
                     })
                     .await?
                     .into_inner();
@@ -696,6 +701,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let job = cc
                     .down(ComputeDownRequest {
                         r#ref: Some(VxidRef { vxid: vxid.clone() }),
+                        ..Default::default()
                     })
                     .await?
                     .into_inner();
@@ -704,7 +710,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             ComputeCmd::List => {
                 let channel = connect(&cli.endpoint).await?;
                 let mut cc = ComputeServiceClient::new(channel);
-                let resp = cc.list(ComputeListRequest {}).await?.into_inner();
+                let resp = cc.list(ComputeListRequest::default()).await?.into_inner();
                 if cli.json {
                     let rows: Vec<serde_json::Value> = resp
                         .nodes
@@ -733,6 +739,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .up(SvcUpRequest {
                         service_type: "ota".to_string(),
                         experiment: manifest_ref(&Some(workspace)),
+                        ..Default::default()
                     })
                     .await?
                     .into_inner();
@@ -746,6 +753,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .down(SvcDownRequest {
                         service_type: "ota".to_string(),
                         experiment: manifest_ref(&Some(workspace)),
+                        ..Default::default()
                     })
                     .await?
                     .into_inner();
@@ -758,6 +766,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .status(SvcStatusRequest {
                         service_type: "ota".to_string(),
                         experiment: manifest_ref(&Some(workspace)),
+                        ..Default::default()
                     })
                     .await?
                     .into_inner();
@@ -784,6 +793,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let job = nc
                     .up(NosCheckUpRequest {
                         experiment: manifest_ref(&Some(workspace)),
+                        ..Default::default()
                     })
                     .await?
                     .into_inner();
@@ -796,6 +806,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let job = nc
                     .down(NosCheckDownRequest {
                         experiment: manifest_ref(&Some(workspace)),
+                        ..Default::default()
                     })
                     .await?
                     .into_inner();
@@ -808,6 +819,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let resp = nc
                     .status(NosCheckStatusRequest {
                         experiment: manifest_ref(&Some(workspace)),
+                        ..Default::default()
                     })
                     .await?
                     .into_inner();
@@ -833,6 +845,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let job = nc
                     .verify(NosCheckVerifyRequest {
                         experiment: manifest_ref(&Some(workspace)),
+                        ..Default::default()
                     })
                     .await?
                     .into_inner();
@@ -868,6 +881,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let job = veh
                         .up(VehicleUpRequest {
                             manifest: manifest_ref(&Some(manifest.clone())),
+                            ..Default::default()
                         })
                         .await?
                         .into_inner();
@@ -877,6 +891,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let job = veh
                         .down(VehicleDownRequest {
                             manifest: manifest_ref(&Some(manifest.clone())),
+                            ..Default::default()
                         })
                         .await?
                         .into_inner();
@@ -1024,6 +1039,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .up(TrafficUpRequest {
                         manifest: manifest_ref(&Some(manifest.clone())),
                         profiles: profiles.clone(),
+                        ..Default::default()
                     })
                     .await?
                     .into_inner();
@@ -1036,6 +1052,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .down(TrafficDownRequest {
                         manifest: manifest_ref(&Some(manifest.clone())),
                         profiles: profiles.clone(),
+                        ..Default::default()
                     })
                     .await?
                     .into_inner();
@@ -1098,6 +1115,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mut stream = client
                 .subscribe(vxedge_api::v1::SubscribeRequest {
                     kinds: kinds.clone(),
+                    ..Default::default()
                 })
                 .await?
                 .into_inner();
@@ -1436,6 +1454,7 @@ mod tests {
                 ..Default::default()
             }],
             gateway: Some(Default::default()),
+            ..Default::default()
         };
         let json = serde_json::to_value(JsonVehicleStatus::from(&status)).unwrap();
         assert_eq!(json["status"]["vxid"], "car");

@@ -220,6 +220,7 @@ async fn the_daemon_serves_a_status_call() {
         .status(SvcStatusRequest {
             service_type: "ota".into(),
             experiment: None,
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -237,6 +238,7 @@ async fn svc_reads_a_bare_vehicle_workspace() {
         .status(SvcStatusRequest {
             service_type: "ota".into(),
             experiment: path_ref(&ws),
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -250,6 +252,7 @@ async fn svc_reads_a_bare_vehicle_workspace() {
         .up(SvcUpRequest {
             service_type: "ota".into(),
             experiment: path_ref(&ws),
+            ..Default::default()
         })
         .await;
     assert!(up.is_ok(), "a bare vehicle workspace is valid: {up:?}");
@@ -263,6 +266,7 @@ async fn svc_status_with_no_workspace_uses_the_active_one() {
         .status(SvcStatusRequest {
             service_type: "ota".into(),
             experiment: None,
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -319,7 +323,7 @@ async fn zone_and_compute_verbs_work_after_a_daemon_restart() {
     let daemon = Daemon::start_with(|run| write_active_record(run, &vehicle_id(), &ws, None));
     let channel = daemon.channel().await;
     let zones = ZoneServiceClient::new(channel.clone())
-        .list(ZoneListRequest {})
+        .list(ZoneListRequest::default())
         .await
         .unwrap()
         .into_inner()
@@ -328,7 +332,7 @@ async fn zone_and_compute_verbs_work_after_a_daemon_restart() {
     ids.sort();
     assert_eq!(ids, ["ecu1", "hpc1"]);
     let nodes = ComputeServiceClient::new(channel)
-        .list(ComputeListRequest {})
+        .list(ComputeListRequest::default())
         .await
         .unwrap()
         .into_inner()
@@ -343,7 +347,7 @@ async fn a_workspace_edited_since_up_is_not_restored() {
     let daemon =
         Daemon::start_with(|run| write_active_record(run, &vehicle_id(), &ws, Some("stale")));
     let refused = ZoneServiceClient::new(daemon.channel().await)
-        .list(ZoneListRequest {})
+        .list(ZoneListRequest::default())
         .await
         .unwrap_err();
     assert_eq!(
@@ -359,7 +363,7 @@ async fn a_zone_list_labels_hpc_devices_as_compute() {
     let ws = vehicle_workspace();
     let daemon = Daemon::start_with(|run| write_active_record(run, &vehicle_id(), &ws, None));
     let zones = ZoneServiceClient::new(daemon.channel().await)
-        .list(ZoneListRequest {})
+        .list(ZoneListRequest::default())
         .await
         .unwrap()
         .into_inner()
@@ -376,6 +380,7 @@ async fn service_events_and_status_share_one_resource_id() {
     let mut events = EventServiceClient::new(channel.clone())
         .subscribe(SubscribeRequest {
             kinds: vec!["service.down".into()],
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -384,6 +389,7 @@ async fn service_events_and_status_share_one_resource_id() {
         .down(SvcDownRequest {
             service_type: "ota".into(),
             experiment: None,
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -413,7 +419,7 @@ async fn vehicle_status_reports_a_declared_signal_plane() {
         .iter()
         .find(|c| c.vxid == "kuksa-databroker")
         .expect("a declared signal plane is a status component");
-    assert_eq!(broker.kind, ResourceKind::Service as i32);
+    assert_eq!(broker.kind, ResourceKind::SignalPlane as i32);
     assert_eq!(broker.state, ResourceState::Down as i32);
     assert!(broker.detail.contains("on `hpc1`"), "{}", broker.detail);
 }
@@ -463,8 +469,8 @@ async fn a_missing_local_signal_plane_image_is_refused_before_the_gateway() {
     );
 }
 
-/// The services stage alone, with no node up, so the stage has nothing to join. It has to fail
-/// and name the databroker: an `experiment up` that skipped it would report success.
+/// The signal plane stage alone, with no node up, so it has nothing to join. It has to fail and
+/// name the databroker: an `experiment up` that skipped it would report success.
 #[tokio::test]
 async fn experiment_up_does_not_skip_a_declared_signal_plane() {
     let daemon = Daemon::start();
@@ -473,7 +479,7 @@ async fn experiment_up_does_not_skip_a_declared_signal_plane() {
     let job = ExperimentServiceClient::new(channel.clone())
         .up(ExperimentUpRequest {
             manifest: path_ref(&ws),
-            stages: vec![ExperimentStage::Services as i32],
+            stages: vec![ExperimentStage::SignalPlane as i32],
         })
         .await
         .unwrap()
@@ -490,4 +496,62 @@ async fn experiment_up_does_not_skip_a_declared_signal_plane() {
         "{}",
         failed.error
     );
+}
+
+/// The contract is ahead of the daemon until 0.5.0. Each RPC leaves this list when it is built, and
+/// a release needs the list empty, so a stub cannot ship by accident.
+#[tokio::test]
+async fn rpcs_still_to_build_answer_unimplemented() {
+    use tonic::Code::Unimplemented;
+    use vxedge_api::v1::host_service_client::HostServiceClient;
+    use vxedge_api::v1::run_service_client::RunServiceClient;
+    use vxedge_api::v1::traffic_service_client::TrafficServiceClient;
+    use vxedge_api::v1::workspace_service_client::WorkspaceServiceClient;
+
+    let daemon = Daemon::start();
+    let channel = daemon.channel().await;
+    let mut jobs = JobServiceClient::new(channel.clone());
+    let codes = [
+        jobs.list(vxedge_api::v1::JobListRequest::default())
+            .await
+            .map(|_| ())
+            .unwrap_err()
+            .code(),
+        jobs.cancel(vxedge_api::v1::JobCancelRequest::default())
+            .await
+            .map(|_| ())
+            .unwrap_err()
+            .code(),
+        TrafficServiceClient::new(channel.clone())
+            .status(vxedge_api::v1::TrafficStatusRequest::default())
+            .await
+            .map(|_| ())
+            .unwrap_err()
+            .code(),
+        RunServiceClient::new(channel.clone())
+            .list(vxedge_api::v1::RunListRequest::default())
+            .await
+            .map(|_| ())
+            .unwrap_err()
+            .code(),
+        RunServiceClient::new(channel.clone())
+            .get(vxedge_api::v1::RunGetRequest::default())
+            .await
+            .map(|_| ())
+            .unwrap_err()
+            .code(),
+        WorkspaceServiceClient::new(channel.clone())
+            .plan(vxedge_api::v1::WorkspacePlanRequest::default())
+            .await
+            .map(|_| ())
+            .unwrap_err()
+            .code(),
+        HostServiceClient::new(channel)
+            .capabilities(vxedge_api::v1::HostCapabilitiesRequest::default())
+            .await
+            .map(|_| ())
+            .unwrap_err()
+            .code(),
+    ];
+    assert_eq!(codes, [Unimplemented; 7]);
 }

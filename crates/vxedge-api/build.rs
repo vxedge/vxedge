@@ -5,6 +5,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "../../proto/vxedge/v1/events.proto",
         "../../proto/vxedge/v1/telemetry.proto",
         "../../proto/vxedge/v1/lifecycle.proto",
+        "../../proto/vxedge/v1/runs.proto",
+        "../../proto/vxedge/v1/workspace.proto",
     ];
     tonic_prost_build::configure()
         .build_server(true)

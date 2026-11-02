@@ -47,6 +47,10 @@ pub enum EventKind {
     ServiceUp,
     /// A service process was stopped.
     ServiceDown,
+    /// The signal plane joined its device's container group.
+    SignalPlaneUp,
+    /// The signal plane left its device's container group.
+    SignalPlaneDown,
     /// A traffic profile started driving load.
     TrafficStarted,
     /// A traffic profile stopped.
@@ -79,6 +83,8 @@ impl EventKind {
             EventKind::ComputeDown => "compute.down",
             EventKind::ServiceUp => "service.up",
             EventKind::ServiceDown => "service.down",
+            EventKind::SignalPlaneUp => "signal-plane.up",
+            EventKind::SignalPlaneDown => "signal-plane.down",
             EventKind::TrafficStarted => "traffic.started",
             EventKind::TrafficStopped => "traffic.stopped",
             EventKind::NosCheckUp => "nos-check.up",
@@ -99,6 +105,7 @@ impl EventKind {
             EventKind::ZoneUp | EventKind::ZoneDown => ResourceKind::Zone,
             EventKind::ComputeUp | EventKind::ComputeDown => ResourceKind::Compute,
             EventKind::ServiceUp | EventKind::ServiceDown => ResourceKind::Service,
+            EventKind::SignalPlaneUp | EventKind::SignalPlaneDown => ResourceKind::SignalPlane,
             EventKind::TrafficStarted | EventKind::TrafficStopped => ResourceKind::Traffic,
             EventKind::NosCheckUp | EventKind::NosCheckDown | EventKind::NosCheckVerified => {
                 ResourceKind::NosCheck
@@ -135,6 +142,7 @@ impl EventBus {
             resource_kind: kind.resource_kind() as i32,
             resource_vxid: resource_vxid.to_string(),
             detail: detail.to_string(),
+            ..Default::default()
         };
         // No subscribers is fine; the bus is fire-and-forget. It must never be able to block
         // provisioning — an event that can is a dashboard made into a dependency of the testbed.
@@ -165,6 +173,8 @@ mod tests {
             EventKind::ComputeDown,
             EventKind::ServiceUp,
             EventKind::ServiceDown,
+            EventKind::SignalPlaneUp,
+            EventKind::SignalPlaneDown,
             EventKind::TrafficStarted,
             EventKind::TrafficStopped,
         ] {

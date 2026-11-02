@@ -8,16 +8,22 @@ import "vxedge/v1/common.proto";
 message Event {
   string id = 1;
   int64 ts_unix_ms = 2;
-  // e.g. "state-transition", "audit", "reconcile"
+  // Dotted `<resource>.<fact>`: "job.state", "gateway.up", "zone.up", "service.down",
+  // "traffic.started", "nos-check.verified".
   string kind = 3;
   ResourceKind resource_kind = 4;
   string resource_vxid = 5;
   string detail = 6;
+  // The run this event belongs to, if any.
+  string run_id = 7;
 }
 
 message SubscribeRequest {
   // Empty = all kinds.
   repeated string kinds = 1;
+  // Resume after this `Event.id`, from a bounded history. An id the history no longer holds, or one
+  // from before a daemon restart, ends the stream with `ERROR_REASON_EVENTS_LOST`.
+  string after_id = 2;
 }
 
 service EventService {

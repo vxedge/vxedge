@@ -399,6 +399,7 @@ impl VehicleService for VehicleSvc {
                 .status(Request::new(SvcStatusRequest {
                     service_type,
                     experiment: inline(&yaml, dir.as_deref()),
+                    ..Default::default()
                 }))
                 .await?;
             components.push(observed.into_inner());
@@ -418,6 +419,7 @@ impl VehicleService for VehicleSvc {
             status: Some(status),
             components,
             gateway: Some(gw),
+            ..Default::default()
         }))
     }
 }
@@ -450,6 +452,7 @@ fn unprovisioned(model: &Experiment, nodes: &[NodePlan]) -> Vec<ResourceStatus> 
             state: ResourceState::Unspecified as i32,
             detail: "declared, not provisioned: no slice-bound link".to_string(),
             since_unix_ms: crate::jobs::now_ms(),
+            ..Default::default()
         })
         .collect()
 }

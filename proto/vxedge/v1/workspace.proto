@@ -1,0 +1,68 @@
+syntax = "proto3";
+
+package vxedge.v1;
+
+import "vxedge/v1/common.proto";
+
+// One thing that would stop this workspace coming up.
+message PlanProblem {
+  ErrorReason reason = 1;
+  // What it is about: a node, an image, a file.
+  string subject = 2;
+  string detail = 3;
+}
+
+message PlannedService {
+  string vxid = 1;
+  string service_type = 2;
+  // The device it is placed on. Empty for a host process.
+  string on = 3;
+  string image = 4;
+}
+
+message HostCheck {
+  string name = 1;
+  bool passed = 2;
+  string detail = 3;
+}
+
+message WorkspacePlanRequest {
+  ManifestRef manifest = 1;
+}
+
+message WorkspacePlan {
+  // True when `problems` is empty.
+  bool valid = 1;
+  repeated PlanProblem problems = 2;
+  repeated NodeSpec nodes = 3;
+  repeated PlannedService services = 4;
+  // Every image the workspace would run.
+  repeated string images = 5;
+  repeated HostCheck host_checks = 6;
+}
+
+service WorkspaceService {
+  // What `up` would do and whether it would be refused. Touches nothing on the host, and runs the
+  // same checks as `up`, so the two cannot disagree.
+  rpc Plan(WorkspacePlanRequest) returns (WorkspacePlan);
+}
+
+message BackendCapability {
+  NodeBackend backend = 1;
+  bool available = 2;
+  string detail = 3;
+}
+
+message HostCapabilitiesRequest {}
+
+message HostCapabilities {
+  repeated BackendCapability backends = 1;
+  // The part kinds this host can run: `container`, `bundle`, `wasm`.
+  repeated string part_kinds = 2;
+  // How many runs this host holds at once.
+  uint32 max_runs = 3;
+}
+
+service HostService {
+  rpc Capabilities(HostCapabilitiesRequest) returns (HostCapabilities);
+}
