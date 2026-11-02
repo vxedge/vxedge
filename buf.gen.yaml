@@ -1,5 +1,5 @@
 version: v2
-# SDK generation (phase 2): TypeScript via connect-es, C++ via protoc/grpc.
+# SDK generation: TypeScript via connect-es.
 # Rust codegen is NOT done via buf — it happens in crates/vxedge-api/build.rs
 # (tonic-build), so `cargo build` is self-sufficient.
 plugins:
