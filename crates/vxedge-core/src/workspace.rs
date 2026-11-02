@@ -391,6 +391,9 @@ pub struct VehicleDoc {
     /// What the vehicle hosts, each placed on one of its devices (`ARCHITECTURE.md` §6.0.1).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub services: BTreeMap<String, crate::services::ServiceDef>,
+    /// The vehicle's signals, placed on one of its devices (`ARCHITECTURE.md` §6.0.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal_plane: Option<crate::services::SignalPlane>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

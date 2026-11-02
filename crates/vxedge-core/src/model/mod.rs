@@ -211,6 +211,14 @@ pub struct Part {
     pub local: bool,
 }
 
+/// One thing running in a device's container group beside its payload.
+#[derive(Debug, Clone, Copy)]
+pub struct Placement<'a> {
+    pub id: &'a str,
+    pub image: &'a crate::services::Image,
+    pub on: &'a str,
+}
+
 impl Part {
     /// Whether a `container` device runs this part as its OCI payload: a published image, or a
     /// `localhost/` one from this host's Podman store. A `local/…` part names a host process
@@ -563,6 +571,9 @@ pub struct Experiment {
     /// raw block on every call, so a malformed `services:` surfaced at `svc up` rather than at
     /// validate, once per service instead of once per workspace.
     pub services: BTreeMap<String, crate::services::ServiceDef>,
+    /// The vehicle's signal plane, if it declares one. Apart from `services` because it has a
+    /// stage of its own; [`Experiment::placements`] is what the two share.
+    pub signal_plane: Option<crate::services::SignalPlane>,
     pub telemetry: Telemetry,
     pub results: Results,
 }
@@ -661,6 +672,13 @@ impl Entity {
 /// fixture, an alternative frontend) cannot skip it.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum InvariantError {
+    #[error(
+        "`{name}` is placed twice: a device's container group gives each member one name, so \
+         rename the service"
+    )]
+    PlacedNameTaken { name: String },
+    #[error("the signal plane cannot start as declared: {detail}")]
+    BadSignalPlane { detail: String },
     #[error(
         "service `{service}` runs `{image}`. A placed service needs `kind: container` and a \
          `localhost/` image or a digest-pinned `<ref>@sha256:…` one."
@@ -766,6 +784,24 @@ pub enum InvariantError {
 }
 
 impl Experiment {
+    /// Everything placed on a device with `on:`, services and the signal plane alike, so one
+    /// set of rules covers both.
+    pub fn placements(&self) -> impl Iterator<Item = Placement<'_>> {
+        let services = self.services.values().filter_map(|s| {
+            Some(Placement {
+                id: &s.id,
+                image: &s.image,
+                on: s.on.as_deref()?,
+            })
+        });
+        let kuksa = self.signal_plane.iter().map(|p| Placement {
+            id: crate::services::KUKSA_MEMBER,
+            image: &p.kuksa.image,
+            on: &p.kuksa.on,
+        });
+        services.chain(kuksa)
+    }
+
     /// Check every model invariant, reporting all violations rather than the first.
     ///
     /// A fix-one-rerun loop is the wrong shape for a validator an engineer runs while authoring;
@@ -782,9 +818,15 @@ impl Experiment {
         }
         let slice_ids: Vec<&str> = self.slices.iter().map(|s| s.id.as_str()).collect();
 
-        for service in self.services.values() {
-            let Some(on) = &service.on else { continue };
-            let names = || (service.id.clone(), on.clone());
+        let mut placed_names: BTreeMap<&str, ()> = BTreeMap::new();
+        for placement in self.placements() {
+            let on = placement.on;
+            if placed_names.insert(placement.id, ()).is_some() {
+                errors.push(E::PlacedNameTaken {
+                    name: placement.id.to_string(),
+                });
+            }
+            let names = || (placement.id.to_string(), on.to_string());
             let Some((entity, device)) = self
                 .entities
                 .iter()
@@ -795,9 +837,9 @@ impl Experiment {
                 continue;
             };
             let (service_id, device_id) = names();
-            let url = &service.image.url;
+            let url = &placement.image.url;
             let pinned = url.starts_with("localhost/") || url.contains("@sha256:");
-            if !pinned || service.image.kind != crate::services::ImageKind::Container {
+            if !pinned || placement.image.kind != crate::services::ImageKind::Container {
                 errors.push(E::ServiceImageNotRunnable {
                     service: service_id.clone(),
                     image: url.clone(),
@@ -829,6 +871,14 @@ impl Experiment {
                     device: device_id,
                 });
             }
+        }
+
+        if let Some(plane) = &self.signal_plane
+            && let Err(e) = crate::services::kuksa_spec(&plane.kuksa)
+        {
+            errors.push(E::BadSignalPlane {
+                detail: e.to_string(),
+            });
         }
 
         for t in &self.tunnels {

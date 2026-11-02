@@ -345,6 +345,71 @@ fn typed_config<T: serde::de::DeserializeOwned>(
     })
 }
 
+/// A vehicle's `signal_plane` block (`ARCHITECTURE.md` §6.0.1). Not a `services` entry: it has a
+/// stage of its own, so `SvcService` never sees it. What it shares with a service is placement.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignalPlane {
+    pub kuksa: Kuksa,
+}
+
+/// The Kuksa databroker, placed on a device the way a service is.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Kuksa {
+    pub image: Image,
+    pub on: String,
+    #[serde(default)]
+    pub config: KuksaConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KuksaConfig {
+    #[serde(default = "default_kuksa_listen")]
+    pub listen: String,
+}
+
+impl Default for KuksaConfig {
+    fn default() -> Self {
+        Self {
+            listen: default_kuksa_listen(),
+        }
+    }
+}
+
+fn default_kuksa_listen() -> String {
+    "0.0.0.0:55555".to_string()
+}
+
+/// The databroker's name in its device's container group.
+pub const KUKSA_MEMBER: &str = "kuksa-databroker";
+
+/// The container the databroker runs as. `--insecure` is what the spec states: slice isolation is
+/// the only protection these signals have.
+pub fn kuksa_spec(def: &Kuksa) -> Result<crate::containers::ContainerSpec, ServiceBackendError> {
+    let listen: std::net::SocketAddr =
+        def.config
+            .listen
+            .parse()
+            .map_err(|e| ServiceBackendError::BadConfig {
+                svc: KUKSA_MEMBER.to_string(),
+                detail: format!("config.listen `{}`: {e}", def.config.listen),
+            })?;
+    Ok(crate::containers::ContainerSpec {
+        name: KUKSA_MEMBER.to_string(),
+        image: def.image.url.clone(),
+        cmd: vec![
+            "--insecure".into(),
+            "--address".into(),
+            listen.ip().to_string(),
+            "--port".into(),
+            listen.port().to_string(),
+        ],
+        ..Default::default()
+    })
+}
+
 /// Where `config.artifacts` is mounted inside a placed service's container.
 const PLACED_ARTIFACTS: &str = "/srv/vxedge/artifacts";
 
@@ -655,6 +720,38 @@ mod tests {
         let def = ota_def("artifacts: ./missing\n");
         assert!(matches!(
             placed_spec(&def, dir.path()),
+            Err(ServiceBackendError::BadConfig { .. })
+        ));
+    }
+
+    fn kuksa(listen: &str) -> Kuksa {
+        Kuksa {
+            image: Image {
+                url: "localhost/kuksa:1".into(),
+                kind: ImageKind::Container,
+            },
+            on: "hpc1".into(),
+            config: KuksaConfig {
+                listen: listen.into(),
+            },
+        }
+    }
+
+    #[test]
+    fn the_databroker_runs_insecure_on_its_declared_address() {
+        let spec = kuksa_spec(&kuksa("0.0.0.0:55555")).unwrap();
+        assert_eq!(spec.name, KUKSA_MEMBER);
+        assert_eq!(
+            spec.cmd,
+            ["--insecure", "--address", "0.0.0.0", "--port", "55555"]
+        );
+        assert!(spec.binds.is_empty());
+    }
+
+    #[test]
+    fn a_databroker_address_that_does_not_parse_is_refused() {
+        assert!(matches!(
+            kuksa_spec(&kuksa("hpc1:55555")),
             Err(ServiceBackendError::BadConfig { .. })
         ));
     }

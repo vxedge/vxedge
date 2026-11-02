@@ -6,6 +6,10 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- A `kind: vehicle` document can declare `signal_plane.kuksa`, the Kuksa databroker placed on a container device with `on:`, under the same rules as a placed service. Its placement is checked when the workspace loads. `vehicle up` does not start it yet.
+
 ## [0.4.1] - 2026-11-02
 
 A vehicle now outlives its daemon. Zone and compute verbs keep working after a daemon restart, a placed
