@@ -58,7 +58,8 @@ pub enum ModelError {
     #[error(
         "`{component}`: part `{part}` is a {kind}, but the device it deploys onto runs the \
          `{backend}` backend. A container backend boots a container image; libvirt, \
-         qemu-microvm and cloud-hypervisor boot a guest bundle. Point this target at the right part, or correct the \
+         qemu-microvm and cloud-hypervisor boot a guest bundle; wasm-capsule runs a `kind: wasm` \
+         module. Point this target at the right part, or correct the \
          device's `backend`."
     )]
     PartKindMismatch {
@@ -67,14 +68,16 @@ pub enum ModelError {
         kind: &'static str,
         backend: &'static str,
     },
-    #[error("`{component}`: part `{part}` declares `kind: {kind}` — expected container or bundle")]
+    #[error(
+        "`{component}`: part `{part}` declares `kind: {kind}` — expected container, bundle or wasm"
+    )]
     UnknownPartKind {
         component: String,
         part: String,
         kind: String,
     },
     #[error(
-        "device `{device}` declares backend `{backend}`, which is not container, qemu-microvm, libvirt or cloud-hypervisor"
+        "device `{device}` declares backend `{backend}`, which is not container, qemu-microvm, libvirt, cloud-hypervisor or wasm-capsule"
     )]
     UnknownBackend { device: String, backend: String },
     #[error(
@@ -214,6 +217,7 @@ fn backend_of(device: &str, spec: &Value) -> Result<Option<Backend>, ModelError>
         Some("qemu-microvm") => Ok(Some(Backend::QemuMicrovm)),
         Some("libvirt") => Ok(Some(Backend::Libvirt)),
         Some("cloud-hypervisor") => Ok(Some(Backend::CloudHypervisor)),
+        Some("wasm-capsule") => Ok(Some(Backend::WasmCapsule)),
         Some(other) => Err(ModelError::UnknownBackend {
             device: device.to_string(),
             backend: other.to_string(),
@@ -317,6 +321,7 @@ fn part_kind(
         None => None,
         Some("container") => Some(PartKind::Container),
         Some("bundle") => Some(PartKind::Bundle),
+        Some("wasm") => Some(PartKind::Wasm),
         Some(other) => {
             return Err(ModelError::UnknownPartKind {
                 component: component.to_string(),
@@ -331,6 +336,7 @@ fn part_kind(
         // guessing is the only option, and the one the `kind:` field exists to remove.
         return Ok(match backend {
             Some(Backend::Container) | None => PartKind::Container,
+            Some(Backend::WasmCapsule) => PartKind::Wasm,
             Some(_) => PartKind::Bundle,
         });
     };
@@ -338,6 +344,7 @@ fn part_kind(
         (kind, backend),
         (_, None)
             | (PartKind::Container, Some(Backend::Container))
+            | (PartKind::Wasm, Some(Backend::WasmCapsule))
             | (
                 PartKind::Bundle,
                 Some(Backend::Libvirt | Backend::QemuMicrovm | Backend::CloudHypervisor)
@@ -350,12 +357,14 @@ fn part_kind(
             kind: match kind {
                 PartKind::Container => "container",
                 PartKind::Bundle => "bundle",
+                PartKind::Wasm => "wasm",
             },
             backend: match backend {
                 Some(Backend::Container) => "container",
                 Some(Backend::QemuMicrovm) => "qemu-microvm",
                 Some(Backend::Libvirt) => "libvirt",
                 Some(Backend::CloudHypervisor) => "cloud-hypervisor",
+                Some(Backend::WasmCapsule) => "wasm-capsule",
                 None => "none",
             },
         });

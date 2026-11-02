@@ -56,7 +56,7 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
       - name: Build
         # rust-toolchain.toml pins the compiler; rustup installs it on first use.
-        run: cargo build --release --locked -p vxedge-cli -p vxedged
+        run: cargo build --release --locked -p vxedge-cli -p vxedged -p vxcapsule
       - name: Package
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -65,7 +65,7 @@ jobs:
           set -euo pipefail
           name="vxedge-${VERSION}-${TARGET}"
           mkdir -p "dist/$name"
-          install -m 0755 target/release/vxedge target/release/vxedged "dist/$name/"
+          install -m 0755 target/release/vxedge target/release/vxedged target/release/vxcapsule "dist/$name/"
           cp LICENSE NOTICE "dist/$name/"
           cat > "dist/$name/README.txt" <<README
           vxedge ${VERSION} (${TARGET}). Run ./vxedge --version, then: ./vxedge manifest validate --manifest <workspace>.
@@ -73,7 +73,7 @@ jobs:
           README
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           "dist/$name/vxedge" --version
-          ldd "dist/$name/vxedge" "dist/$name/vxedged"
+          ldd "dist/$name/vxedge" "dist/$name/vxedged" "dist/$name/vxcapsule"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: archive-${{ matrix.target }}

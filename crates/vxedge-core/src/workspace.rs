@@ -411,7 +411,7 @@ pub struct DeviceDoc {
     pub role: String,
     #[serde(default)]
     pub zone: Option<String>,
-    /// `container` | `qemu-microvm` | `libvirt` | `cloud-hypervisor`. Required for anything attached to a slice: the
+    /// `container` | `qemu-microvm` | `libvirt` | `cloud-hypervisor` | `wasm-capsule`. Required for anything attached to a slice: the
     /// planner has to know whether to build a veth or a tap, and guessing is what produced a
     /// workspace that validated and then could not boot.
     #[serde(default)]

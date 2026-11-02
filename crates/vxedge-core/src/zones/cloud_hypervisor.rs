@@ -386,6 +386,7 @@ mod tests {
             bundle: None,
             remote_bundle: None,
             image: None,
+            module: None,
             pinned_cpus,
         }
     }

@@ -148,6 +148,7 @@ pub enum Backend {
     QemuMicrovm,
     Libvirt,
     CloudHypervisor,
+    WasmCapsule,
 }
 
 /// What a device is *allocated*. Distinct from a part's `requires`, which is what the software
@@ -234,6 +235,8 @@ pub enum PartKind {
     Container,
     /// A guest bundle directory (kernel + initramfs) a VM backend boots.
     Bundle,
+    /// A WebAssembly component file the `wasm-capsule` backend runs.
+    Wasm,
 }
 
 /// Structural connectivity: the harness.

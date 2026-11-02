@@ -38,6 +38,21 @@ pub enum ZonePlanError {
     )]
     AmbiguousImage { device: String, count: usize },
     #[error(
+        "device `{device}` runs `backend: wasm-capsule` but no `kind: wasm` part is deployed on \
+         it. Target one of its functions with the module."
+    )]
+    MissingModule { device: String },
+    #[error(
+        "device `{device}` hosts {count} wasm modules, and a capsule runs one. Deploy the others \
+         on their own devices."
+    )]
+    AmbiguousModule { device: String, count: usize },
+    #[error(
+        "device `{device}`: wasm part `{reference}` is not a local file, and a capsule runs one \
+         from this workspace only. Point `ref` at a path such as `./parts/sensor.wasm`."
+    )]
+    PublishedModule { device: String, reference: String },
+    #[error(
         "device `{device}` attaches to the gateway twice (slices `{first}` and `{second}`), and \
          a node has one port today. Give each slice its own device."
     )]
@@ -48,7 +63,7 @@ pub enum ZonePlanError {
     },
     #[error(
         "device `{0}` declares no `backend`, so there is no way to know whether it attaches by \
-         veth or by tap. Add `backend: container|qemu-microvm|libvirt|cloud-hypervisor`."
+         veth or by tap. Add `backend: container|qemu-microvm|libvirt|cloud-hypervisor|wasm-capsule`."
     )]
     DeviceWithoutBackend(String),
 }
@@ -80,6 +95,8 @@ pub struct NodePlan {
     /// a local part resolves straight to `bundle`, a published one resolves to `remote_bundle`
     /// for `zones::node_up` to fetch immediately before boot (see that function's doc comment).
     pub bundle: Option<PathBuf>,
+    /// For `wasm-capsule`: the local module file a `vxcapsule` runner loads.
+    pub module: Option<PathBuf>,
     /// `(reference, digest)` for a published, not-yet-fetched bundle part. Set instead of
     /// `bundle` when the part is not local — `zones::node_up` resolves this into a real
     /// `bundle` path via `registry::fetch` before dispatching to a backend, so backends never
@@ -159,6 +176,7 @@ pub fn plan_nodes_from_model(
                     Some(crate::model::Backend::Libvirt) => Backend::Libvirt,
                     Some(crate::model::Backend::QemuMicrovm) => Backend::QemuMicrovm,
                     Some(crate::model::Backend::CloudHypervisor) => Backend::CloudHypervisor,
+                    Some(crate::model::Backend::WasmCapsule) => Backend::WasmCapsule,
                     // GatewayPlan::from_model refuses this too, so reaching it means the two
                     // plans came from different models. Reported as what it is: an
                     // "endpoint mismatch" here would point at plan joining and send someone
@@ -214,7 +232,7 @@ pub fn plan_nodes_from_model(
                             None => (None, None),
                         }
                     }
-                    Backend::Container => (None, None),
+                    Backend::Container | Backend::WasmCapsule => (None, None),
                 };
                 // A container node runs an OCI payload only when a published or `localhost/`
                 // image is deployed on it. A `local/…` part names a host process, which the
@@ -235,7 +253,14 @@ pub fn plan_nodes_from_model(
                         }
                         images.first().map(|part| part.image_ref())
                     }
-                    Backend::Libvirt | Backend::QemuMicrovm | Backend::CloudHypervisor => None,
+                    Backend::Libvirt
+                    | Backend::QemuMicrovm
+                    | Backend::CloudHypervisor
+                    | Backend::WasmCapsule => None,
+                };
+                let module = match backend {
+                    Backend::WasmCapsule => Some(capsule_module(entity, device, workspace_dir)?),
+                    _ => None,
                 };
                 if bundle.is_none()
                     && remote_bundle.is_none()
@@ -270,6 +295,7 @@ pub fn plan_nodes_from_model(
                     ip_cidr: endpoint.ip_cidr.clone(),
                     bundle,
                     remote_bundle,
+                    module,
                     image,
                     pinned_cpus: device.pinned_cpus.clone(),
                 });
@@ -291,6 +317,62 @@ pub fn plan_nodes_from_model(
 /// `initrd.img`), resolved the same way [`plan_nodes_from_model`] resolves them. Lets a caller
 /// refuse *before* provisioning anything: a bundle built from a local recipe embeds the host
 /// kernel, so it is per-host and a fresh clone never has one.
+/// The one local module a `wasm-capsule` device runs, resolved against the workspace.
+fn capsule_module(
+    entity: &crate::model::Entity,
+    device: &crate::model::Device,
+    workspace_dir: &Path,
+) -> Result<PathBuf, ZonePlanError> {
+    let modules: Vec<&crate::model::Part> = entity
+        .functions_on(&device.id)
+        .filter_map(|f| f.part.as_ref())
+        .filter(|part| part.kind == crate::model::PartKind::Wasm)
+        .collect();
+    match modules.as_slice() {
+        [] => Err(ZonePlanError::MissingModule {
+            device: device.id.clone(),
+        }),
+        [part] if part.local => Ok(local_path(&part.reference, workspace_dir)),
+        [part] => Err(ZonePlanError::PublishedModule {
+            device: device.id.clone(),
+            reference: part.reference.clone(),
+        }),
+        many => Err(ZonePlanError::AmbiguousModule {
+            device: device.id.clone(),
+            count: many.len(),
+        }),
+    }
+}
+
+fn local_path(reference: &str, workspace_dir: &Path) -> PathBuf {
+    let p = Path::new(reference);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        workspace_dir.join(p)
+    }
+}
+
+/// Every local capsule module the workspace names that is not on this host.
+pub fn missing_local_modules(exp: &crate::model::Experiment, workspace_dir: &Path) -> Vec<PathBuf> {
+    let mut missing: Vec<PathBuf> = Vec::new();
+    for entity in &exp.entities {
+        for device in entity.devices.values() {
+            for part in entity
+                .functions_on(&device.id)
+                .filter_map(|f| f.part.as_ref())
+                .filter(|p| p.kind == crate::model::PartKind::Wasm && p.local)
+            {
+                let path = local_path(&part.reference, workspace_dir);
+                if !path.is_file() && !missing.contains(&path) {
+                    missing.push(path);
+                }
+            }
+        }
+    }
+    missing
+}
+
 pub fn missing_local_bundles(exp: &crate::model::Experiment, workspace_dir: &Path) -> Vec<PathBuf> {
     let mut missing: Vec<PathBuf> = Vec::new();
     for entity in &exp.entities {

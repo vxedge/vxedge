@@ -10,6 +10,8 @@
 //! - `qemu-microvm`: raw QEMU `microvm` machine, direct kernel boot from the
 //!   node's image bundle (vmlinuz + initrd.img), virtio-net on the tap.
 //!   Guest init reads `vx.ip=` from the kernel cmdline; payload autostarts.
+//! - `wasm-capsule`: a `vxcapsule` runner in a network namespace, see
+//!   [`super::wasm_capsule`].
 //! - `libvirt`: full QEMU machine via virsh (qemu:///system), same bundle and
 //!   cmdline, precreated tap (`managed='no'`).
 //!
@@ -25,11 +27,13 @@ use std::path::Path;
 
 use super::cloud_hypervisor;
 use super::plan::NodePlan;
+use super::wasm_capsule;
 use crate::containers::{
     ContainerClient, ContainerError, ContainerSpec, GroupHandle, GroupSpec, InfraNetwork,
     PAUSE_IMAGE,
 };
 use crate::gateway::netlink;
+use crate::gateway::netops::children_are_privileged;
 use crate::gateway::netops::{NetOpsError, Shell};
 use crate::model::Backend;
 
@@ -115,15 +119,34 @@ pub(super) fn bundle_paths(np: &NodePlan) -> Result<(String, String), ZoneBacken
 // container (netns)
 // ---------------------------------------------------------------------------
 
+/// A named namespace for the node, holding its gateway port as `eth0`.
+pub(super) fn netns_port_up(sh: &Shell, np: &NodePlan) -> Result<(), ZoneBackendError> {
+    let ns = np.runtime_name();
+    // Netns registry ops run in the HOST context — never nested inside another netns, since
+    // a bind mount created from inside one doesn't propagate; only the veth move targets
+    // where the interface currently lives. See `gateway::netlink`'s own module doc for why
+    // netns create/delete is `rtnetlink::NetworkNamespace`, not a hand-rolled unshare/mount.
+    if escalates_netns_registry(sh) {
+        if !netlink::netns_exists(&ns) {
+            sh.run_host("ip", &["netns", "add", &ns])?;
+        }
+    } else {
+        netlink::ensure_netns(&ns).map_err(|e| nl(np, e))?;
+    }
+    attach_port(sh, np, &ns)
+}
+
+/// Whether a named namespace has to go through `ip` and sudo. `/run/netns` is root's, and
+/// `cap_net_admin,cap_sys_admin` do not reach a directory another user owns, so a `vxedged` under
+/// `setcap` cannot register a namespace itself. Everything after that works with its own
+/// capabilities.
+fn escalates_netns_registry(sh: &Shell) -> bool {
+    sh.escalate && !children_are_privileged()
+}
+
 fn container_up(sh: &Shell, np: &NodePlan) -> Result<(), ZoneBackendError> {
     let Some(image) = &np.image else {
-        let ns = np.runtime_name();
-        // Netns registry ops run in the HOST context — never nested inside another netns, since
-        // a bind mount created from inside one doesn't propagate; only the veth move targets
-        // where the interface currently lives. See `gateway::netlink`'s own module doc for why
-        // netns create/delete is `rtnetlink::NetworkNamespace`, not a hand-rolled unshare/mount.
-        netlink::ensure_netns(&ns).map_err(|e| nl(np, e))?;
-        return attach_port(sh, np, &ns);
+        return netns_port_up(sh, np);
     };
     // Order matters: the namespace exists (infra up), then the port is in it, then the payload
     // starts — a payload started first would come up with nothing but loopback to bind to.
@@ -163,13 +186,18 @@ fn attach_port(sh: &Shell, np: &NodePlan, ns: &str) -> Result<(), ZoneBackendErr
     Ok(())
 }
 
-fn container_down(sh: &Shell, np: &NodePlan) -> Result<(), ZoneBackendError> {
+pub(super) fn container_down(sh: &Shell, np: &NodePlan) -> Result<(), ZoneBackendError> {
     // Asked before anything is removed: a port still on the gateway side (a node never brought
     // up) has no namespace to die with, so waiting for it would only time out.
     let port_moved = port_netns(np).is_some_and(|ns| netlink::link_exists(Some(&ns), "eth0"));
     // Destroys the moved veth peer (and thus the bridge-side pair);
     // `vxedge up` re-creates endpoints idempotently.
-    netlink::delete_netns(&np.runtime_name()).map_err(|e| nl(np, e))?;
+    let ns = np.runtime_name();
+    if !escalates_netns_registry(sh) {
+        netlink::delete_netns(&ns).map_err(|e| nl(np, e))?;
+    } else if netlink::netns_exists(&ns) {
+        sh.run_host("ip", &["netns", "del", &ns])?;
+    }
     if np.image.is_some() {
         // The group's namespace, and the port in it, go with its infra container.
         let client = block_on(ContainerClient::connect_user()).map_err(|e| ct(np, e))?;
@@ -693,6 +721,7 @@ struct ContainerBackend;
 struct QemuMicrovmBackend;
 struct LibvirtBackend;
 struct CloudHypervisorBackend;
+struct WasmCapsuleBackend;
 
 impl ZoneBackend for ContainerBackend {
     fn name(&self) -> &'static str {
@@ -760,6 +789,21 @@ impl ZoneBackend for CloudHypervisorBackend {
     }
 }
 
+impl ZoneBackend for WasmCapsuleBackend {
+    fn name(&self) -> &'static str {
+        "wasm-capsule"
+    }
+    fn up(&self, sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneBackendError> {
+        wasm_capsule::up(sh, np, runtime_dir)
+    }
+    fn down(&self, sh: &Shell, np: &NodePlan, _runtime_dir: &Path) -> Result<(), ZoneBackendError> {
+        wasm_capsule::down(sh, np)
+    }
+    fn status(&self, _sh: &Shell, np: &NodePlan, _runtime_dir: &Path) -> NodeState {
+        wasm_capsule::status(np)
+    }
+}
+
 /// **The only place a backend kind is matched.** Everything downstream holds a
 /// `&dyn ZoneBackend`, so adding a fourth backend is one impl and one arm here — it used to be
 /// three matches in three functions with nothing saying they had to agree.
@@ -769,6 +813,7 @@ pub fn backend_for(kind: Backend) -> &'static dyn ZoneBackend {
         Backend::QemuMicrovm => &QemuMicrovmBackend,
         Backend::Libvirt => &LibvirtBackend,
         Backend::CloudHypervisor => &CloudHypervisorBackend,
+        Backend::WasmCapsule => &WasmCapsuleBackend,
     }
 }
 
@@ -831,6 +876,7 @@ mod tests {
             backend_for(Backend::CloudHypervisor).name(),
             "cloud-hypervisor"
         );
+        assert_eq!(backend_for(Backend::WasmCapsule).name(), "wasm-capsule");
     }
 
     /// libvirt's wording decides the hint: socket refusal (not in the `libvirt` group), a guest
@@ -867,6 +913,7 @@ mod tests {
             bundle: None,
             remote_bundle: None,
             image: Some(PAUSE_IMAGE.into()),
+            module: None,
             pinned_cpus: Vec::new(),
         }
     }

@@ -137,6 +137,24 @@ fn enter_netns(name: &str) -> Result<(), NetlinkError> {
     })
 }
 
+/// Runs `f` on a dedicated thread inside the named namespace, so a child it spawns starts there.
+/// The thread ends with `f`, so nothing else ever runs in that namespace by accident.
+pub fn in_netns<T: Send + 'static>(
+    name: &str,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, NetlinkError> {
+    let netns = name.to_string();
+    std::thread::spawn(move || {
+        enter_netns(&netns)?;
+        Ok(f())
+    })
+    .join()
+    .map_err(|e| NetlinkError::Namespace {
+        netns: name.to_string(),
+        detail: panic_message(e.as_ref()),
+    })?
+}
+
 fn panic_message(e: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = e.downcast_ref::<&str>() {
         (*s).to_string()
