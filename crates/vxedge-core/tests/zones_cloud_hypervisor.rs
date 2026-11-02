@@ -66,6 +66,15 @@ impl Drop for Guard {
     }
 }
 
+/// Removes the second runtime directory.
+struct OtherDir(std::path::PathBuf);
+
+impl Drop for OtherDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// The runtime directory is unique to this test and on the VMM's command line.
 fn kill_vmm(runtime: &Path) {
     let _ = Command::new("pkill")
@@ -215,7 +224,21 @@ fn a_guest_boots_on_the_gateway_tap_answers_and_survives_its_vmm_dying() {
 
     node_up(&sh, node, &runtime, &runtime).unwrap();
     wait_for_reflector(&ns, &serial);
-    node_down(&sh, node, &runtime).unwrap();
+
+    // --- a daemon with another runtime dir sees the same guest ---------------------
+    let other = std::env::temp_dir().join(format!("vxchb{}", std::process::id()));
+    std::fs::create_dir_all(&other).unwrap();
+    let _other_guard = OtherDir(other.clone());
+    assert_eq!(node_status(&sh, node, &other), NodeState::Up);
+    node_up(&sh, node, &other, &other).unwrap();
+    assert_eq!(vmm_processes(&runtime), 1, "another daemon started a VMM");
+    node_down(&sh, node, &other).unwrap();
+    assert_eq!(
+        vmm_processes(&runtime),
+        0,
+        "another daemon's `down` left it"
+    );
+    assert_eq!(node_status(&sh, node, &runtime), NodeState::Down);
 
     teardown(&sh, &plan).unwrap();
 }

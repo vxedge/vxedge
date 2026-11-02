@@ -24,6 +24,7 @@ use cloud_hypervisor_client::models::{
 use cloud_hypervisor_client::{SocketBasedApiClient, socket_based_api_client};
 
 use super::backend::{ZoneBackendError, block_on, bundle_paths, kernel_cmdline, wait_until};
+use super::foreign;
 use super::plan::NodePlan;
 use crate::gateway::Shell;
 use crate::gateway::netops::children_are_privileged;
@@ -41,7 +42,23 @@ const VMM_TIMEOUT: Duration = Duration::from_secs(5);
 const SOCKET_PATH_MAX: usize = 107;
 
 fn socket_path(np: &NodePlan, runtime_dir: &Path) -> PathBuf {
-    runtime_dir.join(format!("{}.ch.sock", np.runtime_name()))
+    runtime_dir.join(foreign::ch_socket_name(np))
+}
+
+/// The socket to talk to this node on: this runtime dir's, unless only another daemon's answers.
+///
+/// A VMM is one per node whichever daemon started it. Reading another daemon's guest as down
+/// would start a second VMM on its tap, and let `vehicle down` take the gateway from under it.
+fn live_socket(np: &NodePlan, runtime_dir: &Path) -> PathBuf {
+    let own = socket_path(np, runtime_dir);
+    if matches!(probe(&own), Vmm::Alive { .. }) {
+        return own;
+    }
+    let name = foreign::ch_socket_name(np);
+    foreign::ch_sockets()
+        .filter(|s| s.file_name().and_then(|n| n.to_str()) == Some(name.as_str()))
+        .find(|s| matches!(probe(s), Vmm::Alive { .. }))
+        .unwrap_or(own)
 }
 
 fn serial_path(np: &NodePlan, runtime_dir: &Path) -> PathBuf {
@@ -270,14 +287,15 @@ fn launch(np: &NodePlan, sh: &Shell, socket: &Path, log: &Path) -> Result<(), Zo
 }
 
 pub(super) fn up(sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneBackendError> {
-    let socket = socket_path(np, runtime_dir);
-    match probe(&socket) {
+    let found = live_socket(np, runtime_dir);
+    match probe(&found) {
         Vmm::Alive { running: true, .. } => return Ok(()), // idempotent
         // Whatever left a VMM without a running guest, a fresh one is the one way to start.
-        Vmm::Alive { pid, .. } => stop(np, &socket, pid)?,
-        Vmm::Stale => remove_socket(np, &socket)?,
+        Vmm::Alive { pid, .. } => stop(np, &found, pid)?,
+        Vmm::Stale => remove_socket(np, &found)?,
         Vmm::Absent => {}
     }
+    let socket = socket_path(np, runtime_dir);
     refuse_escalated_netns(np, sh)?;
     refuse_long_socket_path(np, &socket)?;
     if !vmm_on_path() {
@@ -332,7 +350,7 @@ pub(super) fn up(sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), Zo
 }
 
 pub(super) fn down(np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneBackendError> {
-    let socket = socket_path(np, runtime_dir);
+    let socket = live_socket(np, runtime_dir);
     match probe(&socket) {
         Vmm::Alive { pid, .. } => stop(np, &socket, pid),
         Vmm::Stale => remove_socket(np, &socket),
@@ -341,7 +359,7 @@ pub(super) fn down(np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneBackendE
 }
 
 pub(super) fn status(np: &NodePlan, runtime_dir: &Path) -> NodeState {
-    match probe(&socket_path(np, runtime_dir)) {
+    match probe(&live_socket(np, runtime_dir)) {
         Vmm::Alive { running: true, .. } => NodeState::Up,
         _ => NodeState::Down,
     }
