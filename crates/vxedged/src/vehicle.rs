@@ -415,14 +415,9 @@ fn node_component(
     node: &NodePlan,
     state: &vxedge_core::zones::backend::NodeState,
 ) -> ResourceStatus {
-    let kind = if node.role == DeviceRole::Hpc {
-        ResourceKind::Compute
-    } else {
-        ResourceKind::Zone
-    };
     crate::status::resource_status(
         node.node_id.clone(),
-        kind,
+        crate::status::node_kind(node.role),
         state,
         format!(
             "zone={} backend={:?} port={} peer={} vlan={}",
@@ -440,11 +435,7 @@ fn unprovisioned(model: &Experiment, nodes: &[NodePlan]) -> Vec<ResourceStatus> 
         .filter(|d| !nodes.iter().any(|n| n.node_id == d.id))
         .map(|d| ResourceStatus {
             vxid: d.id.clone(),
-            kind: if d.role == DeviceRole::Hpc {
-                ResourceKind::Compute as i32
-            } else {
-                ResourceKind::Zone as i32
-            },
+            kind: crate::status::node_kind(d.role) as i32,
             state: ResourceState::Unspecified as i32,
             detail: "declared, not provisioned: no slice-bound link".to_string(),
             since_unix_ms: crate::jobs::now_ms(),
