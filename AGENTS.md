@@ -14,7 +14,7 @@ crates/
   vxedged/           # daemon: tonic gRPC server (+ tonic-web), job engine, event bus, audit
   vxedge-cli/        # thin client binary `vxedge`; may auto-spawn local vxedged
 templates/           # (pending) gateway provisioning templates (netlink/OVS/tc/nftables, libvirt XML)
-sdk/                 # (pending) generated SDKs (TS/connect-es, C++), never hand-edited
+sdk/                 # (pending) generated TypeScript SDK (connect-es), never hand-edited
 ```
 
 ## Hard rules
@@ -24,14 +24,15 @@ sdk/                 # (pending) generated SDKs (TS/connect-es, C++), never hand
   daemon state lives only in ephemeral runtime dirs + logs. No database.
 - **Idempotency via reconciler**: `up|down` compares desired (manifest) vs observed
   (libvirt/OVS/netlink state) and converges; running `up` twice is a no-op.
-- **proto/ is the contract**: additive changes stay in `vxedge.v1`; breaking changes mean
-  `vxedge.v2`. SDKs are generated in CI, never hand-written.
+- **proto/ is the contract**: wire changes are additive and stay in `vxedge.v1`
+  (`ARCHITECTURE.md` §5.2). SDKs are generated in CI, never hand-written.
 - Every mutating RPC returns a `Job`; progress is server-streamed (`JobService.Watch`).
-- Transport defaults: Unix socket + peer creds locally; mTLS + OIDC remotely.
+- Transport: Unix socket only today, guarded by filesystem permissions. Peer credentials
+  locally and mTLS + OIDC remotely are planned (`ARCHITECTURE.md` §5.3).
 
 ## Key dependencies (when scaffolding)
 
-tonic/prost (+ tonic-web), serde/serde_yaml, rtnetlink, ovsdb client, `virt` (libvirt),
+tonic/prost (+ tonic-web), serde/serde_yaml, rtnetlink, ovsdb client, `virsh` (libvirt),
 nftables via `nftables` crate or `nft -j`, clap (CLI), tokio, tracing.
 
 ## Build/test

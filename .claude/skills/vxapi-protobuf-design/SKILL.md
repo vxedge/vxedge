@@ -18,9 +18,9 @@ tonic-build generates... the Protobuf IDL is the authoritative contract").
   reuse that convention exactly for any new verb, don't invent a new shape.
 - Read-only RPCs (`Status`, `List`) return their resource directly, not a `Job` —
   `GatewayStatus`/`ZoneStatus`-shaped messages, synchronous.
-- `Apply` means validate + stage without starting (plan/diff semantics) — distinct from
-  `Up`. Don't collapse them even when a new service's staging step is trivial; the
-  distinction is part of the contract every frontend already codes against.
+- Planning is a read: `WorkspaceService.Plan` touches nothing, so it returns its result directly
+  (`ARCHITECTURE.md` §5.2). `GatewayService.Apply` stays as it is. `Apply` on `ZoneService` and
+  `ComputeService` is unbuilt and deprecated, so don't add `Apply` to a new service.
 
 ## Naming — deliberately not buf's stock convention
 
@@ -39,10 +39,12 @@ comments before "fixing" a lint warning it silences:
 
 ## Versioning
 
-- Additive changes (new RPC, new optional field, new service) stay in `vxedge.v1`.
-  Anything that breaks an existing client — field removal/renumber, changed semantics
-  of an existing RPC — means a new `vxedge.v2` package, not a v1 mutation. This is what
-  makes buf's `FILE`-level breaking-check meaningful instead of a check you route around.
+- vxAPI stays in `vxedge.v1`. Wire changes are additive: new RPCs, fields and values, with old
+  ones kept and marked deprecated, which is what makes buf's `FILE`-level check meaningful.
+  Don't introduce a new package. A version roadmap is defined once vxedge can simulate real
+  software use cases for SDV OEM engineers (`ARCHITECTURE.md` §5.2).
+- Behaviour may change between releases when the changelog says so. buf can't see that kind of
+  change, so review it by hand.
 
 ## SDKs are generated, never hand-written — in either language
 
@@ -62,7 +64,7 @@ comments before "fixing" a lint warning it silences:
 
 1. `buf lint` and `buf breaking --against '.git#branch=main'` locally — CI runs both,
    catching it here is faster.
-2. Regenerate all three SDKs' bindings; a proto change with stale generated Rust/C++/TS
+2. Regenerate the Rust and TypeScript bindings; a proto change with stale generated code
    is a broken build for every frontend, not just the one you're working in.
 3. If the change is additive, confirm it really is — buf's breaking-check is the
    objective check but the `Job`/`Status` split and message-naming rules above aren't
