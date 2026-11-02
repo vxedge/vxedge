@@ -5,6 +5,7 @@ type: software
 authors:
   - family-names: "Djaafri"
     given-names: "Fouzi"
+    orcid: "https://orcid.org/0009-0004-7173-9344"
     affiliation: "Independent Researcher"
 repository-code: "https://github.com/vxedge/vxedge"
 url: "https://vxedge.dev"
