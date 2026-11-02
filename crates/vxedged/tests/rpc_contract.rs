@@ -73,6 +73,13 @@ fn vehicle_workspace() -> PathBuf {
     dir
 }
 
+/// Whether this user's rootless Podman socket answers.
+fn podman_is_reachable() -> bool {
+    std::env::var_os("XDG_RUNTIME_DIR").is_some_and(|dir| {
+        std::os::unix::net::UnixStream::connect(Path::new(&dir).join("podman/podman.sock")).is_ok()
+    })
+}
+
 /// [`VEHICLE`] with a signal plane on `hpc1`, in an image no host has.
 fn vehicle_with_signal_plane() -> String {
     VEHICLE.replace(
@@ -462,6 +469,16 @@ async fn a_missing_local_signal_plane_image_is_refused_before_the_gateway() {
         tonic::Code::FailedPrecondition,
         "{refused:?}"
     );
+    // A host with no Podman socket refuses here too, for a different reason, so naming the image
+    // is only provable where Podman answers. It has to hold there.
+    if podman_is_reachable() {
+        assert!(
+            refused
+                .message()
+                .contains("localhost/vxedge/no-such-kuksa:1"),
+            "{refused:?}"
+        );
+    }
     assert!(
         !daemon.root.join("run/audit.jsonl").exists()
             || !std::fs::read_to_string(daemon.root.join("run/audit.jsonl"))

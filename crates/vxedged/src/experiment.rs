@@ -43,11 +43,13 @@ use vxedge_api::v1::{
 };
 
 use std::path::Path;
+use std::time::Duration;
 
 use vxedge_core::containers::ContainerSpec;
 use vxedge_core::gateway::GatewayPlan;
 use vxedge_core::services::KUKSA_MEMBER;
 use vxedge_core::zones::NodePlan;
+use vxedge_core::zones::backend::NodeState;
 
 use crate::audit::Audit;
 use crate::events::EventKind;
@@ -367,16 +369,36 @@ impl Handles {
         );
         let shell = self.zones.shell.clone();
         let runtime_dir = self.zones.runtime_dir.clone();
-        tokio::task::spawn_blocking(move || {
-            if up {
-                vxedge_core::zones::member_up(&shell, &node, &runtime_dir, &spec)
-            } else {
-                vxedge_core::zones::member_down(&node, &spec)
-            }
-        })
-        .await
-        .map_err(|e| fail(format!("task panicked: {e}")))?
-        .map_err(|e| fail(e.to_string()))?;
+        let (probe_node, probe_spec) = (node.clone(), spec.clone());
+        let change = async move {
+            tokio::task::spawn_blocking(move || {
+                if up {
+                    vxedge_core::zones::member_up(&shell, &node, &runtime_dir, &spec)
+                } else {
+                    vxedge_core::zones::member_down(&node, &spec)
+                }
+            })
+            .await
+            .map_err(|e| format!("task panicked: {e}"))?
+            .map_err(|e| e.to_string())
+        };
+        if up {
+            let running = || {
+                let (node, spec) = (probe_node.clone(), probe_spec.clone());
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        vxedge_core::zones::member_status(&node, &spec) == NodeState::Up
+                    })
+                    .await
+                    .unwrap_or(false)
+                }
+            };
+            start_then_confirm(change, running, SIGNAL_PLANE_WINDOW)
+                .await
+                .map_err(fail)?;
+        } else {
+            change.await.map_err(fail)?;
+        }
         let (kind, msg) = if up {
             (
                 EventKind::SignalPlaneUp,
@@ -464,6 +486,38 @@ impl Handles {
             .map_err(|e| format!("service `{ty}`: {e}"))?;
         }
         Ok(format!("{} service(s)", types.len()))
+    }
+}
+
+/// How long the databroker has to stay running after it starts. `member_up` returns as soon as the
+/// container starts, and a databroker that rejects its flags exits just after that.
+const SIGNAL_PLANE_WINDOW: Duration = Duration::from_secs(2);
+
+/// Run `start`, then require `running` to hold for all of `window`, so a member that starts and
+/// exits straight away is a failure and not a success.
+async fn start_then_confirm<S, R, Fut>(
+    start: S,
+    mut running: R,
+    window: Duration,
+) -> Result<(), String>
+where
+    S: std::future::Future<Output = Result<(), String>>,
+    R: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    start.await?;
+    let deadline = tokio::time::Instant::now() + window;
+    loop {
+        if !running().await {
+            return Err(format!(
+                "started, then stopped running within {} s: see its container log",
+                window.as_secs()
+            ));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(());
+        }
+        tokio::time::sleep(window / 8).await;
     }
 }
 
@@ -925,5 +979,53 @@ mod tests {
             let err = check_active_target(verb, active, "vehicle-b", None).unwrap_err();
             assert!(err.message().contains(&format!("`{verb}`")), "{err:?}");
         }
+    }
+
+    const WINDOW: Duration = Duration::from_millis(80);
+
+    #[tokio::test]
+    async fn a_member_that_exits_straight_after_starting_is_a_failure() {
+        let err = start_then_confirm(async { Ok(()) }, || async { false }, WINDOW)
+            .await
+            .unwrap_err();
+        assert!(err.contains("stopped running"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_member_that_exits_inside_the_window_is_a_failure() {
+        let mut checks = 0;
+        let result = start_then_confirm(
+            async { Ok(()) },
+            || {
+                checks += 1;
+                let alive = checks < 3;
+                async move { alive }
+            },
+            WINDOW,
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(checks, 3, "stops at the first check that fails");
+    }
+
+    #[tokio::test]
+    async fn a_member_that_stays_up_for_the_window_passes() {
+        let started = std::time::Instant::now();
+        start_then_confirm(async { Ok(()) }, || async { true }, WINDOW)
+            .await
+            .unwrap();
+        assert!(started.elapsed() >= WINDOW, "the whole window is watched");
+    }
+
+    #[tokio::test]
+    async fn a_start_that_fails_is_reported_as_itself() {
+        let err = start_then_confirm(
+            async { Err("no such image".into()) },
+            || async { true },
+            WINDOW,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, "no such image");
     }
 }

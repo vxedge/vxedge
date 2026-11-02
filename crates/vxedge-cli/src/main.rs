@@ -1175,7 +1175,7 @@ fn print_vehicle_status(st: &vxedge_api::v1::VehicleStatus) {
     );
     for c in &st.components {
         println!(
-            "  {:<8} {:<16} {:<16} {}",
+            "  {:<12} {:<16} {:<16} {}",
             kind_name(c.kind),
             c.vxid,
             resource_state_name(c.state),
@@ -1185,7 +1185,7 @@ fn print_vehicle_status(st: &vxedge_api::v1::VehicleStatus) {
     let Some(gw) = &st.gateway else { return };
     for s in &gw.slices {
         println!(
-            "  slice    {:<16} {:<16} {}",
+            "  slice        {:<16} {:<16} {}",
             s.slice_id,
             resource_state_name(s.state),
             s.detail
@@ -1193,7 +1193,7 @@ fn print_vehicle_status(st: &vxedge_api::v1::VehicleStatus) {
     }
     for f in &gw.ingress_filters {
         println!(
-            "  filter   {:<16} {:<16} {}",
+            "  filter       {:<16} {:<16} {}",
             f.access_port,
             resource_state_name(f.state),
             f.detail
@@ -1201,7 +1201,7 @@ fn print_vehicle_status(st: &vxedge_api::v1::VehicleStatus) {
     }
     for i in &gw.impairments {
         println!(
-            "  impaired {:<16} {:<16} {}",
+            "  impaired     {:<16} {:<16} {}",
             i.link,
             resource_state_name(i.state),
             i.detail
