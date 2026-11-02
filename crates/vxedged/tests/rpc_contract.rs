@@ -453,6 +453,7 @@ async fn a_missing_local_signal_plane_image_is_refused_before_the_gateway() {
     let refused = VehicleServiceClient::new(daemon.channel().await)
         .up(VehicleUpRequest {
             manifest: path_ref(&ws),
+            ..Default::default()
         })
         .await
         .unwrap_err();
