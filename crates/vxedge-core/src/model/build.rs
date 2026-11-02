@@ -1088,6 +1088,16 @@ pub fn load_vehicle_yaml(text: &str) -> Result<Experiment, LoadError> {
     load_yaml(&synthesize_vehicle_workspace(text)?)
 }
 
+/// Load a workspace as its author wrote it: an experiment workspace as it stands, and a bare vehicle
+/// through its synthesized experiment. For a caller that may be handed either.
+pub fn load_workspace_yaml(text: &str) -> Result<Experiment, LoadError> {
+    if Workspace::from_yaml(text)?.experiments.is_empty() {
+        load_vehicle_yaml(text)
+    } else {
+        load_yaml(text)
+    }
+}
+
 fn checked(exp: Experiment) -> Result<Experiment, LoadError> {
     let violations = exp.check();
     if violations.is_empty() {

@@ -271,15 +271,92 @@ fn active_record(runtime_dir: &Path) -> PathBuf {
     runtime_dir.join("active.json")
 }
 
-/// The record's `(id, workspace dir, bridge)`, if it is there and reads.
-fn read_active_record(runtime_dir: &Path) -> Option<(String, PathBuf, String)> {
+/// What `active.json` says. A record from before 0.4.1 has no `sha256`.
+#[derive(Debug, PartialEq, Eq)]
+struct ActiveRecord {
+    id: String,
+    dir: PathBuf,
+    bridge: String,
+    sha256: Option<String>,
+}
+
+/// The record, if it is there and reads.
+fn read_active_record(runtime_dir: &Path) -> Option<ActiveRecord> {
     let text = std::fs::read_to_string(active_record(runtime_dir)).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-    Some((
-        v["id"].as_str()?.to_string(),
-        PathBuf::from(v["dir"].as_str()?),
-        v["bridge"].as_str()?.to_string(),
-    ))
+    Some(ActiveRecord {
+        id: v["id"].as_str()?.to_string(),
+        dir: PathBuf::from(v["dir"].as_str()?),
+        bridge: v["bridge"].as_str()?.to_string(),
+        sha256: v["sha256"].as_str().map(str::to_string),
+    })
+}
+
+/// Rebuild `EdgeState` from the record after a daemon restart, so verbs that act on what is active
+/// keep working on a vehicle that outlived its daemon. A record only counts while its bridge
+/// exists, and a workspace with no directory cannot be re-read, so both leave the state empty.
+/// A workspace edited since `up` is refused: its plans would not describe what is running.
+pub(crate) async fn restore_active(
+    state: &SharedState,
+    runtime_dir: &Path,
+    shell: &Shell,
+) -> Result<(), Status> {
+    if state.lock().await.active.is_some() {
+        return Ok(());
+    }
+    let Some(record) = read_active_record(runtime_dir) else {
+        return Ok(());
+    };
+    if record.dir == Path::new(".") {
+        return Ok(());
+    }
+    let sh = shell.clone();
+    let bridge = record.bridge.clone();
+    let present = tokio::task::spawn_blocking(move || sh.link_exists(&bridge))
+        .await
+        .unwrap_or(false);
+    if !present {
+        return Ok(());
+    }
+    let refuse = |e: String| {
+        Status::failed_precondition(format!(
+            "`{}` is active from {}, but that workspace cannot be restored: {e}",
+            record.id,
+            record.dir.display()
+        ))
+    };
+    let mref = ManifestRef {
+        source: Some(Source::Path(record.dir.display().to_string())),
+        ..Default::default()
+    };
+    let (yaml, sha256, _) = resolve_manifest(Some(&mref))
+        .await
+        .map_err(|e| refuse(e.message().to_string()))?;
+    if record.sha256.as_ref().is_some_and(|s| *s != sha256) {
+        return Err(refuse("it has changed since `up`".to_string()));
+    }
+    let model =
+        vxedge_core::model::load_workspace_yaml(&yaml).map_err(|e| refuse(e.to_string()))?;
+    if model.id != record.id {
+        return Err(refuse(format!("it now declares `{}`", model.id)));
+    }
+    let plan = GatewayPlan::from_model(&model).map_err(|e| refuse(e.to_string()))?;
+    let fiveg = if plan.snssai_slice_ids.is_empty() {
+        None
+    } else {
+        Some(FiveGPlan::from_model(&model).map_err(|e| refuse(e.to_string()))?)
+    };
+    let mut st = state.lock().await;
+    if st.active.is_none() {
+        st.gateway = Some(plan);
+        st.fiveg = fiveg;
+        st.active = Some(ActiveExperiment {
+            model,
+            dir: record.dir,
+            sha256,
+        });
+    }
+    Ok(())
 }
 
 impl GatewaySvc {
@@ -290,12 +367,13 @@ impl GatewaySvc {
         if let Some(a) = &self.state.lock().await.active {
             return Some((a.model.id.clone(), a.dir.clone()));
         }
-        let (id, dir, bridge) = read_active_record(&self.runtime_dir)?;
+        let record = read_active_record(&self.runtime_dir)?;
         let shell = self.shell.clone();
+        let bridge = record.bridge;
         let present = tokio::task::spawn_blocking(move || shell.link_exists(&bridge))
             .await
             .unwrap_or(false);
-        present.then_some((id, dir))
+        present.then_some((record.id, record.dir))
     }
 
     /// Register a workspace as active when nothing is. `EdgeState` does not survive a daemon
@@ -533,6 +611,7 @@ impl GatewaySvc {
                             "id": model.id,
                             "dir": dir,
                             "bridge": plan.bridge,
+                            "sha256": sha256,
                         });
                         tokio::fs::write(active_record(&runtime_dir), record.to_string())
                             .await
@@ -660,6 +739,10 @@ impl GatewayService for GatewaySvc {
         &self,
         _: Request<GatewayStatusRequest>,
     ) -> Result<Response<GatewayStatus>, Status> {
+        // Best effort: a workspace that cannot be restored still has a gateway to report.
+        if let Err(e) = restore_active(&self.state, &self.runtime_dir, &self.shell).await {
+            tracing::warn!(error = %e.message(), "active workspace not restored");
+        }
         let (plan, fiveg_plan) = {
             let st = self.state.lock().await;
             (st.gateway.clone(), st.fiveg.clone())
@@ -1011,13 +1094,14 @@ pub struct ZoneSvc {
 impl ZoneSvc {
     /// Node plans for the active experiment, optionally filtered to one zone.
     async fn plans_for(&self, zone_vxid: Option<&str>) -> Result<Vec<NodePlan>, Status> {
+        restore_active(&self.state, &self.runtime_dir, &self.shell).await?;
         let st = self.state.lock().await;
         let (model, dir, gateway) = match (&st.active, &st.gateway) {
             (Some(a), Some(g)) => (a.model.clone(), a.dir.clone(), g.clone()),
             _ => {
                 return Err(Status::failed_precondition(
-                    "no active experiment: zone verbs act on the topology the gateway registered, so \
-                     bring one up first (`vxedge experiment up` from a workspace directory)",
+                    "nothing active: zone verbs act on the topology the gateway registered, so \
+                     bring one up first (`vxedge experiment up` or `vxedge vehicle up`)",
                 ));
             }
         };
@@ -1190,7 +1274,7 @@ impl ZoneService for ZoneSvc {
                     let s = zones::node_status(&shell, np, &rd);
                     crate::status::resource_status(
                         np.node_id.clone(),
-                        ResourceKind::Zone,
+                        crate::status::node_kind(np.role),
                         &s,
                         // `peer` is here because interface names are derived from the device id
                         // and shortened to fit IFNAMSIZ, so `vz-node-a-c06a` is not something an
@@ -1265,14 +1349,14 @@ impl ComputeSvc {
     /// shared helper would put a second caller's requirements on code those frozen results
     /// depend on.
     async fn plans_for(&self, vxid: Option<&str>) -> Result<Vec<NodePlan>, Status> {
+        restore_active(&self.state, &self.runtime_dir, &self.shell).await?;
         let st = self.state.lock().await;
         let (model, dir, gateway) = match (&st.active, &st.gateway) {
             (Some(a), Some(g)) => (a.model.clone(), a.dir.clone(), g.clone()),
             _ => {
                 return Err(Status::failed_precondition(
-                    "no active experiment: compute verbs act on the topology the gateway \
-                     registered, so bring one up first (`vxedge experiment up` from a workspace \
-                     directory)",
+                    "nothing active: compute verbs act on the topology the gateway registered, \
+                     so bring one up first (`vxedge experiment up` or `vxedge vehicle up`)",
                 ));
             }
         };
@@ -1487,6 +1571,8 @@ pub struct SvcSvc {
     pub audit: Arc<Audit>,
     /// Reaches a node's namespace to tell whether a placed service's device is up.
     pub shell: Shell,
+    /// Names the workspace of a call that names none.
+    pub state: SharedState,
     pub runtime_dir: PathBuf,
     /// Binaries the process backend spawns (v1 co-locates every service with vxedged — see
     /// ARCHITECTURE.md §8). A struct rather than one path per service, so a new service type
@@ -1504,13 +1590,13 @@ impl SvcSvc {
         // declares, and saying so beats "no `bogus` service declared" or "a manifest is required".
         let service_type = parse_service_type(service_type)?.as_str();
         let (yaml, sha256, dir) = resolve_manifest(experiment).await?;
-        let model = parse_to_model(&yaml)
+        let model = vxedge_core::model::load_workspace_yaml(&yaml)
             .map_err(|e| Status::invalid_argument(format!("workspace invalid: {e}")))?;
         let def = vxedge_core::services::ServiceDef::find(&model, service_type)
             .cloned()
             .ok_or_else(|| {
                 Status::not_found(format!(
-                    "no `{service_type}` service declared under `services` in this experiment"
+                    "no `{service_type}` service declared under `services` in this workspace"
                 ))
             })?;
         // The workspace dir travels with the def: a telemetry service reads its scrape targets
@@ -1540,14 +1626,38 @@ impl SvcSvc {
         })
     }
 
+    /// The active workspace, for a call that names none. `None` when nothing is active, or when
+    /// it has no directory to read.
+    async fn active_workspace(&self) -> Option<ManifestRef> {
+        restore_active(&self.state, &self.runtime_dir, &self.shell)
+            .await
+            .ok()?;
+        let st = self.state.lock().await;
+        let dir = &st.active.as_ref()?.dir;
+        (dir != Path::new(".")).then(|| ManifestRef {
+            source: Some(Source::Path(dir.display().to_string())),
+            ..Default::default()
+        })
+    }
+
     /// The node and container of a service placed with `on:`, or `None` for a host process.
     async fn placed(
         &self,
         service_type: &str,
         experiment: Option<&ManifestRef>,
     ) -> Option<(NodePlan, vxedge_core::containers::ContainerSpec)> {
-        experiment?;
-        let declared = self.service_def(service_type, experiment).await.ok()?;
+        let active;
+        let experiment = match experiment {
+            Some(named) => named,
+            None => {
+                active = self.active_workspace().await?;
+                &active
+            }
+        };
+        let declared = self
+            .service_def(service_type, Some(experiment))
+            .await
+            .ok()?;
         let spec =
             vxedge_core::services::placed_spec(&declared.def, &declared.workspace_dir).ok()?;
         Some((declared.node?, spec))
@@ -1606,7 +1716,11 @@ impl SvcService for SvcSvc {
                     }
                 })
                 .await?;
-                events.emit(crate::events::EventKind::ServiceUp, &service_type, &msg);
+                events.emit(
+                    crate::events::EventKind::ServiceUp,
+                    &format!("svc-{service_type}"),
+                    &msg,
+                );
                 p.update(100, &msg);
                 Ok(msg)
             })
@@ -1648,7 +1762,7 @@ impl SvcService for SvcSvc {
                 .await?;
                 events.emit(
                     crate::events::EventKind::ServiceDown,
-                    &service_type_for_event,
+                    &format!("svc-{service_type_for_event}"),
                     &msg,
                 );
                 p.update(100, &msg);
@@ -2269,6 +2383,7 @@ mod tests {
                 netns: None,
                 escalate: false,
             },
+            state: SharedState::default(),
             runtime_dir,
             bins: vxedge_core::services::ServiceBinaries {
                 vxota: "vxota".into(),
@@ -2352,7 +2467,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             read_active_record(&dir),
-            Some(("vehicle-a".into(), "/ws/a".into(), "vxbr0".into()))
+            Some(ActiveRecord {
+                id: "vehicle-a".into(),
+                dir: "/ws/a".into(),
+                bridge: "vxbr0".into(),
+                sha256: None,
+            })
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }

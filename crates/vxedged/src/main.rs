@@ -177,7 +177,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         engine: engine.clone(),
         audit: audit.clone(),
         shell: shell.clone(),
-        state,
+        state: state.clone(),
         runtime_dir: args.runtime_dir.clone(),
         cache_dir: cache_dir.clone(),
     });
@@ -185,6 +185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         engine: engine.clone(),
         audit: audit.clone(),
         shell: shell.clone(),
+        state,
         runtime_dir: args.runtime_dir.clone(),
         bins: vxedge_core::services::ServiceBinaries {
             vxota: args.vxota_bin.clone(),

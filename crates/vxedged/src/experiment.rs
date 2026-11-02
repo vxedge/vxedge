@@ -490,9 +490,23 @@ impl ExperimentService for ExperimentSvc {
         &self,
         req: Request<ExperimentStatusRequest>,
     ) -> Result<Response<ExperimentStatus>, Status> {
+        let dir = match req.get_ref().manifest.as_ref() {
+            Some(mref) => crate::services::resolve_manifest_dir(mref).await,
+            None => None,
+        };
         let yaml = resolve_once(req.get_ref().manifest.as_ref()).await?;
         let model = vxedge_core::model::load_yaml(&yaml)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        // The components below describe what is active, so this must be what the caller named.
+        let active = self.handles.gateway.active_on_host().await;
+        check_active_target(
+            "experiment status",
+            active
+                .as_ref()
+                .map(|(id, dir)| (id.as_str(), dir.as_path())),
+            &model.id,
+            dir.as_deref(),
+        )?;
 
         let gw = self
             .handles
@@ -502,16 +516,27 @@ impl ExperimentService for ExperimentSvc {
             .into_inner();
         let gw_status = gw.status.clone().unwrap_or_default();
 
-        let zones = self
+        let mut components = self
             .handles
             .zones
             .list(Request::new(vxedge_api::v1::ZoneListRequest {}))
             .await
             .map(|r| r.into_inner().zones)
             .unwrap_or_default();
+        for service_type in vxedge_core::services::ServiceDef::declared_types(&model) {
+            let observed = self
+                .handles
+                .svcs
+                .status(Request::new(vxedge_api::v1::SvcStatusRequest {
+                    service_type,
+                    experiment: inline(&yaml, dir.as_deref()),
+                }))
+                .await?;
+            components.push(observed.into_inner());
+        }
 
         Ok(Response::new(build_experiment_status(
-            &model.id, gw_status, zones,
+            &model.id, gw_status, components,
         )))
     }
 }
@@ -530,10 +555,14 @@ impl ExperimentService for ExperimentSvc {
 fn build_experiment_status(
     experiment_id: &str,
     gw_status: ResourceStatus,
-    zones: Vec<ResourceStatus>,
+    components: Vec<ResourceStatus>,
 ) -> ExperimentStatus {
-    let (status, components) =
-        crate::status::composite_rollup(experiment_id, ResourceKind::Experiment, gw_status, zones);
+    let (status, components) = crate::status::composite_rollup(
+        experiment_id,
+        ResourceKind::Experiment,
+        gw_status,
+        components,
+    );
     ExperimentStatus {
         status: Some(status),
         components,

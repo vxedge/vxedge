@@ -2515,11 +2515,13 @@ name = "vxedged"
 version = "0.4.0"
 dependencies = [
  "clap",
+ "hyper-util",
  "serde_json",
  "sha2 0.11.1",
  "tokio",
  "tokio-stream",
  "tonic",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "vxedge-api",

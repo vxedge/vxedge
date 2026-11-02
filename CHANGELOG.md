@@ -6,6 +6,31 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- `vxedge ota status`, the CLI verb for `SvcService.Status`.
+- `vxedge vehicle status --json`.
+- `crates/vxedged/tests/rpc_contract.rs`: tests that run a real `vxedged` over a Unix socket through
+  the generated clients, unprivileged, as part of plain `cargo test`.
+
+### Changed
+
+- `ExperimentService.Status` refuses a workspace that is not the active one, as the `vehicle` verbs
+  do, and reports the declared services. An experiment brought up without its services stage now
+  reads as degraded.
+- `service.up` and `service.down` events use the id `SvcService.Status` reports (`svc-ota`, not `ota`).
+
+### Fixed
+
+- `SvcService` read a bare vehicle workspace as invalid, so `Up` failed and `Status` said a placed
+  service was not running whatever it was doing.
+- `SvcService.Status` with no workspace always read a placed service as down. It now uses the active
+  workspace.
+- Zone and compute verbs failed with "no active experiment" after a daemon restart, while the vehicle
+  was still up. The daemon now rebuilds its state from the active record, and refuses a workspace
+  edited since `up`.
+- `ZoneService.List` reported hpc devices as zones. They now report as compute.
+
 ## [0.4.0] - 2026-11-02
 
 A fifth zone backend, and every backend proven in one vehicle. `backend: wasm-capsule` runs a
