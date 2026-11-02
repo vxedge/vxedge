@@ -240,6 +240,19 @@ fn tier2() -> Vec<Check> {
         Some("apt install qemu-system-x86"),
     ));
 
+    // Optional: only `backend: cloud-hypervisor` needs it, and QEMU serves every other VM.
+    c.push(check(
+        2,
+        "Cloud Hypervisor (tested: v54.0)",
+        false,
+        present("cloud-hypervisor", &["--version"]),
+        cmd_version("cloud-hypervisor", &["--version"]).unwrap_or_else(|| "not found".to_string()),
+        Some(
+            "needed only for `backend: cloud-hypervisor`: install a release from \
+             https://github.com/cloud-hypervisor/cloud-hypervisor/releases",
+        ),
+    ));
+
     c.push(check(
         2,
         "libvirt >= 10.x",

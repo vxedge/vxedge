@@ -6,6 +6,17 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- `vxedge doctor --tier 2` reports Cloud Hypervisor, as an optional check.
+
+### Fixed
+
+- A Cloud Hypervisor guest is seen from a daemon with another runtime dir, through its VMM's API
+  socket. It used to read as down there, so `up` could start a second VMM and `vehicle down` could
+  remove the gateway from under it. The host check for a vehicle this workspace does not declare
+  names these guests too. Both daemons must run as the same user.
+
 ## [0.3.0] - 2026-11-02
 
 `vxedge vehicle up` now brings up a full vehicle from one workspace: a gateway, zones on several
