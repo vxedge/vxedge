@@ -224,7 +224,11 @@ impl Handles {
     /// keeps `up` from starting several guests concurrently in one call — the concurrency that
     /// invalidated exp-002b's first campaign.
     pub(crate) async fn stage_zones(&self, up: bool, p: &Progress) -> Result<String, String> {
-        let listed = match self.zones.list(Request::new(ZoneListRequest {})).await {
+        let listed = match self
+            .zones
+            .list(Request::new(ZoneListRequest::default()))
+            .await
+        {
             Ok(r) => r.into_inner().zones,
             // A plan that cannot be made is a broken workspace, and reading it as "no zones"
             // reported success with nothing provisioned.
@@ -289,20 +293,36 @@ impl Handles {
             vxid: id.to_string(),
         });
         let job = match (stage, up) {
-            (NodeStage::Zones, true) => self.zones.up(Request::new(ZoneUpRequest { r#ref })).await,
+            (NodeStage::Zones, true) => {
+                self.zones
+                    .up(Request::new(ZoneUpRequest {
+                        r#ref,
+                        ..Default::default()
+                    }))
+                    .await
+            }
             (NodeStage::Zones, false) => {
                 self.zones
-                    .down(Request::new(ZoneDownRequest { r#ref }))
+                    .down(Request::new(ZoneDownRequest {
+                        r#ref,
+                        ..Default::default()
+                    }))
                     .await
             }
             (NodeStage::Compute, true) => {
                 self.compute
-                    .up(Request::new(ComputeUpRequest { r#ref }))
+                    .up(Request::new(ComputeUpRequest {
+                        r#ref,
+                        ..Default::default()
+                    }))
                     .await
             }
             (NodeStage::Compute, false) => {
                 self.compute
-                    .down(Request::new(ComputeDownRequest { r#ref }))
+                    .down(Request::new(ComputeDownRequest {
+                        r#ref,
+                        ..Default::default()
+                    }))
                     .await
             }
         }?;
@@ -332,6 +352,7 @@ impl Handles {
                     .up(Request::new(SvcUpRequest {
                         service_type: ty.clone(),
                         experiment: inline(yaml, dir),
+                        ..Default::default()
                     }))
                     .await
             } else {
@@ -339,6 +360,7 @@ impl Handles {
                     .down(Request::new(SvcDownRequest {
                         service_type: ty.clone(),
                         experiment: inline(yaml, dir),
+                        ..Default::default()
                     }))
                     .await
             }
@@ -519,7 +541,7 @@ impl ExperimentService for ExperimentSvc {
         let mut components = self
             .handles
             .zones
-            .list(Request::new(vxedge_api::v1::ZoneListRequest {}))
+            .list(Request::new(vxedge_api::v1::ZoneListRequest::default()))
             .await
             .map(|r| r.into_inner().zones)
             .unwrap_or_default();
@@ -530,6 +552,7 @@ impl ExperimentService for ExperimentSvc {
                 .status(Request::new(vxedge_api::v1::SvcStatusRequest {
                     service_type,
                     experiment: inline(&yaml, dir.as_deref()),
+                    ..Default::default()
                 }))
                 .await?;
             components.push(observed.into_inner());
@@ -566,6 +589,7 @@ fn build_experiment_status(
     ExperimentStatus {
         status: Some(status),
         components,
+        ..Default::default()
     }
 }
 
@@ -584,6 +608,7 @@ mod tests {
             state: state as i32,
             detail: String::new(),
             since_unix_ms: 0,
+            ..Default::default()
         }
     }
 

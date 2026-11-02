@@ -135,6 +135,7 @@ impl EventBus {
             resource_kind: kind.resource_kind() as i32,
             resource_vxid: resource_vxid.to_string(),
             detail: detail.to_string(),
+            ..Default::default()
         };
         // No subscribers is fine; the bus is fire-and-forget. It must never be able to block
         // provisioning — an event that can is a dashboard made into a dependency of the testbed.

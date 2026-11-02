@@ -113,18 +113,26 @@ message ZoneApplyRequest {
   ManifestRef manifest = 1;
 }
 
+// `run`, here and on the requests below: empty means the only run, and a run that is not the active
+// one is refused with `ERROR_REASON_RUN_MISMATCH`.
 message ZoneUpRequest {
   VxidRef ref = 1;
+  RunRef run = 2;
 }
 
 message ZoneDownRequest {
   VxidRef ref = 1;
+  RunRef run = 2;
 }
 
-message ZoneListRequest {}
+message ZoneListRequest {
+  RunRef run = 1;
+}
 
 message ZoneListResponse {
+  // Every planned node, hpc devices included. Prefer `nodes`.
   repeated ResourceStatus zones = 1;
+  repeated NodeStatus nodes = 2;
 }
 
 message ZoneRemoveRequest {
@@ -154,12 +162,21 @@ message ImagePushResponse {
 }
 
 service ZoneService {
-  rpc Apply(ZoneApplyRequest) returns (Job);
+  // Not built. Manifests define the topology.
+  rpc Apply(ZoneApplyRequest) returns (Job) {
+    option deprecated = true;
+  }
   rpc Up(ZoneUpRequest) returns (Job);
   rpc Down(ZoneDownRequest) returns (Job);
   rpc List(ZoneListRequest) returns (ZoneListResponse);
-  rpc Remove(ZoneRemoveRequest) returns (Job);
-  rpc PushImage(stream ImagePushRequest) returns (ImagePushResponse);
+  // Not built. Manifests define the topology.
+  rpc Remove(ZoneRemoveRequest) returns (Job) {
+    option deprecated = true;
+  }
+  // Not built. Parts come from the registry.
+  rpc PushImage(stream ImagePushRequest) returns (ImagePushResponse) {
+    option deprecated = true;
+  }
 }
 
 message ComputeApplyRequest {
@@ -168,16 +185,22 @@ message ComputeApplyRequest {
 
 message ComputeUpRequest {
   VxidRef ref = 1;
+  RunRef run = 2;
 }
 
 message ComputeDownRequest {
   VxidRef ref = 1;
+  RunRef run = 2;
 }
 
-message ComputeListRequest {}
+message ComputeListRequest {
+  RunRef run = 1;
+}
 
 message ComputeListResponse {
+  // Prefer `node_status`.
   repeated ResourceStatus nodes = 1;
+  repeated NodeStatus node_status = 2;
 }
 
 message ComputeRemoveRequest {
@@ -185,33 +208,47 @@ message ComputeRemoveRequest {
 }
 
 service ComputeService {
-  rpc Apply(ComputeApplyRequest) returns (Job);
+  // Not built. Manifests define the topology.
+  rpc Apply(ComputeApplyRequest) returns (Job) {
+    option deprecated = true;
+  }
   rpc Up(ComputeUpRequest) returns (Job);
   rpc Down(ComputeDownRequest) returns (Job);
   rpc List(ComputeListRequest) returns (ComputeListResponse);
-  rpc Remove(ComputeRemoveRequest) returns (Job);
-  rpc PushImage(stream ImagePushRequest) returns (ImagePushResponse);
+  // Not built. Manifests define the topology.
+  rpc Remove(ComputeRemoveRequest) returns (Job) {
+    option deprecated = true;
+  }
+  // Not built. Parts come from the registry.
+  rpc PushImage(stream ImagePushRequest) returns (ImagePushResponse) {
+    option deprecated = true;
+  }
 }
 
 // ---------------------------------------------------------------------------
-// Services (ota, telemetry) — deployed per experiment manifest
+// Services (ota, telemetry) — declared by an experiment or a vehicle, and on a vehicle placed on a
+// device with `on:`. `SvcService` never starts the signal plane, which has a stage of its own.
 // ---------------------------------------------------------------------------
 
 message SvcUpRequest {
   // "ota" | "telemetry" (§8: only these two types for now). Up, Down and Status
   // answer any other value, or none, with INVALID_ARGUMENT naming the accepted ones.
   string service_type = 1;
+  // The workspace, experiment or bare vehicle. On Down and Status, unset means the active one.
   ManifestRef experiment = 2;
+  RunRef run = 3;
 }
 
 message SvcDownRequest {
   string service_type = 1;
   ManifestRef experiment = 2;
+  RunRef run = 3;
 }
 
 message SvcStatusRequest {
   string service_type = 1;
   ManifestRef experiment = 2;
+  RunRef run = 3;
 }
 
 service SvcService {
@@ -224,12 +261,20 @@ service SvcService {
 // Vehicle (ordered composition: gateway -> zones -> compute -> signal plane -> services)
 // ---------------------------------------------------------------------------
 
+// Up, Down and Status answer FAILED_PRECONDITION for a workspace that is not the active one, or
+// when the host is running what this workspace does not declare: each acts on the host's one
+// gateway. Up also refuses, before touching the host, a workspace that cannot provision, such as a
+// missing `localhost/` image, guest bundle or capsule module.
 message VehicleUpRequest {
   ManifestRef manifest = 1;
+  // Restrict to specific stages (empty = all, in dependency order).
+  repeated ExperimentStage stages = 2;
 }
 
 message VehicleDownRequest {
   ManifestRef manifest = 1;
+  // Restrict to specific stages (empty = all, in reverse dependency order).
+  repeated ExperimentStage stages = 2;
 }
 
 message VehicleStatusRequest {
@@ -242,6 +287,8 @@ message VehicleStatus {
   // The gateway as observed for this vehicle's workspace: per-slice VLANs and queues, ingress
   // filters, impairments and tunnels, which one line in `components` cannot carry.
   GatewayStatus gateway = 3;
+  // The zone and compute entries of `components`, typed.
+  repeated NodeStatus nodes = 4;
 }
 
 service VehicleService {
@@ -264,6 +311,8 @@ enum ExperimentStage {
   EXPERIMENT_STAGE_GATEWAY = 1;
   EXPERIMENT_STAGE_ZONES = 2;
   EXPERIMENT_STAGE_SERVICES = 3;
+  EXPERIMENT_STAGE_COMPUTE = 4;
+  EXPERIMENT_STAGE_SIGNAL_PLANE = 5;
 }
 
 message ExperimentUpRequest {
@@ -290,6 +339,9 @@ message ExperimentStatusRequest {
 message ExperimentStatus {
   ResourceStatus status = 1;
   repeated ResourceStatus components = 2;
+  GatewayStatus gateway = 3;
+  // The zone and compute entries of `components`, typed.
+  repeated NodeStatus nodes = 4;
 }
 
 service ExperimentService {
@@ -302,16 +354,44 @@ message TrafficUpRequest {
   ManifestRef manifest = 1;
   // Restrict to specific profiles (empty = all in manifest).
   repeated string profiles = 2;
+  RunRef run = 3;
+  // Traffic is a time-bounded process, so `Up` does not converge. A retry with the same id returns
+  // the original job instead of starting a second load run.
+  string request_id = 4;
 }
 
 message TrafficDownRequest {
   ManifestRef manifest = 1;
   repeated string profiles = 2;
+  RunRef run = 3;
+}
+
+message TrafficStatusRequest {
+  ManifestRef manifest = 1;
+  RunRef run = 2;
+}
+
+enum TrafficProfileState {
+  TRAFFIC_PROFILE_STATE_UNSPECIFIED = 0;
+  TRAFFIC_PROFILE_STATE_RUNNING = 1;
+  TRAFFIC_PROFILE_STATE_FINISHED = 2;
+  TRAFFIC_PROFILE_STATE_FAILED = 3;
+}
+
+message TrafficProfileStatus {
+  string id = 1;
+  TrafficProfileState state = 2;
+  string detail = 3;
+}
+
+message TrafficStatus {
+  repeated TrafficProfileStatus profiles = 1;
 }
 
 service TrafficService {
   rpc Up(TrafficUpRequest) returns (Job);
   rpc Down(TrafficDownRequest) returns (Job);
+  rpc Status(TrafficStatusRequest) returns (TrafficStatus);
 }
 
 // ---------------------------------------------------------------------------
@@ -324,14 +404,17 @@ service TrafficService {
 
 message NosCheckUpRequest {
   ManifestRef experiment = 1;
+  RunRef run = 2;
 }
 
 message NosCheckDownRequest {
   ManifestRef experiment = 1;
+  RunRef run = 2;
 }
 
 message NosCheckStatusRequest {
   ManifestRef experiment = 1;
+  RunRef run = 2;
 }
 
 message NosCheckStatus {
@@ -340,6 +423,10 @@ message NosCheckStatus {
 
 message NosCheckVerifyRequest {
   ManifestRef experiment = 1;
+  RunRef run = 2;
+  // Each check boots a fresh instance, so `Verify` does not converge. A retry with the same id
+  // returns the original job.
+  string request_id = 3;
 }
 
 service NosCheckService {

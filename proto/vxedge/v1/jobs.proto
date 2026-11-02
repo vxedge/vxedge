@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package vxedge.v1;
 
+import "vxedge/v1/common.proto";
+
 // Every mutating RPC in vxAPI returns a Job. Progress is observed via
 // JobService.Watch (server streaming).
 
@@ -24,6 +26,20 @@ message Job {
   string error = 6;
   int64 created_unix_ms = 7;
   int64 updated_unix_ms = 8;
+  // The composite job this one is a stage of. Empty for a top-level job.
+  string parent_job_id = 9;
+  // The run this job acts on, if any.
+  string run_id = 10;
+  // Why the job failed, when `state` is FAILED.
+  ErrorReason error_reason = 11;
+  // What the job produced, if anything: for example the results archive of `telemetry.collect`.
+  Artifact artifact = 12;
+}
+
+message Artifact {
+  // A path on the daemon's filesystem.
+  string path = 1;
+  string sha256 = 2;
 }
 
 message GetJobRequest {
@@ -34,8 +50,34 @@ message WatchJobRequest {
   string id = 1;
 }
 
+message JobCancelRequest {
+  string id = 1;
+}
+
+message JobListRequest {
+  // Each filter is optional, and they combine. An empty `states` means every state.
+  repeated JobState states = 1;
+  string kind = 2;
+  RunRef run = 3;
+  string parent_job_id = 4;
+  // 0 means the daemon's default.
+  uint32 page_size = 5;
+  string page_token = 6;
+}
+
+message JobListResponse {
+  repeated Job jobs = 1;
+  // Empty on the last page.
+  string next_page_token = 2;
+}
+
 service JobService {
   rpc Get(GetJobRequest) returns (Job);
   // Streams Job updates until the job reaches a terminal state.
   rpc Watch(WatchJobRequest) returns (stream Job);
+  // Most recent first. History is bounded and does not survive a daemon restart.
+  rpc List(JobListRequest) returns (JobListResponse);
+  // Cooperative: takes effect between steps, because a running backend call cannot be interrupted.
+  // A cancelled `up` leaves partial state for `down` to clear. A `down` is not cancellable.
+  rpc Cancel(JobCancelRequest) returns (Job);
 }
