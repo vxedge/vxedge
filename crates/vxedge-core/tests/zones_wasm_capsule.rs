@@ -6,14 +6,16 @@
 //! Privilege comes from file capabilities on the test binary, plus a cached sudo credential for
 //! `tc` and `nft`. It needs no gateway already on this host. Run with:
 //!   cargo build -p vxcapsule
-//!   cargo build --release --target wasm32-wasip2 --manifest-path \
-//!     crates/vxedge-core/tests/fixtures/reflector-capsule/Cargo.toml
+//!   <vxparts>/parts/zone/wasm/app/reflector-capsule/build.sh /path/to/capsule
 //!   sudo -v
 //!   BIN=$(cargo test -p vxedge-core --test zones_wasm_capsule --no-run --message-format=json \
 //!     | jq -r 'select(.target.name=="zones_wasm_capsule" and .executable) | .executable')
 //!   sudo setcap cap_net_admin,cap_sys_admin+ep "$BIN"   # again after every rebuild
-//!   VXEDGE_CAPSULE_BIN=target/debug/vxcapsule VXEDGE_TEST_WASM=/path/to/reflector-capsule.wasm \
-//!     "$BIN" --ignored --nocapture
+//!   VXEDGE_CAPSULE_BIN=target/debug/vxcapsule \
+//!     VXEDGE_TEST_WASM=/path/to/capsule/reflector-capsule.wasm \
+//!     "$BIN" --ignored --nocapture --test-threads=1
+//! `VXEDGE_TEST_PART_REF` and `VXEDGE_TEST_PART_DIGEST` name a published part for the fetch test,
+//! which also needs registry access through `oras`.
 
 #![cfg(target_os = "linux")]
 
@@ -34,7 +36,7 @@ const GUEST_IP: &str = "10.250.102.2";
 const FAR_SIDE_CIDR: &str = "10.250.102.1/24";
 const REFLECTOR: &str = "10.250.102.2:9800";
 
-fn workspace(module: &str) -> String {
+fn workspace(part: &str, device_extra: &str) -> String {
     format!(
         r#"
 kind: experiment
@@ -49,7 +51,7 @@ kind: vehicle
 id: veh
 zones: {{ front-left: {{}} }}
 devices:
-  {NODE}: {{ role: sensor, zone: front-left, backend: wasm-capsule }}
+  {NODE}: {{ role: sensor, zone: front-left, backend: wasm-capsule{device_extra} }}
 functions:
   fn-sensor: {{ deployed_on: {NODE} }}
 links:
@@ -58,7 +60,7 @@ links:
 kind: baseline
 id: bl
 parts:
-  - {{ ref: {module}, kind: wasm, target_ids: fn-sensor }}
+  - {{ {part}, kind: wasm, target_ids: fn-sensor }}
 "#
     )
 }
@@ -137,9 +139,8 @@ fn rss_kib(pid: &str) -> u64 {
         .expect("a running process has VmRSS")
 }
 
-#[test]
-#[ignore = "needs file capabilities, cached sudo, and a built capsule (see module docs)"]
-fn a_capsule_answers_across_the_gateway_and_stops_while_idle() {
+/// A gateway in the host namespace with the far side up, planned from `yaml`.
+fn gateway_for(yaml: &str) -> (Shell, GatewayPlan, NodePlan, PathBuf) {
     assert_ne!(
         own_uid(),
         0,
@@ -149,7 +150,6 @@ fn a_capsule_answers_across_the_gateway_and_stops_while_idle() {
         !Path::new("/sys/class/net/vxbr0").exists(),
         "a gateway is already on this host; bring it down first"
     );
-    let module = std::env::var("VXEDGE_TEST_WASM").expect("VXEDGE_TEST_WASM names a module");
     let runtime = std::env::temp_dir().join(format!("vxcap{}", std::process::id()));
     std::fs::create_dir_all(&runtime).unwrap();
 
@@ -158,17 +158,11 @@ fn a_capsule_answers_across_the_gateway_and_stops_while_idle() {
         netns: None,
         escalate: true,
     };
-    let model = vxedge_core::model::load_yaml(&workspace(&module)).expect("workspace loads");
+    let model = vxedge_core::model::load_yaml(yaml).expect("workspace loads");
     let plan = GatewayPlan::from_model(&model).unwrap();
     apply(&sh, &plan).unwrap();
     let nodes = plan_nodes_from_model(&model, &plan, Path::new("/")).unwrap();
     let node = nodes[0].clone();
-    let _guard = Guard {
-        sh: sh.clone(),
-        plan: plan.clone(),
-        node: node.clone(),
-        runtime: runtime.clone(),
-    };
 
     // The far side, on the sensor's slice and subnet.
     let far_dev = format!("{}.102", plan.uplink_peer);
@@ -193,6 +187,24 @@ fn a_capsule_answers_across_the_gateway_and_stops_while_idle() {
     sh.run("ip", &["link", "set", &far_dev, "up"]).unwrap();
     sh.run("ip", &["link", "set", &plan.uplink_peer, "up"])
         .unwrap();
+    (sh, plan, node, runtime)
+}
+
+fn local_module_part() -> String {
+    let module = std::env::var("VXEDGE_TEST_WASM").expect("VXEDGE_TEST_WASM names a module");
+    format!("ref: {module}")
+}
+
+#[test]
+#[ignore = "needs file capabilities, cached sudo, and a built capsule (see module docs)"]
+fn a_capsule_answers_across_the_gateway_and_stops_while_idle() {
+    let (sh, plan, node, runtime) = gateway_for(&workspace(&local_module_part(), ""));
+    let _guard = Guard {
+        sh: sh.clone(),
+        plan: plan.clone(),
+        node: node.clone(),
+        runtime: runtime.clone(),
+    };
 
     // --- start ----------------------------------------------------------------
     let started = Instant::now();
@@ -276,4 +288,55 @@ fn a_capsule_answers_across_the_gateway_and_stops_while_idle() {
         .unwrap();
     node_up(&sh, &node, &runtime, &runtime).unwrap();
     wait_for_reflector();
+}
+
+/// The whole runner stays on the node's CPUs, every thread of it, wasmtime's included.
+#[test]
+#[ignore = "needs file capabilities, cached sudo, and a built capsule (see module docs)"]
+fn a_pinned_capsule_keeps_every_thread_on_its_cpu() {
+    let extra = ", realtime: { pinned_cpus: [1] }";
+    let (sh, plan, node, runtime) = gateway_for(&workspace(&local_module_part(), extra));
+    let _guard = Guard {
+        sh: sh.clone(),
+        plan: plan.clone(),
+        node: node.clone(),
+        runtime: runtime.clone(),
+    };
+    assert_eq!(node.pinned_cpus, [1]);
+    node_up(&sh, &node, &runtime, &runtime).unwrap();
+    wait_for_reflector();
+
+    let pids = runner_pids();
+    assert_eq!(pids.len(), 1, "one runner: {pids:?}");
+    let mut threads = 0;
+    for task in std::fs::read_dir(format!("/proc/{}/task", pids[0])).unwrap() {
+        let status = std::fs::read_to_string(task.unwrap().path().join("status")).unwrap();
+        let allowed = status
+            .lines()
+            .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
+            .expect("status lists Cpus_allowed_list");
+        assert_eq!(allowed.trim(), "1", "every thread stays on the node's CPU");
+        threads += 1;
+    }
+    assert!(threads >= 1);
+}
+
+/// A published part, fetched by digest through `node_up`, with no local file named anywhere.
+#[test]
+#[ignore = "needs a published part and registry access, as well as the above (see module docs)"]
+fn a_published_capsule_is_fetched_by_digest() {
+    let reference = std::env::var("VXEDGE_TEST_PART_REF").expect("VXEDGE_TEST_PART_REF is set");
+    let digest = std::env::var("VXEDGE_TEST_PART_DIGEST").expect("VXEDGE_TEST_PART_DIGEST is set");
+    let part = format!("ref: {reference}, digest: '{digest}'");
+    let (sh, plan, node, runtime) = gateway_for(&workspace(&part, ""));
+    let _guard = Guard {
+        sh: sh.clone(),
+        plan: plan.clone(),
+        node: node.clone(),
+        runtime: runtime.clone(),
+    };
+    assert_eq!(node.module, None);
+    node_up(&sh, &node, &runtime, &runtime).unwrap();
+    wait_for_reflector();
+    assert_eq!(node_status(&sh, &node, &runtime), NodeState::Up);
 }

@@ -67,6 +67,33 @@ fn runner_path() -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
+/// The module in a pulled part. A part holds exactly one, beside its `meta.json`.
+pub(super) fn module_in(np: &NodePlan, dir: &Path) -> Result<PathBuf, ZoneBackendError> {
+    let entries = std::fs::read_dir(dir).map_err(|e| {
+        err(
+            np,
+            format!("cannot read pulled part `{}`: {e}", dir.display()),
+        )
+    })?;
+    let modules: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "wasm"))
+        .collect();
+    match modules.as_slice() {
+        [module] => Ok(module.clone()),
+        other => Err(err(
+            np,
+            format!(
+                "pulled part `{}` holds {} .wasm files, and a capsule part holds one. Republish \
+                 it, or correct the part's `ref`.",
+                dir.display(),
+                other.len()
+            ),
+        )),
+    }
+}
+
 fn launch_argv(runner: &Path, np: &NodePlan, module: &Path) -> Vec<String> {
     let mut argv: Vec<String> = ["setsid", "-f"].map(String::from).to_vec();
     if !np.pinned_cpus.is_empty() {
@@ -152,7 +179,7 @@ pub(super) fn up(sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), Zo
     let module = np
         .module
         .as_deref()
-        .expect("plan invariant: a wasm-capsule node carries a module");
+        .expect("plan invariant: a wasm-capsule node has a module, or node_up fetched it");
     if !module.is_file() {
         return Err(err(
             np,
@@ -275,6 +302,20 @@ mod tests {
     fn a_pinned_node_keeps_the_whole_runner_on_its_cpus() {
         let argv = launch_argv(Path::new("/r"), &node(vec![2, 3]), Path::new("/m"));
         assert_eq!(argv[2..6], ["taskset", "-c", "2,3", "/r"]);
+    }
+
+    #[test]
+    fn a_pulled_part_must_hold_exactly_one_module() {
+        let dir = std::env::temp_dir().join(format!("vx-capsule-part-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("meta.json"), b"{}").unwrap();
+        assert!(module_in(&node(vec![]), &dir).is_err());
+        std::fs::write(dir.join("a.wasm"), b"").unwrap();
+        assert_eq!(module_in(&node(vec![]), &dir).unwrap(), dir.join("a.wasm"));
+        std::fs::write(dir.join("b.wasm"), b"").unwrap();
+        let e = module_in(&node(vec![]), &dir).unwrap_err().to_string();
+        assert!(e.contains("holds 2 .wasm files"), "{e}");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

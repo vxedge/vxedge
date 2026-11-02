@@ -9,11 +9,11 @@ All notable changes to this repo are documented here. Format follows
 ### Added
 
 - `vxedge doctor --tier 2` reports Cloud Hypervisor, as an optional check.
-- **`backend: wasm-capsule`** (prototype): a zone node can run a local WASI 0.2 command component,
-  a `kind: wasm` part, for a sensor or ECU simulable as a sandboxed control loop. Its network is a
+- **`backend: wasm-capsule`**: a zone node can run a WASI 0.2 command component, a
+  `kind: wasm` part that is a local file or published by digest, for a sensor or ECU simulable as a sandboxed control loop. Its network is a
   container node's: a named namespace with the gateway port as `eth0`. The new `vxcapsule` binary
   runs it inside that namespace, unprivileged and with no filesystem access, and ships beside
-  `vxedged`. Validated on a UDP reflector capsule only; published modules are refused for now.
+  `vxedged`. Validated on the `reflector-capsule` part only.
 
 ### Fixed
 
