@@ -8,7 +8,7 @@ All notable changes to this repo are documented here. Format follows
 
 ### Added
 
-- A `kind: vehicle` document can declare `signal_plane.kuksa`, the Kuksa databroker placed on a container device with `on:`, under the same rules as a placed service. Its placement is checked when the workspace loads. `vehicle up` does not start it yet.
+- A `kind: vehicle` document can declare `signal_plane.kuksa`, the Kuksa databroker placed on a container device with `on:`, under the same rules as a placed service. Its placement is checked when the workspace loads. `vehicle up` and `experiment up` start it in the device's container group, after compute and before services, and `status` reports it. It runs with `--insecure`, so slice isolation is its only protection.
 
 ## [0.4.1] - 2026-11-02
 

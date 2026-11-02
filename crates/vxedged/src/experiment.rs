@@ -42,7 +42,15 @@ use vxedge_api::v1::{
     SvcUpRequest, VxidRef, ZoneDownRequest, ZoneListRequest, ZoneUpRequest, manifest_ref::Source,
 };
 
+use std::path::Path;
+
+use vxedge_core::containers::ContainerSpec;
+use vxedge_core::gateway::GatewayPlan;
+use vxedge_core::services::KUKSA_MEMBER;
+use vxedge_core::zones::NodePlan;
+
 use crate::audit::Audit;
+use crate::events::EventKind;
 use crate::jobs::{JobEngine, Progress, is_terminal};
 use crate::services::{ComputeSvc, GatewaySvc, SvcSvc, ZoneSvc};
 
@@ -309,6 +317,83 @@ impl Handles {
         Ok(job.into_inner())
     }
 
+    /// The Kuksa databroker, as one more member of its device's container group: the path a
+    /// placed service takes. `vehicle up` and `experiment up` both run this, so a declared signal
+    /// plane either starts or fails the job, and is never skipped.
+    pub(crate) async fn stage_signal_plane(
+        &self,
+        model: &vxedge_core::model::Experiment,
+        dir: Option<&Path>,
+        up: bool,
+        p: &Progress,
+    ) -> Result<String, String> {
+        let fail = |e: String| format!("signal plane `{KUKSA_MEMBER}`: {e}");
+        let Some((node, spec)) = signal_plane_member(model, dir).map_err(fail)? else {
+            return Ok("no signal plane declared".into());
+        };
+        let on = node.node_id.clone();
+        let verb = if up { "up" } else { "down" };
+        p.update(
+            72,
+            &format!("signal plane: {KUKSA_MEMBER} on {on} ({verb})"),
+        );
+        self.svcs.audit.record(
+            if up {
+                "SignalPlane.Up"
+            } else {
+                "SignalPlane.Down"
+            },
+            serde_json::json!({ "member": KUKSA_MEMBER, "on": on, "image": spec.image }),
+        );
+        let shell = self.zones.shell.clone();
+        let runtime_dir = self.zones.runtime_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            if up {
+                vxedge_core::zones::member_up(&shell, &node, &runtime_dir, &spec)
+            } else {
+                vxedge_core::zones::member_down(&node, &spec)
+            }
+        })
+        .await
+        .map_err(|e| fail(format!("task panicked: {e}")))?
+        .map_err(|e| fail(e.to_string()))?;
+        let (kind, msg) = if up {
+            (EventKind::ServiceUp, format!("signal plane up on `{on}`"))
+        } else {
+            (
+                EventKind::ServiceDown,
+                format!("signal plane stopped on `{on}`"),
+            )
+        };
+        self.engine.events().emit(kind, KUKSA_MEMBER, &msg);
+        Ok(msg)
+    }
+
+    /// The databroker as a status component, observed through Podman. `None` when none is
+    /// declared. Reported as a service until the proto gains `RESOURCE_KIND_SIGNAL_PLANE`.
+    pub(crate) async fn signal_plane_component(
+        &self,
+        model: &vxedge_core::model::Experiment,
+        dir: Option<&Path>,
+    ) -> Result<Option<ResourceStatus>, Status> {
+        let member = signal_plane_member(model, dir).map_err(Status::failed_precondition)?;
+        let Some((node, spec)) = member else {
+            return Ok(None);
+        };
+        let on = node.node_id.clone();
+        let image = spec.image.clone();
+        let state =
+            tokio::task::spawn_blocking(move || vxedge_core::zones::member_status(&node, &spec))
+                .await
+                .map_err(|e| Status::internal(format!("status task panicked: {e}")))?;
+        Ok(Some(crate::status::resource_status(
+            KUKSA_MEMBER,
+            ResourceKind::Service,
+            &state,
+            format!("signal plane on `{on}`: {image}"),
+        )))
+    }
+
     pub(crate) async fn stage_services(
         &self,
         model: &vxedge_core::model::Experiment,
@@ -357,6 +442,30 @@ impl Handles {
     }
 }
 
+/// The databroker's node and container, if this workspace declares a signal plane.
+fn signal_plane_member(
+    model: &vxedge_core::model::Experiment,
+    dir: Option<&Path>,
+) -> Result<Option<(NodePlan, ContainerSpec)>, String> {
+    let Some(plane) = &model.signal_plane else {
+        return Ok(None);
+    };
+    let spec = vxedge_core::services::kuksa_spec(&plane.kuksa).map_err(|e| e.to_string())?;
+    let gateway = GatewayPlan::from_model(model).map_err(|e| e.to_string())?;
+    let nodes = vxedge_core::zones::plan_nodes_from_model(
+        model,
+        &gateway,
+        dir.unwrap_or_else(|| Path::new(".")),
+    )
+    .map_err(|e| e.to_string())?;
+    let on = &plane.kuksa.on;
+    let node = nodes
+        .into_iter()
+        .find(|n| &n.node_id == on)
+        .ok_or_else(|| format!("signal plane placed on `{on}`, which has no node plan"))?;
+    Ok(Some((node, spec)))
+}
+
 /// Which stages a request asked for. Empty means all of them, which is what every caller that
 /// predates staging sends — so the default stays "the whole experiment".
 fn wants(stages: &[i32], stage: ExperimentStage) -> bool {
@@ -402,7 +511,13 @@ impl ExperimentService for ExperimentSvc {
                 if wants(&stages, ExperimentStage::Zones) {
                     done.push(svc.stage_zones(true, &p).await?);
                 }
+                // Under the services stage until the proto has a stage of its own: it comes
+                // before them, and it never runs apart from them.
                 if wants(&stages, ExperimentStage::Services) {
+                    done.push(
+                        svc.stage_signal_plane(&model, dir.as_deref(), true, &p)
+                            .await?,
+                    );
                     done.push(
                         svc.stage_services(&model, &yaml, dir.as_deref(), true, &p)
                             .await?,
@@ -458,6 +573,13 @@ impl ExperimentService for ExperimentSvc {
                 if wants(&stages, ExperimentStage::Services)
                     && let Err(e) = svc
                         .stage_services(&model, &yaml, dir.as_deref(), false, &p)
+                        .await
+                {
+                    failures.push(e);
+                }
+                if wants(&stages, ExperimentStage::Services)
+                    && let Err(e) = svc
+                        .stage_signal_plane(&model, dir.as_deref(), false, &p)
                         .await
                 {
                     failures.push(e);
@@ -534,6 +656,11 @@ impl ExperimentService for ExperimentSvc {
                 .await?;
             components.push(observed.into_inner());
         }
+        components.extend(
+            self.handles
+                .signal_plane_component(&model, dir.as_deref())
+                .await?,
+        );
 
         Ok(Response::new(build_experiment_status(
             &model.id, gw_status, components,
