@@ -24,6 +24,11 @@ All notable changes to this repo are documented here. Format follows
 - Under `setcap`, `vxedged` could not create a node's named namespace, because `/run/netns` is
   root's. Creating and removing one now uses the `ip` sudo entry when `vxedged` is unprivileged.
 
+### Security
+
+- Lockfile update `pulldown-cmark` 0.13.5 -> 0.13.6, which fixes RUSTSEC-2026-0433 (quadratic parsing
+  with `ENABLE_WIKILINKS`). It is a build-time dependency via `prost-build`.
+
 ## [0.3.0] - 2026-11-02
 
 `vxedge vehicle up` now brings up a full vehicle from one workspace: a gateway, zones on several
