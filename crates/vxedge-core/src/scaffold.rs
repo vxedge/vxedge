@@ -515,8 +515,7 @@ fn parts_yaml(template: Template) -> String {
          # cloud-hypervisor boot a guest bundle, wasm-capsule runs a `kind: wasm` module. State it wherever the ref does not: a published vxparts ref names the kind of\n\
          # node a part loads onto, not how it is packaged.\n\
          parts:\n\
-         \x20 - ref: ghcr.io/vxedge/parts/agent/linux/app/probe:0.1.0\n\
-         \x20   digest: sha256:33c9c8d8625bd5c6d1f4d3d0c561fdaa930e057fcd1fb24fb3badb402f25429d\n\
+         \x20 - ref: local/vxprobe:host-process\n\
          \x20   kind: container            # these devices run `backend: container`\n\
          \x20   target_ids: {targets}     # one declaration, however many nodes share the part\n\n\
          \x20 - ref: ./parts/hpc-reflector\n\
