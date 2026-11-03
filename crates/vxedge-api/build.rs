@@ -17,8 +17,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .compile_protos(&protos, &["../../proto"])?;
     // Serde impls in the canonical Protobuf JSON mapping (enum values by name, lowerCamelCase
     // fields), behind the `serde` feature: what an agent-facing client returns as typed JSON.
+    // Fields at their default value are emitted too, so an agent reads `"available": false` or
+    // `"runs": []` instead of inferring meaning from a missing key.
     pbjson_build::Builder::new()
         .register_descriptors(&std::fs::read(&descriptors)?)?
+        .emit_fields()
         .build(&[".vxedge"])?;
     for p in protos {
         println!("cargo:rerun-if-changed={p}");
