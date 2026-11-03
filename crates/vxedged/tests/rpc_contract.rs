@@ -489,20 +489,24 @@ async fn a_missing_local_signal_plane_image_is_refused_before_the_gateway() {
         })
         .await
         .unwrap_err();
-    assert_eq!(
-        refused.code(),
-        tonic::Code::FailedPrecondition,
-        "{refused:?}"
-    );
-    // A host with no Podman socket refuses here too, for a different reason, so naming the image
-    // is only provable where Podman answers. It has to hold there.
+    // Where Podman answers, the refusal names the missing image. Where it does not, the refusal
+    // says Podman is unavailable, which is the truer answer there. Either way, nothing was touched.
     if podman_is_reachable() {
+        assert_eq!(
+            refused.code(),
+            tonic::Code::FailedPrecondition,
+            "{refused:?}"
+        );
+        assert_eq!(reason(&refused), "ERROR_REASON_LOCAL_IMAGE_MISSING");
         assert!(
             refused
                 .message()
                 .contains("localhost/vxedge/no-such-kuksa:1"),
             "{refused:?}"
         );
+    } else {
+        assert_eq!(refused.code(), tonic::Code::Unavailable, "{refused:?}");
+        assert_eq!(reason(&refused), "ERROR_REASON_BACKEND_UNAVAILABLE");
     }
     assert!(
         !daemon.root.join("run/audit.jsonl").exists()
