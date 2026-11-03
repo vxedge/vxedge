@@ -36,10 +36,11 @@ use vxedge_api::v1::gateway_service_server::GatewayService;
 use vxedge_api::v1::svc_service_server::SvcService;
 use vxedge_api::v1::zone_service_server::ZoneService;
 use vxedge_api::v1::{
-    ComputeDownRequest, ComputeUpRequest, ExperimentDownRequest, ExperimentStage, ExperimentStatus,
-    ExperimentStatusRequest, ExperimentUpRequest, GatewayDownRequest, GatewayStatusRequest,
-    GatewayUpRequest, Job, JobState, ManifestRef, ResourceKind, ResourceStatus, SvcDownRequest,
-    SvcUpRequest, VxidRef, ZoneDownRequest, ZoneListRequest, ZoneUpRequest, manifest_ref::Source,
+    ComputeDownRequest, ComputeListRequest, ComputeUpRequest, ExperimentDownRequest,
+    ExperimentStage, ExperimentStatus, ExperimentStatusRequest, ExperimentUpRequest,
+    GatewayDownRequest, GatewayStatusRequest, GatewayUpRequest, Job, JobState, ManifestRef,
+    ResourceKind, ResourceStatus, SvcDownRequest, SvcUpRequest, VxidRef, ZoneDownRequest,
+    ZoneListRequest, ZoneUpRequest, manifest_ref::Source,
 };
 
 use std::path::Path;
@@ -254,6 +255,23 @@ impl Handles {
         }
         let ids: Vec<String> = listed.into_iter().map(|n| n.vxid).collect();
         self.stage_nodes(NodeStage::Zones, &ids, up, p).await
+    }
+
+    /// Bring every compute device up or down, listed the way [`Self::stage_zones`] lists zones.
+    pub(crate) async fn stage_compute(&self, up: bool, p: &Progress) -> Result<String, String> {
+        let request = Request::new(ComputeListRequest::default());
+        let listed = match self.compute.list(request).await {
+            Ok(r) => r.into_inner().nodes,
+            Err(e) if e.code() == tonic::Code::Internal => {
+                return Err(format!("compute: {}", e.message()));
+            }
+            Err(_) => return Ok("no compute declared".into()),
+        };
+        if listed.is_empty() {
+            return Ok("no compute declared".into());
+        }
+        let ids: Vec<String> = listed.into_iter().map(|n| n.vxid).collect();
+        self.stage_nodes(NodeStage::Compute, &ids, up, p).await
     }
 
     /// Bring these nodes up or down, one RPC each. `up` stops at the first failure. `down` tries
@@ -547,13 +565,28 @@ fn signal_plane_member(
 
 /// Which stages a request asked for. Empty means all of them, which is what every caller that
 /// predates staging sends — so the default stays "the whole experiment".
-fn wants(stages: &[i32], stage: ExperimentStage) -> bool {
+pub(crate) fn wants(stages: &[i32], stage: ExperimentStage) -> bool {
     stages.is_empty() || stages.contains(&(stage as i32))
+}
+
+/// Refuse a stage this daemon does not know. Reading it as "none of the stages" would run nothing
+/// and report success.
+pub(crate) fn check_stages(stages: &[i32]) -> Result<(), Status> {
+    for stage in stages {
+        match ExperimentStage::try_from(*stage) {
+            Ok(ExperimentStage::Unspecified) | Err(_) => {
+                return Err(Status::invalid_argument(format!("unknown stage {stage}")));
+            }
+            Ok(_) => {}
+        }
+    }
+    Ok(())
 }
 
 #[tonic::async_trait]
 impl ExperimentService for ExperimentSvc {
     async fn up(&self, req: Request<ExperimentUpRequest>) -> Result<Response<Job>, Status> {
+        check_stages(&req.get_ref().stages)?;
         // Host requirements first: refusing here costs nothing, and refusing halfway through
         // provisioning strands a partly-built topology on a host that was never going to run it.
         // Also the one resolution of the workspace directory: carried into every stage below
@@ -571,6 +604,15 @@ impl ExperimentService for ExperimentSvc {
         let yaml = resolve_once(req.get_ref().manifest.as_ref()).await?;
         let model = vxedge_core::model::load_yaml(&yaml)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let active = self.handles.gateway.active_on_host().await;
+        check_active_target(
+            "experiment up",
+            active
+                .as_ref()
+                .map(|(id, dir)| (id.as_str(), dir.as_path())),
+            &model.id,
+            dir.as_deref(),
+        )?;
         self.audit.record(
             "ExperimentService.Up",
             serde_json::json!({ "experiment": model.id }),
@@ -589,6 +631,9 @@ impl ExperimentService for ExperimentSvc {
                 }
                 if wants(&stages, ExperimentStage::Zones) {
                     done.push(svc.stage_zones(true, &p).await?);
+                }
+                if wants(&stages, ExperimentStage::Compute) {
+                    done.push(svc.stage_compute(true, &p).await?);
                 }
                 if wants(&stages, ExperimentStage::SignalPlane) {
                     done.push(
@@ -615,6 +660,7 @@ impl ExperimentService for ExperimentSvc {
     }
 
     async fn down(&self, req: Request<ExperimentDownRequest>) -> Result<Response<Job>, Status> {
+        check_stages(&req.get_ref().stages)?;
         // Same resolution `up` does (minus preflight, which only guards provisioning) — carried
         // into every stage below for the same reason: a local bundle/part ref, or the audit
         // sha256, should resolve against the real workspace, not the daemon's own cwd.
@@ -660,6 +706,11 @@ impl ExperimentService for ExperimentSvc {
                     && let Err(e) = svc
                         .stage_signal_plane(&model, dir.as_deref(), false, &p)
                         .await
+                {
+                    failures.push(e);
+                }
+                if wants(&stages, ExperimentStage::Compute)
+                    && let Err(e) = svc.stage_compute(false, &p).await
                 {
                     failures.push(e);
                 }
@@ -717,13 +768,23 @@ impl ExperimentService for ExperimentSvc {
             .into_inner();
         let gw_status = gw.status.clone().unwrap_or_default();
 
-        let mut components = self
+        let mut nodes = self
             .handles
             .zones
             .list(Request::new(vxedge_api::v1::ZoneListRequest::default()))
             .await
-            .map(|r| r.into_inner().zones)
+            .map(|r| r.into_inner().nodes)
             .unwrap_or_default();
+        nodes.extend(
+            self.handles
+                .compute
+                .list(Request::new(ComputeListRequest::default()))
+                .await
+                .map(|r| r.into_inner().node_status)
+                .unwrap_or_default(),
+        );
+        let mut components: Vec<ResourceStatus> =
+            nodes.iter().filter_map(|n| n.status.clone()).collect();
         for service_type in vxedge_core::services::ServiceDef::declared_types(&model) {
             let observed = self
                 .handles
@@ -742,9 +803,10 @@ impl ExperimentService for ExperimentSvc {
                 .await?,
         );
 
-        Ok(Response::new(build_experiment_status(
-            &model.id, gw_status, components,
-        )))
+        let mut status = build_experiment_status(&model.id, gw_status, components);
+        status.gateway = Some(gw);
+        status.nodes = nodes;
+        Ok(Response::new(status))
     }
 }
 

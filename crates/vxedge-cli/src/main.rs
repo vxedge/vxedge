@@ -359,6 +359,7 @@ impl From<TemplateArg> for vxedge_core::Template {
 enum StageArg {
     Gateway,
     Zones,
+    Compute,
     SignalPlane,
     Services,
 }
@@ -368,6 +369,7 @@ impl StageArg {
         match self {
             StageArg::Gateway => vxedge_api::v1::ExperimentStage::Gateway as i32,
             StageArg::Zones => vxedge_api::v1::ExperimentStage::Zones as i32,
+            StageArg::Compute => vxedge_api::v1::ExperimentStage::Compute as i32,
             StageArg::SignalPlane => vxedge_api::v1::ExperimentStage::SignalPlane as i32,
             StageArg::Services => vxedge_api::v1::ExperimentStage::Services as i32,
         }
@@ -379,10 +381,16 @@ enum ManifestLifecycleCmd {
     Up {
         #[arg(long)]
         manifest: String,
+        /// Restrict to specific stages, repeatable (default: all, in dependency order).
+        #[arg(long = "stage", value_enum)]
+        stages: Vec<StageArg>,
     },
     Down {
         #[arg(long)]
         manifest: String,
+        /// Restrict to specific stages, repeatable (default: all, in reverse order).
+        #[arg(long = "stage", value_enum)]
+        stages: Vec<StageArg>,
     },
     Status {
         #[arg(long)]
@@ -871,27 +879,27 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     if cli.json {
                         println!(
                             "{}",
-                            serde_json::to_string_pretty(&JsonVehicleStatus::from(&st))?
+                            serde_json::to_string_pretty(&JsonComposite::from(&st))?
                         );
                     } else {
                         print_vehicle_status(&st);
                     }
                 }
-                ManifestLifecycleCmd::Up { manifest } => {
+                ManifestLifecycleCmd::Up { manifest, stages } => {
                     let job = veh
                         .up(VehicleUpRequest {
                             manifest: manifest_ref(&Some(manifest.clone())),
-                            ..Default::default()
+                            stages: stages.iter().map(|s| s.as_proto()).collect(),
                         })
                         .await?
                         .into_inner();
                     watch_job(channel, job, cli.json).await?;
                 }
-                ManifestLifecycleCmd::Down { manifest } => {
+                ManifestLifecycleCmd::Down { manifest, stages } => {
                     let job = veh
                         .down(VehicleDownRequest {
                             manifest: manifest_ref(&Some(manifest.clone())),
-                            ..Default::default()
+                            stages: stages.iter().map(|s| s.as_proto()).collect(),
                         })
                         .await?
                         .into_inner();
@@ -996,10 +1004,28 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             })
                             .await?
                             .into_inner();
-                        let top = st.status.clone().unwrap_or_default();
-                        println!("{}: {}", top.vxid, top.detail);
-                        for c in &st.components {
-                            println!("  {} [{}] {}", c.vxid, c.state, c.detail);
+                        if cli.json {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&JsonComposite::from(&st))?
+                            );
+                        } else {
+                            let top = st.status.clone().unwrap_or_default();
+                            println!(
+                                "experiment {}: {} ({})",
+                                top.vxid,
+                                resource_state_name(top.state),
+                                top.detail
+                            );
+                            for c in &st.components {
+                                println!(
+                                    "  {:<12} {:<16} {:<16} {}",
+                                    kind_name(c.kind),
+                                    c.vxid,
+                                    resource_state_name(c.state),
+                                    c.detail
+                                );
+                            }
                         }
                     }
                     ExperimentCmd::Up { stages } => {
@@ -1147,7 +1173,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// `RESOURCE_STATE_UP` as `up`, and `not provisioned` for a device nothing brings up.
 fn resource_state_name(state: i32) -> String {
     match vxedge_api::v1::ResourceState::try_from(state) {
-        Ok(vxedge_api::v1::ResourceState::Unspecified) | Err(_) => "not provisioned".to_string(),
+        Ok(vxedge_api::v1::ResourceState::Unspecified)
+        | Ok(vxedge_api::v1::ResourceState::Unprovisioned)
+        | Err(_) => "not provisioned".to_string(),
         Ok(s) => s
             .as_str_name()
             .trim_start_matches("RESOURCE_STATE_")
@@ -1330,18 +1358,28 @@ impl From<&vxedge_api::v1::ResourceStatus> for JsonResource {
 }
 
 #[derive(serde::Serialize)]
-struct JsonVehicleStatus {
+struct JsonComposite {
     status: JsonResource,
     components: Vec<JsonResource>,
     gateway: Option<JsonStatus>,
 }
 
-impl From<&vxedge_api::v1::VehicleStatus> for JsonVehicleStatus {
+impl From<&vxedge_api::v1::VehicleStatus> for JsonComposite {
     fn from(v: &vxedge_api::v1::VehicleStatus) -> Self {
         Self {
             status: JsonResource::from(&v.status.clone().unwrap_or_default()),
             components: v.components.iter().map(JsonResource::from).collect(),
             gateway: v.gateway.as_ref().map(JsonStatus::from),
+        }
+    }
+}
+
+impl From<&vxedge_api::v1::ExperimentStatus> for JsonComposite {
+    fn from(e: &vxedge_api::v1::ExperimentStatus) -> Self {
+        Self {
+            status: JsonResource::from(&e.status.clone().unwrap_or_default()),
+            components: e.components.iter().map(JsonResource::from).collect(),
+            gateway: e.gateway.as_ref().map(JsonStatus::from),
         }
     }
 }
@@ -1449,14 +1487,14 @@ mod tests {
             components: vec![ResourceStatus {
                 vxid: "ecu2".into(),
                 kind: ResourceKind::Zone as i32,
-                state: ResourceState::Unspecified as i32,
+                state: ResourceState::Unprovisioned as i32,
                 detail: "declared, not provisioned: no slice-bound link".into(),
                 ..Default::default()
             }],
             gateway: Some(Default::default()),
             ..Default::default()
         };
-        let json = serde_json::to_value(JsonVehicleStatus::from(&status)).unwrap();
+        let json = serde_json::to_value(JsonComposite::from(&status)).unwrap();
         assert_eq!(json["status"]["vxid"], "car");
         assert_eq!(json["status"]["state"], "up");
         assert_eq!(json["components"][0]["kind"], "zone");

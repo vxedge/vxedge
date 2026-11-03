@@ -8,11 +8,32 @@ All notable changes to this repo are documented here. Format follows
 
 ### Added
 
+- Runs: `RunService` reports the provisioned workspace on this host, and verbs accept a `RunRef`,
+  which is refused if it is not the active run. A run's id lasts from the first `up` to the last
+  `down`, across repeated `up` and daemon restarts.
+- Typed node status (`NodeStatus`) on zone and compute lists, `vehicle status` and `experiment
+  status`: backend, zone, role, port, peer, VLAN and payload with digest. `experiment status` also
+  carries the gateway.
+- `RESOURCE_STATE_UNPROVISIONED`, for a declared device nothing provisions.
+- `vehicle up` and `down` honour `stages`, with `--stage` on the CLI. `--stage compute` is new on both
+  `vehicle` and `experiment`.
 - The agent surface in the vxAPI contract, additive to `vxedge.v1`: `RunService`, `WorkspaceService`,
   `HostService`, `JobService.List` and `Cancel`, `TrafficService.Status`, typed `NodeStatus`,
   `ErrorReason`, and event resume. These are not built yet: the RPCs answer `UNIMPLEMENTED`, and new
   fields read as unset.
 - A `kind: vehicle` document can declare `signal_plane.kuksa`, the Kuksa databroker placed on a container device with `on:`, under the same rules as a placed service. Its placement is checked when the workspace loads. `vehicle up` and `experiment up` start it in the device's container group, after compute and before services, `experiment up --stage signal-plane` starts it alone, and `status` and events report it as `SIGNAL_PLANE`. A databroker that exits right after it starts fails the job. It runs with `--insecure`, so slice isolation is its only protection.
+
+### Changed
+
+- `ZoneService` no longer lists or addresses hpc devices, and `experiment up` brings them up through
+  `ComputeService`, in a compute stage, so their audit lines and events say what they are.
+  `vxedge zone up` on an hpc device now answers not found, naming `vxedge compute`.
+- `experiment up` refuses a workspace that is not the active one, as the `vehicle` verbs do.
+- `since_unix_ms` is 0 unless the transition time is known. `observed_unix_ms` says when a status was
+  read.
+- A stage the daemon does not know is refused rather than ignored.
+- `compute list` shows the zone, like `zone list`.
+- `experiment status` prints state names, and takes `--json`.
 
 ### Deprecated
 
