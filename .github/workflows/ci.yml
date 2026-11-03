@@ -20,8 +20,12 @@ jobs:
         run: cargo build --workspace
       - name: Test
         run: cargo test --workspace
+      - name: Test vxedge-api JSON
+        run: cargo test -p vxedge-api --features serde
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Clippy vxedge-api JSON
+        run: cargo clippy -p vxedge-api --features serde --all-targets -- -D warnings
       - name: Format
         run: cargo fmt --check
 
