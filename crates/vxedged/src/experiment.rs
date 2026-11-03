@@ -42,7 +42,17 @@ use vxedge_api::v1::{
     SvcUpRequest, VxidRef, ZoneDownRequest, ZoneListRequest, ZoneUpRequest, manifest_ref::Source,
 };
 
+use std::path::Path;
+use std::time::Duration;
+
+use vxedge_core::containers::ContainerSpec;
+use vxedge_core::gateway::GatewayPlan;
+use vxedge_core::services::KUKSA_MEMBER;
+use vxedge_core::zones::NodePlan;
+use vxedge_core::zones::backend::NodeState;
+
 use crate::audit::Audit;
+use crate::events::EventKind;
 use crate::jobs::{JobEngine, Progress, is_terminal};
 use crate::services::{ComputeSvc, GatewaySvc, SvcSvc, ZoneSvc};
 
@@ -329,6 +339,106 @@ impl Handles {
         Ok(job.into_inner())
     }
 
+    /// The Kuksa databroker, as one more member of its device's container group: the path a
+    /// placed service takes. `vehicle up` and `experiment up` both run this, so a declared signal
+    /// plane either starts or fails the job, and is never skipped.
+    pub(crate) async fn stage_signal_plane(
+        &self,
+        model: &vxedge_core::model::Experiment,
+        dir: Option<&Path>,
+        up: bool,
+        p: &Progress,
+    ) -> Result<String, String> {
+        let fail = |e: String| format!("signal plane `{KUKSA_MEMBER}`: {e}");
+        let Some((node, spec)) = signal_plane_member(model, dir).map_err(fail)? else {
+            return Ok("no signal plane declared".into());
+        };
+        let on = node.node_id.clone();
+        let verb = if up { "up" } else { "down" };
+        p.update(
+            72,
+            &format!("signal plane: {KUKSA_MEMBER} on {on} ({verb})"),
+        );
+        self.svcs.audit.record(
+            if up {
+                "SignalPlane.Up"
+            } else {
+                "SignalPlane.Down"
+            },
+            serde_json::json!({ "member": KUKSA_MEMBER, "on": on, "image": spec.image }),
+        );
+        let shell = self.zones.shell.clone();
+        let runtime_dir = self.zones.runtime_dir.clone();
+        let (probe_node, probe_spec) = (node.clone(), spec.clone());
+        let change = async move {
+            tokio::task::spawn_blocking(move || {
+                if up {
+                    vxedge_core::zones::member_up(&shell, &node, &runtime_dir, &spec)
+                } else {
+                    vxedge_core::zones::member_down(&node, &spec)
+                }
+            })
+            .await
+            .map_err(|e| format!("task panicked: {e}"))?
+            .map_err(|e| e.to_string())
+        };
+        if up {
+            let running = || {
+                let (node, spec) = (probe_node.clone(), probe_spec.clone());
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        vxedge_core::zones::member_status(&node, &spec) == NodeState::Up
+                    })
+                    .await
+                    .unwrap_or(false)
+                }
+            };
+            start_then_confirm(change, running, SIGNAL_PLANE_WINDOW)
+                .await
+                .map_err(fail)?;
+        } else {
+            change.await.map_err(fail)?;
+        }
+        let (kind, msg) = if up {
+            (
+                EventKind::SignalPlaneUp,
+                format!("signal plane up on `{on}`"),
+            )
+        } else {
+            (
+                EventKind::SignalPlaneDown,
+                format!("signal plane stopped on `{on}`"),
+            )
+        };
+        self.engine.events().emit(kind, KUKSA_MEMBER, &msg);
+        Ok(msg)
+    }
+
+    /// The databroker as a status component, observed through Podman. `None` when none is
+    /// declared.
+    pub(crate) async fn signal_plane_component(
+        &self,
+        model: &vxedge_core::model::Experiment,
+        dir: Option<&Path>,
+    ) -> Result<Option<ResourceStatus>, Status> {
+        let member = signal_plane_member(model, dir).map_err(Status::failed_precondition)?;
+        let Some((node, spec)) = member else {
+            return Ok(None);
+        };
+        let on = node.node_id.clone();
+        let image = spec.image.clone();
+        let state =
+            tokio::task::spawn_blocking(move || vxedge_core::zones::member_status(&node, &spec))
+                .await
+                .map_err(|e| Status::internal(format!("status task panicked: {e}")))?;
+        Ok(Some(crate::status::resource_status(
+            KUKSA_MEMBER,
+            ResourceKind::SignalPlane,
+            &state,
+            format!("signal plane on `{on}`: {image}"),
+        )))
+    }
+
     pub(crate) async fn stage_services(
         &self,
         model: &vxedge_core::model::Experiment,
@@ -379,6 +489,62 @@ impl Handles {
     }
 }
 
+/// How long the databroker has to stay running after it starts. `member_up` returns as soon as the
+/// container starts, and a databroker that rejects its flags exits just after that.
+const SIGNAL_PLANE_WINDOW: Duration = Duration::from_secs(2);
+
+/// Run `start`, then require `running` to hold for all of `window`, so a member that starts and
+/// exits straight away is a failure and not a success.
+async fn start_then_confirm<S, R, Fut>(
+    start: S,
+    mut running: R,
+    window: Duration,
+) -> Result<(), String>
+where
+    S: std::future::Future<Output = Result<(), String>>,
+    R: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    start.await?;
+    let deadline = tokio::time::Instant::now() + window;
+    loop {
+        if !running().await {
+            return Err(format!(
+                "started, then stopped running within {} s: see its container log",
+                window.as_secs()
+            ));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(());
+        }
+        tokio::time::sleep(window / 8).await;
+    }
+}
+
+/// The databroker's node and container, if this workspace declares a signal plane.
+fn signal_plane_member(
+    model: &vxedge_core::model::Experiment,
+    dir: Option<&Path>,
+) -> Result<Option<(NodePlan, ContainerSpec)>, String> {
+    let Some(plane) = &model.signal_plane else {
+        return Ok(None);
+    };
+    let spec = vxedge_core::services::kuksa_spec(&plane.kuksa).map_err(|e| e.to_string())?;
+    let gateway = GatewayPlan::from_model(model).map_err(|e| e.to_string())?;
+    let nodes = vxedge_core::zones::plan_nodes_from_model(
+        model,
+        &gateway,
+        dir.unwrap_or_else(|| Path::new(".")),
+    )
+    .map_err(|e| e.to_string())?;
+    let on = &plane.kuksa.on;
+    let node = nodes
+        .into_iter()
+        .find(|n| &n.node_id == on)
+        .ok_or_else(|| format!("signal plane placed on `{on}`, which has no node plan"))?;
+    Ok(Some((node, spec)))
+}
+
 /// Which stages a request asked for. Empty means all of them, which is what every caller that
 /// predates staging sends — so the default stays "the whole experiment".
 fn wants(stages: &[i32], stage: ExperimentStage) -> bool {
@@ -423,6 +589,12 @@ impl ExperimentService for ExperimentSvc {
                 }
                 if wants(&stages, ExperimentStage::Zones) {
                     done.push(svc.stage_zones(true, &p).await?);
+                }
+                if wants(&stages, ExperimentStage::SignalPlane) {
+                    done.push(
+                        svc.stage_signal_plane(&model, dir.as_deref(), true, &p)
+                            .await?,
+                    );
                 }
                 if wants(&stages, ExperimentStage::Services) {
                     done.push(
@@ -480,6 +652,13 @@ impl ExperimentService for ExperimentSvc {
                 if wants(&stages, ExperimentStage::Services)
                     && let Err(e) = svc
                         .stage_services(&model, &yaml, dir.as_deref(), false, &p)
+                        .await
+                {
+                    failures.push(e);
+                }
+                if wants(&stages, ExperimentStage::SignalPlane)
+                    && let Err(e) = svc
+                        .stage_signal_plane(&model, dir.as_deref(), false, &p)
                         .await
                 {
                     failures.push(e);
@@ -557,6 +736,11 @@ impl ExperimentService for ExperimentSvc {
                 .await?;
             components.push(observed.into_inner());
         }
+        components.extend(
+            self.handles
+                .signal_plane_component(&model, dir.as_deref())
+                .await?,
+        );
 
         Ok(Response::new(build_experiment_status(
             &model.id, gw_status, components,
@@ -795,5 +979,53 @@ mod tests {
             let err = check_active_target(verb, active, "vehicle-b", None).unwrap_err();
             assert!(err.message().contains(&format!("`{verb}`")), "{err:?}");
         }
+    }
+
+    const WINDOW: Duration = Duration::from_millis(80);
+
+    #[tokio::test]
+    async fn a_member_that_exits_straight_after_starting_is_a_failure() {
+        let err = start_then_confirm(async { Ok(()) }, || async { false }, WINDOW)
+            .await
+            .unwrap_err();
+        assert!(err.contains("stopped running"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_member_that_exits_inside_the_window_is_a_failure() {
+        let mut checks = 0;
+        let result = start_then_confirm(
+            async { Ok(()) },
+            || {
+                checks += 1;
+                let alive = checks < 3;
+                async move { alive }
+            },
+            WINDOW,
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(checks, 3, "stops at the first check that fails");
+    }
+
+    #[tokio::test]
+    async fn a_member_that_stays_up_for_the_window_passes() {
+        let started = std::time::Instant::now();
+        start_then_confirm(async { Ok(()) }, || async { true }, WINDOW)
+            .await
+            .unwrap();
+        assert!(started.elapsed() >= WINDOW, "the whole window is watched");
+    }
+
+    #[tokio::test]
+    async fn a_start_that_fails_is_reported_as_itself() {
+        let err = start_then_confirm(
+            async { Err("no such image".into()) },
+            || async { true },
+            WINDOW,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, "no such image");
     }
 }

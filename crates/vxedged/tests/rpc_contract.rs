@@ -19,10 +19,12 @@ use vxedge_api::v1::event_service_client::EventServiceClient;
 use vxedge_api::v1::experiment_service_client::ExperimentServiceClient;
 use vxedge_api::v1::job_service_client::JobServiceClient;
 use vxedge_api::v1::svc_service_client::SvcServiceClient;
+use vxedge_api::v1::vehicle_service_client::VehicleServiceClient;
 use vxedge_api::v1::zone_service_client::ZoneServiceClient;
 use vxedge_api::v1::{
-    ComputeListRequest, ExperimentStatusRequest, GetJobRequest, JobState, ManifestRef,
-    ResourceKind, ResourceState, SubscribeRequest, SvcDownRequest, SvcStatusRequest, SvcUpRequest,
+    ComputeListRequest, ExperimentStage, ExperimentStatusRequest, ExperimentUpRequest,
+    GetJobRequest, JobState, ManifestRef, ResourceKind, ResourceState, SubscribeRequest,
+    SvcDownRequest, SvcStatusRequest, SvcUpRequest, VehicleStatusRequest, VehicleUpRequest,
     ZoneListRequest, manifest_ref::Source,
 };
 
@@ -68,6 +70,38 @@ fn vehicle_workspace() -> PathBuf {
     let dir = scratch();
     std::fs::create_dir_all(dir.join("artifacts")).unwrap();
     std::fs::write(dir.join("vehicle.yaml"), VEHICLE).unwrap();
+    dir
+}
+
+/// Whether this user's rootless Podman socket answers.
+fn podman_is_reachable() -> bool {
+    std::env::var_os("XDG_RUNTIME_DIR").is_some_and(|dir| {
+        std::os::unix::net::UnixStream::connect(Path::new(&dir).join("podman/podman.sock")).is_ok()
+    })
+}
+
+/// [`VEHICLE`] with a signal plane on `hpc1`, in an image no host has.
+fn vehicle_with_signal_plane() -> String {
+    VEHICLE.replace(
+        "---\nkind: baseline",
+        "signal_plane:\n  kuksa:\n    image: { url: localhost/vxedge/no-such-kuksa:1, kind: \
+         container }\n    on: hpc1\n---\nkind: baseline",
+    )
+}
+
+fn signal_plane_workspace() -> PathBuf {
+    let dir = scratch();
+    std::fs::create_dir_all(dir.join("artifacts")).unwrap();
+    std::fs::write(dir.join("vehicle.yaml"), vehicle_with_signal_plane()).unwrap();
+    dir
+}
+
+fn signal_plane_experiment() -> PathBuf {
+    let dir = scratch();
+    std::fs::create_dir_all(dir.join("artifacts")).unwrap();
+    let yaml =
+        vxedge_core::model::synthesize_vehicle_workspace(&vehicle_with_signal_plane()).unwrap();
+    std::fs::write(dir.join("main.yaml"), yaml).unwrap();
     dir
 }
 
@@ -374,6 +408,112 @@ async fn service_events_and_status_share_one_resource_id() {
         .unwrap()
         .unwrap();
     assert_eq!(event.resource_vxid, "svc-ota");
+}
+
+#[tokio::test]
+async fn vehicle_status_reports_a_declared_signal_plane() {
+    let daemon = Daemon::start();
+    let ws = signal_plane_workspace();
+    let status = VehicleServiceClient::new(daemon.channel().await)
+        .status(VehicleStatusRequest {
+            manifest: path_ref(&ws),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let broker = status
+        .components
+        .iter()
+        .find(|c| c.vxid == "kuksa-databroker")
+        .expect("a declared signal plane is a status component");
+    assert_eq!(broker.kind, ResourceKind::SignalPlane as i32);
+    assert_eq!(broker.state, ResourceState::Down as i32);
+    assert!(broker.detail.contains("on `hpc1`"), "{}", broker.detail);
+}
+
+#[tokio::test]
+async fn experiment_status_reports_a_declared_signal_plane() {
+    let daemon = Daemon::start();
+    let ws = signal_plane_experiment();
+    let status = ExperimentServiceClient::new(daemon.channel().await)
+        .status(ExperimentStatusRequest {
+            manifest: path_ref(&ws),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        status
+            .components
+            .iter()
+            .any(|c| c.vxid == "kuksa-databroker"),
+        "{:?}",
+        status.components
+    );
+}
+
+/// Refused before `up` provisions anything: nothing recorded, so no gateway was attempted.
+#[tokio::test]
+async fn a_missing_local_signal_plane_image_is_refused_before_the_gateway() {
+    let daemon = Daemon::start();
+    let ws = signal_plane_workspace();
+    let refused = VehicleServiceClient::new(daemon.channel().await)
+        .up(VehicleUpRequest {
+            manifest: path_ref(&ws),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused.code(),
+        tonic::Code::FailedPrecondition,
+        "{refused:?}"
+    );
+    // A host with no Podman socket refuses here too, for a different reason, so naming the image
+    // is only provable where Podman answers. It has to hold there.
+    if podman_is_reachable() {
+        assert!(
+            refused
+                .message()
+                .contains("localhost/vxedge/no-such-kuksa:1"),
+            "{refused:?}"
+        );
+    }
+    assert!(
+        !daemon.root.join("run/audit.jsonl").exists()
+            || !std::fs::read_to_string(daemon.root.join("run/audit.jsonl"))
+                .unwrap()
+                .contains("GatewayService.Up")
+    );
+}
+
+/// The signal plane stage alone, with no node up, so it has nothing to join. It has to fail and
+/// name the databroker: an `experiment up` that skipped it would report success.
+#[tokio::test]
+async fn experiment_up_does_not_skip_a_declared_signal_plane() {
+    let daemon = Daemon::start();
+    let ws = signal_plane_experiment();
+    let channel = daemon.channel().await;
+    let job = ExperimentServiceClient::new(channel.clone())
+        .up(ExperimentUpRequest {
+            manifest: path_ref(&ws),
+            stages: vec![ExperimentStage::SignalPlane as i32],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let state = wait_for_job(channel.clone(), job.id.clone()).await;
+    assert_eq!(state, JobState::Failed as i32);
+    let failed = JobServiceClient::new(channel)
+        .get(GetJobRequest { id: job.id })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        failed.error.contains("kuksa-databroker"),
+        "{}",
+        failed.error
+    );
 }
 
 /// The contract is ahead of the daemon until 0.5.0. Each RPC leaves this list when it is built, and

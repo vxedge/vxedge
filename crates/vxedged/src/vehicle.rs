@@ -6,9 +6,10 @@
 //!
 //! Same principle `ExperimentSvc` states for itself, and the same [`Handles`] type: each stage
 //! submits the existing service's job and waits for it, against a synthesized workspace. The
-//! order is §5.4's: gateway, zones, compute, services, and the reverse on `down`. Compute is its
-//! own stage because hpc devices go through `ComputeService`, so their audit lines and
-//! `compute.up` events say what they are. The signal plane has no stage until it exists.
+//! order is §5.4's: gateway, zones, compute, signal plane, services, and the reverse on `down`.
+//! Compute is its own stage because hpc devices go through `ComputeService`, so their audit lines
+//! and `compute.up` events say what they are. A vehicle with no `signal_plane` block has no signal
+//! plane stage.
 //!
 //! # The workspace decides, not the daemon's memory
 //!
@@ -116,16 +117,12 @@ fn by_stage(nodes: &[NodePlan]) -> (Vec<String>, Vec<String>) {
     (ids(zones), ids(compute))
 }
 
-/// The `localhost/` images this vehicle runs, payloads and placed services alike.
+/// The `localhost/` images this vehicle runs: payloads and everything placed on a device.
 fn local_images(model: &Experiment, nodes: &[NodePlan]) -> BTreeSet<String> {
     let payloads = nodes.iter().filter_map(|n| n.image.as_deref());
-    let services = model
-        .services
-        .values()
-        .filter(|s| s.on.is_some())
-        .map(|s| s.image.url.as_str());
+    let placed = model.placements().map(|p| p.image.url.as_str());
     payloads
-        .chain(services)
+        .chain(placed)
         .filter(|image| image.starts_with("localhost/"))
         .map(str::to_owned)
         .collect()
@@ -278,11 +275,14 @@ impl VehicleService for VehicleSvc {
                 let compute = svc
                     .stage_nodes(NodeStage::Compute, &compute, true, &p)
                     .await?;
+                let signals = svc
+                    .stage_signal_plane(&model, dir.as_deref(), true, &p)
+                    .await?;
                 let services = svc
                     .stage_services(&model, &yaml, dir.as_deref(), true, &p)
                     .await?;
                 Ok(format!(
-                    "vehicle `{id}` up — gateway, {zones}, {compute}, {services}"
+                    "vehicle `{id}` up — gateway, {zones}, {compute}, {signals}, {services}"
                 ))
             })
             .await;
@@ -322,6 +322,12 @@ impl VehicleService for VehicleSvc {
                 let mut failures: Vec<String> = Vec::new();
                 if let Err(e) = svc
                     .stage_services(&model, &yaml, dir.as_deref(), false, &p)
+                    .await
+                {
+                    failures.push(e);
+                }
+                if let Err(e) = svc
+                    .stage_signal_plane(&model, dir.as_deref(), false, &p)
                     .await
                 {
                     failures.push(e);
@@ -398,6 +404,11 @@ impl VehicleService for VehicleSvc {
                 .await?;
             components.push(observed.into_inner());
         }
+        components.extend(
+            self.handles
+                .signal_plane_component(&model, dir.as_deref())
+                .await?,
+        );
 
         let (status, mut components) =
             crate::status::composite_rollup(&id, ResourceKind::Vehicle, gw_status, components);
@@ -489,6 +500,17 @@ parts:
             by_stage(&nodes),
             (vec!["ecu1".to_string()], vec!["hpc1".to_string()])
         );
+    }
+
+    #[test]
+    fn local_images_cover_the_signal_plane() {
+        let yaml = WS.replace(
+            "---\nkind: baseline",
+            "signal_plane:\n  kuksa:\n    image: { url: localhost/vxedge/kuksa:1, kind: container }\n    on: hpc1\n---\nkind: baseline",
+        );
+        let m = model(&yaml);
+        let (_, nodes) = plan_vehicle(&m, None).unwrap();
+        assert!(local_images(&m, &nodes).contains("localhost/vxedge/kuksa:1"));
     }
 
     #[test]

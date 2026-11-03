@@ -818,10 +818,10 @@ impl Experiment {
         }
         let slice_ids: Vec<&str> = self.slices.iter().map(|s| s.id.as_str()).collect();
 
-        let mut placed_names: BTreeMap<&str, ()> = BTreeMap::new();
+        let mut placed_names = std::collections::BTreeSet::new();
         for placement in self.placements() {
             let on = placement.on;
-            if placed_names.insert(placement.id, ()).is_some() {
+            if !placed_names.insert(placement.id) {
                 errors.push(E::PlacedNameTaken {
                     name: placement.id.to_string(),
                 });

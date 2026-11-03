@@ -12,7 +12,7 @@ All notable changes to this repo are documented here. Format follows
   `HostService`, `JobService.List` and `Cancel`, `TrafficService.Status`, typed `NodeStatus`,
   `ErrorReason`, and event resume. These are not built yet: the RPCs answer `UNIMPLEMENTED`, and new
   fields read as unset.
-- A `kind: vehicle` document can declare `signal_plane.kuksa`, the Kuksa databroker placed on a container device with `on:`, under the same rules as a placed service. Its placement is checked when the workspace loads. `vehicle up` does not start it yet.
+- A `kind: vehicle` document can declare `signal_plane.kuksa`, the Kuksa databroker placed on a container device with `on:`, under the same rules as a placed service. Its placement is checked when the workspace loads. `vehicle up` and `experiment up` start it in the device's container group, after compute and before services, `experiment up --stage signal-plane` starts it alone, and `status` and events report it as `SIGNAL_PLANE`. A databroker that exits right after it starts fails the job. It runs with `--insecure`, so slice isolation is its only protection.
 
 ### Deprecated
 
