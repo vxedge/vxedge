@@ -61,6 +61,8 @@ Proto changes are also checked with `buf lint` in CI. Contributor rules are in [
 
 Stage: "pre-release" and "Gates of phases 1–3 passed, phase 3 content in progress" (`project.stage`, `project.status` in [`FACTS.md`](https://github.com/vxedge/docs/blob/main/FACTS.md)). Before 1.0 the manifest schema and vxAPI may change between minor versions ([`VERSIONING.md`](https://github.com/vxedge/docs/blob/main/VERSIONING.md)); published results are frozen.
 
+Zone backends: `container`, `qemu-microvm`, `libvirt`, `cloud-hypervisor` and `wasm-capsule`.
+
 Fidelity is not uniform. The [parity ledger](https://github.com/vxedge/docs/blob/main/FACTS.md#parity-ledger) marks each part of the virtual vehicle as real, emulated, planned or caveat. For example, the 5G radio is "UERANSIM gNB and UE in software" (emulated), and timing is "Userspace timestamps on a shared host" (caveat). Read the ledger before drawing conclusions from a number.
 
 Phase plan and open work: [`ROADMAP.md`](https://github.com/vxedge/docs/blob/main/ROADMAP.md) and this repository's [`TASKS.md`](TASKS.md). Measured results and their caveats: [`RESULTS.md`](https://github.com/vxedge/docs/blob/main/RESULTS.md). Every published number and state is registered in [`FACTS.md`](https://github.com/vxedge/docs/blob/main/FACTS.md).
