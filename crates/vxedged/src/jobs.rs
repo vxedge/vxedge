@@ -228,7 +228,7 @@ struct Inner {
 }
 
 /// A short id for this daemon's lifetime, so a job id from before a restart cannot match.
-fn boot_id() -> String {
+pub(crate) fn boot_id() -> String {
     static ENGINES: AtomicU64 = AtomicU64::new(0);
     let n = ENGINES.fetch_add(1, Ordering::Relaxed);
     let seed = format!("{}-{}-{n}", std::process::id(), now_ms());
