@@ -8,10 +8,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "../../proto/vxedge/v1/runs.proto",
         "../../proto/vxedge/v1/workspace.proto",
     ];
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
+    let descriptors = out.join("vxedge_descriptor.bin");
     tonic_prost_build::configure()
+        .file_descriptor_set_path(&descriptors)
         .build_server(true)
         .build_client(true)
         .compile_protos(&protos, &["../../proto"])?;
+    // Serde impls in the canonical Protobuf JSON mapping (enum values by name, lowerCamelCase
+    // fields), behind the `serde` feature: what an agent-facing client returns as typed JSON.
+    pbjson_build::Builder::new()
+        .register_descriptors(&std::fs::read(&descriptors)?)?
+        .build(&[".vxedge"])?;
     for p in protos {
         println!("cargo:rerun-if-changed={p}");
     }

@@ -8,6 +8,8 @@ All notable changes to this repo are documented here. Format follows
 
 ### Added
 
+- `vxedge-api` gains a `serde` feature: every message and enum serializes in the canonical
+  Protobuf JSON mapping, with enum values by name. `vxmcp` returns its tool results this way.
 - `TrafficService.Status`: each profile as running, finished or failed, from the exit code its
   process left, so an agent knows when a load run is over.
 - `TelemetryService.Collect`: runs `vxtelemetry collect` as a job and returns the archive, with its
