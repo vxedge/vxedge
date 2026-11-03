@@ -1,6 +1,6 @@
 ---
 name: zone-backend-contract
-description: The shared contract all three zone backends (container/qemu-microvm/libvirt) and every guest image must satisfy — use when touching crates/vxedge-core/src/zones/ in vxedge, or building/publishing a zone-class guest image (Zephyr/FreeRTOS/QNX/AAOS) in vxparts. One contract, three isolation mechanisms — that's the H3 variable itself.
+description: The shared contract all five zone backends (container/qemu-microvm/libvirt/cloud-hypervisor/wasm-capsule) and every guest image must satisfy — use when touching crates/vxedge-core/src/zones/ in vxedge, or building/publishing a zone-class guest image (Zephyr/FreeRTOS/QNX/AAOS) in vxparts. One contract, three isolation mechanisms — that's the H3 variable itself.
 ---
 
 # Zone backend contract
@@ -12,20 +12,27 @@ publish-vm-bundle.sh`/`publish-vm-disk.sh`). This contract is shared across both
 new guest image in `vxparts` and a new backend feature in `vxedge` must agree on it
 independently, since neither repo reads the other's source.
 
-## The three backends attach to the gateway identically — only isolation differs
+## The five backends attach to the gateway identically — only isolation differs
 
-`Backend::{Libvirt, QemuMicrovm, Container}` (`manifest.rs`) all attach to the same
+`Backend::{Container, QemuMicrovm, Libvirt, CloudHypervisor, WasmCapsule}` (`model/mod.rs`) all
+attach to the same
 gateway port; per `zones/backend.rs`'s own doc comment, "the payload is exec'd... the
 isolation mechanism differs — that is exactly the H3 variable." Concretely:
 
 - `container`: named netns, veth peer moves in, renamed `eth0`, addressed from the
-  manifest.
+  manifest. With a digest-pinned or `localhost/` part, the netns belongs to a container group's
+  infra container and the image runs as a member.
 - `qemu-microvm`: raw QEMU `microvm` machine, direct kernel boot from the bundle
   (`vmlinuz`+`initrd.img`), virtio-net on a tap.
 - `libvirt`: full QEMU machine via `virsh` (`qemu:///system`), same bundle/cmdline
   contract, precreated tap (`managed='no'`).
+- `cloud-hypervisor`: the same guest bundle under Cloud Hypervisor, driven over its REST API on a
+  per-node Unix socket. It adopts the gateway's tap without touching its addressing, and needs a
+  stable MAC.
+- `wasm-capsule`: a container node's network (named netns, gateway port as `eth0`) with a WASI 0.2
+  module as the payload, run by a `vxcapsule` process inside it.
 
-Adding a fourth backend (Renode, phase 3) or a new guest under an existing backend means
+Adding another backend (Renode, `crosvm`) or a new guest under an existing backend means
 satisfying this attachment contract exactly — don't special-case gateway wiring per
 guest OS.
 

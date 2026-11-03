@@ -726,8 +726,9 @@ exp-001 measurements).
     `wait()`-ed, so after `kill` it became a zombie — `/proc/<pid>` and `kill -0` kept
     reporting it as alive forever, both to `svc_down`'s own liveness check and to anyone
     else polling status. Fixed with a dedicated reaper thread per spawn.
-- [ ] `vxcompute` scheduling: v1 co-locates every service with vxedged on the host — real
-      placement onto a compute node is blocked on the `vxcompute` backend not existing yet
+- [x] Placement onto a compute node: delivered as `on:` placement, for services in 0.3.0 and for the
+      signal plane after 0.4.1. A placed service runs as a member of its device's container group.
+      (Was blocked on the archived `vxcompute` backend.)
 - [ ] WireGuard `ota`/telemetry slice transport (§7) — the mechanism now exists
       (`network.tunnels`, §2 above, **built 2026-08-03**), but `SvcService`'s generic process
       backend is not wired to bind `config.listen` onto a tunnel address; v1's `config.listen`
