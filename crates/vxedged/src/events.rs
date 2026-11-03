@@ -1,6 +1,8 @@
 //! In-process event bus: every state transition and audit-worthy action is
 //! published here; `EventService.Subscribe` streams it to clients.
 
+use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::broadcast;
@@ -51,6 +53,10 @@ pub enum EventKind {
     SignalPlaneUp,
     /// The signal plane left its device's container group.
     SignalPlaneDown,
+    /// A run began: the first `up` of a workspace brought its gateway up. Its resource is the run.
+    RunUp,
+    /// A run ended: its gateway went down.
+    RunDown,
     /// A traffic profile started driving load.
     TrafficStarted,
     /// A traffic profile stopped.
@@ -85,6 +91,8 @@ impl EventKind {
             EventKind::ServiceDown => "service.down",
             EventKind::SignalPlaneUp => "signal-plane.up",
             EventKind::SignalPlaneDown => "signal-plane.down",
+            EventKind::RunUp => "run.up",
+            EventKind::RunDown => "run.down",
             EventKind::TrafficStarted => "traffic.started",
             EventKind::TrafficStopped => "traffic.stopped",
             EventKind::NosCheckUp => "nos-check.up",
@@ -106,6 +114,8 @@ impl EventKind {
             EventKind::ComputeUp | EventKind::ComputeDown => ResourceKind::Compute,
             EventKind::ServiceUp | EventKind::ServiceDown => ResourceKind::Service,
             EventKind::SignalPlaneUp | EventKind::SignalPlaneDown => ResourceKind::SignalPlane,
+            // A run is a vehicle's unless said otherwise: `emit_run` names the kind it really is.
+            EventKind::RunUp | EventKind::RunDown => ResourceKind::Vehicle,
             EventKind::TrafficStarted | EventKind::TrafficStopped => ResourceKind::Traffic,
             EventKind::NosCheckUp | EventKind::NosCheckDown | EventKind::NosCheckVerified => {
                 ResourceKind::NosCheck
@@ -114,18 +124,58 @@ impl EventKind {
     }
 }
 
+/// Recent events kept for `Subscribe { after_id }`. Older ones are gone, and a cursor pointing at
+/// one is told so.
+const HISTORY: usize = 1024;
+
 #[derive(Clone)]
 pub struct EventBus {
-    tx: broadcast::Sender<Event>,
+    tx: broadcast::Sender<(u64, Event)>,
     seq: Arc<AtomicU64>,
+    boot: Arc<str>,
+    history: Arc<std::sync::Mutex<VecDeque<(u64, Event)>>>,
+    history_cap: usize,
+    runtime_dir: Option<Arc<PathBuf>>,
+}
+
+/// Whether `kind` is one a subscriber asked for: an exact name, or a family such as `zone`, which
+/// matches `zone.up` and `zone.down`.
+pub fn wanted(kinds: &[String], kind: &str) -> bool {
+    kinds.is_empty()
+        || kinds.iter().any(|k| {
+            let family = k.trim_end_matches('.');
+            kind == k
+                || kind
+                    .strip_prefix(family)
+                    .is_some_and(|rest| rest.starts_with('.'))
+        })
 }
 
 impl EventBus {
+    #[cfg(test)]
     pub fn new() -> Self {
-        let (tx, _) = broadcast::channel(BUS_CAPACITY);
+        Self::build(BUS_CAPACITY, HISTORY, None)
+    }
+
+    #[cfg(test)]
+    pub fn sized(capacity: usize, history: usize) -> Self {
+        Self::build(capacity, history, None)
+    }
+
+    /// A bus that stamps each event with the run active in `runtime_dir`.
+    pub fn with_runtime_dir(runtime_dir: PathBuf) -> Self {
+        Self::build(BUS_CAPACITY, HISTORY, Some(runtime_dir))
+    }
+
+    fn build(capacity: usize, history_cap: usize, runtime_dir: Option<PathBuf>) -> Self {
+        let (tx, _) = broadcast::channel(capacity);
         Self {
             tx,
             seq: Arc::new(AtomicU64::new(0)),
+            boot: crate::jobs::boot_id().into(),
+            history: Arc::new(std::sync::Mutex::new(VecDeque::new())),
+            history_cap,
+            runtime_dir: runtime_dir.map(Arc::new),
         }
     }
 
@@ -135,22 +185,74 @@ impl EventBus {
     /// a transition which then fails has been told something untrue. Never call it on a hot
     /// path — measurement code must not perturb the measurement, and the bus is shared.
     pub fn emit(&self, kind: EventKind, resource_vxid: &str, detail: &str) {
-        let event = Event {
-            id: format!("evt-{:08x}", self.seq.fetch_add(1, Ordering::Relaxed)),
-            ts_unix_ms: crate::jobs::now_ms(),
-            kind: kind.as_str().to_string(),
-            resource_kind: kind.resource_kind() as i32,
-            resource_vxid: resource_vxid.to_string(),
-            detail: detail.to_string(),
-            ..Default::default()
-        };
-        // No subscribers is fine; the bus is fire-and-forget. It must never be able to block
-        // provisioning — an event that can is a dashboard made into a dependency of the testbed.
-        let _ = self.tx.send(event);
+        let run_id = self
+            .runtime_dir
+            .as_deref()
+            .and_then(|d| crate::services::active_run(d))
+            .map(|r| r.run_id().to_string())
+            .unwrap_or_default();
+        self.publish(kind, kind.resource_kind(), resource_vxid, detail, run_id);
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<Event> {
+    /// A run began or ended. The run is the resource, and `resource_kind` says whether it is a
+    /// vehicle's or an experiment's.
+    pub fn emit_run(
+        &self,
+        kind: EventKind,
+        resource_kind: ResourceKind,
+        run_id: &str,
+        detail: &str,
+    ) {
+        self.publish(kind, resource_kind, run_id, detail, run_id.to_string());
+    }
+
+    fn publish(
+        &self,
+        kind: EventKind,
+        resource_kind: ResourceKind,
+        resource_vxid: &str,
+        detail: &str,
+        run_id: String,
+    ) {
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        let event = Event {
+            id: format!("evt-{}-{seq:08x}", self.boot),
+            ts_unix_ms: crate::jobs::now_ms(),
+            kind: kind.as_str().to_string(),
+            resource_kind: resource_kind as i32,
+            resource_vxid: resource_vxid.to_string(),
+            detail: detail.to_string(),
+            run_id,
+        };
+        {
+            let mut history = self.history.lock().expect("event history poisoned");
+            history.push_back((seq, event.clone()));
+            while history.len() > self.history_cap {
+                history.pop_front();
+            }
+        }
+        // No subscribers is fine; the bus is fire-and-forget. It must never be able to block
+        // provisioning — an event that can is a dashboard made into a dependency of the testbed.
+        let _ = self.tx.send((seq, event));
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<(u64, Event)> {
         self.tx.subscribe()
+    }
+
+    /// The events after `id`, and `id`'s own sequence number, if the history still holds it.
+    pub fn after(&self, id: &str) -> Option<(u64, Vec<Event>)> {
+        let history = self.history.lock().expect("event history poisoned");
+        let at = history.iter().position(|(_, e)| e.id == id)?;
+        let floor = history[at].0;
+        Some((
+            floor,
+            history
+                .iter()
+                .skip(at + 1)
+                .map(|(_, e)| e.clone())
+                .collect(),
+        ))
     }
 }
 
@@ -219,7 +321,7 @@ mod tests {
             "node-cont-01",
             "Container on vz-node-c-32cc",
         );
-        let event = rx.recv().await.expect("delivered");
+        let (_, event) = rx.recv().await.expect("delivered");
         assert_eq!(event.kind, "zone.up");
         assert_eq!(event.resource_vxid, "node-cont-01");
         assert_eq!(event.resource_kind, ResourceKind::Zone as i32);
@@ -230,5 +332,48 @@ mod tests {
     #[test]
     fn emitting_with_no_subscribers_is_a_no_op() {
         EventBus::new().emit(EventKind::GatewayDown, "vxgateway", "removed");
+    }
+
+    #[test]
+    fn a_family_matches_its_events_and_only_them() {
+        let kinds = |k: &[&str]| k.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(wanted(&kinds(&[]), "zone.up"));
+        assert!(wanted(&kinds(&["zone"]), "zone.up"));
+        assert!(wanted(&kinds(&["zone."]), "zone.down"));
+        assert!(wanted(&kinds(&["zone.up"]), "zone.up"));
+        assert!(!wanted(&kinds(&["zone"]), "zones.up"));
+        assert!(!wanted(&kinds(&["zone.up"]), "zone.down"));
+        assert!(wanted(&kinds(&["signal-plane"]), "signal-plane.up"));
+    }
+
+    #[test]
+    fn history_resumes_after_an_id_and_forgets_the_oldest() {
+        let bus = EventBus::sized(16, 3);
+        for i in 0..5 {
+            bus.emit(EventKind::ZoneUp, &format!("n{i}"), "");
+        }
+        let ids: Vec<String> = bus
+            .history
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, e)| e.id.clone())
+            .collect();
+        assert_eq!(ids.len(), 3, "bounded");
+        let (_, after) = bus.after(&ids[0]).unwrap();
+        let after: Vec<&str> = after.iter().map(|e| e.resource_vxid.as_str()).collect();
+        assert_eq!(after, ["n3", "n4"]);
+        let first_ever = ids[0].replace("00000002", "00000000");
+        assert!(bus.after(&first_ever).is_none(), "aged out");
+    }
+
+    #[test]
+    fn ids_carry_this_daemons_prefix() {
+        let a = EventBus::new();
+        let b = EventBus::new();
+        a.emit(EventKind::ZoneUp, "n", "");
+        b.emit(EventKind::ZoneUp, "n", "");
+        let id = |bus: &EventBus| bus.history.lock().unwrap()[0].1.id.clone();
+        assert_ne!(id(&a), id(&b), "two daemons never share an id");
     }
 }

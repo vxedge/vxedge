@@ -16,31 +16,31 @@ use vxedge_api::v1::{
 
 use crate::services::{ActiveRecord, GatewaySvc, active_run, read_workspace};
 
+/// Whether the workspace is a bare vehicle, and the id its author wrote. A vehicle's record
+/// holds the id of its synthesized experiment.
+pub(crate) async fn target(record: &ActiveRecord) -> (ResourceKind, String) {
+    let experiment = (ResourceKind::Experiment, record.id.clone());
+    if record.dir == Path::new(".") {
+        return experiment;
+    }
+    let Ok(yaml) = read_workspace(&record.dir.display().to_string()).await else {
+        return experiment;
+    };
+    match vxedge_core::Workspace::from_yaml(&yaml) {
+        Ok(ws) if ws.experiments.is_empty() => match ws.vehicles.first() {
+            Some(vehicle) => (ResourceKind::Vehicle, vehicle.id.clone()),
+            None => experiment,
+        },
+        _ => experiment,
+    }
+}
+
 pub struct RunSvc {
     pub gateway: Arc<GatewaySvc>,
     pub runtime_dir: PathBuf,
 }
 
 impl RunSvc {
-    /// Whether the workspace is a bare vehicle, and the id its author wrote. A vehicle's record
-    /// holds the id of its synthesized experiment.
-    async fn target(record: &ActiveRecord) -> (ResourceKind, String) {
-        let experiment = (ResourceKind::Experiment, record.id.clone());
-        if record.dir == Path::new(".") {
-            return experiment;
-        }
-        let Ok(yaml) = read_workspace(&record.dir.display().to_string()).await else {
-            return experiment;
-        };
-        match vxedge_core::Workspace::from_yaml(&yaml) {
-            Ok(ws) if ws.experiments.is_empty() => match ws.vehicles.first() {
-                Some(vehicle) => (ResourceKind::Vehicle, vehicle.id.clone()),
-                None => experiment,
-            },
-            _ => experiment,
-        }
-    }
-
     async fn current(&self) -> Result<Option<Run>, Status> {
         let Some(record) = active_run(&self.runtime_dir) else {
             return Ok(None);
@@ -50,7 +50,7 @@ impl RunSvc {
             .status(Request::new(GatewayStatusRequest {}))
             .await?
             .into_inner();
-        let (kind, target_id) = Self::target(&record).await;
+        let (kind, target_id) = target(&record).await;
         Ok(Some(Run {
             id: record.run_id().to_string(),
             kind: kind as i32,

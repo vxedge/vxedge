@@ -130,7 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| args.runtime_dir.join("cache/parts"));
     let _ = std::fs::create_dir_all(&cache_dir);
 
-    let bus = events::EventBus::new();
+    let bus = events::EventBus::with_runtime_dir(args.runtime_dir.clone());
     let engine = jobs::JobEngine::with_runtime_dir(bus.clone(), args.runtime_dir.clone());
     let audit = Arc::new(audit::Audit::new(&args.runtime_dir));
     // Optional netns confinement of all gateway objects (used by tests/dev).

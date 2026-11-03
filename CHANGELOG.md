@@ -8,6 +8,11 @@ All notable changes to this repo are documented here. Format follows
 
 ### Added
 
+- Event resume: `Subscribe { after_id }` replays from a bounded history of 1,024 events, and a
+  cursor that history no longer holds is refused as `ERROR_REASON_EVENTS_LOST`. A subscriber that
+  falls behind gets the same reason and its stream ends, instead of a silent gap.
+- `run.up` and `run.down` events, whose resource is the run, and `run_id` on every event.
+- `Subscribe.kinds` accepts a family: `zone` matches `zone.up` and `zone.down`.
 - `WorkspaceService.Plan`: what `up` would do and whether it would be refused, with typed problems,
   planned nodes and services, every image, and host checks, without touching the host. It runs the
   same checks as `vehicle up` and `experiment up`, and a test fails if the two disagree.
@@ -38,6 +43,7 @@ All notable changes to this repo are documented here. Format follows
 
 ### Changed
 
+- Event ids carry a per-daemon prefix, so an id from before a restart cannot match a new event.
 - `experiment up` runs the checks `vehicle up` does before touching the host: local images, guest
   bundles, capsule modules, another vehicle on the host, and placed services. Both also refuse a
   runtime dir too long for a Cloud Hypervisor API socket before any node starts.

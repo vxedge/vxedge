@@ -7,7 +7,7 @@ use sha2::Digest;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
+use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
 use vxedge_api::v1::compute_service_server::ComputeService;
@@ -716,6 +716,7 @@ impl GatewaySvc {
                         // A repeated `up` of the same workspace is the same run.
                         let previous =
                             read_active_record(&runtime_dir).filter(|r| r.id == model.id);
+                        let fresh = previous.is_none();
                         let run_id = previous
                             .as_ref()
                             .and_then(|r| r.run_id.clone())
@@ -734,6 +735,15 @@ impl GatewaySvc {
                         tokio::fs::write(active_record(&runtime_dir), record.to_string())
                             .await
                             .map_err(|e| format!("cannot record the active workspace: {e}"))?;
+                        if fresh && let Some(record) = read_active_record(&runtime_dir) {
+                            let (kind, target) = crate::runs::target(&record).await;
+                            events.emit_run(
+                                crate::events::EventKind::RunUp,
+                                kind,
+                                record.run_id(),
+                                &format!("run of `{target}` started"),
+                            );
+                        }
 
                         let summary = plan.summary();
                         let mut st = state.lock().await;
@@ -801,6 +811,7 @@ impl GatewaySvc {
                         })
                         .await?;
                         *state.lock().await = EdgeState::default();
+                        let ended = read_active_record(&runtime_dir);
                         match tokio::fs::remove_file(active_record(&runtime_dir)).await {
                             Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
                                 return Err(format!("cannot clear the active workspace: {e}"));
@@ -812,6 +823,15 @@ impl GatewaySvc {
                             "vxgateway",
                             "bridge, uplink and endpoints removed",
                         );
+                        if let Some(record) = ended {
+                            let (kind, target) = crate::runs::target(&record).await;
+                            events.emit_run(
+                                crate::events::EventKind::RunDown,
+                                kind,
+                                record.run_id(),
+                                &format!("run of `{target}` ended"),
+                            );
+                        }
                         Ok("vxgateway down — all gateway objects removed".to_string())
                     }
                 }
@@ -1229,16 +1249,68 @@ impl EventService for EventSvc {
         &self,
         req: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
-        let kinds = req.into_inner().kinds;
-        let stream = BroadcastStream::new(self.bus.subscribe()).filter_map(move |item| {
-            match item {
-                Ok(event) if kinds.is_empty() || kinds.contains(&event.kind) => Some(Ok(event)),
-                Ok(_) => None,
-                // Slow consumer skipped `n` events; keep streaming rather than erroring.
-                Err(_lagged) => None,
+        let req = req.into_inner();
+        let kinds = req.kinds;
+        // Subscribe before reading the history, so nothing falls between the two. An event in
+        // both is skipped live by its sequence number.
+        let mut live = self.bus.subscribe();
+        let (floor, replay) = if req.after_id.is_empty() {
+            (None, Vec::new())
+        } else {
+            let (floor, replay) = self.bus.after(&req.after_id).ok_or_else(|| {
+                crate::errors::refuse(
+                    tonic::Code::OutOfRange,
+                    crate::errors::R::EventsLost,
+                    format!(
+                        "event `{}` is not in this daemon's history: it aged out, or predates a \
+                         restart. Re-read status, then subscribe again",
+                        req.after_id
+                    ),
+                )
+            })?;
+            (Some(floor), replay)
+        };
+        let (tx, out) = tokio::sync::mpsc::channel::<Result<Event, Status>>(64);
+        tokio::spawn(async move {
+            for event in replay {
+                if crate::events::wanted(&kinds, &event.kind) && tx.send(Ok(event)).await.is_err() {
+                    return;
+                }
+            }
+            loop {
+                match live.recv().await {
+                    Ok((seq, event)) => {
+                        if floor.is_some_and(|f| seq <= f)
+                            || !crate::events::wanted(&kinds, &event.kind)
+                        {
+                            continue;
+                        }
+                        if tx.send(Ok(event)).await.is_err() {
+                            return;
+                        }
+                    }
+                    // Too slow to keep up: say so and stop, rather than leave a silent gap. The
+                    // subscriber resumes from the last id it saw.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        let _ = tx
+                            .send(Err(crate::errors::refuse(
+                                tonic::Code::DataLoss,
+                                crate::errors::R::EventsLost,
+                                format!(
+                                    "this subscriber fell {n} events behind. Resume with \
+                                     `after_id` set to the last event it received"
+                                ),
+                            )))
+                            .await;
+                        return;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
             }
         });
-        Ok(Response::new(Box::pin(stream)))
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(out),
+        )))
     }
 }
 
@@ -2765,5 +2837,33 @@ mod tests {
             })
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A subscriber that falls behind is told, and the stream ends, rather than leaving a gap.
+    #[tokio::test]
+    async fn a_lagging_subscriber_is_told_events_were_lost() {
+        use tokio_stream::StreamExt;
+        let svc = EventSvc {
+            bus: EventBus::sized(2, 16),
+        };
+        let mut stream = svc
+            .subscribe(Request::new(SubscribeRequest::default()))
+            .await
+            .unwrap()
+            .into_inner();
+        for i in 0..10 {
+            svc.bus
+                .emit(crate::events::EventKind::ZoneUp, &format!("n{i}"), "");
+        }
+        let mut lost = None;
+        while let Some(item) = stream.next().await {
+            if let Err(status) = item {
+                lost = Some(status);
+                break;
+            }
+        }
+        let status = lost.expect("the stream reports the loss");
+        assert_eq!(status.code(), tonic::Code::DataLoss);
+        assert!(stream.next().await.is_none(), "and then ends");
     }
 }
