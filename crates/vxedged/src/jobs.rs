@@ -184,6 +184,16 @@ impl Progress {
         });
     }
 
+    /// What this job produced, reported with its result.
+    pub fn artifact(&self, path: &std::path::Path, sha256: &str) {
+        self.tx.send_modify(|job| {
+            job.artifact = Some(vxedge_api::v1::Artifact {
+                path: path.display().to_string(),
+                sha256: sha256.to_string(),
+            });
+        });
+    }
+
     /// This job's id, for the stages it starts.
     pub fn job_id(&self) -> &str {
         &self.id

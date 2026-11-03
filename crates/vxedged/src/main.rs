@@ -13,6 +13,7 @@ mod plan;
 mod runs;
 mod services;
 mod status;
+mod telemetry;
 mod vehicle;
 
 use clap::Parser;
@@ -30,6 +31,7 @@ use vxedge_api::v1::job_service_server::JobServiceServer;
 use vxedge_api::v1::nos_check_service_server::NosCheckServiceServer;
 use vxedge_api::v1::run_service_server::RunServiceServer;
 use vxedge_api::v1::svc_service_server::SvcServiceServer;
+use vxedge_api::v1::telemetry_service_server::TelemetryServiceServer;
 use vxedge_api::v1::traffic_service_server::TrafficServiceServer;
 use vxedge_api::v1::vehicle_service_server::VehicleServiceServer;
 use vxedge_api::v1::workspace_service_server::WorkspaceServiceServer;
@@ -218,6 +220,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let plan_gateway = gateway.clone();
+    let telemetry_engine = engine.clone();
+    let telemetry_audit = audit.clone();
     let runs = runs::RunSvc {
         gateway: gateway.clone(),
         runtime_dir: args.runtime_dir.clone(),
@@ -256,6 +260,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }))
         .add_service(JobServiceServer::new(services::JobSvc { engine }))
         .add_service(EventServiceServer::new(services::EventSvc { bus }))
+        .add_service(TelemetryServiceServer::new(telemetry::TelemetrySvc {
+            engine: telemetry_engine,
+            audit: telemetry_audit,
+            runtime_dir: args.runtime_dir.clone(),
+            vxtelemetry_bin: args.vxtelemetry_bin.clone(),
+        }))
         .serve_with_incoming_shutdown(UnixListenerStream::new(listener), async {
             let _ = tokio::signal::ctrl_c().await;
             info!("shutdown signal received");

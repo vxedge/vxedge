@@ -66,6 +66,49 @@ fn pidfile(runtime_dir: &Path, profile_id: &str, role: &str) -> PathBuf {
     runtime_dir.join(format!("traffic-{profile_id}-{role}.pid"))
 }
 
+fn exitfile(runtime_dir: &Path, profile_id: &str, role: &str) -> PathBuf {
+    runtime_dir.join(format!("traffic-{profile_id}-{role}.exit"))
+}
+
+/// Where a profile's load stands, read from its pidfiles and the exit codes their reapers wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProfileState {
+    /// No process of this profile was started, or it was brought down.
+    NotStarted,
+    Running,
+    Finished,
+    Failed(String),
+    /// It stopped, and nothing recorded how: the daemon that reaped it was not this one.
+    Unknown,
+}
+
+/// The state of one profile. The load role (`send` or `load`) decides it: a reflector serves
+/// until it is brought down, so it says nothing about whether the run is over.
+pub fn profile_status(runtime_dir: &Path, profile_id: &str) -> ProfileState {
+    let mut started = false;
+    for role in ["send", "load"] {
+        let Some(pid) = read_pid(runtime_dir, profile_id, role) else {
+            continue;
+        };
+        started = true;
+        if alive(pid) {
+            return ProfileState::Running;
+        }
+        match std::fs::read_to_string(exitfile(runtime_dir, profile_id, role)) {
+            Ok(code) if code.trim() == "0" => {}
+            Ok(code) => {
+                return ProfileState::Failed(format!("`{role}` exited with {}", code.trim()));
+            }
+            Err(_) => return ProfileState::Unknown,
+        }
+    }
+    if started {
+        ProfileState::Finished
+    } else {
+        ProfileState::NotStarted
+    }
+}
+
 fn read_pid(runtime_dir: &Path, profile_id: &str, role: &str) -> Option<i32> {
     std::fs::read_to_string(pidfile(runtime_dir, profile_id, role))
         .ok()?
@@ -205,13 +248,23 @@ fn spawn_tracked(
             source,
         })?;
     let pid = child.id();
+    let exit = exitfile(runtime_dir, profile_id, role);
+    let _ = std::fs::remove_file(&exit);
     std::fs::write(pidfile(runtime_dir, profile_id, role), pid.to_string())
         .map_err(|e| TrafficLifecycleError::Pidfile(profile_id.to_string(), e))?;
     // See services.rs::svc_up's own comment: reap on a background thread so
     // a later-killed child doesn't linger as a zombie that `alive()` keeps
-    // reporting as running.
+    // reporting as running. The exit code is kept, so status can tell a
+    // finished run from a failed one.
     std::thread::spawn(move || {
-        let _ = child.wait();
+        let code = match child.wait() {
+            Ok(status) => status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "a signal".to_string()),
+            Err(e) => format!("unknown ({e})"),
+        };
+        let _ = std::fs::write(exit, code);
     });
     Ok(pid)
 }
@@ -438,6 +491,7 @@ pub fn profile_down(runtime_dir: &Path, profile_id: &str) -> String {
             }
         }
         let _ = std::fs::remove_file(pidfile(runtime_dir, profile_id, role));
+        let _ = std::fs::remove_file(exitfile(runtime_dir, profile_id, role));
     }
     format!("traffic profile `{profile_id}` down")
 }
@@ -601,5 +655,22 @@ devices: {}
             err,
             TrafficLifecycleError::Spawn { role: "load", .. }
         ));
+    }
+
+    #[test]
+    fn a_profile_reads_as_not_started_finished_failed_or_unknown() {
+        let dir = std::env::temp_dir().join(format!("vxtraffic-status-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(profile_status(&dir, "p"), ProfileState::NotStarted);
+        // A pid that cannot be alive: above the kernel's limit.
+        std::fs::write(pidfile(&dir, "p", "send"), "99999999").unwrap();
+        assert_eq!(profile_status(&dir, "p"), ProfileState::Unknown);
+        std::fs::write(exitfile(&dir, "p", "send"), "0").unwrap();
+        assert_eq!(profile_status(&dir, "p"), ProfileState::Finished);
+        std::fs::write(exitfile(&dir, "p", "send"), "2").unwrap();
+        assert!(matches!(profile_status(&dir, "p"), ProfileState::Failed(_)));
+        std::fs::write(pidfile(&dir, "p", "send"), std::process::id().to_string()).unwrap();
+        assert_eq!(profile_status(&dir, "p"), ProfileState::Running);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
