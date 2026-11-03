@@ -26,7 +26,7 @@ message CollectRequest {
 }
 
 service TelemetryService {
-  // Live metrics for dashboards / HMI.
+  // Live metrics for dashboards / HMI. Not built: answers `UNIMPLEMENTED`.
   rpc StreamMetrics(StreamMetricsRequest) returns (stream Metric);
   // Bundle Prometheus data, PCAPs, logs + metadata into the results archive.
   rpc Collect(CollectRequest) returns (Job);
