@@ -31,7 +31,6 @@
 //! (`GatewaySvc`/`ZoneSvc`/`SvcSvc`, via `crate::services::resolve_manifest`), sees an ordinary
 //! §6.0 workspace and needs no vehicle-aware code path of its own.
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
@@ -42,7 +41,6 @@ use vxedge_api::v1::{
     ExperimentStage, ManifestRef, ResourceKind, ResourceState, ResourceStatus, SvcStatusRequest,
     VehicleDownRequest, VehicleStatus, VehicleStatusRequest, VehicleUpRequest,
 };
-use vxedge_core::containers::LazyClient;
 use vxedge_core::gateway::GatewayPlan;
 use vxedge_core::model::{DeviceRole, Experiment};
 use vxedge_core::zones::NodePlan;
@@ -119,50 +117,6 @@ fn by_stage(nodes: &[NodePlan]) -> (Vec<String>, Vec<String>) {
     (ids(zones), ids(compute))
 }
 
-/// The `localhost/` images this vehicle runs: payloads and everything placed on a device.
-fn local_images(model: &Experiment, nodes: &[NodePlan]) -> BTreeSet<String> {
-    let payloads = nodes.iter().filter_map(|n| n.image.as_deref());
-    let placed = model.placements().map(|p| p.image.url.as_str());
-    payloads
-        .chain(placed)
-        .filter(|image| image.starts_with("localhost/"))
-        .map(str::to_owned)
-        .collect()
-}
-
-/// Refuse now, naming the images, rather than on a failed pull with the gateway already up.
-/// A vehicle with no local image never reaches Podman here.
-async fn require_local_images(id: &str, images: &BTreeSet<String>) -> Result<(), Status> {
-    if images.is_empty() {
-        return Ok(());
-    }
-    let containers = LazyClient::user();
-    let client = containers.get().await.map_err(|e| {
-        crate::errors::unavailable(crate::errors::R::BackendUnavailable, e.to_string())
-    })?;
-    let mut missing = Vec::new();
-    for image in images {
-        let present = client.image_present(image).await.map_err(|e| {
-            crate::errors::unavailable(crate::errors::R::BackendUnavailable, e.to_string())
-        })?;
-        if !present {
-            missing.push(format!("  {image}"));
-        }
-    }
-    if missing.is_empty() {
-        return Ok(());
-    }
-    Err(crate::errors::precondition(
-        crate::errors::R::LocalImageMissing,
-        format!(
-            "vehicle `{id}` runs local images that are not in this host's Podman store:\n{}\n\
-         A `localhost/` image is built per host. Build it with the workspace's build script, \
-         then run `vehicle up` again.",
-            missing.join("\n")
-        ),
-    ))
-}
-
 impl VehicleSvc {
     /// Every verb acts on the host's one gateway, so each refuses a workspace other than the
     /// active one. What is active comes from this daemon's memory and record first, and then from
@@ -222,58 +176,21 @@ impl VehicleService for VehicleSvc {
             model,
             id,
         } = resolve_and_synthesize(req.get_ref().manifest.as_ref()).await?;
-        // Host requirements before anything is provisioned, same as `ExperimentSvc::up` — see
-        // that function's own comment for why refusing here costs nothing but refusing halfway
-        // through does not.
-        crate::services::preflight_requires(dir.as_deref())?;
+        // Every check `up` makes before touching the host, shared with `WorkspaceService.Plan` so
+        // the two cannot disagree. Refusing here costs nothing; refusing halfway strands a gateway.
         let (_, nodes) = plan_vehicle(&model, dir.as_deref())?;
-        self.require_active("vehicle up", &model, dir.as_deref(), &nodes)
-            .await?;
-        // A store that is missing would otherwise fail last, with the whole vehicle already up.
-        for def in model.services.values().filter(|s| s.on.is_some()) {
-            let workspace = dir.as_deref().unwrap_or_else(|| Path::new("."));
-            vxedge_core::services::placed_spec(def, workspace).map_err(|e| {
-                crate::errors::precondition(crate::errors::R::WorkspaceInvalid, e.to_string())
-            })?;
-        }
-        require_local_images(&id, &local_images(&model, &nodes)).await?;
-        // A local bundle (e.g. `./bundle`) is built per host and absent on a fresh clone;
-        // refuse now, with the build command, rather than after the gateway is up.
-        if let Some(d) = dir.as_deref() {
-            let missing = vxedge_core::zones::missing_local_bundles(&model, d);
-            if !missing.is_empty() {
-                let list = missing
-                    .iter()
-                    .map(|p| format!("  {}", p.display()))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                return Err(crate::errors::precondition(
-                    crate::errors::R::LocalBundleMissing,
-                    format!(
-                        "vehicle `{id}` boots a local guest bundle that has not been built on this host:\n{list}\n\
-                     A bundle embeds the host kernel, so it is built per host and never published. Build it with \
-                     `<vxparts>/parts/zone/linux/stack/probe-bundle/build.sh <dir above>` (needs busybox-static \
-                     and a readable /boot/vmlinuz-$(uname -r); see that part's README), then run `vehicle up` again."
-                    ),
-                ));
-            }
-        }
-        if let Some(d) = dir.as_deref() {
-            let missing = vxedge_core::zones::missing_local_modules(&model, d);
-            if !missing.is_empty() {
-                let list = missing
-                    .iter()
-                    .map(|p| format!("  {}", p.display()))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                return Err(crate::errors::precondition(
-                    crate::errors::R::CapsuleModuleMissing,
-                    format!(
-                        "vehicle `{id}` runs a capsule module that is not on this host:\n{list}\n\
-                     Build the module, or correct the part's `ref`, then run `vehicle up` again."
-                    ),
-                ));
-            }
+        let pf = crate::plan::preflight(
+            "vehicle up",
+            &id,
+            &model,
+            &nodes,
+            dir.as_deref(),
+            &self.handles.zones.runtime_dir,
+            &self.handles.gateway,
+        )
+        .await;
+        if let Some(refusal) = pf.refusal() {
+            return Err(refusal);
         }
         self.audit.record(
             "VehicleService.Up",
@@ -553,7 +470,7 @@ parts:
         );
         let m = model(&yaml);
         let (_, nodes) = plan_vehicle(&m, None).unwrap();
-        assert!(local_images(&m, &nodes).contains("localhost/vxedge/kuksa:1"));
+        assert!(crate::plan::local_images(&m, &nodes).contains("localhost/vxedge/kuksa:1"));
     }
 
     #[test]
@@ -561,7 +478,9 @@ parts:
         let m = model(WS);
         let (_, nodes) = plan_vehicle(&m, None).unwrap();
         assert_eq!(
-            local_images(&m, &nodes).into_iter().collect::<Vec<_>>(),
+            crate::plan::local_images(&m, &nodes)
+                .into_iter()
+                .collect::<Vec<_>>(),
             ["localhost/vxedge/ota:1", "localhost/vxedge/probe:1"]
         );
     }
@@ -576,11 +495,6 @@ parts:
         let err = plan_vehicle(&model(&yaml), None).unwrap_err();
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
         assert!(err.message().contains("ecu1"), "{err:?}");
-    }
-
-    #[tokio::test]
-    async fn a_vehicle_without_local_images_never_asks_podman() {
-        require_local_images("car", &BTreeSet::new()).await.unwrap();
     }
 
     #[test]

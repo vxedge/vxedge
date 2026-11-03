@@ -103,8 +103,22 @@ fn signal_plane_workspace() -> PathBuf {
 fn signal_plane_experiment() -> PathBuf {
     let dir = scratch();
     std::fs::create_dir_all(dir.join("artifacts")).unwrap();
-    let yaml =
-        vxedge_core::model::synthesize_vehicle_workspace(&vehicle_with_signal_plane()).unwrap();
+    // A published, digest-pinned databroker, so no local image check stands in front of the stage.
+    let pinned = |r: &str| format!("{r}@sha256:{}", "b".repeat(64));
+    let vehicle = vehicle_with_signal_plane()
+        .replace(
+            "localhost/vxedge/no-such-kuksa:1",
+            &pinned("ghcr.io/eclipse-kuksa/kuksa-databroker"),
+        )
+        .replace("localhost/vxedge/ota:1", &pinned("ghcr.io/vxedge/ota"))
+        .replace(
+            "{ ref: localhost/vxedge/probe:1, target_ids: f-hpc }",
+            &format!(
+                "{{ ref: ghcr.io/vxedge/probe:1, digest: 'sha256:{}', target_ids: f-hpc }}",
+                "b".repeat(64)
+            ),
+        );
+    let yaml = vxedge_core::model::synthesize_vehicle_workspace(&vehicle).unwrap();
     std::fs::write(dir.join("main.yaml"), yaml).unwrap();
     dir
 }
@@ -143,10 +157,19 @@ impl Daemon {
         Self::start_with(|_| {})
     }
 
+    /// A daemon whose runtime dir is `name` under its scratch dir.
+    fn start_in(name: &str) -> Self {
+        Self::start_at(name, |_| {})
+    }
+
     /// `seed` runs on the runtime dir before the daemon starts, as a previous daemon's leftovers.
     fn start_with(seed: impl FnOnce(&Path)) -> Self {
+        Self::start_at("run", seed)
+    }
+
+    fn start_at(name: &str, seed: impl FnOnce(&Path)) -> Self {
         let root = scratch();
-        let runtime = root.join("run");
+        let runtime = root.join(name);
         std::fs::create_dir_all(&runtime).unwrap();
         seed(&runtime);
         let socket = root.join("d.sock");
@@ -550,32 +573,16 @@ async fn experiment_up_does_not_skip_a_declared_signal_plane() {
 #[tokio::test]
 async fn rpcs_still_to_build_answer_unimplemented() {
     use tonic::Code::Unimplemented;
-    use vxedge_api::v1::host_service_client::HostServiceClient;
-    use vxedge_api::v1::workspace_service_client::WorkspaceServiceClient;
 
     let daemon = Daemon::start();
     let channel = daemon.channel().await;
-    let codes = [
-        TrafficServiceClient::new(channel.clone())
-            .status(vxedge_api::v1::TrafficStatusRequest::default())
-            .await
-            .map(|_| ())
-            .unwrap_err()
-            .code(),
-        WorkspaceServiceClient::new(channel.clone())
-            .plan(vxedge_api::v1::WorkspacePlanRequest::default())
-            .await
-            .map(|_| ())
-            .unwrap_err()
-            .code(),
-        HostServiceClient::new(channel)
-            .capabilities(vxedge_api::v1::HostCapabilitiesRequest::default())
-            .await
-            .map(|_| ())
-            .unwrap_err()
-            .code(),
-    ];
-    assert_eq!(codes, [Unimplemented; 3]);
+    let codes = [TrafficServiceClient::new(channel.clone())
+        .status(vxedge_api::v1::TrafficStatusRequest::default())
+        .await
+        .map(|_| ())
+        .unwrap_err()
+        .code()];
+    assert_eq!(codes, [Unimplemented; 1]);
 }
 
 const ONE_OF_EACH: &str = r#"
@@ -1019,4 +1026,194 @@ async fn jobs_are_listed_and_a_finished_one_cannot_be_cancelled() {
         .await
         .unwrap_err();
     assert_eq!(reason(&refused), "ERROR_REASON_NOT_CANCELLABLE");
+}
+
+/// A one-device vehicle on `backend`, with `part` as its only part.
+fn single(backend: &str, part: &str) -> String {
+    format!(
+        r#"
+kind: vehicle
+id: single
+zones: {{ z: {{}} }}
+devices:
+  a: {{ role: ecu, zone: z, backend: {backend} }}
+functions:
+  fa: {{ deployed_on: a }}
+links:
+  - {{ id: la, endpoints: [{{ node: a, port: eth0, ip: 10.4.0.1/24 }}], slice: adas }}
+---
+kind: baseline
+id: bl
+parts:
+  - {part}
+"#
+    )
+}
+
+fn workspace_of(yaml: &str) -> PathBuf {
+    let dir = scratch();
+    std::fs::write(dir.join("vehicle.yaml"), yaml).unwrap();
+    dir
+}
+
+async fn plan_of(channel: &Channel, dir: &Path) -> vxedge_api::v1::WorkspacePlan {
+    vxedge_api::v1::workspace_service_client::WorkspaceServiceClient::new(channel.clone())
+        .plan(vxedge_api::v1::WorkspacePlanRequest {
+            manifest: path_ref(dir),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+}
+
+/// `Plan` and `vehicle up` run one list of checks, so `Plan`'s first problem is the reason `up`
+/// refuses with. A case where they disagreed would fail here.
+#[tokio::test]
+async fn plan_and_up_agree() {
+    let bundle = "{ ref: ./bundle, kind: bundle, target_ids: fa }";
+    let built_bundle = |dir: &Path| {
+        std::fs::create_dir_all(dir.join("bundle")).unwrap();
+        std::fs::write(dir.join("bundle/vmlinuz"), b"").unwrap();
+        std::fs::write(dir.join("bundle/initrd.img"), b"").unwrap();
+    };
+    type Prepare = Box<dyn Fn(&Path)>;
+    let cases: Vec<(&str, String, Prepare, &str)> = vec![
+        (
+            "unbuilt bundle",
+            single("qemu-microvm", bundle),
+            Box::new(|_| {}),
+            "ERROR_REASON_LOCAL_BUNDLE_MISSING",
+        ),
+        (
+            "missing capsule module",
+            single(
+                "wasm-capsule",
+                "{ ref: ./capsule.wasm, kind: wasm, target_ids: fa }",
+            ),
+            Box::new(|_| {}),
+            "ERROR_REASON_CAPSULE_MODULE_MISSING",
+        ),
+        (
+            "socket path too long",
+            single("cloud-hypervisor", bundle),
+            Box::new(built_bundle),
+            "ERROR_REASON_RUNTIME_DIR_TOO_LONG",
+        ),
+    ];
+    for (name, yaml, prepare, expected) in cases {
+        let daemon = if name == "socket path too long" {
+            Daemon::start_in(&"r".repeat(100))
+        } else {
+            Daemon::start()
+        };
+        let channel = daemon.channel().await;
+        let dir = workspace_of(&yaml);
+        prepare(&dir);
+        let plan = plan_of(&channel, &dir).await;
+        assert!(!plan.valid, "{name}");
+        let first = plan
+            .problems
+            .first()
+            .unwrap_or_else(|| panic!("{name}: no problem"));
+        assert_eq!(
+            vxedge_api::v1::ErrorReason::try_from(first.reason)
+                .unwrap()
+                .as_str_name(),
+            expected,
+            "{name}: plan"
+        );
+        let refused = VehicleServiceClient::new(channel)
+            .up(VehicleUpRequest {
+                manifest: path_ref(&dir),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(reason(&refused), expected, "{name}: up");
+    }
+}
+
+#[tokio::test]
+async fn plan_and_up_agree_on_the_wrong_workspace() {
+    let (active, id) = experiment_workspace();
+    let daemon = Daemon::start_with(|run| write_active_record(run, &id, &active, None));
+    let channel = daemon.channel().await;
+    let other = workspace_of(PROCESS_ONLY);
+    let plan = plan_of(&channel, &other).await;
+    let first = plan.problems.first().expect("refused");
+    assert_eq!(
+        first.reason,
+        vxedge_api::v1::ErrorReason::WrongWorkspace as i32
+    );
+    let refused = VehicleServiceClient::new(channel)
+        .up(VehicleUpRequest {
+            manifest: path_ref(&other),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&refused), "ERROR_REASON_WRONG_WORKSPACE");
+}
+
+#[tokio::test]
+async fn experiment_up_runs_the_same_checks() {
+    let daemon = Daemon::start();
+    let dir = scratch();
+    let yaml = vxedge_core::model::synthesize_vehicle_workspace(&single(
+        "qemu-microvm",
+        "{ ref: ./bundle, kind: bundle, target_ids: fa }",
+    ))
+    .unwrap();
+    std::fs::write(dir.join("main.yaml"), yaml).unwrap();
+    let refused = ExperimentServiceClient::new(daemon.channel().await)
+        .up(ExperimentUpRequest {
+            manifest: path_ref(&dir),
+            stages: Vec::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&refused), "ERROR_REASON_LOCAL_BUNDLE_MISSING");
+}
+
+#[tokio::test]
+async fn a_valid_plan_lists_what_up_would_run() {
+    let daemon = Daemon::start();
+    let channel = daemon.channel().await;
+    let dir = workspace_of(PROCESS_ONLY);
+    let plan = plan_of(&channel, &dir).await;
+    assert!(plan.valid, "{:?}", plan.problems);
+    assert_eq!(plan.nodes.len(), 1);
+    assert_eq!(plan.nodes[0].vxid, "a");
+    assert!(
+        plan.host_checks
+            .iter()
+            .any(|c| c.name == "guest bundles" && c.passed)
+    );
+    let broken = workspace_of("kind: vehicle\nid: x\nzones: {}\nnot_a_field: 1\n");
+    let invalid = plan_of(&channel, &broken).await;
+    assert!(!invalid.valid);
+    assert_eq!(
+        invalid.problems[0].reason,
+        vxedge_api::v1::ErrorReason::WorkspaceInvalid as i32
+    );
+}
+
+#[tokio::test]
+async fn host_capabilities_cover_every_backend() {
+    let daemon = Daemon::start();
+    let caps = vxedge_api::v1::host_service_client::HostServiceClient::new(daemon.channel().await)
+        .capabilities(vxedge_api::v1::HostCapabilitiesRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    let mut backends: Vec<i32> = caps.backends.iter().map(|b| b.backend).collect();
+    backends.sort();
+    assert_eq!(backends, [1, 2, 3, 4, 5]);
+    assert!(
+        caps.backends
+            .iter()
+            .all(|b| b.available || !b.detail.is_empty())
+    );
+    assert_eq!(caps.part_kinds, ["container", "bundle", "wasm"]);
+    assert_eq!(caps.max_runs, 1);
 }

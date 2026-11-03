@@ -8,6 +8,11 @@ All notable changes to this repo are documented here. Format follows
 
 ### Added
 
+- `WorkspaceService.Plan`: what `up` would do and whether it would be refused, with typed problems,
+  planned nodes and services, every image, and host checks, without touching the host. It runs the
+  same checks as `vehicle up` and `experiment up`, and a test fails if the two disagree.
+- `HostService.Capabilities`: which backends this host can run, the part kinds, and how many runs it
+  holds at once.
 - Structured errors: every refusal carries `google.rpc.ErrorInfo` with an `ErrorReason` and the
   domain `vxedge.v1`, and a failed job carries `Job.error_reason`, including from its stages. A test
   fails if any refusal bypasses the reasons. New reasons: `INVALID_REQUEST`, `NOT_FOUND`,
@@ -33,6 +38,9 @@ All notable changes to this repo are documented here. Format follows
 
 ### Changed
 
+- `experiment up` runs the checks `vehicle up` does before touching the host: local images, guest
+  bundles, capsule modules, another vehicle on the host, and placed services. Both also refuse a
+  runtime dir too long for a Cloud Hypervisor API socket before any node starts.
 - One lifecycle operation runs at a time: a second call for the same thing returns the running job,
   and any other is refused as `ERROR_REASON_BUSY` (`ABORTED`).
 - Job ids carry a per-daemon prefix, and job history is bounded, so an old id is reported unknown

@@ -50,6 +50,11 @@ fn running_pid(np: &NodePlan) -> Option<i32> {
 
 /// The runner: `VXEDGE_CAPSULE_BIN`, else beside this executable, else on PATH. Absolute, since
 /// it is an install location rather than a name to search for.
+/// Whether a `vxcapsule` runner is installed where this daemon would look for it.
+pub fn runner_available() -> bool {
+    runner_path().is_some()
+}
+
 fn runner_path() -> Option<PathBuf> {
     let explicit = std::env::var_os("VXEDGE_CAPSULE_BIN").map(PathBuf::from);
     let beside = std::env::current_exe()

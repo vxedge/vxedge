@@ -168,6 +168,19 @@ fn refuse_long_socket_path(np: &NodePlan, socket: &Path) -> Result<(), ZoneBacke
     Ok(())
 }
 
+/// Why this node's API socket path cannot work in `runtime_dir`, if it cannot. The same check `up`
+/// makes, for a caller that plans before touching the host.
+pub fn socket_too_long(np: &NodePlan, runtime_dir: &Path) -> Option<String> {
+    refuse_long_socket_path(np, &socket_path(np, runtime_dir))
+        .err()
+        .map(|e| e.to_string())
+}
+
+/// Whether the Cloud Hypervisor VMM is on this host's `PATH`.
+pub fn vmm_available() -> bool {
+    vmm_on_path()
+}
+
 fn vmm_on_path() -> bool {
     std::env::var_os("PATH")
         .is_some_and(|path| std::env::split_paths(&path).any(|d| d.join(VMM).is_file()))

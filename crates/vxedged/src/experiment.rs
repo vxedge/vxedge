@@ -613,26 +613,39 @@ impl ExperimentService for ExperimentSvc {
         // workspace instead of the daemon's own cwd once the document is re-wrapped as inline
         // YAML — found live 2026-08-04, `zone up` after `experiment up --stage gateway`.
         let dir = match req.get_ref().manifest.as_ref() {
-            Some(mref) => {
-                let dir = crate::services::resolve_manifest_dir(mref).await;
-                crate::services::preflight_requires(dir.as_deref())?;
-                dir
-            }
+            Some(mref) => crate::services::resolve_manifest_dir(mref).await,
             None => None,
         };
         let yaml = resolve_once(req.get_ref().manifest.as_ref()).await?;
         let model = vxedge_core::model::load_yaml(&yaml).map_err(|e| {
             crate::errors::invalid(crate::errors::R::WorkspaceInvalid, e.to_string())
         })?;
-        let active = self.handles.gateway.active_on_host().await;
-        check_active_target(
+        // Every check `up` makes before touching the host, shared with `vehicle up` and
+        // `WorkspaceService.Plan`.
+        let nodes = GatewayPlan::from_model(&model)
+            .map_err(|e| e.to_string())
+            .and_then(|gw| {
+                vxedge_core::zones::plan_nodes_from_model(
+                    &model,
+                    &gw,
+                    dir.as_deref().unwrap_or_else(|| std::path::Path::new(".")),
+                )
+                .map_err(|e| e.to_string())
+            })
+            .map_err(|e| crate::errors::precondition(crate::errors::R::WorkspaceInvalid, e))?;
+        let pf = crate::plan::preflight(
             "experiment up",
-            active
-                .as_ref()
-                .map(|(id, dir)| (id.as_str(), dir.as_path())),
             &model.id,
+            &model,
+            &nodes,
             dir.as_deref(),
-        )?;
+            &self.handles.zones.runtime_dir,
+            &self.handles.gateway,
+        )
+        .await;
+        if let Some(refusal) = pf.refusal() {
+            return Err(refusal);
+        }
         self.audit.record(
             "ExperimentService.Up",
             serde_json::json!({ "experiment": model.id }),

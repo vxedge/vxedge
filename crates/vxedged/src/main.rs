@@ -9,6 +9,7 @@ mod errors;
 mod events;
 mod experiment;
 mod jobs;
+mod plan;
 mod runs;
 mod services;
 mod status;
@@ -24,12 +25,14 @@ use vxedge_api::v1::compute_service_server::ComputeServiceServer;
 use vxedge_api::v1::event_service_server::EventServiceServer;
 use vxedge_api::v1::experiment_service_server::ExperimentServiceServer;
 use vxedge_api::v1::gateway_service_server::GatewayServiceServer;
+use vxedge_api::v1::host_service_server::HostServiceServer;
 use vxedge_api::v1::job_service_server::JobServiceServer;
 use vxedge_api::v1::nos_check_service_server::NosCheckServiceServer;
 use vxedge_api::v1::run_service_server::RunServiceServer;
 use vxedge_api::v1::svc_service_server::SvcServiceServer;
 use vxedge_api::v1::traffic_service_server::TrafficServiceServer;
 use vxedge_api::v1::vehicle_service_server::VehicleServiceServer;
+use vxedge_api::v1::workspace_service_server::WorkspaceServiceServer;
 use vxedge_api::v1::zone_service_server::ZoneServiceServer;
 
 #[derive(Parser, Debug)]
@@ -214,6 +217,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         svcs: svcs.clone(),
     };
 
+    let plan_gateway = gateway.clone();
     let runs = runs::RunSvc {
         gateway: gateway.clone(),
         runtime_dir: args.runtime_dir.clone(),
@@ -221,6 +225,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Server::builder()
         .add_service(GatewayServiceServer::from_arc(gateway))
         .add_service(RunServiceServer::new(runs))
+        .add_service(WorkspaceServiceServer::new(plan::PlanSvc {
+            gateway: plan_gateway.clone(),
+            runtime_dir: args.runtime_dir.clone(),
+        }))
+        .add_service(HostServiceServer::new(plan::PlanSvc {
+            gateway: plan_gateway,
+            runtime_dir: args.runtime_dir.clone(),
+        }))
         .add_service(ZoneServiceServer::from_arc(zones))
         .add_service(ComputeServiceServer::from_arc(compute))
         .add_service(SvcServiceServer::from_arc(svcs))
