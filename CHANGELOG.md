@@ -8,6 +8,11 @@ All notable changes to this repo are documented here. Format follows
 
 ### Added
 
+- `TrafficService.Status`: each profile as running, finished or failed, from the exit code its
+  process left, so an agent knows when a load run is over.
+- `TelemetryService.Collect`: runs `vxtelemetry collect` as a job and returns the archive, with its
+  sha256, as `Job.artifact`. It records the digest of every image the workspace runs.
+  `vxedge telemetry up`, `down` and `collect` stop being scaffolds. `StreamMetrics` is not built.
 - Event resume: `Subscribe { after_id }` replays from a bounded history of 1,024 events, and a
   cursor that history no longer holds is refused as `ERROR_REASON_EVENTS_LOST`. A subscriber that
   falls behind gets the same reason and its stream ends, instead of a silent gap.

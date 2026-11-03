@@ -331,6 +331,20 @@ pub fn backend_for(service_type: ServiceType) -> &'static dyn ServiceBackend {
 
 /// Deserialize a service's `config` block, defaulting an absent one so a service whose config
 /// is entirely optional needs no special case in its backend.
+/// Where a telemetry service writes what it ingests: its `config.ingest_dir`, or `ingest` in the
+/// runtime dir. `TelemetryService.Collect` archives the same directory.
+pub fn telemetry_ingest_dir(
+    def: &ServiceDef,
+    runtime_dir: &Path,
+) -> Result<PathBuf, ServiceBackendError> {
+    let cfg: TelemetryConfig =
+        typed_config(def, "a telemetry service takes an optional config block")?;
+    Ok(cfg
+        .ingest_dir
+        .map(PathBuf::from)
+        .unwrap_or_else(|| runtime_dir.join("ingest")))
+}
+
 fn typed_config<T: serde::de::DeserializeOwned>(
     def: &ServiceDef,
     missing: &str,

@@ -168,6 +168,15 @@ impl Daemon {
     }
 
     fn start_at(name: &str, seed: impl FnOnce(&Path)) -> Self {
+        Self::start_full(name, seed, &[])
+    }
+
+    /// A daemon with extra environment, such as a stand-in binary for one of its tools.
+    fn start_env(seed: impl FnOnce(&Path), env: &[(&str, &Path)]) -> Self {
+        Self::start_full("run", seed, env)
+    }
+
+    fn start_full(name: &str, seed: impl FnOnce(&Path), env: &[(&str, &Path)]) -> Self {
         let root = scratch();
         let runtime = root.join(name);
         std::fs::create_dir_all(&runtime).unwrap();
@@ -180,6 +189,7 @@ impl Daemon {
             .arg(&runtime)
             .arg("--cache-dir")
             .arg(root.join("cache"))
+            .envs(env.iter().map(|(k, v)| (*k, v.as_os_str())))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -568,21 +578,60 @@ async fn experiment_up_does_not_skip_a_declared_signal_plane() {
     );
 }
 
-/// The contract is ahead of the daemon until 0.5.0. Each RPC leaves this list when it is built, and
-/// a release needs the list empty, so a stub cannot ship by accident.
+/// The 0.5.0 release gate: every RPC the agent surface added is built. Each answers something other
+/// than `UNIMPLEMENTED`, even to an empty request. `StreamMetrics` is the one documented exception.
 #[tokio::test]
-async fn rpcs_still_to_build_answer_unimplemented() {
+async fn no_rpc_of_the_agent_surface_is_a_stub() {
     use tonic::Code::Unimplemented;
-
+    use vxedge_api::v1::*;
     let daemon = Daemon::start();
-    let channel = daemon.channel().await;
-    let codes = [TrafficServiceClient::new(channel.clone())
-        .status(vxedge_api::v1::TrafficStatusRequest::default())
-        .await
-        .map(|_| ())
-        .unwrap_err()
-        .code()];
-    assert_eq!(codes, [Unimplemented; 1]);
+    let ch = daemon.channel().await;
+    let code = |r: Result<(), tonic::Status>| r.err().map(|s| s.code());
+    let codes = [
+        code(
+            run_service_client::RunServiceClient::new(ch.clone())
+                .list(RunListRequest::default())
+                .await
+                .map(|_| ()),
+        ),
+        code(
+            job_service_client::JobServiceClient::new(ch.clone())
+                .list(JobListRequest::default())
+                .await
+                .map(|_| ()),
+        ),
+        code(
+            job_service_client::JobServiceClient::new(ch.clone())
+                .cancel(JobCancelRequest::default())
+                .await
+                .map(|_| ()),
+        ),
+        code(
+            traffic_service_client::TrafficServiceClient::new(ch.clone())
+                .status(TrafficStatusRequest::default())
+                .await
+                .map(|_| ()),
+        ),
+        code(
+            workspace_service_client::WorkspaceServiceClient::new(ch.clone())
+                .plan(WorkspacePlanRequest::default())
+                .await
+                .map(|_| ()),
+        ),
+        code(
+            host_service_client::HostServiceClient::new(ch.clone())
+                .capabilities(HostCapabilitiesRequest::default())
+                .await
+                .map(|_| ()),
+        ),
+        code(
+            telemetry_service_client::TelemetryServiceClient::new(ch)
+                .collect(CollectRequest::default())
+                .await
+                .map(|_| ()),
+        ),
+    ];
+    assert!(codes.iter().all(|c| *c != Some(Unimplemented)), "{codes:?}");
 }
 
 const ONE_OF_EACH: &str = r#"
@@ -1285,4 +1334,98 @@ async fn a_cursor_the_daemon_never_issued_is_events_lost() {
         .unwrap_err();
     assert_eq!(refused.code(), tonic::Code::OutOfRange);
     assert_eq!(reason(&refused), "ERROR_REASON_EVENTS_LOST");
+}
+
+/// A stand-in `vxtelemetry` that writes the archive it is asked for, or fails.
+fn fake_vxtelemetry(exit: i32) -> PathBuf {
+    let dir = scratch();
+    let bin = dir.join("vxtelemetry");
+    std::fs::write(
+        &bin,
+        format!(
+            "#!/bin/sh\necho \"$@\" > \"{}/args\"\nwhile [ $# -gt 0 ]; do [ \"$1\" = --out ] && \
+             printf archive > \"$2\"; shift; done\nexit {exit}\n",
+            dir.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    bin
+}
+
+#[tokio::test]
+async fn collect_returns_the_archive_and_its_digest() {
+    let (ws, _) = experiment_workspace();
+    let bin = fake_vxtelemetry(0);
+    let daemon = Daemon::start_env(
+        |run| std::fs::create_dir_all(run.join("ingest")).unwrap(),
+        &[("VXEDGE_VXTELEMETRY_BIN", &bin)],
+    );
+    let channel = daemon.channel().await;
+    let job =
+        vxedge_api::v1::telemetry_service_client::TelemetryServiceClient::new(channel.clone())
+            .collect(vxedge_api::v1::CollectRequest {
+                manifest: path_ref(&ws),
+                out_path: "results/run.zip".into(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+    assert_eq!(job.kind, "telemetry.collect");
+    assert_eq!(
+        wait_for_job(channel.clone(), job.id.clone()).await,
+        JobState::Succeeded as i32
+    );
+    let done = JobServiceClient::new(channel)
+        .get(GetJobRequest { id: job.id })
+        .await
+        .unwrap()
+        .into_inner();
+    let artifact = done.artifact.expect("the archive is the job's artifact");
+    let archive = ws.join("results/run.zip");
+    assert_eq!(PathBuf::from(&artifact.path), archive);
+    use sha2::Digest;
+    let expected: String = sha2::Sha256::digest(std::fs::read(&archive).unwrap())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(artifact.sha256, expected);
+    let args = std::fs::read_to_string(bin.parent().unwrap().join("args")).unwrap();
+    assert!(
+        args.contains("--record-image localhost/vxedge/probe:1"),
+        "{args}"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_collect_fails_its_job_and_nothing_ingested_is_refused() {
+    let (ws, _) = experiment_workspace();
+    let bin = fake_vxtelemetry(3);
+    let daemon = Daemon::start_env(
+        |run| std::fs::create_dir_all(run.join("ingest")).unwrap(),
+        &[("VXEDGE_VXTELEMETRY_BIN", &bin)],
+    );
+    let channel = daemon.channel().await;
+    let mut telemetry =
+        vxedge_api::v1::telemetry_service_client::TelemetryServiceClient::new(channel.clone());
+    let job = telemetry
+        .collect(vxedge_api::v1::CollectRequest {
+            manifest: path_ref(&ws),
+            out_path: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(wait_for_job(channel, job.id).await, JobState::Failed as i32);
+    let empty = Daemon::start();
+    let refused = vxedge_api::v1::telemetry_service_client::TelemetryServiceClient::new(
+        empty.channel().await,
+    )
+    .collect(vxedge_api::v1::CollectRequest {
+        manifest: path_ref(&ws),
+        out_path: String::new(),
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(reason(&refused), "ERROR_REASON_NOT_FOUND");
 }
