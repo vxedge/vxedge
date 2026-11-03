@@ -8,6 +8,7 @@ mod audit;
 mod events;
 mod experiment;
 mod jobs;
+mod runs;
 mod services;
 mod status;
 mod vehicle;
@@ -24,6 +25,7 @@ use vxedge_api::v1::experiment_service_server::ExperimentServiceServer;
 use vxedge_api::v1::gateway_service_server::GatewayServiceServer;
 use vxedge_api::v1::job_service_server::JobServiceServer;
 use vxedge_api::v1::nos_check_service_server::NosCheckServiceServer;
+use vxedge_api::v1::run_service_server::RunServiceServer;
 use vxedge_api::v1::svc_service_server::SvcServiceServer;
 use vxedge_api::v1::traffic_service_server::TrafficServiceServer;
 use vxedge_api::v1::vehicle_service_server::VehicleServiceServer;
@@ -211,8 +213,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         svcs: svcs.clone(),
     };
 
+    let runs = runs::RunSvc {
+        gateway: gateway.clone(),
+        runtime_dir: args.runtime_dir.clone(),
+    };
     Server::builder()
         .add_service(GatewayServiceServer::from_arc(gateway))
+        .add_service(RunServiceServer::new(runs))
         .add_service(ZoneServiceServer::from_arc(zones))
         .add_service(ComputeServiceServer::from_arc(compute))
         .add_service(SvcServiceServer::from_arc(svcs))

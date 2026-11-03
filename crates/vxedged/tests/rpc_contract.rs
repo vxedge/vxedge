@@ -18,14 +18,18 @@ use vxedge_api::v1::compute_service_client::ComputeServiceClient;
 use vxedge_api::v1::event_service_client::EventServiceClient;
 use vxedge_api::v1::experiment_service_client::ExperimentServiceClient;
 use vxedge_api::v1::job_service_client::JobServiceClient;
+use vxedge_api::v1::nos_check_service_client::NosCheckServiceClient;
+use vxedge_api::v1::run_service_client::RunServiceClient;
 use vxedge_api::v1::svc_service_client::SvcServiceClient;
+use vxedge_api::v1::traffic_service_client::TrafficServiceClient;
 use vxedge_api::v1::vehicle_service_client::VehicleServiceClient;
 use vxedge_api::v1::zone_service_client::ZoneServiceClient;
 use vxedge_api::v1::{
     ComputeListRequest, ExperimentStage, ExperimentStatusRequest, ExperimentUpRequest,
-    GetJobRequest, JobState, ManifestRef, ResourceKind, ResourceState, SubscribeRequest,
-    SvcDownRequest, SvcStatusRequest, SvcUpRequest, VehicleStatusRequest, VehicleUpRequest,
-    ZoneListRequest, manifest_ref::Source,
+    GetJobRequest, JobState, ManifestRef, NodeBackend, NosCheckStatusRequest, PayloadKind,
+    ResourceKind, ResourceState, RunGetRequest, RunListRequest, RunRef, SubscribeRequest,
+    SvcDownRequest, SvcStatusRequest, SvcUpRequest, TrafficDownRequest, VehicleStatusRequest,
+    VehicleUpRequest, VxidRef, ZoneListRequest, ZoneUpRequest, manifest_ref::Source,
 };
 
 const VEHICLE: &str = r#"
@@ -335,9 +339,8 @@ async fn zone_and_compute_verbs_work_after_a_daemon_restart() {
         .unwrap()
         .into_inner()
         .zones;
-    let mut ids: Vec<&str> = zones.iter().map(|z| z.vxid.as_str()).collect();
-    ids.sort();
-    assert_eq!(ids, ["ecu1", "hpc1"]);
+    let ids: Vec<&str> = zones.iter().map(|z| z.vxid.as_str()).collect();
+    assert_eq!(ids, ["ecu1"]);
     let nodes = ComputeServiceClient::new(channel)
         .list(ComputeListRequest::default())
         .await
@@ -366,18 +369,40 @@ async fn a_workspace_edited_since_up_is_not_restored() {
 }
 
 #[tokio::test]
-async fn a_zone_list_labels_hpc_devices_as_compute() {
+async fn hpc_devices_belong_to_compute_not_zones() {
     let ws = vehicle_workspace();
     let daemon = Daemon::start_with(|run| write_active_record(run, &vehicle_id(), &ws, None));
-    let zones = ZoneServiceClient::new(daemon.channel().await)
+    let channel = daemon.channel().await;
+    let mut zones = ZoneServiceClient::new(channel.clone());
+    let listed = zones
         .list(ZoneListRequest::default())
         .await
         .unwrap()
+        .into_inner();
+    assert!(
+        listed
+            .zones
+            .iter()
+            .all(|z| z.kind == ResourceKind::Zone as i32)
+    );
+    assert!(listed.zones.iter().all(|z| z.vxid != "hpc1"));
+    let refused = zones
+        .up(ZoneUpRequest {
+            r#ref: Some(VxidRef {
+                vxid: "hpc1".into(),
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::NotFound, "{refused:?}");
+    let nodes = ComputeServiceClient::new(channel)
+        .list(ComputeListRequest::default())
+        .await
+        .unwrap()
         .into_inner()
-        .zones;
-    let kind_of = |id: &str| zones.iter().find(|z| z.vxid == id).unwrap().kind;
-    assert_eq!(kind_of("ecu1"), ResourceKind::Zone as i32);
-    assert_eq!(kind_of("hpc1"), ResourceKind::Compute as i32);
+        .nodes;
+    assert_eq!(nodes[0].kind, ResourceKind::Compute as i32);
 }
 
 #[tokio::test]
@@ -522,8 +547,6 @@ async fn experiment_up_does_not_skip_a_declared_signal_plane() {
 async fn rpcs_still_to_build_answer_unimplemented() {
     use tonic::Code::Unimplemented;
     use vxedge_api::v1::host_service_client::HostServiceClient;
-    use vxedge_api::v1::run_service_client::RunServiceClient;
-    use vxedge_api::v1::traffic_service_client::TrafficServiceClient;
     use vxedge_api::v1::workspace_service_client::WorkspaceServiceClient;
 
     let daemon = Daemon::start();
@@ -546,18 +569,6 @@ async fn rpcs_still_to_build_answer_unimplemented() {
             .map(|_| ())
             .unwrap_err()
             .code(),
-        RunServiceClient::new(channel.clone())
-            .list(vxedge_api::v1::RunListRequest::default())
-            .await
-            .map(|_| ())
-            .unwrap_err()
-            .code(),
-        RunServiceClient::new(channel.clone())
-            .get(vxedge_api::v1::RunGetRequest::default())
-            .await
-            .map(|_| ())
-            .unwrap_err()
-            .code(),
         WorkspaceServiceClient::new(channel.clone())
             .plan(vxedge_api::v1::WorkspacePlanRequest::default())
             .await
@@ -571,5 +582,345 @@ async fn rpcs_still_to_build_answer_unimplemented() {
             .unwrap_err()
             .code(),
     ];
-    assert_eq!(codes, [Unimplemented; 7]);
+    assert_eq!(codes, [Unimplemented; 5]);
+}
+
+const ONE_OF_EACH: &str = r#"
+kind: vehicle
+id: five
+zones: { z: {} }
+devices:
+  a: { role: zone-controller, zone: z, backend: container }
+  b: { role: ecu, zone: z, backend: qemu-microvm }
+  c: { role: ecu, zone: z, backend: libvirt }
+  d: { role: ecu, zone: z, backend: cloud-hypervisor }
+  e: { role: sensor, zone: z, backend: wasm-capsule }
+  f: { role: ecu, zone: z, backend: container }
+  idle: { role: ecu, zone: z, backend: container }
+functions:
+  fa: { deployed_on: a }
+  fb: { deployed_on: b }
+  fc: { deployed_on: c }
+  fd: { deployed_on: d }
+  fe: { deployed_on: e }
+  ff: { deployed_on: f }
+links:
+  - { id: la, endpoints: [{ node: a, port: eth0, ip: 10.2.0.1/24 }], slice: adas }
+  - { id: lb, endpoints: [{ node: b, port: eth0, ip: 10.2.0.2/24 }], slice: adas }
+  - { id: lc, endpoints: [{ node: c, port: eth0, ip: 10.2.0.3/24 }], slice: adas }
+  - { id: ld, endpoints: [{ node: d, port: eth0, ip: 10.2.0.4/24 }], slice: adas }
+  - { id: le, endpoints: [{ node: e, port: eth0, ip: 10.2.0.5/24 }], slice: adas }
+  - { id: lf, endpoints: [{ node: f, port: eth0, ip: 10.2.0.6/24 }], slice: adas }
+---
+kind: baseline
+id: bl
+parts:
+  - { ref: 'local/vxprobe:host-process', target_ids: ff }
+  - ref: ghcr.io/vxedge/parts/probe:1
+    digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    target_ids: fa
+  - { ref: ./bundle, kind: bundle, target_ids: [fb, fc, fd] }
+  - { ref: ./capsule.wasm, kind: wasm, target_ids: fe }
+"#;
+
+fn one_of_each_workspace() -> (PathBuf, String) {
+    let dir = scratch();
+    std::fs::write(dir.join("vehicle.yaml"), ONE_OF_EACH).unwrap();
+    (
+        dir,
+        vxedge_core::model::load_vehicle_yaml(ONE_OF_EACH)
+            .unwrap()
+            .id,
+    )
+}
+
+fn write_run_record(runtime: &Path, id: &str, dir: &Path, run_id: &str) {
+    let record = serde_json::json!({
+        "id": id, "dir": dir, "bridge": "lo", "run_id": run_id,
+        "started_unix_ms": 1234, "sha256": vxedge_core::Workspace::content_sha256(dir).unwrap(),
+    });
+    std::fs::write(runtime.join("active.json"), record.to_string()).unwrap();
+}
+
+#[tokio::test]
+async fn run_service_reports_the_active_run() {
+    let ws = vehicle_workspace();
+    let daemon = Daemon::start_with(|run| write_run_record(run, &vehicle_id(), &ws, "run-a"));
+    let mut runs = RunServiceClient::new(daemon.channel().await);
+    let listed = runs
+        .list(RunListRequest::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .runs;
+    assert_eq!(listed.len(), 1);
+    let run = &listed[0];
+    assert_eq!(run.id, "run-a");
+    assert_eq!(run.kind, ResourceKind::Vehicle as i32);
+    assert_eq!(run.target_id, "car");
+    assert_eq!(run.started_unix_ms, 1234);
+    assert_eq!(
+        run.workspace_sha256,
+        vxedge_core::Workspace::content_sha256(&ws).unwrap()
+    );
+    let named = |id: &str| RunGetRequest {
+        run: Some(RunRef { run_id: id.into() }),
+    };
+    assert_eq!(
+        runs.get(named("run-a")).await.unwrap().into_inner().id,
+        "run-a"
+    );
+    assert_eq!(
+        runs.get(RunGetRequest::default())
+            .await
+            .unwrap()
+            .into_inner()
+            .id,
+        "run-a",
+        "no run named means the only run"
+    );
+    let missing = runs.get(named("run-b")).await.unwrap_err();
+    assert_eq!(missing.code(), tonic::Code::NotFound, "{missing:?}");
+}
+
+#[tokio::test]
+async fn run_service_is_empty_with_nothing_active() {
+    let daemon = Daemon::start();
+    let runs = RunServiceClient::new(daemon.channel().await)
+        .list(RunListRequest::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .runs;
+    assert!(runs.is_empty());
+}
+
+#[tokio::test]
+async fn a_run_that_is_not_active_is_refused() {
+    let ws = vehicle_workspace();
+    let daemon = Daemon::start_with(|run| write_run_record(run, &vehicle_id(), &ws, "run-a"));
+    let channel = daemon.channel().await;
+    let other = Some(RunRef {
+        run_id: "run-b".into(),
+    });
+    let refused = [
+        ZoneServiceClient::new(channel.clone())
+            .list(ZoneListRequest { run: other.clone() })
+            .await
+            .map(|_| ())
+            .unwrap_err(),
+        ComputeServiceClient::new(channel.clone())
+            .list(ComputeListRequest { run: other.clone() })
+            .await
+            .map(|_| ())
+            .unwrap_err(),
+        SvcServiceClient::new(channel.clone())
+            .status(SvcStatusRequest {
+                service_type: "ota".into(),
+                run: other.clone(),
+                ..Default::default()
+            })
+            .await
+            .map(|_| ())
+            .unwrap_err(),
+        NosCheckServiceClient::new(channel.clone())
+            .status(NosCheckStatusRequest {
+                run: other.clone(),
+                ..Default::default()
+            })
+            .await
+            .map(|_| ())
+            .unwrap_err(),
+        TrafficServiceClient::new(channel.clone())
+            .down(TrafficDownRequest {
+                run: other,
+                ..Default::default()
+            })
+            .await
+            .map(|_| ())
+            .unwrap_err(),
+    ];
+    for status in refused {
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status:?}");
+        assert!(status.message().contains("run-a"), "{status:?}");
+    }
+    let named = ZoneServiceClient::new(channel)
+        .list(ZoneListRequest {
+            run: Some(RunRef {
+                run_id: "run-a".into(),
+            }),
+        })
+        .await;
+    assert!(named.is_ok(), "{named:?}");
+}
+
+#[tokio::test]
+async fn experiment_up_refuses_a_workspace_that_is_not_active() {
+    let (active, id) = experiment_workspace();
+    let (other, _) = experiment_workspace();
+    let daemon = Daemon::start_with(|run| write_active_record(run, &id, &active, None));
+    let refused = ExperimentServiceClient::new(daemon.channel().await)
+        .up(ExperimentUpRequest {
+            manifest: path_ref(&other),
+            stages: Vec::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused.code(),
+        tonic::Code::FailedPrecondition,
+        "{refused:?}"
+    );
+}
+
+#[tokio::test]
+async fn node_status_is_typed_on_every_backend() {
+    let (ws, id) = one_of_each_workspace();
+    let daemon = Daemon::start_with(|run| write_active_record(run, &id, &ws, None));
+    let nodes = ZoneServiceClient::new(daemon.channel().await)
+        .list(ZoneListRequest::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .nodes;
+    let spec = |id: &str| {
+        nodes
+            .iter()
+            .find(|n| n.status.as_ref().unwrap().vxid == id)
+            .and_then(|n| n.spec.clone())
+            .unwrap_or_else(|| panic!("{id} missing"))
+    };
+    for (id, backend, kind) in [
+        ("a", NodeBackend::Container, PayloadKind::Container),
+        ("b", NodeBackend::QemuMicrovm, PayloadKind::GuestBundle),
+        ("c", NodeBackend::Libvirt, PayloadKind::GuestBundle),
+        ("d", NodeBackend::CloudHypervisor, PayloadKind::GuestBundle),
+        ("e", NodeBackend::WasmCapsule, PayloadKind::Wasm),
+        ("f", NodeBackend::Container, PayloadKind::HostProcess),
+    ] {
+        let node = spec(id);
+        assert_eq!(node.backend, backend as i32, "{id}");
+        assert_eq!(node.payload.unwrap().kind, kind as i32, "{id}");
+    }
+    let a = spec("a");
+    assert_eq!(a.zone, "z");
+    assert_eq!(a.role, "zone-controller");
+    assert_eq!(a.slice, "adas");
+    assert!(a.vlan > 0);
+    let payload = a.payload.unwrap();
+    assert_eq!(payload.reference, "ghcr.io/vxedge/parts/probe:1");
+    assert_eq!(
+        payload.digest,
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
+}
+
+#[tokio::test]
+async fn a_status_says_when_it_was_read_and_not_when_it_began() {
+    let ws = vehicle_workspace();
+    let daemon = Daemon::start_with(|run| write_active_record(run, &vehicle_id(), &ws, None));
+    let zones = ZoneServiceClient::new(daemon.channel().await)
+        .list(ZoneListRequest::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .zones;
+    assert!(zones[0].observed_unix_ms > 0);
+    assert_eq!(zones[0].since_unix_ms, 0);
+}
+
+#[tokio::test]
+async fn a_declared_device_nothing_provisions_is_unprovisioned() {
+    let (ws, id) = one_of_each_workspace();
+    let daemon = Daemon::start_with(|run| write_active_record(run, &id, &ws, None));
+    let status = VehicleServiceClient::new(daemon.channel().await)
+        .status(VehicleStatusRequest {
+            manifest: path_ref(&ws),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let idle = status.components.iter().find(|c| c.vxid == "idle").unwrap();
+    assert_eq!(idle.state, ResourceState::Unprovisioned as i32);
+    assert_eq!(status.nodes.len(), 6, "typed entries for provisioned nodes");
+}
+
+#[tokio::test]
+async fn experiment_status_carries_the_gateway_and_typed_nodes() {
+    let (ws, id) = experiment_workspace();
+    let daemon = Daemon::start_with(|run| write_active_record(run, &id, &ws, None));
+    let status = ExperimentServiceClient::new(daemon.channel().await)
+        .status(ExperimentStatusRequest {
+            manifest: path_ref(&ws),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(status.gateway.is_some());
+    let ids: Vec<&str> = status
+        .nodes
+        .iter()
+        .map(|n| n.status.as_ref().unwrap().vxid.as_str())
+        .collect();
+    assert_eq!(ids, ["ecu1", "hpc1"]);
+}
+
+/// A vehicle with nothing that needs a host check, so a stage can run unprivileged.
+const PROCESS_ONLY: &str = r#"
+kind: vehicle
+id: plain
+zones: { z: {} }
+devices:
+  a: { role: ecu, zone: z, backend: container }
+functions:
+  fa: { deployed_on: a }
+links:
+  - { id: la, endpoints: [{ node: a, port: eth0, ip: 10.3.0.1/24 }], slice: adas }
+---
+kind: baseline
+id: bl
+parts:
+  - { ref: 'local/vxprobe:host-process', target_ids: fa }
+"#;
+
+#[tokio::test]
+async fn vehicle_up_runs_only_the_stages_it_was_given() {
+    let daemon = Daemon::start();
+    let dir = scratch();
+    std::fs::write(dir.join("vehicle.yaml"), PROCESS_ONLY).unwrap();
+    let channel = daemon.channel().await;
+    let job = VehicleServiceClient::new(channel.clone())
+        .up(VehicleUpRequest {
+            manifest: path_ref(&dir),
+            stages: vec![ExperimentStage::Services as i32],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let state = wait_for_job(channel.clone(), job.id.clone()).await;
+    let done = JobServiceClient::new(channel)
+        .get(GetJobRequest { id: job.id })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(state, JobState::Succeeded as i32, "{}", done.error);
+    assert!(!done.message.contains("gateway"), "{}", done.message);
+}
+
+#[tokio::test]
+async fn a_stage_the_daemon_does_not_know_is_refused() {
+    let daemon = Daemon::start();
+    let dir = scratch();
+    std::fs::write(dir.join("vehicle.yaml"), PROCESS_ONLY).unwrap();
+    let channel = daemon.channel().await;
+    for stage in [ExperimentStage::Unspecified as i32, 99] {
+        let refused = VehicleServiceClient::new(channel.clone())
+            .up(VehicleUpRequest {
+                manifest: path_ref(&dir),
+                stages: vec![stage],
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::InvalidArgument, "{refused:?}");
+    }
 }

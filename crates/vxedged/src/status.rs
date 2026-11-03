@@ -7,8 +7,14 @@
 //! domain model stays proto-agnostic), so this mapping can only live here, in the daemon that
 //! already depends on both.
 
-use vxedge_api::v1::{ResourceKind, ResourceState, ResourceStatus};
+use vxedge_api::v1::{
+    NodeBackend, NodePayload, NodeSpec, NodeStatus, PayloadKind, ResourceKind, ResourceState,
+    ResourceStatus,
+};
+use vxedge_core::model::{Backend, DeviceRole};
 use vxedge_core::status::{Observable, ObservedState};
+use vxedge_core::zones::NodePlan;
+use vxedge_core::zones::backend::NodeState;
 
 use crate::jobs::now_ms;
 
@@ -40,6 +46,100 @@ pub fn node_kind(role: vxedge_core::model::DeviceRole) -> ResourceKind {
     }
 }
 
+/// The role as the manifest spells it.
+fn role_name(role: DeviceRole) -> &'static str {
+    match role {
+        DeviceRole::ZoneController => "zone-controller",
+        DeviceRole::Hpc => "hpc",
+        DeviceRole::Gateway => "gateway",
+        DeviceRole::Ecu => "ecu",
+        DeviceRole::Sensor => "sensor",
+        DeviceRole::Actuator => "actuator",
+        DeviceRole::Switch => "switch",
+    }
+}
+
+fn node_payload(np: &NodePlan) -> NodePayload {
+    let part = |kind: PayloadKind, local: Option<&std::path::Path>| match &np.remote_bundle {
+        Some((reference, digest)) => NodePayload {
+            kind: kind as i32,
+            reference: reference.clone(),
+            digest: digest.clone(),
+        },
+        None => NodePayload {
+            kind: kind as i32,
+            reference: local.map(|p| p.display().to_string()).unwrap_or_default(),
+            digest: String::new(),
+        },
+    };
+    match np.backend {
+        Backend::Container => match &np.image {
+            Some(image) => {
+                let (reference, digest) = image.split_once('@').unwrap_or((image, ""));
+                NodePayload {
+                    kind: PayloadKind::Container as i32,
+                    reference: reference.to_string(),
+                    digest: digest.to_string(),
+                }
+            }
+            None => NodePayload {
+                kind: PayloadKind::HostProcess as i32,
+                ..Default::default()
+            },
+        },
+        Backend::WasmCapsule => part(PayloadKind::Wasm, np.module.as_deref()),
+        Backend::QemuMicrovm | Backend::Libvirt | Backend::CloudHypervisor => {
+            part(PayloadKind::GuestBundle, np.bundle.as_deref())
+        }
+    }
+}
+
+/// One node as the workspace plans it: the typed form of [`node_detail`].
+pub fn node_spec(np: &NodePlan) -> NodeSpec {
+    let backend = match np.backend {
+        Backend::Container => NodeBackend::Container,
+        Backend::QemuMicrovm => NodeBackend::QemuMicrovm,
+        Backend::Libvirt => NodeBackend::Libvirt,
+        Backend::CloudHypervisor => NodeBackend::CloudHypervisor,
+        Backend::WasmCapsule => NodeBackend::WasmCapsule,
+    };
+    NodeSpec {
+        vxid: np.node_id.clone(),
+        zone: np.zone_id.clone(),
+        role: role_name(np.role).to_string(),
+        backend: backend as i32,
+        port: np.endpoint.clone(),
+        peer: np.peer.clone(),
+        vlan: u32::from(np.vlan),
+        slice: np.slice.clone().unwrap_or_default(),
+        payload: Some(node_payload(np)),
+    }
+}
+
+/// `peer` is here because interface names are derived from the device id and shortened to fit
+/// IFNAMSIZ, so `vz-node-a-c06a` is not something an operator reconstructs by eye. For a
+/// container-backed node the useful half is the peer: that is the end campaign scripts address.
+fn node_detail(np: &NodePlan) -> String {
+    format!(
+        "zone={} backend={:?} port={} peer={} vlan={}",
+        np.zone_id, np.backend, np.endpoint, np.peer, np.vlan
+    )
+}
+
+/// One node, observed. The one place that builds a node's status, so the text and the typed
+/// fields cannot disagree.
+pub fn observed_node(np: &NodePlan, state: &NodeState) -> NodeStatus {
+    NodeStatus {
+        status: Some(resource_status(
+            np.node_id.clone(),
+            node_kind(np.role),
+            state,
+            node_detail(np),
+        )),
+        spec: Some(node_spec(np)),
+    }
+}
+
 /// Builds one `ResourceStatus` from anything `Observable`, plus the identity/kind vxedged
 /// itself always knows. An `Observable` domain type never carries its own `vxid`/`kind` — those
 /// are routing information the daemon owns (which node, which resource kind), not something
@@ -55,7 +155,7 @@ pub fn resource_status(
         kind: kind as i32,
         state: wire_state(o.state()) as i32,
         detail: detail.into(),
-        since_unix_ms: now_ms(),
+        observed_unix_ms: now_ms(),
         ..Default::default()
     }
 }
@@ -100,7 +200,7 @@ pub fn composite_rollup(
         state: gw_status.state,
         detail: gw_status.detail.clone(),
         since_unix_ms: gw_status.since_unix_ms,
-        ..Default::default()
+        observed_unix_ms: gw_status.observed_unix_ms,
     }];
     resources.append(&mut components);
     let state = aggregate_resource_states(&resources);
@@ -110,7 +210,7 @@ pub fn composite_rollup(
         state: state as i32,
         detail: format!("{} resource(s)", resources.len()),
         since_unix_ms: gw_status.since_unix_ms,
-        ..Default::default()
+        observed_unix_ms: gw_status.observed_unix_ms,
     };
     (top, resources)
 }

@@ -130,7 +130,7 @@ message ZoneListRequest {
 }
 
 message ZoneListResponse {
-  // Every planned node, hpc devices included. Prefer `nodes`.
+  // Zone nodes. Hpc devices answer to `ComputeService`. Prefer `nodes`.
   repeated ResourceStatus zones = 1;
   repeated NodeStatus nodes = 2;
 }

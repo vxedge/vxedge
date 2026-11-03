@@ -24,12 +24,12 @@ use vxedge_api::v1::{
     ComputeRemoveRequest, ComputeUpRequest, Event, GatewayApplyRequest, GatewayDownRequest,
     GatewayStatus, GatewayStatusRequest, GatewayUpRequest, GetJobRequest, ImagePushRequest,
     ImagePushResponse, ImpairmentStatus, IngressFilterStatus, Job, JobCancelRequest,
-    JobListRequest, JobListResponse, ManifestRef, NosCheckDownRequest, NosCheckStatus,
+    JobListRequest, JobListResponse, ManifestRef, NodeStatus, NosCheckDownRequest, NosCheckStatus,
     NosCheckStatusRequest, NosCheckUpRequest, NosCheckVerifyRequest, ResourceKind, ResourceState,
-    ResourceStatus, SliceStatus, SubscribeRequest, SvcDownRequest, SvcStatusRequest, SvcUpRequest,
-    TrafficDownRequest, TrafficStatus, TrafficStatusRequest, TrafficUpRequest, TunnelStatus,
-    WatchJobRequest, ZoneApplyRequest, ZoneDownRequest, ZoneListRequest, ZoneListResponse,
-    ZoneRemoveRequest, ZoneUpRequest,
+    ResourceStatus, RunRef, SliceStatus, SubscribeRequest, SvcDownRequest, SvcStatusRequest,
+    SvcUpRequest, TrafficDownRequest, TrafficStatus, TrafficStatusRequest, TrafficUpRequest,
+    TunnelStatus, WatchJobRequest, ZoneApplyRequest, ZoneDownRequest, ZoneListRequest,
+    ZoneListResponse, ZoneRemoveRequest, ZoneUpRequest,
 };
 use vxedge_core::Workspace;
 use vxedge_core::containers::LazyClient;
@@ -175,7 +175,7 @@ pub(crate) async fn resolve_manifest(
 /// to every sub-RPC, so `up` cannot fan out to a topology that changed underneath it.
 ///
 /// The reproducibility checksum therefore covers exactly the documents that were read.
-async fn read_workspace(dir: &str) -> Result<String, Status> {
+pub(crate) async fn read_workspace(dir: &str) -> Result<String, Status> {
     let root = PathBuf::from(dir);
     tokio::task::spawn_blocking(move || {
         let bad =
@@ -272,13 +272,78 @@ fn active_record(runtime_dir: &Path) -> PathBuf {
     runtime_dir.join("active.json")
 }
 
-/// What `active.json` says. A record from before 0.4.1 has no `sha256`.
+/// What `active.json` says. A record from before 0.4.1 has no `sha256`, and one from before 0.5.0
+/// has no `run_id` or `started_unix_ms`.
 #[derive(Debug, PartialEq, Eq)]
-struct ActiveRecord {
-    id: String,
-    dir: PathBuf,
-    bridge: String,
-    sha256: Option<String>,
+pub(crate) struct ActiveRecord {
+    pub id: String,
+    pub dir: PathBuf,
+    pub bridge: String,
+    pub sha256: Option<String>,
+    pub run_id: Option<String>,
+    pub started_unix_ms: Option<i64>,
+}
+
+impl ActiveRecord {
+    /// The run this record describes. A record older than run ids still names one run.
+    pub fn run_id(&self) -> &str {
+        self.run_id.as_deref().unwrap_or("run-legacy")
+    }
+}
+
+/// The record of the run on this host: it only counts while its bridge exists.
+pub(crate) fn active_run(runtime_dir: &Path) -> Option<ActiveRecord> {
+    let record = read_active_record(runtime_dir)?;
+    Path::new("/sys/class/net")
+        .join(&record.bridge)
+        .exists()
+        .then_some(record)
+}
+
+/// Refuse a call that names a run other than the active one. Naming no run means the only run, so
+/// a caller that predates runs keeps working.
+pub(crate) fn require_run(run: Option<&RunRef>, runtime_dir: &Path) -> Result<(), Status> {
+    let Some(wanted) = run.filter(|r| !r.run_id.is_empty()) else {
+        return Ok(());
+    };
+    match active_run(runtime_dir) {
+        Some(record) if record.run_id() == wanted.run_id => Ok(()),
+        Some(record) => Err(Status::failed_precondition(format!(
+            "run `{}` is not the active one, `{}`",
+            wanted.run_id,
+            record.run_id()
+        ))),
+        None => Err(Status::failed_precondition(format!(
+            "run `{}` is not active: nothing is",
+            wanted.run_id
+        ))),
+    }
+}
+
+/// A run's id, unique across repeated runs of the same workspace.
+fn new_run_id(workspace_sha256: &str) -> String {
+    let seed = format!("{workspace_sha256}-{}", now_ms());
+    let hash = hex::encode(sha2::Sha256::digest(seed.as_bytes()));
+    format!("run-{}", &hash[..12])
+}
+
+/// Observe these nodes.
+async fn observed_nodes(
+    shell: Shell,
+    runtime_dir: PathBuf,
+    plans: Vec<NodePlan>,
+) -> Result<Vec<NodeStatus>, Status> {
+    tokio::task::spawn_blocking(move || {
+        plans
+            .iter()
+            .map(|np| {
+                let state = zones::node_status(&shell, np, &runtime_dir);
+                crate::status::observed_node(np, &state)
+            })
+            .collect()
+    })
+    .await
+    .map_err(|e| Status::internal(format!("status task panicked: {e}")))
 }
 
 /// The record, if it is there and reads.
@@ -290,6 +355,8 @@ fn read_active_record(runtime_dir: &Path) -> Option<ActiveRecord> {
         dir: PathBuf::from(v["dir"].as_str()?),
         bridge: v["bridge"].as_str()?.to_string(),
         sha256: v["sha256"].as_str().map(str::to_string),
+        run_id: v["run_id"].as_str().map(str::to_string),
+        started_unix_ms: v["started_unix_ms"].as_i64(),
     })
 }
 
@@ -608,11 +675,23 @@ impl GatewaySvc {
                         }
 
                         let dir = manifest_dir.clone().unwrap_or_else(|| PathBuf::from("."));
+                        // A repeated `up` of the same workspace is the same run.
+                        let previous =
+                            read_active_record(&runtime_dir).filter(|r| r.id == model.id);
+                        let run_id = previous
+                            .as_ref()
+                            .and_then(|r| r.run_id.clone())
+                            .unwrap_or_else(|| new_run_id(&sha256));
+                        let started = previous
+                            .and_then(|r| r.started_unix_ms)
+                            .unwrap_or_else(now_ms);
                         let record = serde_json::json!({
                             "id": model.id,
                             "dir": dir,
                             "bridge": plan.bridge,
                             "sha256": sha256,
+                            "run_id": run_id,
+                            "started_unix_ms": started,
                         });
                         tokio::fs::write(active_record(&runtime_dir), record.to_string())
                             .await
@@ -991,7 +1070,7 @@ impl GatewaySvc {
                 kind: ResourceKind::Gateway as i32,
                 state: state as i32,
                 detail,
-                since_unix_ms: now_ms(),
+                observed_unix_ms: now_ms(),
                 ..Default::default()
             }),
             slices,
@@ -1117,7 +1196,9 @@ impl ZoneSvc {
         };
         drop(st);
         let plans = zones::plan_nodes_from_model(&model, &gateway, &dir)
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| Status::internal(e.to_string()))?
+            .into_iter()
+            .filter(|p| p.role != vxedge_core::model::DeviceRole::Hpc);
         // A zone is a *region*, so `--vxid front-left` brings up everything in it. A single
         // device is addressable by its own id as well, and that is not a convenience: exp-002's
         // isolation contract is exactly one arm up at a time, and its three arms are three
@@ -1126,16 +1207,15 @@ impl ZoneSvc {
         // exp-002b's first campaign. The model forbids a zone and a device sharing an id
         // (`InvariantError::ZoneDeviceCollision`), so accepting either is unambiguous.
         let filtered: Vec<NodePlan> = match zone_vxid {
-            Some(z) => plans
-                .into_iter()
-                .filter(|p| p.zone_id == z || p.node_id == z)
-                .collect(),
-            None => plans,
+            Some(z) => plans.filter(|p| p.zone_id == z || p.node_id == z).collect(),
+            None => plans.collect(),
         };
-        if filtered.is_empty() {
+        if let Some(z) = zone_vxid
+            && filtered.is_empty()
+        {
             return Err(Status::not_found(format!(
-                "no zone or device `{}` in the active experiment",
-                zone_vxid.unwrap_or("<all>")
+                "no zone or device `{z}` in the active workspace (hpc devices answer to `vxedge \
+                 compute`)"
             )));
         }
         Ok(filtered)
@@ -1249,6 +1329,7 @@ impl ZoneService for ZoneSvc {
     }
 
     async fn up(&self, req: Request<ZoneUpRequest>) -> Result<Response<Job>, Status> {
+        require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
         let vxid = req
             .into_inner()
             .r#ref
@@ -1260,6 +1341,7 @@ impl ZoneService for ZoneSvc {
     }
 
     async fn down(&self, req: Request<ZoneDownRequest>) -> Result<Response<Job>, Status> {
+        require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
         let vxid = req
             .into_inner()
             .r#ref
@@ -1272,39 +1354,13 @@ impl ZoneService for ZoneSvc {
 
     async fn list(
         &self,
-        _: Request<ZoneListRequest>,
+        req: Request<ZoneListRequest>,
     ) -> Result<Response<ZoneListResponse>, Status> {
+        require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
         let plans = self.plans_for(None).await?;
-        let shell = self.shell.clone();
-        let rd = self.runtime_dir.clone();
-        let statuses = tokio::task::spawn_blocking(move || {
-            plans
-                .iter()
-                .map(|np| {
-                    let s = zones::node_status(&shell, np, &rd);
-                    crate::status::resource_status(
-                        np.node_id.clone(),
-                        crate::status::node_kind(np.role),
-                        &s,
-                        // `peer` is here because interface names are derived from the device id
-                        // and shortened to fit IFNAMSIZ, so `vz-node-a-c06a` is not something an
-                        // operator reconstructs by eye. This listing is the answer to "which
-                        // interface is this device", and for a container-backed node the useful
-                        // half is the peer — that is the end campaign scripts address.
-                        format!(
-                            "zone={} backend={:?} port={} peer={} vlan={}",
-                            np.zone_id, np.backend, np.endpoint, np.peer, np.vlan
-                        ),
-                    )
-                })
-                .collect()
-        })
-        .await
-        .map_err(|e| Status::internal(format!("status task panicked: {e}")))?;
-        Ok(Response::new(ZoneListResponse {
-            zones: statuses,
-            ..Default::default()
-        }))
+        let nodes = observed_nodes(self.shell.clone(), self.runtime_dir.clone(), plans).await?;
+        let zones = nodes.iter().filter_map(|n| n.status.clone()).collect();
+        Ok(Response::new(ZoneListResponse { zones, nodes }))
     }
 
     async fn remove(&self, _: Request<ZoneRemoveRequest>) -> Result<Response<Job>, Status> {
@@ -1381,10 +1437,11 @@ impl ComputeSvc {
             .filter(|p| p.role == vxedge_core::model::DeviceRole::Hpc)
             .filter(|p| vxid.is_none_or(|v| p.node_id == v))
             .collect();
-        if compute.is_empty() {
+        if let Some(v) = vxid
+            && compute.is_empty()
+        {
             return Err(Status::not_found(format!(
-                "no compute (hpc-role) device `{}` in the active experiment",
-                vxid.unwrap_or("<all>")
+                "no compute (hpc-role) device `{v}` in the active workspace"
             )));
         }
         Ok(compute)
@@ -1493,6 +1550,7 @@ impl ComputeService for ComputeSvc {
     }
 
     async fn up(&self, req: Request<ComputeUpRequest>) -> Result<Response<Job>, Status> {
+        require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
         let vxid = req
             .into_inner()
             .r#ref
@@ -1504,6 +1562,7 @@ impl ComputeService for ComputeSvc {
     }
 
     async fn down(&self, req: Request<ComputeDownRequest>) -> Result<Response<Job>, Status> {
+        require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
         let vxid = req
             .into_inner()
             .r#ref
@@ -1516,34 +1575,17 @@ impl ComputeService for ComputeSvc {
 
     async fn list(
         &self,
-        _: Request<ComputeListRequest>,
+        req: Request<ComputeListRequest>,
     ) -> Result<Response<ComputeListResponse>, Status> {
+        require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
         let plans = self.plans_for(None).await?;
-        let shell = self.shell.clone();
-        let rd = self.runtime_dir.clone();
-        let statuses = tokio::task::spawn_blocking(move || {
-            plans
-                .iter()
-                .map(|np| {
-                    let s = zones::node_status(&shell, np, &rd);
-                    crate::status::resource_status(
-                        np.node_id.clone(),
-                        ResourceKind::Compute,
-                        &s,
-                        format!(
-                            "backend={:?} port={} peer={} vlan={}",
-                            np.backend, np.endpoint, np.peer, np.vlan
-                        ),
-                    )
-                })
-                .collect()
-        })
-        .await
-        .map_err(|e| Status::internal(format!("status task panicked: {e}")))?;
-        Ok(Response::new(ComputeListResponse {
-            nodes: statuses,
-            ..Default::default()
-        }))
+        let node_status =
+            observed_nodes(self.shell.clone(), self.runtime_dir.clone(), plans).await?;
+        let nodes = node_status
+            .iter()
+            .filter_map(|n| n.status.clone())
+            .collect();
+        Ok(Response::new(ComputeListResponse { nodes, node_status }))
     }
 
     async fn remove(&self, _: Request<ComputeRemoveRequest>) -> Result<Response<Job>, Status> {
@@ -1691,6 +1733,7 @@ struct DeclaredService {
 #[tonic::async_trait]
 impl SvcService for SvcSvc {
     async fn up(&self, req: Request<SvcUpRequest>) -> Result<Response<Job>, Status> {
+        require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
         let req = req.into_inner();
         let declared = self
             .service_def(&req.service_type, req.experiment.as_ref())
@@ -1745,6 +1788,7 @@ impl SvcService for SvcSvc {
     }
 
     async fn down(&self, req: Request<SvcDownRequest>) -> Result<Response<Job>, Status> {
+        require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
         let req = req.into_inner();
         parse_service_type(&req.service_type)?;
         // A workspace that no longer reads, or declares no such service, leaves the host path:
@@ -1792,6 +1836,7 @@ impl SvcService for SvcSvc {
         &self,
         req: Request<SvcStatusRequest>,
     ) -> Result<Response<ResourceStatus>, Status> {
+        require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
         let req = req.into_inner();
         let service_type = parse_service_type(&req.service_type)?.as_str().to_string();
         if let Some((np, spec)) = self.placed(&service_type, req.experiment.as_ref()).await {
@@ -1828,7 +1873,7 @@ impl SvcService for SvcSvc {
             kind: ResourceKind::Service as i32,
             state: state as i32,
             detail,
-            since_unix_ms: now_ms(),
+            observed_unix_ms: now_ms(),
             ..Default::default()
         }))
     }
@@ -1918,6 +1963,7 @@ impl TrafficService for TrafficSvc {
     }
 
     async fn up(&self, req: Request<TrafficUpRequest>) -> Result<Response<Job>, Status> {
+        require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
         let req = req.into_inner();
         let (traffic_plan, five_g_plan, sha256, duration_s) =
             self.resolve_plans(req.manifest.as_ref()).await?;
@@ -1970,6 +2016,7 @@ impl TrafficService for TrafficSvc {
     }
 
     async fn down(&self, req: Request<TrafficDownRequest>) -> Result<Response<Job>, Status> {
+        require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
         let req = req.into_inner();
         let (traffic_plan, _five_g_plan, sha256, _duration_s) =
             self.resolve_plans(req.manifest.as_ref()).await?;
@@ -2176,6 +2223,7 @@ fn boot_disposable_copy(
 #[tonic::async_trait]
 impl NosCheckService for NosCheckSvc {
     async fn up(&self, req: Request<NosCheckUpRequest>) -> Result<Response<Job>, Status> {
+        require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
         let req = req.into_inner();
         let (model, image, sha256) = self.resolve(req.experiment.as_ref()).await?;
         self.audit.record(
@@ -2201,6 +2249,7 @@ impl NosCheckService for NosCheckSvc {
     }
 
     async fn down(&self, req: Request<NosCheckDownRequest>) -> Result<Response<Job>, Status> {
+        require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
         let req = req.into_inner();
         let (yaml, sha256, _dir) = resolve_manifest(req.experiment.as_ref()).await?;
         let model = parse_to_model(&yaml)
@@ -2245,6 +2294,7 @@ impl NosCheckService for NosCheckSvc {
         &self,
         req: Request<NosCheckStatusRequest>,
     ) -> Result<Response<NosCheckStatus>, Status> {
+        require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
         let req = req.into_inner();
         let (yaml, _sha256, _dir) = resolve_manifest(req.experiment.as_ref()).await?;
         let model = parse_to_model(&yaml)
@@ -2288,6 +2338,7 @@ impl NosCheckService for NosCheckSvc {
     }
 
     async fn verify(&self, req: Request<NosCheckVerifyRequest>) -> Result<Response<Job>, Status> {
+        require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
         let req = req.into_inner();
         let (model, image, sha256) = self.resolve(req.experiment.as_ref()).await?;
         self.audit.record(
@@ -2498,6 +2549,8 @@ mod tests {
                 dir: "/ws/a".into(),
                 bridge: "vxbr0".into(),
                 sha256: None,
+                run_id: None,
+                started_unix_ms: None,
             })
         );
         std::fs::remove_dir_all(&dir).unwrap();

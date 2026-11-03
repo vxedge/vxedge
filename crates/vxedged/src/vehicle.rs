@@ -39,8 +39,8 @@ use tonic::{Request, Response, Status};
 use vxedge_api::v1::svc_service_server::SvcService;
 use vxedge_api::v1::vehicle_service_server::VehicleService;
 use vxedge_api::v1::{
-    ManifestRef, ResourceKind, ResourceState, ResourceStatus, SvcStatusRequest, VehicleDownRequest,
-    VehicleStatus, VehicleStatusRequest, VehicleUpRequest,
+    ExperimentStage, ManifestRef, ResourceKind, ResourceState, ResourceStatus, SvcStatusRequest,
+    VehicleDownRequest, VehicleStatus, VehicleStatusRequest, VehicleUpRequest,
 };
 use vxedge_core::containers::LazyClient;
 use vxedge_core::gateway::GatewayPlan;
@@ -48,7 +48,7 @@ use vxedge_core::model::{DeviceRole, Experiment};
 use vxedge_core::zones::NodePlan;
 
 use crate::audit::Audit;
-use crate::experiment::{Handles, NodeStage, check_active_target, inline};
+use crate::experiment::{Handles, NodeStage, check_active_target, check_stages, inline, wants};
 
 pub struct VehicleSvc {
     pub audit: Arc<Audit>,
@@ -207,6 +207,8 @@ impl VehicleService for VehicleSvc {
         &self,
         req: Request<VehicleUpRequest>,
     ) -> Result<Response<vxedge_api::v1::Job>, Status> {
+        check_stages(&req.get_ref().stages)?;
+        let stages = req.get_ref().stages.clone();
         let Resolved {
             yaml,
             dir,
@@ -270,20 +272,33 @@ impl VehicleService for VehicleSvc {
             .handles
             .engine
             .submit("vehicle.up", move |p| async move {
-                svc.stage_gateway(&yaml, dir.as_deref(), true, &p).await?;
-                let zones = svc.stage_nodes(NodeStage::Zones, &zones, true, &p).await?;
-                let compute = svc
-                    .stage_nodes(NodeStage::Compute, &compute, true, &p)
-                    .await?;
-                let signals = svc
-                    .stage_signal_plane(&model, dir.as_deref(), true, &p)
-                    .await?;
-                let services = svc
-                    .stage_services(&model, &yaml, dir.as_deref(), true, &p)
-                    .await?;
-                Ok(format!(
-                    "vehicle `{id}` up — gateway, {zones}, {compute}, {signals}, {services}"
-                ))
+                let mut done: Vec<String> = Vec::new();
+                if wants(&stages, ExperimentStage::Gateway) {
+                    svc.stage_gateway(&yaml, dir.as_deref(), true, &p).await?;
+                    done.push("gateway".to_string());
+                }
+                if wants(&stages, ExperimentStage::Zones) {
+                    done.push(svc.stage_nodes(NodeStage::Zones, &zones, true, &p).await?);
+                }
+                if wants(&stages, ExperimentStage::Compute) {
+                    done.push(
+                        svc.stage_nodes(NodeStage::Compute, &compute, true, &p)
+                            .await?,
+                    );
+                }
+                if wants(&stages, ExperimentStage::SignalPlane) {
+                    done.push(
+                        svc.stage_signal_plane(&model, dir.as_deref(), true, &p)
+                            .await?,
+                    );
+                }
+                if wants(&stages, ExperimentStage::Services) {
+                    done.push(
+                        svc.stage_services(&model, &yaml, dir.as_deref(), true, &p)
+                            .await?,
+                    );
+                }
+                Ok(format!("vehicle `{id}` up — {}", done.join(", ")))
             })
             .await;
         Ok(Response::new(job))
@@ -293,6 +308,8 @@ impl VehicleService for VehicleSvc {
         &self,
         req: Request<VehicleDownRequest>,
     ) -> Result<Response<vxedge_api::v1::Job>, Status> {
+        check_stages(&req.get_ref().stages)?;
+        let stages = req.get_ref().stages.clone();
         let Resolved {
             yaml,
             dir,
@@ -320,28 +337,35 @@ impl VehicleService for VehicleSvc {
                 // Reverse order, best-effort — same reasoning as `ExperimentSvc::down`: a
                 // teardown that stops at the first error strands whatever came after it.
                 let mut failures: Vec<String> = Vec::new();
-                if let Err(e) = svc
-                    .stage_services(&model, &yaml, dir.as_deref(), false, &p)
-                    .await
+                if wants(&stages, ExperimentStage::Services)
+                    && let Err(e) = svc
+                        .stage_services(&model, &yaml, dir.as_deref(), false, &p)
+                        .await
                 {
                     failures.push(e);
                 }
-                if let Err(e) = svc
-                    .stage_signal_plane(&model, dir.as_deref(), false, &p)
-                    .await
+                if wants(&stages, ExperimentStage::SignalPlane)
+                    && let Err(e) = svc
+                        .stage_signal_plane(&model, dir.as_deref(), false, &p)
+                        .await
                 {
                     failures.push(e);
                 }
-                if let Err(e) = svc
-                    .stage_nodes(NodeStage::Compute, &compute, false, &p)
-                    .await
+                if wants(&stages, ExperimentStage::Compute)
+                    && let Err(e) = svc
+                        .stage_nodes(NodeStage::Compute, &compute, false, &p)
+                        .await
                 {
                     failures.push(e);
                 }
-                if let Err(e) = svc.stage_nodes(NodeStage::Zones, &zones, false, &p).await {
+                if wants(&stages, ExperimentStage::Zones)
+                    && let Err(e) = svc.stage_nodes(NodeStage::Zones, &zones, false, &p).await
+                {
                     failures.push(e);
                 }
-                if let Err(e) = svc.stage_gateway(&yaml, dir.as_deref(), false, &p).await {
+                if wants(&stages, ExperimentStage::Gateway)
+                    && let Err(e) = svc.stage_gateway(&yaml, dir.as_deref(), false, &p).await
+                {
                     failures.push(e);
                 }
                 if failures.is_empty() {
@@ -381,16 +405,19 @@ impl VehicleService for VehicleSvc {
         let unattached = unprovisioned(&model, &nodes);
         let shell = self.handles.zones.shell.clone();
         let runtime_dir = self.handles.zones.runtime_dir.clone();
-        let mut components = tokio::task::spawn_blocking(move || {
+        let typed = tokio::task::spawn_blocking(move || {
             nodes
                 .iter()
                 .map(|n| {
-                    node_component(n, &vxedge_core::zones::node_status(&shell, n, &runtime_dir))
+                    let state = vxedge_core::zones::node_status(&shell, n, &runtime_dir);
+                    crate::status::observed_node(n, &state)
                 })
                 .collect::<Vec<_>>()
         })
         .await
         .map_err(|e| Status::internal(format!("status task panicked: {e}")))?;
+        let mut components: Vec<ResourceStatus> =
+            typed.iter().filter_map(|n| n.status.clone()).collect();
 
         for service_type in vxedge_core::services::ServiceDef::declared_types(&model) {
             let observed = self
@@ -419,24 +446,9 @@ impl VehicleService for VehicleSvc {
             status: Some(status),
             components,
             gateway: Some(gw),
-            ..Default::default()
+            nodes: typed,
         }))
     }
-}
-
-fn node_component(
-    node: &NodePlan,
-    state: &vxedge_core::zones::backend::NodeState,
-) -> ResourceStatus {
-    crate::status::resource_status(
-        node.node_id.clone(),
-        crate::status::node_kind(node.role),
-        state,
-        format!(
-            "zone={} backend={:?} port={} peer={} vlan={}",
-            node.zone_id, node.backend, node.endpoint, node.peer, node.vlan
-        ),
-    )
 }
 
 /// Declared devices with no node plan: no slice-bound link, so nothing provisions them.
@@ -449,9 +461,9 @@ fn unprovisioned(model: &Experiment, nodes: &[NodePlan]) -> Vec<ResourceStatus> 
         .map(|d| ResourceStatus {
             vxid: d.id.clone(),
             kind: crate::status::node_kind(d.role) as i32,
-            state: ResourceState::Unspecified as i32,
+            state: ResourceState::Unprovisioned as i32,
             detail: "declared, not provisioned: no slice-bound link".to_string(),
-            since_unix_ms: crate::jobs::now_ms(),
+            observed_unix_ms: crate::jobs::now_ms(),
             ..Default::default()
         })
         .collect()
@@ -552,7 +564,7 @@ parts:
         let listed = unprovisioned(&m, &nodes);
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].vxid, "spare");
-        assert_eq!(listed[0].state, ResourceState::Unspecified as i32);
+        assert_eq!(listed[0].state, ResourceState::Unprovisioned as i32);
     }
 
     #[test]
@@ -571,7 +583,8 @@ parts:
         let m = model(WS);
         let (_, nodes) = plan_vehicle(&m, None).unwrap();
         let hpc = nodes.iter().find(|n| n.node_id == "hpc1").unwrap();
-        let c = node_component(hpc, &vxedge_core::zones::backend::NodeState::Up);
+        let node = crate::status::observed_node(hpc, &vxedge_core::zones::backend::NodeState::Up);
+        let c = node.status.unwrap();
         assert_eq!(c.kind, ResourceKind::Compute as i32);
         assert_eq!(c.state, ResourceState::Up as i32);
     }
