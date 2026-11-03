@@ -282,10 +282,13 @@ enum TelemetryCmd {
         #[arg(long)]
         experiment: String,
     },
+    /// Archive what the telemetry service ingested, with the workspace and image digests.
     Collect {
         #[arg(long)]
         manifest: String,
-        #[arg(long)]
+        /// Where to write the archive; relative to the workspace. Default:
+        /// `results/<id>-<time>.zip`.
+        #[arg(long, default_value = "")]
         out: String,
     },
 }
@@ -860,7 +863,45 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 watch_job(channel, job, cli.json).await?;
             }
         },
-        Command::Telemetry { .. } => scaffold_notice("telemetry"),
+        Command::Telemetry { cmd } => {
+            let channel = connect(&cli.endpoint).await?;
+            match cmd {
+                TelemetryCmd::Up { experiment } | TelemetryCmd::Down { experiment } => {
+                    let mut svc = SvcServiceClient::new(channel.clone());
+                    let workspace = manifest_ref(&Some(experiment.clone()));
+                    let job = if matches!(cmd, TelemetryCmd::Up { .. }) {
+                        svc.up(SvcUpRequest {
+                            service_type: "telemetry".to_string(),
+                            experiment: workspace,
+                            ..Default::default()
+                        })
+                        .await?
+                    } else {
+                        svc.down(SvcDownRequest {
+                            service_type: "telemetry".to_string(),
+                            experiment: workspace,
+                            ..Default::default()
+                        })
+                        .await?
+                    }
+                    .into_inner();
+                    watch_job(channel, job, cli.json).await?;
+                }
+                TelemetryCmd::Collect { manifest, out } => {
+                    let job =
+                        vxedge_api::v1::telemetry_service_client::TelemetryServiceClient::new(
+                            channel.clone(),
+                        )
+                        .collect(vxedge_api::v1::CollectRequest {
+                            manifest: manifest_ref(&Some(manifest.clone())),
+                            out_path: out.clone(),
+                        })
+                        .await?
+                        .into_inner();
+                    watch_job(channel, job, cli.json).await?;
+                }
+            }
+        }
         // Unlike `experiment` verbs, kept `--manifest`-addressed rather than cwd-discovered:
         // that Terraform-style decision (`docs/ROADMAP.md`'s 2026-07-30 workspace-model note) is
         // scoped to experiment verbs specifically, and root `CLAUDE.md`'s own CLI command table

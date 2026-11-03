@@ -1,0 +1,139 @@
+//! `TelemetryService`: the results archive of a run, built by `vxtelemetry collect`.
+//!
+//! `Collect` archives what the workspace's telemetry service ingested, with the workspace itself
+//! and the digests of every image it runs, and returns the archive through `Job.artifact` with its
+//! sha256. `StreamMetrics` is not built.
+
+use sha2::Digest;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
+use tokio_stream::Stream;
+use tonic::{Request, Response, Status};
+
+use vxedge_api::v1::telemetry_service_server::TelemetryService;
+use vxedge_api::v1::{CollectRequest, Job, Metric, StreamMetricsRequest};
+
+use crate::audit::Audit;
+use crate::errors::{self, R};
+use crate::jobs::{JobEngine, JobFailure};
+
+pub struct TelemetrySvc {
+    pub engine: JobEngine,
+    pub audit: Arc<Audit>,
+    pub runtime_dir: PathBuf,
+    pub vxtelemetry_bin: String,
+}
+
+fn sha256_of(path: &Path) -> std::io::Result<String> {
+    let bytes = std::fs::read(path)?;
+    Ok(crate::services::hex::encode(sha2::Sha256::digest(&bytes)))
+}
+
+#[tonic::async_trait]
+impl TelemetryService for TelemetrySvc {
+    type StreamMetricsStream = Pin<Box<dyn Stream<Item = Result<Metric, Status>> + Send>>;
+
+    async fn stream_metrics(
+        &self,
+        _: Request<StreamMetricsRequest>,
+    ) -> Result<Response<Self::StreamMetricsStream>, Status> {
+        Err(Status::unimplemented(
+            "TelemetryService.StreamMetrics is not built (ARCHITECTURE.md section 5.2)",
+        ))
+    }
+
+    async fn collect(&self, req: Request<CollectRequest>) -> Result<Response<Job>, Status> {
+        let req = req.into_inner();
+        let (yaml, sha256, dir) = crate::services::resolve_manifest(req.manifest.as_ref()).await?;
+        let workspace = dir.ok_or_else(|| {
+            errors::invalid(
+                R::InvalidRequest,
+                "collect needs a workspace directory: pass a path, not an inline manifest",
+            )
+        })?;
+        let model = vxedge_core::model::load_workspace_yaml(&yaml)
+            .map_err(|e| errors::invalid(R::WorkspaceInvalid, e.to_string()))?;
+        let ingest = match vxedge_core::services::ServiceDef::find(&model, "telemetry") {
+            Some(def) => vxedge_core::services::telemetry_ingest_dir(def, &self.runtime_dir)
+                .map_err(|e| errors::invalid(R::WorkspaceInvalid, e.to_string()))?,
+            None => self.runtime_dir.join("ingest"),
+        };
+        if !ingest.is_dir() {
+            return Err(errors::precondition(
+                R::NotFound,
+                format!(
+                    "nothing has been ingested: `{}` does not exist. Run the workspace's \
+                     telemetry service first",
+                    ingest.display()
+                ),
+            ));
+        }
+        let out = if req.out_path.is_empty() {
+            workspace
+                .join("results")
+                .join(format!("{}-{}.zip", model.id, crate::jobs::now_ms()))
+        } else {
+            let p = PathBuf::from(&req.out_path);
+            if p.is_absolute() {
+                p
+            } else {
+                workspace.join(p)
+            }
+        };
+        let mut images: Vec<String> = model.placements().map(|p| p.image.url.clone()).collect();
+        images.extend(model.entities.iter().flat_map(|e| {
+            e.functions
+                .values()
+                .filter_map(|f| f.part.as_ref())
+                .filter(|p| p.kind == vxedge_core::model::PartKind::Container)
+                .map(|p| p.reference.clone())
+        }));
+        images.sort();
+        images.dedup();
+        self.audit.record(
+            "TelemetryService.Collect",
+            serde_json::json!({ "workspace_sha256": sha256, "out": out }),
+        );
+        let bin = self.vxtelemetry_bin.clone();
+        let log = self.runtime_dir.join("collect.log");
+        let job = self
+            .engine
+            .submit("telemetry.collect", move |p| async move {
+                p.update(10, &format!("archiving {}", ingest.display()));
+                if let Some(parent) = out.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("cannot create `{}`: {e}", parent.display()))?;
+                }
+                let mut cmd = tokio::process::Command::new(&bin);
+                cmd.arg("collect")
+                    .arg("--workspace")
+                    .arg(&workspace)
+                    .arg("--ingest-dir")
+                    .arg(&ingest)
+                    .arg("--out")
+                    .arg(&out);
+                for image in &images {
+                    cmd.arg("--record-image").arg(image);
+                }
+                let output = cmd
+                    .output()
+                    .await
+                    .map_err(|e| format!("cannot run `{bin}`: {e}"))?;
+                let _ = std::fs::write(&log, [&output.stdout[..], &output.stderr[..]].concat());
+                if !output.status.success() {
+                    return Err(JobFailure::from(format!(
+                        "`{bin} collect` failed ({}): see {}",
+                        output.status,
+                        log.display()
+                    )));
+                }
+                let sha = sha256_of(&out)
+                    .map_err(|e| format!("no archive at `{}`: {e}", out.display()))?;
+                p.artifact(&out, &sha);
+                Ok::<_, JobFailure>(format!("archive {} (sha256 {sha})", out.display()))
+            })
+            .await;
+        Ok(Response::new(job))
+    }
+}

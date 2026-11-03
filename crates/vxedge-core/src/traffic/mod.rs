@@ -8,5 +8,7 @@
 pub mod lifecycle;
 pub mod plan;
 
-pub use lifecycle::{TrafficLifecycleError, profile_down, profile_up};
+pub use lifecycle::{
+    ProfileState, TrafficLifecycleError, profile_down, profile_status, profile_up,
+};
 pub use plan::{ProfileEndpoint, ResolvedProfile, TrafficPlan, TrafficPlanError};

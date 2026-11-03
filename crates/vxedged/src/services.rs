@@ -2211,11 +2211,41 @@ fn select_profiles(
 impl TrafficService for TrafficSvc {
     async fn status(
         &self,
-        _: Request<TrafficStatusRequest>,
+        req: Request<TrafficStatusRequest>,
     ) -> Result<Response<TrafficStatus>, Status> {
-        Err(Status::unimplemented(
-            "TrafficService.Status: not built yet",
-        ))
+        require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
+        let (plan, _, _, _) = self.resolve_plans(req.get_ref().manifest.as_ref()).await?;
+        let runtime_dir = self.runtime_dir.clone();
+        let profiles = tokio::task::spawn_blocking(move || {
+            use vxedge_api::v1::TrafficProfileState as S;
+            use vxedge_core::traffic::ProfileState as P;
+            plan.profiles
+                .iter()
+                .map(|p| {
+                    let (state, detail) =
+                        match vxedge_core::traffic::profile_status(&runtime_dir, &p.id) {
+                            P::NotStarted => (S::Unspecified, "not started".to_string()),
+                            P::Running => (S::Running, String::new()),
+                            P::Finished => (S::Finished, String::new()),
+                            P::Failed(why) => (S::Failed, why),
+                            P::Unknown => (
+                                S::Unspecified,
+                                "stopped, and no exit status was recorded: it outlived the \
+                                 daemon that started it"
+                                    .to_string(),
+                            ),
+                        };
+                    vxedge_api::v1::TrafficProfileStatus {
+                        id: p.id.clone(),
+                        state: state as i32,
+                        detail,
+                    }
+                })
+                .collect()
+        })
+        .await
+        .map_err(|e| Status::internal(format!("status task panicked: {e}")))?;
+        Ok(Response::new(TrafficStatus { profiles }))
     }
 
     async fn up(&self, req: Request<TrafficUpRequest>) -> Result<Response<Job>, Status> {
