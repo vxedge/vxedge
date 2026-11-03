@@ -5,6 +5,7 @@
 //! and fail honestly at provisioning until the backend lands — TASKS.md §2).
 
 mod audit;
+mod errors;
 mod events;
 mod experiment;
 mod jobs;
@@ -127,7 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = std::fs::create_dir_all(&cache_dir);
 
     let bus = events::EventBus::new();
-    let engine = jobs::JobEngine::new(bus.clone());
+    let engine = jobs::JobEngine::with_runtime_dir(bus.clone(), args.runtime_dir.clone());
     let audit = Arc::new(audit::Audit::new(&args.runtime_dir));
     // Optional netns confinement of all gateway objects (used by tests/dev).
     // `escalate: true` means "escalate if the children would not already be privileged" —

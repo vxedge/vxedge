@@ -68,8 +68,14 @@ impl RunService for RunSvc {
         let wanted = req.into_inner().run.map(|r| r.run_id).unwrap_or_default();
         match self.current().await? {
             Some(run) if wanted.is_empty() || run.id == wanted => Ok(Response::new(run)),
-            Some(_) => Err(Status::not_found(format!("no run `{wanted}` on this host"))),
-            None => Err(Status::not_found("no run is active on this host")),
+            Some(_) => Err(crate::errors::not_found(
+                crate::errors::R::RunMismatch,
+                format!("no run `{wanted}` on this host"),
+            )),
+            None => Err(crate::errors::not_found(
+                crate::errors::R::NoActiveRun,
+                "no run is active on this host",
+            )),
         }
     }
 

@@ -44,7 +44,6 @@ use vxedge_api::v1::{
 };
 
 use std::path::Path;
-use std::time::Duration;
 
 use vxedge_core::containers::ContainerSpec;
 use vxedge_core::gateway::GatewayPlan;
@@ -54,8 +53,11 @@ use vxedge_core::zones::backend::NodeState;
 
 use crate::audit::Audit;
 use crate::events::EventKind;
-use crate::jobs::{JobEngine, Progress, is_terminal};
+use crate::jobs::{
+    JobEngine, JobFailure, JobOpts, Progress, START_WINDOW, is_terminal, stage, start_then_confirm,
+};
 use crate::services::{ComputeSvc, GatewaySvc, SvcSvc, ZoneSvc};
+use vxedge_api::v1::ErrorReason;
 
 pub struct ExperimentSvc {
     pub audit: Arc<Audit>,
@@ -96,11 +98,13 @@ async fn await_job(
     parent: &Progress,
     percent: u32,
     label: &str,
-) -> Result<String, String> {
-    let mut rx = engine
-        .watch(&job.id)
-        .await
-        .ok_or_else(|| format!("job {} vanished before it could be watched", job.id))?;
+) -> Result<String, JobFailure> {
+    let mut rx = engine.watch(&job.id).await.ok_or_else(|| {
+        JobFailure::from(format!(
+            "job {} vanished before it could be watched",
+            job.id
+        ))
+    })?;
     let mut relayed = String::new();
     loop {
         {
@@ -112,13 +116,21 @@ async fn await_job(
             if is_terminal(current.state) {
                 return if current.state == JobState::Succeeded as i32 {
                     Ok(current.message.clone())
+                } else if current.state == JobState::Cancelled as i32 {
+                    Err(JobFailure::cancelled())
                 } else {
-                    Err(current.error.clone())
+                    Err(JobFailure::new(
+                        ErrorReason::try_from(current.error_reason).unwrap_or_default(),
+                        current.error.clone(),
+                    ))
                 };
             }
         }
         if rx.changed().await.is_err() {
-            return Err(format!("job {} stopped reporting before finishing", job.id));
+            return Err(JobFailure::from(format!(
+                "job {} stopped reporting before finishing",
+                job.id
+            )));
         }
     }
 }
@@ -161,11 +173,14 @@ pub(crate) fn check_active_target(
     } else {
         String::new()
     };
-    Err(Status::failed_precondition(format!(
-        "`{active_id}`{active_at} is the one active on this host, not \
+    Err(crate::errors::precondition(
+        crate::errors::R::WrongWorkspace,
+        format!(
+            "`{active_id}`{active_at} is the one active on this host, not \
          `{requested_id}`{requested_at}: `{verb}` only acts on what is active — run it from that \
          workspace, or bring it down first"
-    )))
+        ),
+    ))
 }
 
 pub(crate) fn inline(yaml: &str, dir: Option<&std::path::Path>) -> Option<ManifestRef> {
@@ -184,7 +199,8 @@ pub(crate) fn inline(yaml: &str, dir: Option<&std::path::Path>) -> Option<Manife
 /// One read, one document, one experiment.
 async fn resolve_once(mref: Option<&ManifestRef>) -> Result<String, Status> {
     let mref = mref.ok_or_else(|| {
-        Status::invalid_argument(
+        crate::errors::invalid(
+            crate::errors::R::InvalidRequest,
             "no experiment to run: the daemon received no manifest or workspace reference",
         )
     })?;
@@ -198,7 +214,7 @@ impl Handles {
         dir: Option<&std::path::Path>,
         up: bool,
         p: &Progress,
-    ) -> Result<String, String> {
+    ) -> Result<String, JobFailure> {
         p.update(
             10,
             if up {
@@ -209,21 +225,27 @@ impl Handles {
         );
         let job = if up {
             self.gateway
-                .up(Request::new(GatewayUpRequest {
-                    manifest: inline(yaml, dir),
-                }))
+                .up(stage(
+                    GatewayUpRequest {
+                        manifest: inline(yaml, dir),
+                    },
+                    p.job_id(),
+                ))
                 .await
         } else {
             self.gateway
-                .down(Request::new(GatewayDownRequest {
-                    manifest: inline(yaml, dir),
-                }))
+                .down(stage(
+                    GatewayDownRequest {
+                        manifest: inline(yaml, dir),
+                    },
+                    p.job_id(),
+                ))
                 .await
         }
-        .map_err(|e| format!("gateway: {}", e.message()))?;
+        .map_err(|e| JobFailure::from_status(&e).context("gateway"))?;
         await_job(&self.engine, job.into_inner(), p, 30, "gateway")
             .await
-            .map_err(|e| format!("gateway: {e}"))
+            .map_err(|e| e.context("gateway"))
     }
 
     /// Bring every provisioned device up or down, one RPC each.
@@ -234,7 +256,7 @@ impl Handles {
     /// meant to be provisioned. Addressing devices individually rather than by region also
     /// keeps `up` from starting several guests concurrently in one call — the concurrency that
     /// invalidated exp-002b's first campaign.
-    pub(crate) async fn stage_zones(&self, up: bool, p: &Progress) -> Result<String, String> {
+    pub(crate) async fn stage_zones(&self, up: bool, p: &Progress) -> Result<String, JobFailure> {
         let listed = match self
             .zones
             .list(Request::new(ZoneListRequest::default()))
@@ -244,7 +266,7 @@ impl Handles {
             // A plan that cannot be made is a broken workspace, and reading it as "no zones"
             // reported success with nothing provisioned.
             Err(e) if e.code() == tonic::Code::Internal => {
-                return Err(format!("zones: {}", e.message()));
+                return Err(JobFailure::from_status(&e).context("zones"));
             }
             // No active experiment, or nothing plannable in it: both mean there is nothing to
             // stage, which is not a failure.
@@ -258,12 +280,12 @@ impl Handles {
     }
 
     /// Bring every compute device up or down, listed the way [`Self::stage_zones`] lists zones.
-    pub(crate) async fn stage_compute(&self, up: bool, p: &Progress) -> Result<String, String> {
+    pub(crate) async fn stage_compute(&self, up: bool, p: &Progress) -> Result<String, JobFailure> {
         let request = Request::new(ComputeListRequest::default());
         let listed = match self.compute.list(request).await {
             Ok(r) => r.into_inner().nodes,
             Err(e) if e.code() == tonic::Code::Internal => {
-                return Err(format!("compute: {}", e.message()));
+                return Err(JobFailure::from_status(&e).context("compute"));
             }
             Err(_) => return Ok("no compute declared".into()),
         };
@@ -282,7 +304,7 @@ impl Handles {
         ids: &[String],
         up: bool,
         p: &Progress,
-    ) -> Result<String, String> {
+    ) -> Result<String, JobFailure> {
         let total = ids.len();
         let (label, base, span) = match stage {
             NodeStage::Zones => ("zone", 40, 20),
@@ -290,6 +312,7 @@ impl Handles {
         };
         let mut failures = Vec::new();
         for (i, id) in ids.iter().enumerate() {
+            p.checkpoint()?;
             let percent = base + (i as u32 * span) / total as u32;
             let verb = if up { "up" } else { "down" };
             p.update(
@@ -297,12 +320,12 @@ impl Handles {
                 &format!("{label} {}/{total}: {id} ({verb})", i + 1),
             );
             let step = format!("{label} {id}");
-            let result = match self.submit_node(stage, id, up).await {
+            let result = match self.submit_node(stage, id, up, p.job_id()).await {
                 Ok(job) => await_job(&self.engine, job, p, percent, &step).await,
-                Err(status) => Err(status.message().to_string()),
+                Err(status) => Err(JobFailure::from_status(&status)),
             };
             if let Err(e) = result {
-                let failure = format!("{label} `{id}`: {e}");
+                let failure = e.context(format!("{label} `{id}`"));
                 if up {
                     return Err(failure);
                 }
@@ -312,45 +335,63 @@ impl Handles {
         if failures.is_empty() {
             Ok(format!("{total} {label}(s)"))
         } else {
-            Err(failures.join("; "))
+            Err(JobFailure::joined(label, failures))
         }
     }
 
-    async fn submit_node(&self, stage: NodeStage, id: &str, up: bool) -> Result<Job, Status> {
+    async fn submit_node(
+        &self,
+        stage: NodeStage,
+        id: &str,
+        up: bool,
+        parent: &str,
+    ) -> Result<Job, Status> {
         let r#ref = Some(VxidRef {
             vxid: id.to_string(),
         });
         let job = match (stage, up) {
             (NodeStage::Zones, true) => {
                 self.zones
-                    .up(Request::new(ZoneUpRequest {
-                        r#ref,
-                        ..Default::default()
-                    }))
+                    .up(crate::jobs::stage(
+                        ZoneUpRequest {
+                            r#ref,
+                            ..Default::default()
+                        },
+                        parent,
+                    ))
                     .await
             }
             (NodeStage::Zones, false) => {
                 self.zones
-                    .down(Request::new(ZoneDownRequest {
-                        r#ref,
-                        ..Default::default()
-                    }))
+                    .down(crate::jobs::stage(
+                        ZoneDownRequest {
+                            r#ref,
+                            ..Default::default()
+                        },
+                        parent,
+                    ))
                     .await
             }
             (NodeStage::Compute, true) => {
                 self.compute
-                    .up(Request::new(ComputeUpRequest {
-                        r#ref,
-                        ..Default::default()
-                    }))
+                    .up(crate::jobs::stage(
+                        ComputeUpRequest {
+                            r#ref,
+                            ..Default::default()
+                        },
+                        parent,
+                    ))
                     .await
             }
             (NodeStage::Compute, false) => {
                 self.compute
-                    .down(Request::new(ComputeDownRequest {
-                        r#ref,
-                        ..Default::default()
-                    }))
+                    .down(crate::jobs::stage(
+                        ComputeDownRequest {
+                            r#ref,
+                            ..Default::default()
+                        },
+                        parent,
+                    ))
                     .await
             }
         }?;
@@ -366,8 +407,8 @@ impl Handles {
         dir: Option<&Path>,
         up: bool,
         p: &Progress,
-    ) -> Result<String, String> {
-        let fail = |e: String| format!("signal plane `{KUKSA_MEMBER}`: {e}");
+    ) -> Result<String, JobFailure> {
+        let fail = |e: String| JobFailure::from(format!("signal plane `{KUKSA_MEMBER}`: {e}"));
         let Some((node, spec)) = signal_plane_member(model, dir).map_err(fail)? else {
             return Ok("no signal plane declared".into());
         };
@@ -411,7 +452,7 @@ impl Handles {
                     .unwrap_or(false)
                 }
             };
-            start_then_confirm(change, running, SIGNAL_PLANE_WINDOW)
+            start_then_confirm(change, running, START_WINDOW)
                 .await
                 .map_err(fail)?;
         } else {
@@ -439,7 +480,8 @@ impl Handles {
         model: &vxedge_core::model::Experiment,
         dir: Option<&Path>,
     ) -> Result<Option<ResourceStatus>, Status> {
-        let member = signal_plane_member(model, dir).map_err(Status::failed_precondition)?;
+        let member = signal_plane_member(model, dir)
+            .map_err(|e| crate::errors::precondition(crate::errors::R::WorkspaceInvalid, e))?;
         let Some((node, spec)) = member else {
             return Ok(None);
         };
@@ -464,7 +506,7 @@ impl Handles {
         dir: Option<&std::path::Path>,
         up: bool,
         p: &Progress,
-    ) -> Result<String, String> {
+    ) -> Result<String, JobFailure> {
         // Keyed by service *type* because that is what SvcService dispatches on.
         let types = vxedge_core::services::ServiceDef::declared_types(model);
         if types.is_empty() {
@@ -477,22 +519,28 @@ impl Handles {
             );
             let job = if up {
                 self.svcs
-                    .up(Request::new(SvcUpRequest {
-                        service_type: ty.clone(),
-                        experiment: inline(yaml, dir),
-                        ..Default::default()
-                    }))
+                    .up(stage(
+                        SvcUpRequest {
+                            service_type: ty.clone(),
+                            experiment: inline(yaml, dir),
+                            ..Default::default()
+                        },
+                        p.job_id(),
+                    ))
                     .await
             } else {
                 self.svcs
-                    .down(Request::new(SvcDownRequest {
-                        service_type: ty.clone(),
-                        experiment: inline(yaml, dir),
-                        ..Default::default()
-                    }))
+                    .down(stage(
+                        SvcDownRequest {
+                            service_type: ty.clone(),
+                            experiment: inline(yaml, dir),
+                            ..Default::default()
+                        },
+                        p.job_id(),
+                    ))
                     .await
             }
-            .map_err(|e| format!("service `{ty}`: {}", e.message()))?;
+            .map_err(|e| JobFailure::from_status(&e).context(format!("service `{ty}`")))?;
             await_job(
                 &self.engine,
                 job.into_inner(),
@@ -501,41 +549,9 @@ impl Handles {
                 &format!("service {ty}"),
             )
             .await
-            .map_err(|e| format!("service `{ty}`: {e}"))?;
+            .map_err(|e| e.context(format!("service `{ty}`")))?;
         }
         Ok(format!("{} service(s)", types.len()))
-    }
-}
-
-/// How long the databroker has to stay running after it starts. `member_up` returns as soon as the
-/// container starts, and a databroker that rejects its flags exits just after that.
-const SIGNAL_PLANE_WINDOW: Duration = Duration::from_secs(2);
-
-/// Run `start`, then require `running` to hold for all of `window`, so a member that starts and
-/// exits straight away is a failure and not a success.
-async fn start_then_confirm<S, R, Fut>(
-    start: S,
-    mut running: R,
-    window: Duration,
-) -> Result<(), String>
-where
-    S: std::future::Future<Output = Result<(), String>>,
-    R: FnMut() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    start.await?;
-    let deadline = tokio::time::Instant::now() + window;
-    loop {
-        if !running().await {
-            return Err(format!(
-                "started, then stopped running within {} s: see its container log",
-                window.as_secs()
-            ));
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Ok(());
-        }
-        tokio::time::sleep(window / 8).await;
     }
 }
 
@@ -575,7 +591,10 @@ pub(crate) fn check_stages(stages: &[i32]) -> Result<(), Status> {
     for stage in stages {
         match ExperimentStage::try_from(*stage) {
             Ok(ExperimentStage::Unspecified) | Err(_) => {
-                return Err(Status::invalid_argument(format!("unknown stage {stage}")));
+                return Err(crate::errors::invalid(
+                    crate::errors::R::InvalidRequest,
+                    format!("unknown stage {stage}"),
+                ));
             }
             Ok(_) => {}
         }
@@ -602,8 +621,9 @@ impl ExperimentService for ExperimentSvc {
             None => None,
         };
         let yaml = resolve_once(req.get_ref().manifest.as_ref()).await?;
-        let model = vxedge_core::model::load_yaml(&yaml)
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let model = vxedge_core::model::load_yaml(&yaml).map_err(|e| {
+            crate::errors::invalid(crate::errors::R::WorkspaceInvalid, e.to_string())
+        })?;
         let active = self.handles.gateway.active_on_host().await;
         check_active_target(
             "experiment up",
@@ -623,39 +643,48 @@ impl ExperimentService for ExperimentSvc {
         let job = self
             .handles
             .engine
-            .submit("experiment.up", move |p| async move {
-                let mut done: Vec<String> = Vec::new();
-                if wants(&stages, ExperimentStage::Gateway) {
-                    svc.stage_gateway(&yaml, dir.as_deref(), true, &p).await?;
-                    done.push("gateway".to_string());
-                }
-                if wants(&stages, ExperimentStage::Zones) {
-                    done.push(svc.stage_zones(true, &p).await?);
-                }
-                if wants(&stages, ExperimentStage::Compute) {
-                    done.push(svc.stage_compute(true, &p).await?);
-                }
-                if wants(&stages, ExperimentStage::SignalPlane) {
-                    done.push(
-                        svc.stage_signal_plane(&model, dir.as_deref(), true, &p)
-                            .await?,
-                    );
-                }
-                if wants(&stages, ExperimentStage::Services) {
-                    done.push(
-                        svc.stage_services(&model, &yaml, dir.as_deref(), true, &p)
-                            .await?,
-                    );
-                }
-                // Said explicitly, because an engineer expecting `up` to have started the load
-                // would otherwise sit waiting for numbers that are not coming.
-                Ok(format!(
-                    "experiment `{id}` up — {}. \
+            .submit_with(
+                JobOpts::lifecycle(&req, format!("experiment {id}")),
+                "experiment.up",
+                move |p| async move {
+                    let mut done: Vec<String> = Vec::new();
+                    p.checkpoint()?;
+                    if wants(&stages, ExperimentStage::Gateway) {
+                        svc.stage_gateway(&yaml, dir.as_deref(), true, &p).await?;
+                        done.push("gateway".to_string());
+                    }
+                    p.checkpoint()?;
+                    if wants(&stages, ExperimentStage::Zones) {
+                        done.push(svc.stage_zones(true, &p).await?);
+                    }
+                    p.checkpoint()?;
+                    if wants(&stages, ExperimentStage::Compute) {
+                        done.push(svc.stage_compute(true, &p).await?);
+                    }
+                    p.checkpoint()?;
+                    if wants(&stages, ExperimentStage::SignalPlane) {
+                        done.push(
+                            svc.stage_signal_plane(&model, dir.as_deref(), true, &p)
+                                .await?,
+                        );
+                    }
+                    p.checkpoint()?;
+                    if wants(&stages, ExperimentStage::Services) {
+                        done.push(
+                            svc.stage_services(&model, &yaml, dir.as_deref(), true, &p)
+                                .await?,
+                        );
+                    }
+                    // Said explicitly, because an engineer expecting `up` to have started the load
+                    // would otherwise sit waiting for numbers that are not coming.
+                    Ok::<_, crate::jobs::JobFailure>(format!(
+                        "experiment `{id}` up — {}. \
                      Traffic is not started by `up`: run `vxedge traffic up`.",
-                    done.join(", ")
-                ))
-            })
-            .await;
+                        done.join(", ")
+                    ))
+                },
+            )
+            .await?;
         Ok(Response::new(job))
     }
 
@@ -669,8 +698,9 @@ impl ExperimentService for ExperimentSvc {
             None => None,
         };
         let yaml = resolve_once(req.get_ref().manifest.as_ref()).await?;
-        let model = vxedge_core::model::load_yaml(&yaml)
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let model = vxedge_core::model::load_yaml(&yaml).map_err(|e| {
+            crate::errors::invalid(crate::errors::R::WorkspaceInvalid, e.to_string())
+        })?;
         let active = self.handles.gateway.active_on_host().await;
         check_active_target(
             "experiment down",
@@ -690,51 +720,57 @@ impl ExperimentService for ExperimentSvc {
         let job = self
             .handles
             .engine
-            .submit("experiment.down", move |p| async move {
-                // Reverse order, and **best-effort**: a teardown that stops at the first error
-                // strands whatever came after it. Collect failures, tear the rest down anyway,
-                // and report everything that went wrong.
-                let mut failures: Vec<String> = Vec::new();
-                if wants(&stages, ExperimentStage::Services)
-                    && let Err(e) = svc
-                        .stage_services(&model, &yaml, dir.as_deref(), false, &p)
-                        .await
-                {
-                    failures.push(e);
-                }
-                if wants(&stages, ExperimentStage::SignalPlane)
-                    && let Err(e) = svc
-                        .stage_signal_plane(&model, dir.as_deref(), false, &p)
-                        .await
-                {
-                    failures.push(e);
-                }
-                if wants(&stages, ExperimentStage::Compute)
-                    && let Err(e) = svc.stage_compute(false, &p).await
-                {
-                    failures.push(e);
-                }
-                if wants(&stages, ExperimentStage::Zones)
-                    && let Err(e) = svc.stage_zones(false, &p).await
-                {
-                    failures.push(e);
-                }
-                if wants(&stages, ExperimentStage::Gateway)
-                    && let Err(e) = svc.stage_gateway(&yaml, dir.as_deref(), false, &p).await
-                {
-                    failures.push(e);
-                }
-                if failures.is_empty() {
-                    Ok(format!("experiment `{id}` down"))
-                } else {
-                    Err(format!(
-                        "experiment `{id}` down with {} failure(s); the rest was torn down: {}",
-                        failures.len(),
-                        failures.join("; ")
-                    ))
-                }
-            })
-            .await;
+            .submit_with(
+                JobOpts::lifecycle(&req, format!("experiment {id}")),
+                "experiment.down",
+                move |p| async move {
+                    // Reverse order, and **best-effort**: a teardown that stops at the first error
+                    // strands whatever came after it. Collect failures, tear the rest down anyway,
+                    // and report everything that went wrong.
+                    let mut failures: Vec<JobFailure> = Vec::new();
+                    if wants(&stages, ExperimentStage::Services)
+                        && let Err(e) = svc
+                            .stage_services(&model, &yaml, dir.as_deref(), false, &p)
+                            .await
+                    {
+                        failures.push(e);
+                    }
+                    if wants(&stages, ExperimentStage::SignalPlane)
+                        && let Err(e) = svc
+                            .stage_signal_plane(&model, dir.as_deref(), false, &p)
+                            .await
+                    {
+                        failures.push(e);
+                    }
+                    if wants(&stages, ExperimentStage::Compute)
+                        && let Err(e) = svc.stage_compute(false, &p).await
+                    {
+                        failures.push(e);
+                    }
+                    if wants(&stages, ExperimentStage::Zones)
+                        && let Err(e) = svc.stage_zones(false, &p).await
+                    {
+                        failures.push(e);
+                    }
+                    if wants(&stages, ExperimentStage::Gateway)
+                        && let Err(e) = svc.stage_gateway(&yaml, dir.as_deref(), false, &p).await
+                    {
+                        failures.push(e);
+                    }
+                    if failures.is_empty() {
+                        Ok::<_, JobFailure>(format!("experiment `{id}` down"))
+                    } else {
+                        Err(JobFailure::joined(
+                            format!(
+                                "experiment `{id}` down with {} failure(s); the rest was torn down",
+                                failures.len()
+                            ),
+                            failures,
+                        ))
+                    }
+                },
+            )
+            .await?;
         Ok(Response::new(job))
     }
 
@@ -747,8 +783,9 @@ impl ExperimentService for ExperimentSvc {
             None => None,
         };
         let yaml = resolve_once(req.get_ref().manifest.as_ref()).await?;
-        let model = vxedge_core::model::load_yaml(&yaml)
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let model = vxedge_core::model::load_yaml(&yaml).map_err(|e| {
+            crate::errors::invalid(crate::errors::R::WorkspaceInvalid, e.to_string())
+        })?;
         // The components below describe what is active, so this must be what the caller named.
         let active = self.handles.gateway.active_on_host().await;
         check_active_target(
@@ -1014,7 +1051,7 @@ mod tests {
             .submit("sub", move |p| async move {
                 p.update(50, "moving port");
                 let _ = gate.await;
-                Ok("done".to_string())
+                Ok::<_, String>("done".to_string())
             })
             .await;
         let inner = engine.clone();
@@ -1041,53 +1078,5 @@ mod tests {
             let err = check_active_target(verb, active, "vehicle-b", None).unwrap_err();
             assert!(err.message().contains(&format!("`{verb}`")), "{err:?}");
         }
-    }
-
-    const WINDOW: Duration = Duration::from_millis(80);
-
-    #[tokio::test]
-    async fn a_member_that_exits_straight_after_starting_is_a_failure() {
-        let err = start_then_confirm(async { Ok(()) }, || async { false }, WINDOW)
-            .await
-            .unwrap_err();
-        assert!(err.contains("stopped running"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn a_member_that_exits_inside_the_window_is_a_failure() {
-        let mut checks = 0;
-        let result = start_then_confirm(
-            async { Ok(()) },
-            || {
-                checks += 1;
-                let alive = checks < 3;
-                async move { alive }
-            },
-            WINDOW,
-        )
-        .await;
-        assert!(result.is_err());
-        assert_eq!(checks, 3, "stops at the first check that fails");
-    }
-
-    #[tokio::test]
-    async fn a_member_that_stays_up_for_the_window_passes() {
-        let started = std::time::Instant::now();
-        start_then_confirm(async { Ok(()) }, || async { true }, WINDOW)
-            .await
-            .unwrap();
-        assert!(started.elapsed() >= WINDOW, "the whole window is watched");
-    }
-
-    #[tokio::test]
-    async fn a_start_that_fails_is_reported_as_itself() {
-        let err = start_then_confirm(
-            async { Err("no such image".into()) },
-            || async { true },
-            WINDOW,
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err, "no such image");
     }
 }

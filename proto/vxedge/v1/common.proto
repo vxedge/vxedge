@@ -106,6 +106,13 @@ enum ErrorReason {
   ERROR_REASON_EVENTS_LOST = 18;
   // This job cannot be cancelled, for example a `down`.
   ERROR_REASON_NOT_CANCELLABLE = 19;
+  // The request itself is malformed: a required field is missing or holds an unknown value.
+  ERROR_REASON_INVALID_REQUEST = 20;
+  // The resource the call names does not exist: a zone, device, service, run or profile.
+  ERROR_REASON_NOT_FOUND = 21;
+  // A backend the daemon needs did not answer: Podman, a registry, the 5G core. Usually worth a
+  // retry.
+  ERROR_REASON_BACKEND_UNAVAILABLE = 22;
 }
 
 // Names one run. See `RunService`.

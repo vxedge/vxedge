@@ -48,6 +48,11 @@ pub enum ZoneBackendError {
     BundleFile { node: String, path: String },
     #[error("node `{node}`: {detail}")]
     Runtime { node: String, detail: String },
+    #[error(
+        "node `{node}`: gateway port `{port}` is gone (it is destroyed with the namespace it was \
+         moved into). Re-run `vxedge up` to recreate it, then bring the zone up again"
+    )]
+    PortGone { node: String, port: String },
     #[error("node `{node}`: fetching published bundle `{reference}` failed: {source}")]
     Fetch {
         node: String,
@@ -169,13 +174,9 @@ fn attach_port(sh: &Shell, np: &NodePlan, ns: &str) -> Result<(), ZoneBackendErr
         // Neither on the host nor in the namespace: the pair died with an earlier namespace
         // (`zone down`, or an infra container that was replaced), and only the gateway makes
         // ports.
-        return Err(ZoneBackendError::Runtime {
+        return Err(ZoneBackendError::PortGone {
             node: np.node_id.clone(),
-            detail: format!(
-                "gateway port `{}` is gone (it is destroyed with the namespace it was moved \
-                 into). Re-run `vxedge up` to recreate it, then bring the zone up again",
-                np.peer
-            ),
+            port: np.peer.clone(),
         });
     }
     netlink::link_up(Some(ns), "lo").map_err(|e| nl(np, e))?;

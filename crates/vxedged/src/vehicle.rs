@@ -49,6 +49,7 @@ use vxedge_core::zones::NodePlan;
 
 use crate::audit::Audit;
 use crate::experiment::{Handles, NodeStage, check_active_target, check_stages, inline, wants};
+use crate::jobs::{JobFailure, JobOpts};
 
 pub struct VehicleSvc {
     pub audit: Arc<Audit>,
@@ -68,15 +69,16 @@ struct Resolved {
 
 async fn resolve_and_synthesize(mref: Option<&ManifestRef>) -> Result<Resolved, Status> {
     let mref = mref.ok_or_else(|| {
-        Status::invalid_argument(
+        crate::errors::invalid(
+            crate::errors::R::InvalidRequest,
             "no vehicle to run: the daemon received no manifest or workspace reference",
         )
     })?;
     let (raw_yaml, sha256, dir) = crate::services::resolve_manifest(Some(mref)).await?;
     let yaml = vxedge_core::model::synthesize_vehicle_workspace(&raw_yaml)
-        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        .map_err(|e| crate::errors::invalid(crate::errors::R::WorkspaceInvalid, e.to_string()))?;
     let model = vxedge_core::model::load_yaml(&yaml)
-        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        .map_err(|e| crate::errors::invalid(crate::errors::R::WorkspaceInvalid, e.to_string()))?;
     // Exactly one entity: `synthesize_vehicle_workspace` refuses anything but exactly one
     // `kind: vehicle` document, and the synthesized experiment names only that one.
     let id = model
@@ -98,7 +100,7 @@ fn plan_vehicle(
     model: &Experiment,
     dir: Option<&Path>,
 ) -> Result<(GatewayPlan, Vec<NodePlan>), Status> {
-    let refuse = |e: String| Status::failed_precondition(e);
+    let refuse = |e: String| crate::errors::precondition(crate::errors::R::WorkspaceInvalid, e);
     let gateway = GatewayPlan::from_model(model).map_err(|e| refuse(e.to_string()))?;
     let nodes = vxedge_core::zones::plan_nodes_from_model(
         model,
@@ -135,16 +137,14 @@ async fn require_local_images(id: &str, images: &BTreeSet<String>) -> Result<(),
         return Ok(());
     }
     let containers = LazyClient::user();
-    let client = containers
-        .get()
-        .await
-        .map_err(|e| Status::failed_precondition(e.to_string()))?;
+    let client = containers.get().await.map_err(|e| {
+        crate::errors::unavailable(crate::errors::R::BackendUnavailable, e.to_string())
+    })?;
     let mut missing = Vec::new();
     for image in images {
-        let present = client
-            .image_present(image)
-            .await
-            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        let present = client.image_present(image).await.map_err(|e| {
+            crate::errors::unavailable(crate::errors::R::BackendUnavailable, e.to_string())
+        })?;
         if !present {
             missing.push(format!("  {image}"));
         }
@@ -152,12 +152,15 @@ async fn require_local_images(id: &str, images: &BTreeSet<String>) -> Result<(),
     if missing.is_empty() {
         return Ok(());
     }
-    Err(Status::failed_precondition(format!(
-        "vehicle `{id}` runs local images that are not in this host's Podman store:\n{}\n\
+    Err(crate::errors::precondition(
+        crate::errors::R::LocalImageMissing,
+        format!(
+            "vehicle `{id}` runs local images that are not in this host's Podman store:\n{}\n\
          A `localhost/` image is built per host. Build it with the workspace's build script, \
          then run `vehicle up` again.",
-        missing.join("\n")
-    )))
+            missing.join("\n")
+        ),
+    ))
 }
 
 impl VehicleSvc {
@@ -193,12 +196,15 @@ fn refuse_foreign(verb: &str, id: &str, foreign: &[String]) -> Result<(), Status
     if foreign.is_empty() {
         return Ok(());
     }
-    Err(Status::failed_precondition(format!(
-        "this host is running what `{id}` does not declare: {}. Another vehicle is up, possibly \
+    Err(crate::errors::precondition(
+        crate::errors::R::ForeignWorkload,
+        format!(
+            "this host is running what `{id}` does not declare: {}. Another vehicle is up, possibly \
          under a daemon with a different runtime dir, and `{verb}` would act on its gateway. Run \
          it from that workspace, or bring that vehicle down first",
-        foreign.join(", ")
-    )))
+            foreign.join(", ")
+        ),
+    ))
 }
 
 #[tonic::async_trait]
@@ -226,8 +232,9 @@ impl VehicleService for VehicleSvc {
         // A store that is missing would otherwise fail last, with the whole vehicle already up.
         for def in model.services.values().filter(|s| s.on.is_some()) {
             let workspace = dir.as_deref().unwrap_or_else(|| Path::new("."));
-            vxedge_core::services::placed_spec(def, workspace)
-                .map_err(|e| Status::failed_precondition(e.to_string()))?;
+            vxedge_core::services::placed_spec(def, workspace).map_err(|e| {
+                crate::errors::precondition(crate::errors::R::WorkspaceInvalid, e.to_string())
+            })?;
         }
         require_local_images(&id, &local_images(&model, &nodes)).await?;
         // A local bundle (e.g. `./bundle`) is built per host and absent on a fresh clone;
@@ -240,12 +247,15 @@ impl VehicleService for VehicleSvc {
                     .map(|p| format!("  {}", p.display()))
                     .collect::<Vec<_>>()
                     .join("\n");
-                return Err(Status::failed_precondition(format!(
-                    "vehicle `{id}` boots a local guest bundle that has not been built on this host:\n{list}\n\
+                return Err(crate::errors::precondition(
+                    crate::errors::R::LocalBundleMissing,
+                    format!(
+                        "vehicle `{id}` boots a local guest bundle that has not been built on this host:\n{list}\n\
                      A bundle embeds the host kernel, so it is built per host and never published. Build it with \
                      `<vxparts>/parts/zone/linux/stack/probe-bundle/build.sh <dir above>` (needs busybox-static \
                      and a readable /boot/vmlinuz-$(uname -r); see that part's README), then run `vehicle up` again."
-                )));
+                    ),
+                ));
             }
         }
         if let Some(d) = dir.as_deref() {
@@ -256,10 +266,13 @@ impl VehicleService for VehicleSvc {
                     .map(|p| format!("  {}", p.display()))
                     .collect::<Vec<_>>()
                     .join("\n");
-                return Err(Status::failed_precondition(format!(
-                    "vehicle `{id}` runs a capsule module that is not on this host:\n{list}\n\
+                return Err(crate::errors::precondition(
+                    crate::errors::R::CapsuleModuleMissing,
+                    format!(
+                        "vehicle `{id}` runs a capsule module that is not on this host:\n{list}\n\
                      Build the module, or correct the part's `ref`, then run `vehicle up` again."
-                )));
+                    ),
+                ));
             }
         }
         self.audit.record(
@@ -271,36 +284,48 @@ impl VehicleService for VehicleSvc {
         let job = self
             .handles
             .engine
-            .submit("vehicle.up", move |p| async move {
-                let mut done: Vec<String> = Vec::new();
-                if wants(&stages, ExperimentStage::Gateway) {
-                    svc.stage_gateway(&yaml, dir.as_deref(), true, &p).await?;
-                    done.push("gateway".to_string());
-                }
-                if wants(&stages, ExperimentStage::Zones) {
-                    done.push(svc.stage_nodes(NodeStage::Zones, &zones, true, &p).await?);
-                }
-                if wants(&stages, ExperimentStage::Compute) {
-                    done.push(
-                        svc.stage_nodes(NodeStage::Compute, &compute, true, &p)
-                            .await?,
-                    );
-                }
-                if wants(&stages, ExperimentStage::SignalPlane) {
-                    done.push(
-                        svc.stage_signal_plane(&model, dir.as_deref(), true, &p)
-                            .await?,
-                    );
-                }
-                if wants(&stages, ExperimentStage::Services) {
-                    done.push(
-                        svc.stage_services(&model, &yaml, dir.as_deref(), true, &p)
-                            .await?,
-                    );
-                }
-                Ok(format!("vehicle `{id}` up — {}", done.join(", ")))
-            })
-            .await;
+            .submit_with(
+                JobOpts::lifecycle(&req, format!("vehicle {id}")),
+                "vehicle.up",
+                move |p| async move {
+                    let mut done: Vec<String> = Vec::new();
+                    p.checkpoint()?;
+                    if wants(&stages, ExperimentStage::Gateway) {
+                        svc.stage_gateway(&yaml, dir.as_deref(), true, &p).await?;
+                        done.push("gateway".to_string());
+                    }
+                    p.checkpoint()?;
+                    if wants(&stages, ExperimentStage::Zones) {
+                        done.push(svc.stage_nodes(NodeStage::Zones, &zones, true, &p).await?);
+                    }
+                    p.checkpoint()?;
+                    if wants(&stages, ExperimentStage::Compute) {
+                        done.push(
+                            svc.stage_nodes(NodeStage::Compute, &compute, true, &p)
+                                .await?,
+                        );
+                    }
+                    p.checkpoint()?;
+                    if wants(&stages, ExperimentStage::SignalPlane) {
+                        done.push(
+                            svc.stage_signal_plane(&model, dir.as_deref(), true, &p)
+                                .await?,
+                        );
+                    }
+                    p.checkpoint()?;
+                    if wants(&stages, ExperimentStage::Services) {
+                        done.push(
+                            svc.stage_services(&model, &yaml, dir.as_deref(), true, &p)
+                                .await?,
+                        );
+                    }
+                    Ok::<_, crate::jobs::JobFailure>(format!(
+                        "vehicle `{id}` up — {}",
+                        done.join(", ")
+                    ))
+                },
+            )
+            .await?;
         Ok(Response::new(job))
     }
 
@@ -333,52 +358,58 @@ impl VehicleService for VehicleSvc {
         let job = self
             .handles
             .engine
-            .submit("vehicle.down", move |p| async move {
-                // Reverse order, best-effort — same reasoning as `ExperimentSvc::down`: a
-                // teardown that stops at the first error strands whatever came after it.
-                let mut failures: Vec<String> = Vec::new();
-                if wants(&stages, ExperimentStage::Services)
-                    && let Err(e) = svc
-                        .stage_services(&model, &yaml, dir.as_deref(), false, &p)
-                        .await
-                {
-                    failures.push(e);
-                }
-                if wants(&stages, ExperimentStage::SignalPlane)
-                    && let Err(e) = svc
-                        .stage_signal_plane(&model, dir.as_deref(), false, &p)
-                        .await
-                {
-                    failures.push(e);
-                }
-                if wants(&stages, ExperimentStage::Compute)
-                    && let Err(e) = svc
-                        .stage_nodes(NodeStage::Compute, &compute, false, &p)
-                        .await
-                {
-                    failures.push(e);
-                }
-                if wants(&stages, ExperimentStage::Zones)
-                    && let Err(e) = svc.stage_nodes(NodeStage::Zones, &zones, false, &p).await
-                {
-                    failures.push(e);
-                }
-                if wants(&stages, ExperimentStage::Gateway)
-                    && let Err(e) = svc.stage_gateway(&yaml, dir.as_deref(), false, &p).await
-                {
-                    failures.push(e);
-                }
-                if failures.is_empty() {
-                    Ok(format!("vehicle `{id}` down"))
-                } else {
-                    Err(format!(
-                        "vehicle `{id}` down with {} failure(s); the rest was torn down: {}",
-                        failures.len(),
-                        failures.join("; ")
-                    ))
-                }
-            })
-            .await;
+            .submit_with(
+                JobOpts::lifecycle(&req, format!("vehicle {id}")),
+                "vehicle.down",
+                move |p| async move {
+                    // Reverse order, best-effort — same reasoning as `ExperimentSvc::down`: a
+                    // teardown that stops at the first error strands whatever came after it.
+                    let mut failures: Vec<JobFailure> = Vec::new();
+                    if wants(&stages, ExperimentStage::Services)
+                        && let Err(e) = svc
+                            .stage_services(&model, &yaml, dir.as_deref(), false, &p)
+                            .await
+                    {
+                        failures.push(e);
+                    }
+                    if wants(&stages, ExperimentStage::SignalPlane)
+                        && let Err(e) = svc
+                            .stage_signal_plane(&model, dir.as_deref(), false, &p)
+                            .await
+                    {
+                        failures.push(e);
+                    }
+                    if wants(&stages, ExperimentStage::Compute)
+                        && let Err(e) = svc
+                            .stage_nodes(NodeStage::Compute, &compute, false, &p)
+                            .await
+                    {
+                        failures.push(e);
+                    }
+                    if wants(&stages, ExperimentStage::Zones)
+                        && let Err(e) = svc.stage_nodes(NodeStage::Zones, &zones, false, &p).await
+                    {
+                        failures.push(e);
+                    }
+                    if wants(&stages, ExperimentStage::Gateway)
+                        && let Err(e) = svc.stage_gateway(&yaml, dir.as_deref(), false, &p).await
+                    {
+                        failures.push(e);
+                    }
+                    if failures.is_empty() {
+                        Ok::<_, JobFailure>(format!("vehicle `{id}` down"))
+                    } else {
+                        Err(JobFailure::joined(
+                            format!(
+                                "vehicle `{id}` down with {} failure(s); the rest was torn down",
+                                failures.len()
+                            ),
+                            failures,
+                        ))
+                    }
+                },
+            )
+            .await?;
         Ok(Response::new(job))
     }
 
