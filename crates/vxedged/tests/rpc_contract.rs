@@ -1217,3 +1217,72 @@ async fn host_capabilities_cover_every_backend() {
     assert_eq!(caps.part_kinds, ["container", "bundle", "wasm"]);
     assert_eq!(caps.max_runs, 1);
 }
+
+#[tokio::test]
+async fn a_subscriber_resumes_after_the_last_event_it_saw() {
+    let daemon = Daemon::start();
+    let channel = daemon.channel().await;
+    let down = |channel: Channel| async move {
+        let job = SvcServiceClient::new(channel.clone())
+            .down(SvcDownRequest {
+                service_type: "ota".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        wait_for_job(channel, job.id).await;
+    };
+    let mut events = EventServiceClient::new(channel.clone());
+    let mut first = events
+        .subscribe(SubscribeRequest {
+            kinds: vec!["service".into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    down(channel.clone()).await;
+    let seen = first.message().await.unwrap().unwrap();
+    assert_eq!(
+        seen.kind, "service.down",
+        "a family name matches its events"
+    );
+    assert!(
+        seen.id.starts_with("evt-") && seen.id.matches('-').count() == 2,
+        "{}",
+        seen.id
+    );
+    drop(first);
+    // Missed while disconnected.
+    down(channel.clone()).await;
+    let mut resumed = events
+        .subscribe(SubscribeRequest {
+            kinds: vec!["service".into()],
+            after_id: seen.id.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let missed = tokio::time::timeout(Duration::from_secs(5), resumed.message())
+        .await
+        .expect("replayed from history")
+        .unwrap()
+        .unwrap();
+    assert_eq!(missed.kind, "service.down");
+    assert_ne!(missed.id, seen.id);
+}
+
+#[tokio::test]
+async fn a_cursor_the_daemon_never_issued_is_events_lost() {
+    let daemon = Daemon::start();
+    let refused = EventServiceClient::new(daemon.channel().await)
+        .subscribe(SubscribeRequest {
+            after_id: "evt-000000-00000000".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::OutOfRange);
+    assert_eq!(reason(&refused), "ERROR_REASON_EVENTS_LOST");
+}
