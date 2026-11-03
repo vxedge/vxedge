@@ -32,6 +32,15 @@ fn enums_serialize_by_name_and_fields_in_lower_camel_case() {
 }
 
 #[test]
+fn default_values_are_emitted_not_omitted() {
+    let v = serde_json::to_value(vxedge_api::v1::RunListResponse::default()).unwrap();
+    assert_eq!(v["runs"], serde_json::json!([]));
+    let v = serde_json::to_value(Job::default()).unwrap();
+    assert_eq!(v["state"], "JOB_STATE_UNSPECIFIED");
+    assert_eq!(v["error"], "");
+}
+
+#[test]
 fn json_round_trips() {
     let job = Job {
         id: "job-1-2".into(),
