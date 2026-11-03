@@ -74,6 +74,11 @@ All notable changes to this repo are documented here. Format follows
 
 - `Apply`, `Remove` and `PushImage` on `ZoneService` and `ComputeService`, which were never built.
 
+### Fixed
+
+- A staged `vehicle` or `experiment` verb is an exact duplicate only with the same stages. `up --stage gateway`
+  while a full `up` runs is refused as `BUSY` instead of being handed the full job. Found live.
+
 ## [0.4.1] - 2026-11-02
 
 A vehicle now outlives its daemon. Zone and compute verbs keep working after a daemon restart, a placed

@@ -581,6 +581,26 @@ fn signal_plane_member(
 
 /// Which stages a request asked for. Empty means all of them, which is what every caller that
 /// predates staging sends — so the default stays "the whole experiment".
+/// The lifecycle claim for a staged verb. The stages are part of it, so only an exact duplicate
+/// gets the running job: `up --stage gateway` while a full `up` runs is refused as busy instead
+/// of being handed a job that does more than it asked for.
+pub(crate) fn staged_target(base: String, stages: &[i32]) -> String {
+    if stages.is_empty() {
+        return base;
+    }
+    let mut names: Vec<&str> = stages
+        .iter()
+        .map(|s| {
+            ExperimentStage::try_from(*s)
+                .map(|st| st.as_str_name())
+                .unwrap_or("?")
+        })
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    format!("{base} [{}]", names.join(", "))
+}
+
 pub(crate) fn wants(stages: &[i32], stage: ExperimentStage) -> bool {
     stages.is_empty() || stages.contains(&(stage as i32))
 }
@@ -657,7 +677,7 @@ impl ExperimentService for ExperimentSvc {
             .handles
             .engine
             .submit_with(
-                JobOpts::lifecycle(&req, format!("experiment {id}")),
+                JobOpts::lifecycle(&req, staged_target(format!("experiment {id}"), &stages)),
                 "experiment.up",
                 move |p| async move {
                     let mut done: Vec<String> = Vec::new();
@@ -734,7 +754,7 @@ impl ExperimentService for ExperimentSvc {
             .handles
             .engine
             .submit_with(
-                JobOpts::lifecycle(&req, format!("experiment {id}")),
+                JobOpts::lifecycle(&req, staged_target(format!("experiment {id}"), &stages)),
                 "experiment.down",
                 move |p| async move {
                     // Reverse order, and **best-effort**: a teardown that stops at the first error
@@ -892,6 +912,33 @@ fn build_experiment_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_claim_names_the_stages_so_only_an_exact_duplicate_matches() {
+        let all = staged_target("vehicle car".into(), &[]);
+        assert_eq!(all, "vehicle car");
+        let gw = staged_target("vehicle car".into(), &[ExperimentStage::Gateway as i32]);
+        assert_ne!(
+            gw, all,
+            "a gateway-only up is not a duplicate of a full one"
+        );
+        let a = staged_target(
+            "vehicle car".into(),
+            &[
+                ExperimentStage::Zones as i32,
+                ExperimentStage::Gateway as i32,
+            ],
+        );
+        let b = staged_target(
+            "vehicle car".into(),
+            &[
+                ExperimentStage::Gateway as i32,
+                ExperimentStage::Zones as i32,
+                ExperimentStage::Gateway as i32,
+            ],
+        );
+        assert_eq!(a, b, "order and repeats do not matter");
+    }
 
     fn status(
         vxid: &str,
