@@ -12,6 +12,7 @@ repository.workspace = true
 vxedge-api = { workspace = true }
 vxedge-core = { workspace = true }
 tonic = { workspace = true }
+tonic-types = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 clap = { workspace = true }
@@ -21,5 +22,6 @@ sha2 = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+tonic-types = { workspace = true }
 tower = { workspace = true }
 hyper-util = { workspace = true }

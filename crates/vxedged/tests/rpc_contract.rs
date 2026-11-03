@@ -551,18 +551,7 @@ async fn rpcs_still_to_build_answer_unimplemented() {
 
     let daemon = Daemon::start();
     let channel = daemon.channel().await;
-    let mut jobs = JobServiceClient::new(channel.clone());
     let codes = [
-        jobs.list(vxedge_api::v1::JobListRequest::default())
-            .await
-            .map(|_| ())
-            .unwrap_err()
-            .code(),
-        jobs.cancel(vxedge_api::v1::JobCancelRequest::default())
-            .await
-            .map(|_| ())
-            .unwrap_err()
-            .code(),
         TrafficServiceClient::new(channel.clone())
             .status(vxedge_api::v1::TrafficStatusRequest::default())
             .await
@@ -582,7 +571,7 @@ async fn rpcs_still_to_build_answer_unimplemented() {
             .unwrap_err()
             .code(),
     ];
-    assert_eq!(codes, [Unimplemented; 5]);
+    assert_eq!(codes, [Unimplemented; 3]);
 }
 
 const ONE_OF_EACH: &str = r#"
@@ -923,4 +912,107 @@ async fn a_stage_the_daemon_does_not_know_is_refused() {
             .unwrap_err();
         assert_eq!(refused.code(), tonic::Code::InvalidArgument, "{refused:?}");
     }
+}
+
+/// The `ErrorInfo.reason` a refusal carries, and its domain.
+fn reason(status: &tonic::Status) -> String {
+    use tonic_types::StatusExt;
+    let info = status
+        .get_error_details()
+        .error_info()
+        .cloned()
+        .unwrap_or_else(|| panic!("no ErrorInfo on {status:?}"));
+    assert_eq!(info.domain, "vxedge.v1");
+    info.reason
+}
+
+#[tokio::test]
+async fn refusals_carry_a_reason_an_agent_can_branch_on() {
+    let (active, id) = experiment_workspace();
+    let (other, _) = experiment_workspace();
+    let daemon = Daemon::start_with(|run| write_run_record(run, &id, &active, "run-a"));
+    let channel = daemon.channel().await;
+    let wrong = ExperimentServiceClient::new(channel.clone())
+        .status(ExperimentStatusRequest {
+            manifest: path_ref(&other),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&wrong), "ERROR_REASON_WRONG_WORKSPACE");
+    let unknown = SvcServiceClient::new(channel.clone())
+        .status(SvcStatusRequest {
+            service_type: "bogus".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&unknown), "ERROR_REASON_UNKNOWN_SERVICE_TYPE");
+    let mismatch = ZoneServiceClient::new(channel.clone())
+        .list(ZoneListRequest {
+            run: Some(RunRef {
+                run_id: "run-b".into(),
+            }),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&mismatch), "ERROR_REASON_RUN_MISMATCH");
+    let job = JobServiceClient::new(channel)
+        .get(GetJobRequest {
+            id: "job-000000-000000".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(job.code(), tonic::Code::NotFound);
+    assert_eq!(reason(&job), "ERROR_REASON_JOB_UNKNOWN");
+}
+
+#[tokio::test]
+async fn nothing_active_is_its_own_reason() {
+    let daemon = Daemon::start();
+    let refused = ZoneServiceClient::new(daemon.channel().await)
+        .list(ZoneListRequest::default())
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&refused), "ERROR_REASON_NO_ACTIVE_RUN");
+}
+
+#[tokio::test]
+async fn jobs_are_listed_and_a_finished_one_cannot_be_cancelled() {
+    let daemon = Daemon::start();
+    let channel = daemon.channel().await;
+    let job = SvcServiceClient::new(channel.clone())
+        .down(SvcDownRequest {
+            service_type: "ota".into(),
+            experiment: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    wait_for_job(channel.clone(), job.id.clone()).await;
+    let mut jobs = JobServiceClient::new(channel);
+    let listed = jobs
+        .list(vxedge_api::v1::JobListRequest {
+            kind: "svc.down".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed.jobs.len(), 1);
+    assert_eq!(listed.jobs[0].id, job.id);
+    let none = jobs
+        .list(vxedge_api::v1::JobListRequest {
+            kind: "vehicle.up".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(none.jobs.is_empty());
+    let refused = jobs
+        .cancel(vxedge_api::v1::JobCancelRequest { id: job.id })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&refused), "ERROR_REASON_NOT_CANCELLABLE");
 }

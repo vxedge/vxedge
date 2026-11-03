@@ -109,14 +109,19 @@ pub(crate) fn preflight_requires(dir: Option<&std::path::Path>) -> Result<(), St
             &found.package.id,
             &vxedge_core::package::HostCapabilities::probe(),
         )
-        .map_err(|e| Status::failed_precondition(e.to_string()))
+        .map_err(|e| {
+            crate::errors::precondition(crate::errors::R::HostRequirementUnmet, e.to_string())
+        })
 }
 
 pub(crate) async fn resolve_manifest(
     mref: Option<&ManifestRef>,
 ) -> Result<(String, String, Option<PathBuf>), Status> {
     let mref = mref.ok_or_else(|| {
-        Status::invalid_argument("a manifest is required (pass --manifest <path> on the CLI)")
+        crate::errors::invalid(
+            crate::errors::R::InvalidRequest,
+            "a manifest is required (pass --manifest <path> on the CLI)",
+        )
     })?;
     let (yaml, dir) = match &mref.source {
         Some(Source::Path(path)) if PathBuf::from(path).is_dir() => {
@@ -124,9 +129,10 @@ pub(crate) async fn resolve_manifest(
         }
         Some(Source::Path(path)) => {
             let yaml = tokio::fs::read_to_string(path).await.map_err(|e| {
-                Status::invalid_argument(format!(
-                    "cannot read manifest `{path}` on the daemon host: {e}"
-                ))
+                crate::errors::invalid(
+                    crate::errors::R::WorkspaceInvalid,
+                    format!("cannot read manifest `{path}` on the daemon host: {e}"),
+                )
             })?;
             (yaml, PathBuf::from(path).parent().map(PathBuf::from))
         }
@@ -140,7 +146,8 @@ pub(crate) async fn resolve_manifest(
             (yaml.clone(), dir)
         }
         None => {
-            return Err(Status::invalid_argument(
+            return Err(crate::errors::invalid(
+                crate::errors::R::InvalidRequest,
                 "manifest has no source (path or inline_yaml)",
             ));
         }
@@ -151,15 +158,21 @@ pub(crate) async fn resolve_manifest(
     // manifest has no directory, so it falls back to hashing what it was actually given.
     let sha256 = match &dir {
         Some(root) => Workspace::content_sha256(root).map_err(|e| {
-            Status::invalid_argument(format!("workspace `{}`: {e}", root.display()))
+            crate::errors::invalid(
+                crate::errors::R::WorkspaceInvalid,
+                format!("workspace `{}`: {e}", root.display()),
+            )
         })?,
         None => hex::encode(sha2::Sha256::digest(yaml.as_bytes())),
     };
     if !mref.sha256.is_empty() && mref.sha256 != sha256 {
-        return Err(Status::failed_precondition(format!(
-            "manifest checksum mismatch: expected {}, got {sha256}",
-            mref.sha256
-        )));
+        return Err(crate::errors::precondition(
+            crate::errors::R::ChecksumMismatch,
+            format!(
+                "manifest checksum mismatch: expected {}, got {sha256}",
+                mref.sha256
+            ),
+        ));
     }
     Ok((yaml, sha256, dir))
 }
@@ -178,8 +191,12 @@ pub(crate) async fn resolve_manifest(
 pub(crate) async fn read_workspace(dir: &str) -> Result<String, Status> {
     let root = PathBuf::from(dir);
     tokio::task::spawn_blocking(move || {
-        let bad =
-            |e: String| Status::invalid_argument(format!("workspace `{}`: {e}", root.display()));
+        let bad = |e: String| {
+            crate::errors::invalid(
+                crate::errors::R::WorkspaceInvalid,
+                format!("workspace `{}`: {e}", root.display()),
+            )
+        };
         let mut paths: Vec<PathBuf> = std::fs::read_dir(&root)
             .map_err(|e| bad(e.to_string()))?
             .filter_map(|e| e.ok().map(|e| e.path()))
@@ -207,7 +224,7 @@ pub(crate) async fn read_workspace(dir: &str) -> Result<String, Status> {
     .map_err(|e| Status::internal(format!("workspace task panicked: {e}")))?
 }
 
-mod hex {
+pub(crate) mod hex {
     pub fn encode(bytes: impl AsRef<[u8]>) -> String {
         bytes.as_ref().iter().map(|b| format!("{b:02x}")).collect()
     }
@@ -229,14 +246,24 @@ fn parse_and_fiveg_plan(yaml: &str) -> Result<FiveGPlan, String> {
 }
 
 /// Run a blocking gateway operation off the async runtime.
-async fn blocking<T, F>(work: F) -> Result<T, String>
+async fn blocking<T, E, F>(work: F) -> Result<T, E>
 where
     T: Send + 'static,
-    F: FnOnce() -> Result<T, String> + Send + 'static,
+    E: From<String> + Send + 'static,
+    F: FnOnce() -> Result<T, E> + Send + 'static,
 {
     tokio::task::spawn_blocking(work)
         .await
-        .map_err(|e| format!("gateway task panicked: {e}"))?
+        .map_err(|e| E::from(format!("gateway task panicked: {e}")))?
+}
+
+/// A zone backend error as a job failure, keeping the reason an agent can act on.
+fn zone_failure(e: zones::backend::ZoneBackendError) -> crate::jobs::JobFailure {
+    let reason = match e {
+        zones::backend::ZoneBackendError::PortGone { .. } => crate::errors::R::NodePortGone,
+        _ => crate::errors::R::Unspecified,
+    };
+    crate::jobs::JobFailure::new(reason, e.to_string())
 }
 
 #[derive(Clone, Copy)]
@@ -308,15 +335,18 @@ pub(crate) fn require_run(run: Option<&RunRef>, runtime_dir: &Path) -> Result<()
     };
     match active_run(runtime_dir) {
         Some(record) if record.run_id() == wanted.run_id => Ok(()),
-        Some(record) => Err(Status::failed_precondition(format!(
-            "run `{}` is not the active one, `{}`",
-            wanted.run_id,
-            record.run_id()
-        ))),
-        None => Err(Status::failed_precondition(format!(
-            "run `{}` is not active: nothing is",
-            wanted.run_id
-        ))),
+        Some(record) => Err(crate::errors::precondition(
+            crate::errors::R::RunMismatch,
+            format!(
+                "run `{}` is not the active one, `{}`",
+                wanted.run_id,
+                record.run_id()
+            ),
+        )),
+        None => Err(crate::errors::precondition(
+            crate::errors::R::NoActiveRun,
+            format!("run `{}` is not active: nothing is", wanted.run_id),
+        )),
     }
 }
 
@@ -386,13 +416,17 @@ pub(crate) async fn restore_active(
     if !present {
         return Ok(());
     }
-    let refuse = |e: String| {
-        Status::failed_precondition(format!(
-            "`{}` is active from {}, but that workspace cannot be restored: {e}",
-            record.id,
-            record.dir.display()
-        ))
+    let refuse_as = |reason, e: String| {
+        crate::errors::precondition(
+            reason,
+            format!(
+                "`{}` is active from {}, but that workspace cannot be restored: {e}",
+                record.id,
+                record.dir.display()
+            ),
+        )
     };
+    let refuse = |e: String| refuse_as(crate::errors::R::WorkspaceInvalid, e);
     let mref = ManifestRef {
         source: Some(Source::Path(record.dir.display().to_string())),
         ..Default::default()
@@ -401,7 +435,10 @@ pub(crate) async fn restore_active(
         .await
         .map_err(|e| refuse(e.message().to_string()))?;
     if record.sha256.as_ref().is_some_and(|s| *s != sha256) {
-        return Err(refuse("it has changed since `up`".to_string()));
+        return Err(refuse_as(
+            crate::errors::R::WorkspaceChanged,
+            "it has changed since `up`".to_string(),
+        ));
     }
     let model =
         vxedge_core::model::load_workspace_yaml(&yaml).map_err(|e| refuse(e.to_string()))?;
@@ -467,6 +504,7 @@ impl GatewaySvc {
 
     async fn lifecycle_job(
         &self,
+        opts: crate::jobs::JobOpts,
         rpc: &'static str,
         kind: &'static str,
         mref: Option<&ManifestRef>,
@@ -482,7 +520,7 @@ impl GatewaySvc {
         let events = self.engine.events().clone();
         let job = self
             .engine
-            .submit(kind, move |p| async move {
+            .submit_with(opts, kind, move |p| async move {
                 p.update(10, "parsing workspace");
                 // Built once, here, and kept: every verb downstream reads the model rather
                 // than re-deriving it from the document.
@@ -778,7 +816,7 @@ impl GatewaySvc {
                     }
                 }
             })
-            .await;
+            .await?;
         Ok(Response::new(job))
     }
 }
@@ -787,6 +825,7 @@ impl GatewaySvc {
 impl GatewayService for GatewaySvc {
     async fn apply(&self, req: Request<GatewayApplyRequest>) -> Result<Response<Job>, Status> {
         self.lifecycle_job(
+            crate::jobs::JobOpts::lifecycle(&req, "vxgateway"),
             "GatewayService.Apply",
             "gateway.apply",
             req.get_ref().manifest.as_ref(),
@@ -797,6 +836,7 @@ impl GatewayService for GatewaySvc {
 
     async fn up(&self, req: Request<GatewayUpRequest>) -> Result<Response<Job>, Status> {
         self.lifecycle_job(
+            crate::jobs::JobOpts::lifecycle(&req, "vxgateway"),
             "GatewayService.Up",
             "gateway.up",
             req.get_ref().manifest.as_ref(),
@@ -807,6 +847,7 @@ impl GatewayService for GatewaySvc {
 
     async fn down(&self, req: Request<GatewayDownRequest>) -> Result<Response<Job>, Status> {
         self.lifecycle_job(
+            crate::jobs::JobOpts::lifecycle(&req, "vxgateway"),
             "GatewayService.Down",
             "gateway.down",
             req.get_ref().manifest.as_ref(),
@@ -1023,11 +1064,9 @@ impl GatewaySvc {
         let mut slices = slices;
         let (mut state, mut detail) = (state, detail);
         if let Some(fp) = fiveg_plan {
-            let client = self
-                .containers
-                .get()
-                .await
-                .map_err(|e| Status::unavailable(e.to_string()))?;
+            let client = self.containers.get().await.map_err(|e| {
+                crate::errors::unavailable(crate::errors::R::BackendUnavailable, e.to_string())
+            })?;
             let fstatus = fiveg::fiveg_status(client, &FiveGLifecycleConfig::default())
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?;
@@ -1089,12 +1128,51 @@ pub struct JobSvc {
 impl JobService for JobSvc {
     type WatchStream = Pin<Box<dyn Stream<Item = Result<Job, Status>> + Send>>;
 
-    async fn list(&self, _: Request<JobListRequest>) -> Result<Response<JobListResponse>, Status> {
-        Err(Status::unimplemented("JobService.List: not built yet"))
+    async fn list(
+        &self,
+        req: Request<JobListRequest>,
+    ) -> Result<Response<JobListResponse>, Status> {
+        let req = req.into_inner();
+        let offset = if req.page_token.is_empty() {
+            0
+        } else {
+            req.page_token.parse::<usize>().map_err(|_| {
+                crate::errors::invalid(
+                    crate::errors::R::InvalidRequest,
+                    format!(
+                        "page_token `{}` is not one this daemon issued",
+                        req.page_token
+                    ),
+                )
+            })?
+        };
+        let limit = match req.page_size {
+            0 => 50,
+            n => (n as usize).min(500),
+        };
+        let filter = crate::jobs::JobFilter {
+            states: req.states,
+            kind: req.kind,
+            run_id: req.run.map(|r| r.run_id).unwrap_or_default(),
+            parent: req.parent_job_id,
+        };
+        let (jobs, more) = self.engine.list(&filter, offset, limit).await;
+        let next_page_token = if more {
+            (offset + limit).to_string()
+        } else {
+            String::new()
+        };
+        Ok(Response::new(JobListResponse {
+            jobs,
+            next_page_token,
+        }))
     }
 
-    async fn cancel(&self, _: Request<JobCancelRequest>) -> Result<Response<Job>, Status> {
-        Err(Status::unimplemented("JobService.Cancel: not built yet"))
+    async fn cancel(&self, req: Request<JobCancelRequest>) -> Result<Response<Job>, Status> {
+        self.engine
+            .cancel(&req.get_ref().id)
+            .await
+            .map(Response::new)
     }
 
     async fn get(&self, req: Request<GetJobRequest>) -> Result<Response<Job>, Status> {
@@ -1103,7 +1181,7 @@ impl JobService for JobSvc {
             .get(id)
             .await
             .map(Response::new)
-            .ok_or_else(|| Status::not_found(format!("unknown job `{id}`")))
+            .ok_or_else(|| crate::jobs::unknown_job(id))
     }
 
     async fn watch(
@@ -1115,7 +1193,7 @@ impl JobService for JobSvc {
             .engine
             .watch(&id)
             .await
-            .ok_or_else(|| Status::not_found(format!("unknown job `{id}`")))?;
+            .ok_or_else(|| crate::jobs::unknown_job(&id))?;
 
         let (tx, out) = tokio::sync::mpsc::channel::<Result<Job, Status>>(16);
         tokio::spawn(async move {
@@ -1188,7 +1266,8 @@ impl ZoneSvc {
         let (model, dir, gateway) = match (&st.active, &st.gateway) {
             (Some(a), Some(g)) => (a.model.clone(), a.dir.clone(), g.clone()),
             _ => {
-                return Err(Status::failed_precondition(
+                return Err(crate::errors::precondition(
+                    crate::errors::R::NoActiveRun,
                     "nothing active: zone verbs act on the topology the gateway registered, so \
                      bring one up first (`vxedge experiment up` or `vxedge vehicle up`)",
                 ));
@@ -1213,16 +1292,20 @@ impl ZoneSvc {
         if let Some(z) = zone_vxid
             && filtered.is_empty()
         {
-            return Err(Status::not_found(format!(
-                "no zone or device `{z}` in the active workspace (hpc devices answer to `vxedge \
+            return Err(crate::errors::not_found(
+                crate::errors::R::NotFound,
+                format!(
+                    "no zone or device `{z}` in the active workspace (hpc devices answer to `vxedge \
                  compute`)"
-            )));
+                ),
+            ));
         }
         Ok(filtered)
     }
 
     async fn lifecycle(
         &self,
+        opts: crate::jobs::JobOpts,
         rpc: &'static str,
         kind: &'static str,
         vxid: String,
@@ -1249,9 +1332,10 @@ impl ZoneSvc {
         let events = self.engine.events().clone();
         let job = self
             .engine
-            .submit(kind, move |p| async move {
+            .submit_with(opts, kind, move |p| async move {
                 let total = plans.len();
                 for (i, np) in plans.iter().enumerate() {
+                    p.checkpoint()?;
                     let pct = 10 + (i as u32 * 80) / total as u32;
                     p.update(
                         pct,
@@ -1270,9 +1354,9 @@ impl ZoneSvc {
                     let node = np.clone();
                     blocking(move || {
                         if up {
-                            zones::node_up(&sh, &node, &rd, &cd).map_err(|e| e.to_string())
+                            zones::node_up(&sh, &node, &rd, &cd).map_err(zone_failure)
                         } else {
-                            zones::node_down(&sh, &node, &rd).map_err(|e| e.to_string())
+                            zones::node_down(&sh, &node, &rd).map_err(zone_failure)
                         }
                     })
                     .await?;
@@ -1292,7 +1376,7 @@ impl ZoneSvc {
                 let sh = shell.clone();
                 let rd = runtime_dir.clone();
                 let verify = plans.clone();
-                let wrong: Vec<String> = blocking(move || {
+                let wrong: Vec<String> = blocking::<_, String, _>(move || {
                     Ok(verify
                         .iter()
                         .filter(|np| {
@@ -1304,18 +1388,18 @@ impl ZoneSvc {
                 })
                 .await?;
                 if !wrong.is_empty() {
-                    return Err(format!(
+                    return Err(crate::jobs::JobFailure::from(format!(
                         "verification failed — nodes not {}: {}",
                         if up { "up" } else { "down" },
                         wrong.join(", ")
-                    ));
+                    )));
                 }
-                Ok(format!(
+                Ok::<_, crate::jobs::JobFailure>(format!(
                     "zone `{vxid}` {}: {total} node(s)",
                     if up { "up" } else { "down" }
                 ))
             })
-            .await;
+            .await?;
         Ok(Response::new(job))
     }
 }
@@ -1331,24 +1415,38 @@ impl ZoneService for ZoneSvc {
     async fn up(&self, req: Request<ZoneUpRequest>) -> Result<Response<Job>, Status> {
         require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
         let vxid = req
-            .into_inner()
+            .get_ref()
             .r#ref
-            .map(|r| r.vxid)
+            .as_ref()
+            .map(|r| r.vxid.clone())
             .filter(|v| !v.is_empty())
-            .ok_or_else(|| Status::invalid_argument("--vxid <zone id> is required"))?;
-        self.lifecycle("ZoneService.Up", "zone.up", vxid, true)
+            .ok_or_else(|| {
+                crate::errors::invalid(
+                    crate::errors::R::InvalidRequest,
+                    "--vxid <zone id> is required",
+                )
+            })?;
+        let opts = crate::jobs::JobOpts::lifecycle(&req, format!("zone {vxid}"));
+        self.lifecycle(opts, "ZoneService.Up", "zone.up", vxid, true)
             .await
     }
 
     async fn down(&self, req: Request<ZoneDownRequest>) -> Result<Response<Job>, Status> {
         require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
         let vxid = req
-            .into_inner()
+            .get_ref()
             .r#ref
-            .map(|r| r.vxid)
+            .as_ref()
+            .map(|r| r.vxid.clone())
             .filter(|v| !v.is_empty())
-            .ok_or_else(|| Status::invalid_argument("--vxid <zone id> is required"))?;
-        self.lifecycle("ZoneService.Down", "zone.down", vxid, false)
+            .ok_or_else(|| {
+                crate::errors::invalid(
+                    crate::errors::R::InvalidRequest,
+                    "--vxid <zone id> is required",
+                )
+            })?;
+        let opts = crate::jobs::JobOpts::lifecycle(&req, format!("zone {vxid}"));
+        self.lifecycle(opts, "ZoneService.Down", "zone.down", vxid, false)
             .await
     }
 
@@ -1423,7 +1521,8 @@ impl ComputeSvc {
         let (model, dir, gateway) = match (&st.active, &st.gateway) {
             (Some(a), Some(g)) => (a.model.clone(), a.dir.clone(), g.clone()),
             _ => {
-                return Err(Status::failed_precondition(
+                return Err(crate::errors::precondition(
+                    crate::errors::R::NoActiveRun,
                     "nothing active: compute verbs act on the topology the gateway registered, \
                      so bring one up first (`vxedge experiment up` or `vxedge vehicle up`)",
                 ));
@@ -1440,15 +1539,17 @@ impl ComputeSvc {
         if let Some(v) = vxid
             && compute.is_empty()
         {
-            return Err(Status::not_found(format!(
-                "no compute (hpc-role) device `{v}` in the active workspace"
-            )));
+            return Err(crate::errors::not_found(
+                crate::errors::R::NotFound,
+                format!("no compute (hpc-role) device `{v}` in the active workspace"),
+            ));
         }
         Ok(compute)
     }
 
     async fn lifecycle(
         &self,
+        opts: crate::jobs::JobOpts,
         rpc: &'static str,
         kind: &'static str,
         vxid: String,
@@ -1473,9 +1574,10 @@ impl ComputeSvc {
         let events = self.engine.events().clone();
         let job = self
             .engine
-            .submit(kind, move |p| async move {
+            .submit_with(opts, kind, move |p| async move {
                 let total = plans.len();
                 for (i, np) in plans.iter().enumerate() {
+                    p.checkpoint()?;
                     let pct = 10 + (i as u32 * 80) / total as u32;
                     p.update(
                         pct,
@@ -1494,9 +1596,9 @@ impl ComputeSvc {
                     let node = np.clone();
                     blocking(move || {
                         if up {
-                            zones::node_up(&sh, &node, &rd, &cd).map_err(|e| e.to_string())
+                            zones::node_up(&sh, &node, &rd, &cd).map_err(zone_failure)
                         } else {
-                            zones::node_down(&sh, &node, &rd).map_err(|e| e.to_string())
+                            zones::node_down(&sh, &node, &rd).map_err(zone_failure)
                         }
                     })
                     .await?;
@@ -1513,7 +1615,7 @@ impl ComputeSvc {
                 let sh = shell.clone();
                 let rd = runtime_dir.clone();
                 let verify = plans.clone();
-                let wrong: Vec<String> = blocking(move || {
+                let wrong: Vec<String> = blocking::<_, String, _>(move || {
                     Ok(verify
                         .iter()
                         .filter(|np| {
@@ -1525,18 +1627,18 @@ impl ComputeSvc {
                 })
                 .await?;
                 if !wrong.is_empty() {
-                    return Err(format!(
+                    return Err(crate::jobs::JobFailure::from(format!(
                         "verification failed — nodes not {}: {}",
                         if up { "up" } else { "down" },
                         wrong.join(", ")
-                    ));
+                    )));
                 }
-                Ok(format!(
+                Ok::<_, crate::jobs::JobFailure>(format!(
                     "compute `{vxid}` {}: {total} node(s)",
                     if up { "up" } else { "down" }
                 ))
             })
-            .await;
+            .await?;
         Ok(Response::new(job))
     }
 }
@@ -1552,24 +1654,38 @@ impl ComputeService for ComputeSvc {
     async fn up(&self, req: Request<ComputeUpRequest>) -> Result<Response<Job>, Status> {
         require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
         let vxid = req
-            .into_inner()
+            .get_ref()
             .r#ref
-            .map(|r| r.vxid)
+            .as_ref()
+            .map(|r| r.vxid.clone())
             .filter(|v| !v.is_empty())
-            .ok_or_else(|| Status::invalid_argument("--vxid <compute node id> is required"))?;
-        self.lifecycle("ComputeService.Up", "compute.up", vxid, true)
+            .ok_or_else(|| {
+                crate::errors::invalid(
+                    crate::errors::R::InvalidRequest,
+                    "--vxid <compute node id> is required",
+                )
+            })?;
+        let opts = crate::jobs::JobOpts::lifecycle(&req, format!("compute {vxid}"));
+        self.lifecycle(opts, "ComputeService.Up", "compute.up", vxid, true)
             .await
     }
 
     async fn down(&self, req: Request<ComputeDownRequest>) -> Result<Response<Job>, Status> {
         require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
         let vxid = req
-            .into_inner()
+            .get_ref()
             .r#ref
-            .map(|r| r.vxid)
+            .as_ref()
+            .map(|r| r.vxid.clone())
             .filter(|v| !v.is_empty())
-            .ok_or_else(|| Status::invalid_argument("--vxid <compute node id> is required"))?;
-        self.lifecycle("ComputeService.Down", "compute.down", vxid, false)
+            .ok_or_else(|| {
+                crate::errors::invalid(
+                    crate::errors::R::InvalidRequest,
+                    "--vxid <compute node id> is required",
+                )
+            })?;
+        let opts = crate::jobs::JobOpts::lifecycle(&req, format!("compute {vxid}"));
+        self.lifecycle(opts, "ComputeService.Down", "compute.down", vxid, false)
             .await
     }
 
@@ -1616,12 +1732,16 @@ impl ComputeService for ComputeSvc {
 /// unparsed `bogus` would read as a stopped service instead of a nonexistent one.
 fn parse_service_type(raw: &str) -> Result<vxedge_core::services::ServiceType, Status> {
     if raw.is_empty() {
-        return Err(Status::invalid_argument(format!(
-            "service_type is required ({})",
-            vxedge_core::services::ServiceType::expected()
-        )));
+        return Err(crate::errors::invalid(
+            crate::errors::R::UnknownServiceType,
+            format!(
+                "service_type is required ({})",
+                vxedge_core::services::ServiceType::expected()
+            ),
+        ));
     }
-    raw.parse().map_err(Status::invalid_argument)
+    raw.parse()
+        .map_err(|e| crate::errors::invalid(crate::errors::R::UnknownServiceType, e))
 }
 
 pub struct SvcSvc {
@@ -1648,14 +1768,21 @@ impl SvcSvc {
         // declares, and saying so beats "no `bogus` service declared" or "a manifest is required".
         let service_type = parse_service_type(service_type)?.as_str();
         let (yaml, sha256, dir) = resolve_manifest(experiment).await?;
-        let model = vxedge_core::model::load_workspace_yaml(&yaml)
-            .map_err(|e| Status::invalid_argument(format!("workspace invalid: {e}")))?;
+        let model = vxedge_core::model::load_workspace_yaml(&yaml).map_err(|e| {
+            crate::errors::invalid(
+                crate::errors::R::WorkspaceInvalid,
+                format!("workspace invalid: {e}"),
+            )
+        })?;
         let def = vxedge_core::services::ServiceDef::find(&model, service_type)
             .cloned()
             .ok_or_else(|| {
-                Status::not_found(format!(
-                    "no `{service_type}` service declared under `services` in this workspace"
-                ))
+                crate::errors::not_found(
+                    crate::errors::R::NotFound,
+                    format!(
+                        "no `{service_type}` service declared under `services` in this workspace"
+                    ),
+                )
             })?;
         // The workspace dir travels with the def: a telemetry service reads its scrape targets
         // from the workspace rather than from its own config, so the backend needs to know
@@ -1666,7 +1793,8 @@ impl SvcSvc {
         let node = match &def.on {
             None => None,
             Some(on) => {
-                let refuse = |e: String| Status::failed_precondition(e);
+                let refuse =
+                    |e: String| crate::errors::precondition(crate::errors::R::WorkspaceInvalid, e);
                 let gateway = GatewayPlan::from_model(&model).map_err(|e| refuse(e.to_string()))?;
                 let plans = zones::plan_nodes_from_model(&model, &gateway, &workspace_dir)
                     .map_err(|e| refuse(e.to_string()))?;
@@ -1734,6 +1862,8 @@ struct DeclaredService {
 impl SvcService for SvcSvc {
     async fn up(&self, req: Request<SvcUpRequest>) -> Result<Response<Job>, Status> {
         require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
+        let opts =
+            crate::jobs::JobOpts::lifecycle(&req, format!("svc {}", req.get_ref().service_type));
         let req = req.into_inner();
         let declared = self
             .service_def(&req.service_type, req.experiment.as_ref())
@@ -1749,7 +1879,7 @@ impl SvcService for SvcSvc {
         let events = self.engine.events().clone();
         let job = self
             .engine
-            .submit("svc.up", move |p| async move {
+            .submit_with(opts, "svc.up", move |p| async move {
                 p.update(30, &format!("starting {service_type} service"));
                 let DeclaredService {
                     def,
@@ -1757,10 +1887,18 @@ impl SvcService for SvcSvc {
                     workspace_dir,
                     ..
                 } = declared;
-                let msg = blocking(move || match node {
-                    Some(np) => {
-                        let spec = vxedge_core::services::placed_spec(&def, &workspace_dir)
-                            .map_err(|e| e.to_string())?;
+                let probe = match &node {
+                    Some(np) => Some((
+                        np.clone(),
+                        vxedge_core::services::placed_spec(&def, &workspace_dir)
+                            .map_err(|e| e.to_string())?,
+                    )),
+                    None => None,
+                };
+                let (watched, watched_dir, watched_type) =
+                    (probe.clone(), runtime_dir.clone(), service_type.clone());
+                let msg = blocking(move || match probe {
+                    Some((np, spec)) => {
                         zones::member_up(&shell, &np, &runtime_dir, &spec)
                             .map_err(|e| e.to_string())?;
                         Ok(format!(
@@ -1775,20 +1913,48 @@ impl SvcService for SvcSvc {
                     }
                 })
                 .await?;
+                // Started is not running: a service that rejects its arguments exits at once.
+                let running = || {
+                    let (probe, dir, ty) =
+                        (watched.clone(), watched_dir.clone(), watched_type.clone());
+                    async move {
+                        tokio::task::spawn_blocking(move || match probe {
+                            Some((np, spec)) => {
+                                zones::member_status(&np, &spec)
+                                    == vxedge_core::zones::backend::NodeState::Up
+                            }
+                            None => {
+                                vxedge_core::services::svc_status(&dir, &ty)
+                                    == vxedge_core::services::SvcState::Up
+                            }
+                        })
+                        .await
+                        .unwrap_or(false)
+                    }
+                };
+                crate::jobs::start_then_confirm(
+                    async { Ok(()) },
+                    running,
+                    crate::jobs::START_WINDOW,
+                )
+                .await
+                .map_err(|e| format!("{service_type} service {e}"))?;
                 events.emit(
                     crate::events::EventKind::ServiceUp,
                     &format!("svc-{service_type}"),
                     &msg,
                 );
                 p.update(100, &msg);
-                Ok(msg)
+                Ok::<_, crate::jobs::JobFailure>(msg)
             })
-            .await;
+            .await?;
         Ok(Response::new(job))
     }
 
     async fn down(&self, req: Request<SvcDownRequest>) -> Result<Response<Job>, Status> {
         require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
+        let opts =
+            crate::jobs::JobOpts::lifecycle(&req, format!("svc {}", req.get_ref().service_type));
         let req = req.into_inner();
         parse_service_type(&req.service_type)?;
         // A workspace that no longer reads, or declares no such service, leaves the host path:
@@ -1806,7 +1972,7 @@ impl SvcService for SvcSvc {
         let service_type_for_event = service_type.clone();
         let job = self
             .engine
-            .submit("svc.down", move |p| async move {
+            .submit_with(opts, "svc.down", move |p| async move {
                 p.update(50, &format!("stopping {service_type} service"));
                 let msg = blocking(move || match placed {
                     Some((np, spec)) => {
@@ -1826,9 +1992,9 @@ impl SvcService for SvcSvc {
                     &msg,
                 );
                 p.update(100, &msg);
-                Ok(msg)
+                Ok::<_, crate::jobs::JobFailure>(msg)
             })
-            .await;
+            .await?;
         Ok(Response::new(job))
     }
 
@@ -1910,17 +2076,34 @@ impl TrafficSvc {
         mref: Option<&ManifestRef>,
     ) -> Result<(TrafficPlan, Option<FiveGPlan>, String, u64), Status> {
         let (yaml, sha256, _dir) = resolve_manifest(mref).await?;
-        let model = parse_to_model(&yaml)
-            .map_err(|e| Status::invalid_argument(format!("manifest invalid: {e}")))?;
-        let gateway_plan = GatewayPlan::from_model(&model)
-            .map_err(|e| Status::invalid_argument(format!("gateway plan: {e}")))?;
+        let model = parse_to_model(&yaml).map_err(|e| {
+            crate::errors::invalid(
+                crate::errors::R::WorkspaceInvalid,
+                format!("manifest invalid: {e}"),
+            )
+        })?;
+        let gateway_plan = GatewayPlan::from_model(&model).map_err(|e| {
+            crate::errors::invalid(
+                crate::errors::R::WorkspaceInvalid,
+                format!("gateway plan: {e}"),
+            )
+        })?;
         let five_g_plan = match FiveGPlan::from_model(&model) {
             Ok(p) => Some(p),
             Err(fiveg::FiveGPlanError::NoSnssaiSlices) => None,
-            Err(e) => return Err(Status::invalid_argument(format!("fiveg plan: {e}"))),
+            Err(e) => {
+                return Err(crate::errors::invalid(
+                    crate::errors::R::WorkspaceInvalid,
+                    format!("fiveg plan: {e}"),
+                ));
+            }
         };
-        let traffic_plan = TrafficPlan::from_model(&model, &gateway_plan)
-            .map_err(|e| Status::invalid_argument(format!("traffic plan: {e}")))?;
+        let traffic_plan = TrafficPlan::from_model(&model, &gateway_plan).map_err(|e| {
+            crate::errors::invalid(
+                crate::errors::R::WorkspaceInvalid,
+                format!("traffic plan: {e}"),
+            )
+        })?;
         // `experiment.duration_s` is the manifest's own probe/load-window
         // knob (already used for `results_prefix`-adjacent metadata
         // elsewhere) — reused here as the run duration handed to
@@ -1943,7 +2126,8 @@ fn select_profiles(
         .filter(|p| requested.is_empty() || requested.contains(&p.id))
         .collect();
     if selected.is_empty() {
-        return Err(Status::not_found(
+        return Err(crate::errors::not_found(
+            crate::errors::R::NotFound,
             "no matching traffic_profiles in this manifest (check `profiles` filter and \
              `network.slices`/`traffic_profiles` in the manifest itself)",
         ));
@@ -1964,6 +2148,7 @@ impl TrafficService for TrafficSvc {
 
     async fn up(&self, req: Request<TrafficUpRequest>) -> Result<Response<Job>, Status> {
         require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
+        let opts = crate::jobs::JobOpts::request(&req, &req.get_ref().request_id);
         let req = req.into_inner();
         let (traffic_plan, five_g_plan, sha256, duration_s) =
             self.resolve_plans(req.manifest.as_ref()).await?;
@@ -1981,7 +2166,7 @@ impl TrafficService for TrafficSvc {
         let events = self.engine.events().clone();
         let job = self
             .engine
-            .submit("traffic.up", move |p| async move {
+            .submit_with(opts, "traffic.up", move |p| async move {
                 let total = selected.len().max(1);
                 let mut messages = Vec::with_capacity(selected.len());
                 for (i, profile) in selected.into_iter().enumerate() {
@@ -2009,9 +2194,9 @@ impl TrafficService for TrafficSvc {
                     messages.push(msg);
                 }
                 p.update(100, "all traffic profiles up");
-                Ok(messages.join("; "))
+                Ok::<_, crate::jobs::JobFailure>(messages.join("; "))
             })
-            .await;
+            .await?;
         Ok(Response::new(job))
     }
 
@@ -2048,7 +2233,7 @@ impl TrafficService for TrafficSvc {
                     messages.push(msg);
                 }
                 p.update(100, "all traffic profiles down");
-                Ok(messages.join("; "))
+                Ok::<_, crate::jobs::JobFailure>(messages.join("; "))
             })
             .await;
         Ok(Response::new(job))
@@ -2124,10 +2309,15 @@ impl NosCheckSvc {
         mref: Option<&ManifestRef>,
     ) -> Result<(vxedge_core::model::Experiment, PathBuf, String), Status> {
         let (yaml, sha256, dir) = resolve_manifest(mref).await?;
-        let model = parse_to_model(&yaml)
-            .map_err(|e| Status::invalid_argument(format!("workspace invalid: {e}")))?;
+        let model = parse_to_model(&yaml).map_err(|e| {
+            crate::errors::invalid(
+                crate::errors::R::WorkspaceInvalid,
+                format!("workspace invalid: {e}"),
+            )
+        })?;
         let nos_check = model.nos_check.clone().ok_or_else(|| {
-            Status::failed_precondition(
+            crate::errors::precondition(
+                crate::errors::R::WorkspaceInvalid,
                 "this experiment declares no `network.nos_check` block — nothing to check",
             )
         })?;
@@ -2138,7 +2328,8 @@ impl NosCheckSvc {
                     p
                 } else {
                     let Some(dir) = &dir else {
-                        return Err(Status::invalid_argument(
+                        return Err(crate::errors::invalid(
+                            crate::errors::R::WorkspaceInvalid,
                             "`network.nos_check.part_ref` is a relative path, which needs a \
                              workspace directory to resolve against — an inline manifest has none",
                         ));
@@ -2151,7 +2342,8 @@ impl NosCheckSvc {
                 // `model::build` (§13: a published ref with no digest isn't reproducible) — so
                 // this is reachable only with a real digest in hand, never `None` here.
                 let Some(digest) = nos_check.digest.clone() else {
-                    return Err(Status::invalid_argument(
+                    return Err(crate::errors::invalid(
+                        crate::errors::R::WorkspaceInvalid,
                         "`network.nos_check.part_ref` is a published ref but declares no \
                          `digest` — published refs must be digest-pinned (§13)",
                     ));
@@ -2164,9 +2356,10 @@ impl NosCheckSvc {
                 .await
                 .map_err(|e| Status::internal(format!("registry fetch task panicked: {e}")))?
                 .map_err(|e| {
-                    Status::unavailable(format!(
-                        "fetching `network.nos_check.part_ref` `{r}` failed: {e}"
-                    ))
+                    crate::errors::unavailable(
+                        crate::errors::R::BackendUnavailable,
+                        format!("fetching `network.nos_check.part_ref` `{r}` failed: {e}"),
+                    )
                 })?;
                 disk_file_in(&pulled_dir).map_err(|e| {
                     Status::internal(format!(
@@ -2175,7 +2368,8 @@ impl NosCheckSvc {
                 })?
             }
             None => self.default_image.clone().ok_or_else(|| {
-                Status::failed_precondition(
+                crate::errors::precondition(
+                    crate::errors::R::WorkspaceInvalid,
                     "this experiment's `network.nos_check` declares no `part_ref` and this \
                      daemon has no default image configured — start vxedged with \
                      `--sonic-vs-image <path>`, or declare a local `part_ref` in the manifest",
@@ -2183,10 +2377,13 @@ impl NosCheckSvc {
             })?,
         };
         if !image.is_file() {
-            return Err(Status::failed_precondition(format!(
-                "nos_check image `{}` does not exist on this host",
-                image.display()
-            )));
+            return Err(crate::errors::precondition(
+                crate::errors::R::HostRequirementUnmet,
+                format!(
+                    "nos_check image `{}` does not exist on this host",
+                    image.display()
+                ),
+            ));
         }
         Ok((model, image, sha256))
     }
@@ -2242,7 +2439,7 @@ impl NosCheckService for NosCheckSvc {
                 let msg = "nos_check instance up".to_string();
                 events.emit(crate::events::EventKind::NosCheckUp, &experiment_id, &msg);
                 p.update(100, &msg);
-                Ok(msg)
+                Ok::<_, crate::jobs::JobFailure>(msg)
             })
             .await;
         Ok(Response::new(job))
@@ -2252,8 +2449,12 @@ impl NosCheckService for NosCheckSvc {
         require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
         let req = req.into_inner();
         let (yaml, sha256, _dir) = resolve_manifest(req.experiment.as_ref()).await?;
-        let model = parse_to_model(&yaml)
-            .map_err(|e| Status::invalid_argument(format!("workspace invalid: {e}")))?;
+        let model = parse_to_model(&yaml).map_err(|e| {
+            crate::errors::invalid(
+                crate::errors::R::WorkspaceInvalid,
+                format!("workspace invalid: {e}"),
+            )
+        })?;
         self.audit.record(
             "NosCheckService.Down",
             serde_json::json!({ "manifest_sha256": sha256, "experiment": model.id }),
@@ -2266,7 +2467,7 @@ impl NosCheckService for NosCheckSvc {
             .engine
             .submit("nos-check.down", move |p| async move {
                 p.update(50, "stopping nos_check instance");
-                blocking(move || {
+                blocking::<_, String, _>(move || {
                     let plan = vxedge_core::sonic::lifecycle::NosCheckLifecyclePlan {
                         name,
                         // Unused by `nos_check_down` (only `.name` matters for locating the
@@ -2284,7 +2485,7 @@ impl NosCheckService for NosCheckSvc {
                 let msg = "nos_check instance down".to_string();
                 events.emit(crate::events::EventKind::NosCheckDown, &experiment_id, &msg);
                 p.update(100, &msg);
-                Ok(msg)
+                Ok::<_, crate::jobs::JobFailure>(msg)
             })
             .await;
         Ok(Response::new(job))
@@ -2297,15 +2498,20 @@ impl NosCheckService for NosCheckSvc {
         require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
         let req = req.into_inner();
         let (yaml, _sha256, _dir) = resolve_manifest(req.experiment.as_ref()).await?;
-        let model = parse_to_model(&yaml)
-            .map_err(|e| Status::invalid_argument(format!("workspace invalid: {e}")))?;
+        let model = parse_to_model(&yaml).map_err(|e| {
+            crate::errors::invalid(
+                crate::errors::R::WorkspaceInvalid,
+                format!("workspace invalid: {e}"),
+            )
+        })?;
         // Same requirement `Up`/`Down`/`Verify` enforce via `resolve()` — checked directly here
         // rather than through it, since `Status` needs no image resolution. Without this, an
         // experiment declaring no `network.nos_check` at all would report "not running" as if
         // a check existed and simply wasn't up, rather than naming the real reason there's
         // nothing to report on.
         if model.nos_check.is_none() {
-            return Err(Status::failed_precondition(
+            return Err(crate::errors::precondition(
+                crate::errors::R::WorkspaceInvalid,
                 "this experiment declares no `network.nos_check` block — nothing to check",
             ));
         }
@@ -2339,14 +2545,19 @@ impl NosCheckService for NosCheckSvc {
 
     async fn verify(&self, req: Request<NosCheckVerifyRequest>) -> Result<Response<Job>, Status> {
         require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
+        let opts = crate::jobs::JobOpts::request(&req, &req.get_ref().request_id);
         let req = req.into_inner();
         let (model, image, sha256) = self.resolve(req.experiment.as_ref()).await?;
         self.audit.record(
             "NosCheckService.Verify",
             serde_json::json!({ "manifest_sha256": sha256, "experiment": model.id }),
         );
-        let gateway_plan = vxedge_core::gateway::GatewayPlan::from_model(&model)
-            .map_err(|e| Status::invalid_argument(format!("gateway plan: {e}")))?;
+        let gateway_plan = vxedge_core::gateway::GatewayPlan::from_model(&model).map_err(|e| {
+            crate::errors::invalid(
+                crate::errors::R::WorkspaceInvalid,
+                format!("gateway plan: {e}"),
+            )
+        })?;
         let trunk_port = model
             .nos_check
             .as_ref()
@@ -2369,7 +2580,7 @@ impl NosCheckService for NosCheckSvc {
         let events = self.engine.events().clone();
         let job = self
             .engine
-            .submit("nos-check.verify", move |p| async move {
+            .submit_with(opts, "nos-check.verify", move |p| async move {
                 p.update(10, "booting a disposable nos_check instance");
                 let outcome = blocking(move || {
                     let plan = boot_disposable_copy(&name, &image, &instance_dir)?;
@@ -2439,7 +2650,7 @@ impl NosCheckService for NosCheckSvc {
                     Err(msg)
                 }
             })
-            .await;
+            .await?;
         Ok(Response::new(job))
     }
 }

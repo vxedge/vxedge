@@ -8,6 +8,14 @@ All notable changes to this repo are documented here. Format follows
 
 ### Added
 
+- Structured errors: every refusal carries `google.rpc.ErrorInfo` with an `ErrorReason` and the
+  domain `vxedge.v1`, and a failed job carries `Job.error_reason`, including from its stages. A test
+  fails if any refusal bypasses the reasons. New reasons: `INVALID_REQUEST`, `NOT_FOUND`,
+  `BACKEND_UNAVAILABLE`, and `NODE_PORT_GONE` for `zone up` after `zone down` on a container node.
+- `JobService.List`, filtered by state, kind, run and parent, and `JobService.Cancel`, which stops a
+  job and its stages at their next step. A `down` cannot be cancelled.
+- Composite jobs link their stages through `Job.parent_job_id`, and every job carries its `run_id`.
+- `request_id` on `TrafficService.Up` and `NosCheckService.Verify` returns the job a retry started.
 - Runs: `RunService` reports the provisioned workspace on this host, and verbs accept a `RunRef`,
   which is refused if it is not the active run. A run's id lasts from the first `up` to the last
   `down`, across repeated `up` and daemon restarts.
@@ -25,6 +33,11 @@ All notable changes to this repo are documented here. Format follows
 
 ### Changed
 
+- One lifecycle operation runs at a time: a second call for the same thing returns the running job,
+  and any other is refused as `ERROR_REASON_BUSY` (`ABORTED`).
+- Job ids carry a per-daemon prefix, and job history is bounded, so an old id is reported unknown
+  rather than naming another job.
+- A service that exits straight after starting fails `svc up`, as the signal plane already did.
 - `ZoneService` no longer lists or addresses hpc devices, and `experiment up` brings them up through
   `ComputeService`, in a compute stage, so their audit lines and events say what they are.
   `vxedge zone up` on an hpc device now answers not found, naming `vxedge compute`.
