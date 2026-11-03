@@ -202,7 +202,10 @@ impl VehicleService for VehicleSvc {
             .handles
             .engine
             .submit_with(
-                JobOpts::lifecycle(&req, format!("vehicle {id}")),
+                JobOpts::lifecycle(
+                    &req,
+                    crate::experiment::staged_target(format!("vehicle {id}"), &stages),
+                ),
                 "vehicle.up",
                 move |p| async move {
                     let mut done: Vec<String> = Vec::new();
@@ -276,7 +279,10 @@ impl VehicleService for VehicleSvc {
             .handles
             .engine
             .submit_with(
-                JobOpts::lifecycle(&req, format!("vehicle {id}")),
+                JobOpts::lifecycle(
+                    &req,
+                    crate::experiment::staged_target(format!("vehicle {id}"), &stages),
+                ),
                 "vehicle.down",
                 move |p| async move {
                     // Reverse order, best-effort — same reasoning as `ExperimentSvc::down`: a
