@@ -6,6 +6,17 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-04
+
+vxAPI for agents. An agent can plan a workspace, bring it up, follow its jobs, read typed status,
+run traffic, collect the evidence and recover from a restart, branching only on typed fields: enum
+values, `ErrorReason` on every refusal, and run and job ids that never name the wrong thing. The
+contract stays `vxedge.v1`, additive only; `buf breaking` passes against `v0.3.0`, and `vxmcp`
+0.1.0 still works against this daemon. The release gate ran live through `vxmcp`: ten consecutive
+`vx-vehicle-03` runs with a daemon restart each, cancel during `up`, libvirt on `exp-002-ws`, and
+traffic and collection on `exp-001-ws`, each leaving the host clean
+([evidence](https://github.com/vxedge/vxperiments/tree/main/results/vxapi-0.5.0-gate-2026-11-04)).
+
 ### Added
 
 - `vxedge-api` gains a `serde` feature: every message and enum serializes in the canonical
@@ -43,10 +54,6 @@ All notable changes to this repo are documented here. Format follows
 - `RESOURCE_STATE_UNPROVISIONED`, for a declared device nothing provisions.
 - `vehicle up` and `down` honour `stages`, with `--stage` on the CLI. `--stage compute` is new on both
   `vehicle` and `experiment`.
-- The agent surface in the vxAPI contract, additive to `vxedge.v1`: `RunService`, `WorkspaceService`,
-  `HostService`, `JobService.List` and `Cancel`, `TrafficService.Status`, typed `NodeStatus`,
-  `ErrorReason`, and event resume. These are not built yet: the RPCs answer `UNIMPLEMENTED`, and new
-  fields read as unset.
 - A `kind: vehicle` document can declare `signal_plane.kuksa`, the Kuksa databroker placed on a container device with `on:`, under the same rules as a placed service. Its placement is checked when the workspace loads. `vehicle up` and `experiment up` start it in the device's container group, after compute and before services, `experiment up --stage signal-plane` starts it alone, and `status` and events report it as `SIGNAL_PLANE`. A databroker that exits right after it starts fails the job. It runs with `--insecure`, so slice isolation is its only protection.
 
 ### Changed
@@ -73,6 +80,7 @@ All notable changes to this repo are documented here. Format follows
 ### Deprecated
 
 - `Apply`, `Remove` and `PushImage` on `ZoneService` and `ComputeService`, which were never built.
+  `TelemetryService.StreamMetrics` is marked not built in the contract.
 
 ### Fixed
 
