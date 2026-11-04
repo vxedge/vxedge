@@ -490,6 +490,11 @@ impl JobEngine {
     }
 
     /// Ask a job, and the stages it started, to stop at their next checkpoint.
+    /// Whether a lifecycle operation holds the host now.
+    pub async fn lifecycle_running(&self) -> bool {
+        self.inner.state.lock().await.lifecycle.is_some()
+    }
+
     pub async fn cancel(&self, id: &str) -> Result<Job, Status> {
         let st = self.inner.state.lock().await;
         let entry = st.jobs.get(id).ok_or_else(|| unknown_job(id))?;

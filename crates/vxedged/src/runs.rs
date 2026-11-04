@@ -3,18 +3,42 @@
 //! A run is exactly as long-lived as `active.json`: the gateway's `up` writes it and its `down`
 //! removes it, so a run survives a repeated `up` and a daemon restart. The host runs one at a time,
 //! so `List` returns zero or one until the fleet layer makes it plural.
+//!
+//! A run's state is observed, not remembered: `UP` only when the gateway and every node it
+//! provisions are up. A half-built run, for example after a daemon stopped in the middle of `up`,
+//! reads `DEGRADED` until an `up` or `down` converges it, and `STAGING` while one runs.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
+use vxedge_api::v1::experiment_service_server::ExperimentService;
 use vxedge_api::v1::gateway_service_server::GatewayService;
+use vxedge_api::v1::manifest_ref::Source;
 use vxedge_api::v1::run_service_server::RunService;
+use vxedge_api::v1::vehicle_service_server::VehicleService;
 use vxedge_api::v1::{
-    GatewayStatusRequest, ResourceKind, Run, RunGetRequest, RunListRequest, RunListResponse,
+    ExperimentStatusRequest, GatewayStatusRequest, ManifestRef, ResourceKind, ResourceState, Run,
+    RunGetRequest, RunListRequest, RunListResponse, VehicleStatusRequest,
 };
 
+use crate::experiment::ExperimentSvc;
 use crate::services::{ActiveRecord, GatewaySvc, active_run, read_workspace};
+use crate::vehicle::VehicleSvc;
+
+/// The run's state from what is observed. `STAGING` while a lifecycle job holds the host; the
+/// gateway's own state unless it is up; then the workspace's status, which rolls up every zone,
+/// compute node, service and signal plane it declares, so a half-built run reads `DEGRADED`.
+pub(crate) fn run_state(gateway: i32, workspace: Option<i32>, busy: bool) -> i32 {
+    if busy {
+        return ResourceState::Staging as i32;
+    }
+    if gateway != ResourceState::Up as i32 {
+        return gateway;
+    }
+    // A status that cannot be read leaves the gateway's state: the run exists either way.
+    workspace.unwrap_or(gateway)
+}
 
 /// Whether the workspace is a bare vehicle, and the id its author wrote. A vehicle's record
 /// holds the id of its synthesized experiment.
@@ -37,6 +61,8 @@ pub(crate) async fn target(record: &ActiveRecord) -> (ResourceKind, String) {
 
 pub struct RunSvc {
     pub gateway: Arc<GatewaySvc>,
+    pub experiments: Arc<ExperimentSvc>,
+    pub vehicles: Arc<VehicleSvc>,
     pub runtime_dir: PathBuf,
 }
 
@@ -50,13 +76,38 @@ impl RunSvc {
             .status(Request::new(GatewayStatusRequest {}))
             .await?
             .into_inner();
+        let gateway_state = gateway.status.unwrap_or_default().state;
         let (kind, target_id) = target(&record).await;
+        let manifest = (record.dir != Path::new(".")).then(|| ManifestRef {
+            source: Some(Source::Path(record.dir.display().to_string())),
+            ..Default::default()
+        });
+        let workspace = match (manifest, kind) {
+            (None, _) => None,
+            (Some(m), ResourceKind::Vehicle) => self
+                .vehicles
+                .status(Request::new(VehicleStatusRequest { manifest: Some(m) }))
+                .await
+                .ok()
+                .and_then(|r| r.into_inner().status),
+            (Some(m), _) => self
+                .experiments
+                .status(Request::new(ExperimentStatusRequest { manifest: Some(m) }))
+                .await
+                .ok()
+                .and_then(|r| r.into_inner().status),
+        }
+        .map(|s| s.state);
         Ok(Some(Run {
             id: record.run_id().to_string(),
             kind: kind as i32,
             target_id,
             workspace_sha256: record.sha256.unwrap_or_default(),
-            state: gateway.status.unwrap_or_default().state,
+            state: run_state(
+                gateway_state,
+                workspace,
+                self.gateway.engine.lifecycle_running().await,
+            ),
             started_unix_ms: record.started_unix_ms.unwrap_or_default(),
         }))
     }
@@ -82,5 +133,34 @@ impl RunService for RunSvc {
     async fn list(&self, _: Request<RunListRequest>) -> Result<Response<RunListResponse>, Status> {
         let runs = self.current().await?.into_iter().collect();
         Ok(Response::new(RunListResponse { runs }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_run_reads_the_workspace_rollup_once_the_gateway_is_up() {
+        let up = ResourceState::Up as i32;
+        let degraded = ResourceState::Degraded as i32;
+        assert_eq!(run_state(up, Some(up), false), up);
+        assert_eq!(
+            run_state(up, Some(degraded), false),
+            degraded,
+            "a half-built run is not up"
+        );
+        assert_eq!(
+            run_state(up, Some(degraded), true),
+            ResourceState::Staging as i32,
+            "a run with a lifecycle job in flight is staging"
+        );
+        let down = ResourceState::Down as i32;
+        assert_eq!(run_state(down, Some(up), false), down);
+        assert_eq!(
+            run_state(up, None, false),
+            up,
+            "no readable status keeps the gateway's"
+        );
     }
 }
