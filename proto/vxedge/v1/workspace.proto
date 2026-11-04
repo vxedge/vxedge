@@ -61,6 +61,14 @@ message HostCapabilities {
   repeated string part_kinds = 2;
   // How many runs this host holds at once.
   uint32 max_runs = 3;
+  // The best NVIDIA GPU the driver reports, the probe a workspace's `requires` is checked
+  // against. Unset when there is none.
+  HostGpu gpu = 4;
+}
+
+message HostGpu {
+  float compute_capability = 1;
+  uint64 vram_mib = 2;
 }
 
 service HostService {

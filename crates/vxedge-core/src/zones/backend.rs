@@ -25,6 +25,10 @@
 
 use std::path::Path;
 
+/// The emulator a `qemu-microvm` node runs. x86_64 only today; `HostService.Capabilities` probes
+/// this same name, so it cannot report a backend the backend itself would not start.
+pub const QEMU_MICROVM_BIN: &str = "qemu-system-x86_64";
+
 use super::cloud_hypervisor;
 use super::plan::NodePlan;
 use super::wasm_capsule;
@@ -430,7 +434,7 @@ fn microvm_up(sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneB
                 .join(","),
         ]);
     }
-    args.push("qemu-system-x86_64".into());
+    args.push(QEMU_MICROVM_BIN.into());
     args.extend(
         [
             "-M",
