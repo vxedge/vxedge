@@ -102,8 +102,8 @@ pub struct WorkspacePlan {
 
 /// Ids become directory names *and* OCI repository path components on publish. OCI requires
 /// lowercase alphanumerics with separators between them, so reject anything else here rather
-/// than letting it fail at `experiment publish` — which is exactly how a `_`-prefixed name
-/// bit us during the container publish work (see vxparts TASKS.md).
+/// than letting it fail when the workspace is published — which is exactly how a `_`-prefixed
+/// name bit us during the container publish work (see vxparts TASKS.md).
 fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.starts_with(|c: char| c.is_ascii_lowercase())
@@ -564,10 +564,11 @@ fn readme(id: &str, template: Template) -> String {
          Zip the folder. Everything the experiment needs is inside it, which is the point of\n\
          the layout — a workspace whose parts live three directories up is not something anyone\n\
          can unpack and run.\n\n\
-         `vxedge experiment publish` refuses while any local ref (`./parts/...`) is still\n\
-         unpublished, for the same reason in reverse: a workspace handed to someone else with a\n\
-         path from your disk in it is broken for them by construction. Publish those parts\n\
-         first, and the references are rewritten to digests in place.\n",
+         A ref that points outside the folder is the same problem in reverse: a workspace\n\
+         handed to someone else with a path from your disk in it is broken for them by\n\
+         construction. Keep local parts under `./parts/`, or publish a part to a registry and\n\
+         pin it in `parts.yaml` by digest. No vxedge verb publishes a workspace or rewrites its\n\
+         refs yet.\n",
         t = template.as_str()
     )
 }
