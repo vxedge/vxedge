@@ -113,6 +113,9 @@ enum ErrorReason {
   // A backend the daemon needs did not answer: Podman, a registry, the 5G core. Usually worth a
   // retry.
   ERROR_REASON_BACKEND_UNAVAILABLE = 22;
+  // A traffic endpoint is not on the host: its node's zone is up, which moves the gateway-side
+  // veth into the node. Bring the run up with the gateway stage only for host-side traffic.
+  ERROR_REASON_ENDPOINT_NOT_ON_HOST = 23;
 }
 
 // Names one run. See `RunService`.

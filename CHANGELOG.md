@@ -6,6 +6,28 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-11-04
+
+Closes the vxAPI upgrade plan. `HostService.Capabilities` now answers from the checks `up` itself
+makes, so it cannot tell an agent a backend is available when `up` would refuse it, and it reports
+the GPU. `traffic up` refuses before starting when an endpoint is not on the host.
+
+### Added
+
+- `HostCapabilities.gpu`: the best NVIDIA GPU the driver reports, the probe a workspace's
+  `requires` is checked against.
+- `ERROR_REASON_ENDPOINT_NOT_ON_HOST`: `TrafficService.Up` refuses a profile whose node-side endpoint
+  is inside a node, because its zone is up, and names `--stage gateway`. It used to start a job that
+  failed with a shell error.
+
+### Fixed
+
+- `HostService.Capabilities` and `WorkspaceService.Plan`'s backend checks report the container
+  backend only where Podman answers, as the preflight requires, and probe the emulator the
+  qemu-microvm backend starts. They checked only that `ip` and a fixed binary name were on `PATH`.
+- `RunService` reads one workspace status per call instead of the gateway and then the workspace,
+  and answers `STAGING` without observing while a lifecycle job runs.
+
 ## [0.5.1] - 2026-11-04
 
 A run's state is now observed, not assumed. After a daemon stopped in the middle of `up`,

@@ -12,7 +12,7 @@ use tonic::{Request, Response, Status};
 use vxedge_api::v1::host_service_server::HostService;
 use vxedge_api::v1::workspace_service_server::WorkspaceService;
 use vxedge_api::v1::{
-    BackendCapability, HostCapabilities, HostCapabilitiesRequest, HostCheck, NodeBackend,
+    BackendCapability, HostCapabilities, HostCapabilitiesRequest, HostCheck, HostGpu, NodeBackend,
     PlanProblem, PlannedService, WorkspacePlan, WorkspacePlanRequest,
 };
 use vxedge_core::containers::LazyClient;
@@ -266,42 +266,65 @@ fn on_path(binary: &str) -> bool {
         .is_some_and(|path| std::env::split_paths(&path).any(|d| d.join(binary).is_file()))
 }
 
-fn backends() -> Vec<BackendCapability> {
+/// What this host can run, from the checks `up` itself makes: Podman for container nodes (the
+/// preflight's image check), the emulator the qemu-microvm backend starts, and the GPU probe a
+/// workspace's `requires` is checked against.
+async fn backends() -> (Vec<BackendCapability>, Option<HostGpu>) {
+    let podman = LazyClient::user()
+        .get()
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+    tokio::task::spawn_blocking(move || {
+        let gpu = vxedge_core::package::HostCapabilities::probe()
+            .gpu
+            .map(|g| HostGpu {
+                compute_capability: g.compute_cap,
+                vram_mib: g.vram_mib,
+            });
+        (probe_backends(podman), gpu)
+    })
+    .await
+    .unwrap_or_default()
+}
+
+fn probe_backends(podman: Result<(), String>) -> Vec<BackendCapability> {
     let kvm = Path::new("/dev/kvm").exists();
-    let entry = |backend: NodeBackend, available: bool, detail: &str| BackendCapability {
+    let entry = |backend: NodeBackend, available: bool, detail: String| BackendCapability {
         backend: backend as i32,
         available,
-        detail: if available {
-            String::new()
-        } else {
-            detail.to_string()
-        },
+        detail: if available { String::new() } else { detail },
+    };
+    let qemu = vxedge_core::zones::QEMU_MICROVM_BIN;
+    let container = match (&podman, on_path("ip")) {
+        (Err(e), _) => format!("Podman did not answer: {e}"),
+        (Ok(()), _) => "`ip` (iproute2) is not on PATH".to_string(),
     };
     vec![
         entry(
             NodeBackend::Container,
-            on_path("ip"),
-            "`ip` (iproute2) is not on PATH",
+            podman.is_ok() && on_path("ip"),
+            container,
         ),
         entry(
             NodeBackend::QemuMicrovm,
-            kvm && on_path("qemu-system-x86_64"),
-            "needs /dev/kvm and qemu-system-x86_64",
+            kvm && on_path(qemu),
+            format!("needs /dev/kvm and `{qemu}` on PATH"),
         ),
         entry(
             NodeBackend::Libvirt,
             on_path("virsh"),
-            "`virsh` is not on PATH",
+            "`virsh` is not on PATH".to_string(),
         ),
         entry(
             NodeBackend::CloudHypervisor,
             kvm && vxedge_core::zones::ch_available(),
-            "needs /dev/kvm and cloud-hypervisor",
+            "needs /dev/kvm and cloud-hypervisor".to_string(),
         ),
         entry(
             NodeBackend::WasmCapsule,
             vxedge_core::zones::capsule_runner_available(),
-            "no `vxcapsule` runner beside vxedged, on PATH or in VXEDGE_CAPSULE_BIN",
+            "no `vxcapsule` runner beside vxedged, on PATH or in VXEDGE_CAPSULE_BIN".to_string(),
         ),
     ]
 }
@@ -361,7 +384,12 @@ impl WorkspaceService for PlanSvc {
             .iter()
             .map(|n| crate::status::node_spec(n).backend)
             .collect();
-        for b in backends().into_iter().filter(|b| used.contains(&b.backend)) {
+        for b in backends()
+            .await
+            .0
+            .into_iter()
+            .filter(|b| used.contains(&b.backend))
+        {
             let name = NodeBackend::try_from(b.backend)
                 .map(|n| {
                     n.as_str_name()
@@ -410,13 +438,12 @@ impl HostService for PlanSvc {
         &self,
         _: Request<HostCapabilitiesRequest>,
     ) -> Result<Response<HostCapabilities>, Status> {
-        let backends = tokio::task::spawn_blocking(backends)
-            .await
-            .map_err(|e| Status::internal(format!("probe task panicked: {e}")))?;
+        let (backends, gpu) = backends().await;
         Ok(Response::new(HostCapabilities {
             backends,
             part_kinds: vec!["container".into(), "bundle".into(), "wasm".into()],
             max_runs: 1,
+            gpu,
         }))
     }
 }

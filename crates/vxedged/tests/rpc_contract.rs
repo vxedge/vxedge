@@ -1265,6 +1265,16 @@ async fn host_capabilities_cover_every_backend() {
     );
     assert_eq!(caps.part_kinds, ["container", "bundle", "wasm"]);
     assert_eq!(caps.max_runs, 1);
+    // The container backend is available only where `up`'s own Podman check would pass.
+    let container = caps
+        .backends
+        .iter()
+        .find(|b| b.backend == vxedge_api::v1::NodeBackend::Container as i32)
+        .unwrap();
+    if !podman_is_reachable() {
+        assert!(!container.available, "no Podman, so no container backend");
+        assert!(container.detail.contains("Podman"), "{}", container.detail);
+    }
 }
 
 #[tokio::test]

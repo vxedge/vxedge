@@ -2188,6 +2188,35 @@ impl TrafficSvc {
     }
 }
 
+/// Refuse, before any job starts, a profile whose node-side endpoint is not on the host: a node
+/// whose zone is up holds its gateway-side veth in its own namespace, where a host-side load
+/// generator cannot bind. Found in the 0.5.0 gate, where it surfaced only as a failed job.
+fn endpoints_on_host(
+    profiles: &[vxedge_core::traffic::ResolvedProfile],
+    sys_class_net: &Path,
+) -> Result<(), Status> {
+    use vxedge_core::traffic::ProfileEndpoint;
+    for p in profiles {
+        for ep in [&p.source, &p.target] {
+            if let ProfileEndpoint::VlanNodePeer { peer_iface, .. } = ep
+                && !sys_class_net.join(peer_iface).exists()
+            {
+                return Err(crate::errors::precondition(
+                    crate::errors::R::EndpointNotOnHost,
+                    format!(
+                        "traffic profile `{}`: its endpoint `{peer_iface}` is not on the host. Its \
+                         node's zone is up, which moves the gateway-side veth into the node; for \
+                         host-side traffic bring the run up with the gateway stage only \
+                         (`experiment up --stage gateway`)",
+                        p.id
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn select_profiles(
     plan: TrafficPlan,
     requested: &[String],
@@ -2259,6 +2288,9 @@ impl TrafficService for TrafficSvc {
             serde_json::json!({ "manifest_sha256": sha256, "profiles": req.profiles }),
         );
         let selected = select_profiles(traffic_plan, &req.profiles)?;
+        if active_run(&self.runtime_dir).is_some() {
+            endpoints_on_host(&selected, Path::new("/sys/class/net"))?;
+        }
 
         let shell = self.shell.clone();
         let runtime_dir = self.runtime_dir.clone();
@@ -2759,6 +2791,37 @@ impl NosCheckService for NosCheckSvc {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn traffic_refuses_an_endpoint_that_is_not_on_the_host() {
+        use tonic_types::StatusExt;
+        use vxedge_core::traffic::{ProfileEndpoint, ResolvedProfile};
+        let net = std::env::temp_dir().join(format!("vx-endpoints-{}", std::process::id()));
+        std::fs::create_dir_all(net.join("vzp-present")).unwrap();
+        let profile = |iface: &str| ResolvedProfile {
+            id: "load".into(),
+            source: ProfileEndpoint::VlanNodePeer {
+                peer_iface: iface.into(),
+                vlan: 103,
+                addr: "10.103.0.2".into(),
+            },
+            target: ProfileEndpoint::VlanUplinkFarSide {
+                uplink_peer: "vxup0p".into(),
+                vlan: 103,
+                addr: "10.103.0.1".into(),
+            },
+            pps: None,
+            bandwidth_mbps: Some(10),
+            payload_bytes: 1200,
+        };
+        assert!(endpoints_on_host(&[profile("vzp-present")], &net).is_ok());
+        let refused = endpoints_on_host(&[profile("vzp-gone")], &net).unwrap_err();
+        let _ = std::fs::remove_dir_all(&net);
+        assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+        let info = refused.get_error_details().error_info().cloned().unwrap();
+        assert_eq!(info.reason, "ERROR_REASON_ENDPOINT_NOT_ON_HOST");
+        assert!(refused.message().contains("--stage gateway"));
+    }
+
     use super::*;
 
     /// A `SvcSvc` whose runtime dir does not exist: every case here must be decided from the

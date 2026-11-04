@@ -32,7 +32,7 @@ sdk/                 # (pending) generated TypeScript SDK (connect-es), never ha
 
 ## Key dependencies (when scaffolding)
 
-tonic/prost (+ tonic-web), serde/serde_yaml, rtnetlink, ovsdb client, `virsh` (libvirt),
+tonic/prost (+ tonic-web), serde/serde_yaml_ng, rtnetlink, ovsdb client, `virsh` (libvirt),
 nftables via `nftables` crate or `nft -j`, clap (CLI), tokio, tracing.
 
 ## Build/test

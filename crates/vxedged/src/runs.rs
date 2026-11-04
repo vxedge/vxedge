@@ -67,47 +67,73 @@ pub struct RunSvc {
 }
 
 impl RunSvc {
-    async fn current(&self) -> Result<Option<Run>, Status> {
-        let Some(record) = active_run(&self.runtime_dir) else {
-            return Ok(None);
-        };
-        let gateway = self
-            .gateway
-            .status(Request::new(GatewayStatusRequest {}))
-            .await?
-            .into_inner();
-        let gateway_state = gateway.status.unwrap_or_default().state;
-        let (kind, target_id) = target(&record).await;
+    /// The gateway's state and the workspace's rollup, from one workspace status read: vehicle and
+    /// experiment status both carry the gateway, so it is not observed twice.
+    async fn observe(
+        &self,
+        record: &ActiveRecord,
+        kind: ResourceKind,
+    ) -> Result<(i32, Option<i32>), Status> {
         let manifest = (record.dir != Path::new(".")).then(|| ManifestRef {
             source: Some(Source::Path(record.dir.display().to_string())),
             ..Default::default()
         });
-        let workspace = match (manifest, kind) {
+        let read = match (manifest, kind) {
             (None, _) => None,
             (Some(m), ResourceKind::Vehicle) => self
                 .vehicles
                 .status(Request::new(VehicleStatusRequest { manifest: Some(m) }))
                 .await
                 .ok()
-                .and_then(|r| r.into_inner().status),
+                .map(|r| {
+                    let r = r.into_inner();
+                    (r.gateway.and_then(|g| g.status), r.status)
+                }),
             (Some(m), _) => self
                 .experiments
                 .status(Request::new(ExperimentStatusRequest { manifest: Some(m) }))
                 .await
                 .ok()
-                .and_then(|r| r.into_inner().status),
-        }
-        .map(|s| s.state);
+                .map(|r| {
+                    let r = r.into_inner();
+                    (r.gateway.and_then(|g| g.status), r.status)
+                }),
+        };
+        let (gateway, workspace) = read.unwrap_or((None, None));
+        let gateway = match gateway {
+            Some(g) => g.state,
+            None => {
+                self.gateway
+                    .status(Request::new(GatewayStatusRequest {}))
+                    .await?
+                    .into_inner()
+                    .status
+                    .unwrap_or_default()
+                    .state
+            }
+        };
+        Ok((gateway, workspace.map(|s| s.state)))
+    }
+
+    async fn current(&self) -> Result<Option<Run>, Status> {
+        let Some(record) = active_run(&self.runtime_dir) else {
+            return Ok(None);
+        };
+        let (kind, target_id) = target(&record).await;
+        let busy = self.gateway.engine.lifecycle_running().await;
+        // While a job holds the host the answer is `STAGING` whatever is observed, so skip the
+        // observation: it is the slow part of this call.
+        let (gateway_state, workspace) = if busy {
+            (ResourceState::Staging as i32, None)
+        } else {
+            self.observe(&record, kind).await?
+        };
         Ok(Some(Run {
             id: record.run_id().to_string(),
             kind: kind as i32,
             target_id,
             workspace_sha256: record.sha256.unwrap_or_default(),
-            state: run_state(
-                gateway_state,
-                workspace,
-                self.gateway.engine.lifecycle_running().await,
-            ),
+            state: run_state(gateway_state, workspace, busy),
             started_unix_ms: record.started_unix_ms.unwrap_or_default(),
         }))
     }
