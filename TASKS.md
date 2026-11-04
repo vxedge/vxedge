@@ -381,9 +381,10 @@ Tracked here so they are not rediscovered. None block the critical path.
       into a local cache before `up`, so a run either has everything or fails before it starts.
       Fits the offline-first direction; not yet scheduled.
 - [ ] `vxedge vehicle extract` — inline component defs to their own files, once reused
-- [ ] `vxedge manifest bom` (Track D dimension 3) + `vxedge experiment publish` (refuses
-      while any local ref is unpublished — a shared workspace with a local path is broken
-      for the recipient by construction)
+- [ ] `vxedge manifest bom` (Track D dimension 3) + package publishing, planned as
+      `vxedge pkg pack` and `vxedge pkg push` (refuses while any ref points outside the
+      package — a shared workspace with a local path is broken for the recipient by
+      construction). Not built; the scaffold README no longer claims it is.
 - [ ] `requires` → `resources` → host checking, once `part.yaml` carries `requires`
       (`vxparts/TASKS.md`)
 - [ ] Publish the manifest JSON Schema generated from `vxedge-core` as a config part —
