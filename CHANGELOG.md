@@ -20,9 +20,9 @@ All notable changes to this repo are documented here. Format follows
   keeps its identity. `results/` and `.git` cannot be re-included, and `.vxpignore` is itself
   hashed. Values differ from 0.5.2's by design.
 - Every recorded identity names its algorithm: `Run.workspace_identity_algorithm` (new, additive),
-  `identity_algorithm` in the run record and in audit lines. A run recorded by an older daemon
-  reads as `vxws/1`, is verified under `vxws/1`, and is still restored after an upgrade rather
-  than refused as changed.
+  `identity_algorithm` in the run record, `workspace_identity_algorithm` in audit lines. A run
+  recorded by an older daemon reads as `vxws/1`, is verified under `vxws/1`, and is still restored
+  after an upgrade rather than refused as changed.
 - `Workspace::content_sha256` is replaced by `Workspace::identity` and
   `Workspace::identity_with`, which return the value with its algorithm.
 

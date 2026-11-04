@@ -1456,7 +1456,7 @@ impl ZoneSvc {
             rpc,
             serde_json::json!({
                 "zone": vxid, "nodes": plans.len(),
-                "workspace_sha256": workspace.0, "identity_algorithm": workspace.1,
+                "workspace_sha256": workspace.0, "workspace_identity_algorithm": workspace.1,
             }),
         );
         let shell = self.shell.clone();
@@ -1701,7 +1701,7 @@ impl ComputeSvc {
             rpc,
             serde_json::json!({
                 "compute": vxid, "nodes": plans.len(),
-                "workspace_sha256": workspace.0, "identity_algorithm": workspace.1,
+                "workspace_sha256": workspace.0, "workspace_identity_algorithm": workspace.1,
             }),
         );
         let shell = self.shell.clone();

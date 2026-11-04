@@ -196,7 +196,7 @@ impl VehicleService for VehicleSvc {
             "VehicleService.Up",
             serde_json::json!({
                 "vehicle": id, "workspace_sha256": sha256,
-                "identity_algorithm": crate::services::identity_algorithm(dir.as_deref()),
+                "workspace_identity_algorithm": crate::services::identity_algorithm(dir.as_deref()),
             }),
         );
         let (zones, compute) = by_stage(&nodes);
@@ -272,7 +272,7 @@ impl VehicleService for VehicleSvc {
             "VehicleService.Down",
             serde_json::json!({
                 "vehicle": id, "workspace_sha256": sha256,
-                "identity_algorithm": crate::services::identity_algorithm(dir.as_deref()),
+                "workspace_identity_algorithm": crate::services::identity_algorithm(dir.as_deref()),
             }),
         );
         self.handles

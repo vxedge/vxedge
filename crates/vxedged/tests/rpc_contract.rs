@@ -417,6 +417,16 @@ async fn a_run_recorded_under_vxws1_is_still_restored() {
         .into_inner()
         .zones;
     assert_eq!(zones.len(), 1);
+    // Run reads the record the same way: the value it holds, under the rule that made it.
+    let runs = RunServiceClient::new(daemon.channel().await)
+        .list(RunListRequest::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .runs;
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].workspace_sha256, v1);
+    assert_eq!(runs[0].workspace_identity_algorithm, "vxws/1");
 }
 
 #[tokio::test]

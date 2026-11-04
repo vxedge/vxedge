@@ -95,7 +95,7 @@ impl TelemetryService for TelemetrySvc {
             "TelemetryService.Collect",
             serde_json::json!({
                 "workspace_sha256": sha256, "out": out,
-                "identity_algorithm": crate::services::identity_algorithm(Some(&workspace)),
+                "workspace_identity_algorithm": crate::services::identity_algorithm(Some(&workspace)),
             }),
         );
         let bin = self.vxtelemetry_bin.clone();
