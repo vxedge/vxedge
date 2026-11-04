@@ -76,20 +76,6 @@ fn err(np: &NodePlan, detail: String) -> ZoneBackendError {
     }
 }
 
-/// A stable, locally administered unicast MAC for a node. Left unset, the VMM draws a random
-/// one per boot, and a run should not differ from the last in anything the manifest fixed.
-fn guest_mac(np: &NodePlan) -> String {
-    // FNV-1a: a stable function of the id, unlike the standard library's hasher.
-    let hash = np.node_id.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
-        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
-    });
-    let b = hash.to_be_bytes();
-    format!(
-        "02:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        b[0], b[1], b[2], b[3], b[4]
-    )
-}
-
 /// The guest, as the API takes it.
 ///
 /// The tap is named and `ip`/`mask` stay unset: the gateway owns that port, and it is a bridge
@@ -102,7 +88,7 @@ fn vm_config(np: &NodePlan, kernel: String, initrd: String, serial: &Path) -> Vm
 
     let mut net = NetConfig::new();
     net.tap = Some(np.endpoint.clone());
-    net.mac = Some(guest_mac(np));
+    net.mac = Some(np.guest_mac());
 
     let mut serial_console = SerialConfig::new(ConsoleMode::File);
     serial_console.file = Some(serial.display().to_string());
@@ -430,9 +416,9 @@ mod tests {
         let a = node(vec![]);
         let mut b = node(vec![]);
         b.node_id = "node-ch-02".into();
-        assert_eq!(guest_mac(&a), guest_mac(&a));
-        assert_ne!(guest_mac(&a), guest_mac(&b));
-        let first = u8::from_str_radix(&guest_mac(&a)[..2], 16).unwrap();
+        assert_eq!(a.guest_mac(), a.guest_mac());
+        assert_ne!(a.guest_mac(), b.guest_mac());
+        let first = u8::from_str_radix(&a.guest_mac()[..2], 16).unwrap();
         assert_eq!(first & 0b11, 0b10, "locally administered and unicast");
     }
 

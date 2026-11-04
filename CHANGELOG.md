@@ -6,6 +6,13 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- qemu-microvm guests get a stable, unique MAC. QEMU gave every guest `52:54:00:12:34:56`, so on a
+  vehicle with several qemu guests on one slice the bridge delivered unicast to one of them and the
+  others answered nothing, while ARP still worked. The MAC comes from the node id, as it already did
+  under Cloud Hypervisor, and both backends now share one function.
+
 ## [0.5.3] - 2026-11-04
 
 A workspace's identity no longer changes when it is its own git repository or an editor leaves a
