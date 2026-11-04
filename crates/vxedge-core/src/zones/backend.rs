@@ -418,6 +418,7 @@ fn microvm_up(sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneB
         runtime_dir.join(format!("{name}.serial.log")).display()
     );
     let netdev = format!("tap,id=n0,ifname={},script=no,downscript=no", np.endpoint);
+    let nic = format!("virtio-net-device,netdev=n0,mac={}", np.guest_mac());
     let append = kernel_cmdline(np);
     let kvm = Path::new("/dev/kvm").exists();
 
@@ -461,7 +462,7 @@ fn microvm_up(sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneB
             "-netdev",
             &netdev,
             "-device",
-            "virtio-net-device,netdev=n0",
+            &nic,
             "-pidfile",
             &pidfile.display().to_string(),
             "-daemonize",

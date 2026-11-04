@@ -117,6 +117,25 @@ impl NodePlan {
         s.truncate(48);
         format!("vx-{s}")
     }
+
+    /// A stable, locally administered unicast MAC for this node's guest NIC. Left unset, QEMU
+    /// gives every guest `52:54:00:12:34:56`, so two guests on one bridge answered ARP as the same
+    /// station and unicast reached only one; Cloud Hypervisor draws a random one per boot, and a
+    /// run should not differ from the last in anything the manifest fixed.
+    pub fn guest_mac(&self) -> String {
+        // FNV-1a: a stable function of the id, unlike the standard library's hasher.
+        let hash = self
+            .node_id
+            .bytes()
+            .fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+                (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+            });
+        let b = hash.to_be_bytes();
+        format!(
+            "02:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            b[0], b[1], b[2], b[3], b[4]
+        )
+    }
 }
 
 /// Join model devices with the gateway plan's endpoints.
@@ -439,6 +458,24 @@ parts:
         let model = crate::model::load_yaml(ws).expect("valid test workspace");
         let gw = GatewayPlan::from_model(&model).unwrap();
         plan_nodes_from_model(&model, &gw, Path::new("/manifests")).unwrap()
+    }
+
+    #[test]
+    fn guest_macs_are_unique_stable_and_locally_administered() {
+        let p = plans(WS);
+        let (a, b) = (p[0].guest_mac(), p[1].guest_mac());
+        assert_ne!(a, b, "two nodes must not share a MAC");
+        assert_eq!(
+            a,
+            plans(WS)[0].guest_mac(),
+            "the MAC is stable across plans"
+        );
+        for m in [&a, &b] {
+            assert_eq!(m.len(), 17);
+            let first = u8::from_str_radix(&m[..2], 16).unwrap();
+            assert_eq!(first & 0b11, 0b10, "locally administered unicast: {m}");
+        }
+        assert_ne!(a, "52:54:00:12:34:56");
     }
 
     #[test]
