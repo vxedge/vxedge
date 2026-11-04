@@ -8,6 +8,7 @@
 pub mod containers;
 pub mod fiveg;
 pub mod gateway;
+pub mod identity;
 pub mod model;
 pub mod package;
 pub mod registry;
@@ -19,6 +20,7 @@ pub mod traffic;
 pub mod workspace;
 pub mod zones;
 
+pub use identity::{IdentityAlgorithm, WorkspaceIdentity};
 pub use model::{Experiment as ModelExperiment, ModelError, build as build_model};
 pub use package::{DiscoverError, DiscoveredWorkspace, PackageDoc, discover};
 pub use scaffold::{ScaffoldError, Template, WorkspacePlan};

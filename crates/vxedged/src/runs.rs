@@ -132,6 +132,7 @@ impl RunSvc {
             id: record.run_id().to_string(),
             kind: kind as i32,
             target_id,
+            workspace_identity_algorithm: record.identity_algorithm().to_string(),
             workspace_sha256: record.sha256.unwrap_or_default(),
             state: run_state(gateway_state, workspace, busy),
             started_unix_ms: record.started_unix_ms.unwrap_or_default(),

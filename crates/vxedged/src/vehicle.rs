@@ -194,7 +194,10 @@ impl VehicleService for VehicleSvc {
         }
         self.audit.record(
             "VehicleService.Up",
-            serde_json::json!({ "vehicle": id, "workspace_sha256": sha256 }),
+            serde_json::json!({
+                "vehicle": id, "workspace_sha256": sha256,
+                "workspace_identity_algorithm": crate::services::identity_algorithm(dir.as_deref()),
+            }),
         );
         let (zones, compute) = by_stage(&nodes);
         let svc = self.handles.clone();
@@ -267,7 +270,10 @@ impl VehicleService for VehicleSvc {
             .await?;
         self.audit.record(
             "VehicleService.Down",
-            serde_json::json!({ "vehicle": id, "workspace_sha256": sha256 }),
+            serde_json::json!({
+                "vehicle": id, "workspace_sha256": sha256,
+                "workspace_identity_algorithm": crate::services::identity_algorithm(dir.as_deref()),
+            }),
         );
         self.handles
             .gateway

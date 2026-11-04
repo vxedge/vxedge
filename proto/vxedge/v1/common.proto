@@ -14,8 +14,8 @@ message ManifestRef {
   }
   // Optional expected workspace identity; the daemon answers FAILED_PRECONDITION if it does not
   // match (reproducibility guard). For `path`, or `inline_yaml` with `resolved_dir`, this is the
-  // SHA-256 over every file in the workspace (`ARCHITECTURE.md` §13), not the hash of one
-  // document. For a genuinely inline manifest it is the SHA-256 of `inline_yaml`.
+  // workspace identity under the current algorithm, `vxws/2` (`ARCHITECTURE.md` §13), not the
+  // hash of one document. For a genuinely inline manifest it is the SHA-256 of `inline_yaml`.
   string sha256 = 3;
   // Internal orchestration hint, not part of the public contract: when a stage forwards an
   // already-resolved workspace as `inline_yaml` (ExperimentService's and VehicleService's stages
