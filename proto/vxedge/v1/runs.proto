@@ -13,10 +13,16 @@ message Run {
   ResourceKind kind = 2;
   // The workspace's id.
   string target_id = 3;
-  // The workspace identity (`ARCHITECTURE.md` §13).
+  // The workspace identity (`ARCHITECTURE.md` §13), computed under
+  // `workspace_identity_algorithm`.
   string workspace_sha256 = 4;
   ResourceState state = 5;
   int64 started_unix_ms = 6;
+  // The rule that computed `workspace_sha256`: `vxws/2` for a run started by this daemon,
+  // `vxws/1` for one recorded before `vxws/2` existed, `sha256` for a manifest passed inline with
+  // no workspace directory (the hash of that document). Identities under different algorithms
+  // are not comparable.
+  string workspace_identity_algorithm = 7;
 }
 
 message RunGetRequest {

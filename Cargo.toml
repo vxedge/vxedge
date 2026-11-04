@@ -31,6 +31,9 @@ pbjson-build = "0.9"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "fs", "sync", "process", "time"] }
 tokio-stream = { version = "0.1", features = ["net", "sync"] }
 sha2 = "0.11"
+# `.vxpignore` matching for the workspace identity (`vxws/2`). Only the gitignore matcher is
+# used, never its directory walker, which reads global and environment ignore rules.
+ignore = "0.4"
 tower = "0.5"
 rtnetlink = "0.23"
 futures-util = "0.3"

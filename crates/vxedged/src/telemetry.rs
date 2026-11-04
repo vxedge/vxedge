@@ -93,7 +93,10 @@ impl TelemetryService for TelemetrySvc {
         images.dedup();
         self.audit.record(
             "TelemetryService.Collect",
-            serde_json::json!({ "workspace_sha256": sha256, "out": out }),
+            serde_json::json!({
+                "workspace_sha256": sha256, "out": out,
+                "identity_algorithm": crate::services::identity_algorithm(Some(&workspace)),
+            }),
         );
         let bin = self.vxtelemetry_bin.clone();
         let log = self.runtime_dir.join("collect.log");

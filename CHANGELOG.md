@@ -14,6 +14,17 @@ All notable changes to this repo are documented here. Format follows
   and the daemon refuses with `ERROR_REASON_WORKSPACE_INVALID` before provisioning anything.
 - `Workspace::load` reads the descriptor, so a malformed `.vxp`, or a second one, fails
   validation instead of failing later at `experiment up`.
+- The workspace identity is now computed under `vxws/2` (`ARCHITECTURE.md` §13). It skips `.git`
+  at any depth, editor swap and backup files, and whatever a root `.vxpignore` names in
+  `.gitignore` syntax, so a workspace that is its own repository, or that an editor has touched,
+  keeps its identity. `results/` and `.git` cannot be re-included, and `.vxpignore` is itself
+  hashed. Values differ from 0.5.2's by design.
+- Every recorded identity names its algorithm: `Run.workspace_identity_algorithm` (new, additive),
+  `identity_algorithm` in the run record and in audit lines. A run recorded by an older daemon
+  reads as `vxws/1`, is verified under `vxws/1`, and is still restored after an upgrade rather
+  than refused as changed.
+- `Workspace::content_sha256` is replaced by `Workspace::identity` and
+  `Workspace::identity_with`, which return the value with its algorithm.
 
 ## [0.5.2] - 2026-11-04
 

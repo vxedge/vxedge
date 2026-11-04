@@ -401,6 +401,24 @@ async fn a_workspace_edited_since_up_is_not_restored() {
     assert!(refused.message().contains("changed"), "{refused:?}");
 }
 
+/// A run recorded by a daemon from before `vxws/2` holds a `vxws/1` identity and names no
+/// algorithm. Upgrading the daemon under a running vehicle must not read that as an edit.
+#[tokio::test]
+async fn a_run_recorded_under_vxws1_is_still_restored() {
+    let ws = vehicle_workspace();
+    let v1 = vxedge_core::Workspace::identity_with(&ws, vxedge_core::IdentityAlgorithm::Vxws1)
+        .unwrap()
+        .value;
+    let daemon = Daemon::start_with(|run| write_active_record(run, &vehicle_id(), &ws, Some(&v1)));
+    let zones = ZoneServiceClient::new(daemon.channel().await)
+        .list(ZoneListRequest::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .zones;
+    assert_eq!(zones.len(), 1);
+}
+
 #[tokio::test]
 async fn hpc_devices_belong_to_compute_not_zones() {
     let ws = vehicle_workspace();
@@ -686,7 +704,8 @@ fn one_of_each_workspace() -> (PathBuf, String) {
 fn write_run_record(runtime: &Path, id: &str, dir: &Path, run_id: &str) {
     let record = serde_json::json!({
         "id": id, "dir": dir, "bridge": "lo", "run_id": run_id,
-        "started_unix_ms": 1234, "sha256": vxedge_core::Workspace::content_sha256(dir).unwrap(),
+        "started_unix_ms": 1234, "sha256": vxedge_core::Workspace::identity(dir).unwrap().value,
+        "identity_algorithm": "vxws/2",
     });
     std::fs::write(runtime.join("active.json"), record.to_string()).unwrap();
 }
@@ -710,8 +729,9 @@ async fn run_service_reports_the_active_run() {
     assert_eq!(run.started_unix_ms, 1234);
     assert_eq!(
         run.workspace_sha256,
-        vxedge_core::Workspace::content_sha256(&ws).unwrap()
+        vxedge_core::Workspace::identity(&ws).unwrap().value
     );
+    assert_eq!(run.workspace_identity_algorithm, "vxws/2");
     let named = |id: &str| RunGetRequest {
         run: Some(RunRef { run_id: id.into() }),
     };

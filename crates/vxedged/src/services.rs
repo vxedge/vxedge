@@ -114,6 +114,20 @@ pub(crate) fn preflight_requires(dir: Option<&std::path::Path>) -> Result<(), St
         })
 }
 
+/// The algorithm behind the identity [`resolve_manifest`] computes: the workspace rule when there
+/// is a directory, the plain SHA-256 of the document for a manifest passed inline without one.
+pub(crate) fn identity_algorithm(dir: Option<&Path>) -> &'static str {
+    match dir {
+        Some(_) => vxedge_core::IdentityAlgorithm::CURRENT.as_str(),
+        None => "sha256",
+    }
+}
+
+/// [`identity_algorithm`] for the active experiment, whose `dir` is `.` when it came inline.
+fn active_identity_algorithm(a: &ActiveExperiment) -> &'static str {
+    identity_algorithm((a.dir != Path::new(".")).then_some(a.dir.as_path()))
+}
+
 pub(crate) async fn resolve_manifest(
     mref: Option<&ManifestRef>,
 ) -> Result<(String, String, Option<PathBuf>), Status> {
@@ -157,7 +171,7 @@ pub(crate) async fn resolve_manifest(
     // identity that ignored them would call two different experiments the same. An inline
     // manifest has no directory, so it falls back to hashing what it was actually given.
     let sha256 = match &dir {
-        Some(root) => Workspace::content_sha256(root).map_err(|e| {
+        Some(root) => Workspace::identity(root).map(|i| i.value).map_err(|e| {
             crate::errors::invalid(
                 crate::errors::R::WorkspaceInvalid,
                 format!("workspace `{}`: {e}", root.display()),
@@ -299,19 +313,32 @@ fn active_record(runtime_dir: &Path) -> PathBuf {
     runtime_dir.join("active.json")
 }
 
-/// What `active.json` says. A record from before 0.4.1 has no `sha256`, and one from before 0.5.0
-/// has no `run_id` or `started_unix_ms`.
+/// What `active.json` says. A record from before 0.4.1 has no `sha256`, one from before 0.5.0
+/// has no `run_id` or `started_unix_ms`, and one from before `vxws/2` has no
+/// `identity_algorithm`.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ActiveRecord {
     pub id: String,
     pub dir: PathBuf,
     pub bridge: String,
     pub sha256: Option<String>,
+    /// The rule that computed `sha256`. See [`ActiveRecord::identity_algorithm`].
+    pub identity_algorithm: Option<String>,
     pub run_id: Option<String>,
     pub started_unix_ms: Option<i64>,
 }
 
 impl ActiveRecord {
+    /// The rule that computed `sha256`. A record that names none was written before `vxws/2`
+    /// existed, so its identity is `vxws/1`. Empty when there is no `sha256` at all.
+    pub fn identity_algorithm(&self) -> &str {
+        match (&self.sha256, &self.identity_algorithm) {
+            (None, _) => "",
+            (Some(_), Some(a)) => a,
+            (Some(_), None) => vxedge_core::IdentityAlgorithm::Vxws1.as_str(),
+        }
+    }
+
     /// The run this record describes. A record older than run ids still names one run.
     pub fn run_id(&self) -> &str {
         self.run_id.as_deref().unwrap_or("run-legacy")
@@ -395,6 +422,7 @@ fn read_active_record(runtime_dir: &Path) -> Option<ActiveRecord> {
         dir: PathBuf::from(v["dir"].as_str()?),
         bridge: v["bridge"].as_str()?.to_string(),
         sha256: v["sha256"].as_str().map(str::to_string),
+        identity_algorithm: v["identity_algorithm"].as_str().map(str::to_string),
         run_id: v["run_id"].as_str().map(str::to_string),
         started_unix_ms: v["started_unix_ms"].as_i64(),
     })
@@ -444,11 +472,30 @@ pub(crate) async fn restore_active(
     let (yaml, sha256, _) = resolve_manifest(Some(&mref))
         .await
         .map_err(|e| refuse(e.message().to_string()))?;
-    if record.sha256.as_ref().is_some_and(|s| *s != sha256) {
-        return Err(refuse_as(
-            crate::errors::R::WorkspaceChanged,
-            "it has changed since `up`".to_string(),
-        ));
+    if let Some(recorded) = &record.sha256 {
+        // Compare under the algorithm the record was written with: a run recorded before
+        // `vxws/2` holds a `vxws/1` value, and recomputing that one is what tells an upgraded
+        // daemon whether the workspace really changed.
+        let algorithm: vxedge_core::IdentityAlgorithm = record
+            .identity_algorithm()
+            .parse()
+            .map_err(|e: vxedge_core::identity::IdentityError| refuse(e.to_string()))?;
+        let now = if algorithm == vxedge_core::IdentityAlgorithm::CURRENT {
+            sha256.clone()
+        } else {
+            let dir = record.dir.clone();
+            tokio::task::spawn_blocking(move || Workspace::identity_with(&dir, algorithm))
+                .await
+                .map_err(|e| Status::internal(format!("identity task panicked: {e}")))?
+                .map_err(|e| refuse(e.to_string()))?
+                .value
+        };
+        if *recorded != now {
+            return Err(refuse_as(
+                crate::errors::R::WorkspaceChanged,
+                "it has changed since `up`".to_string(),
+            ));
+        }
     }
     let model =
         vxedge_core::model::load_workspace_yaml(&yaml).map_err(|e| refuse(e.to_string()))?;
@@ -739,6 +786,7 @@ impl GatewaySvc {
                             "dir": dir,
                             "bridge": plan.bridge,
                             "sha256": sha256,
+                            "identity_algorithm": identity_algorithm(manifest_dir.as_deref()),
                             "run_id": run_id,
                             "started_unix_ms": started,
                         });
@@ -1402,11 +1450,14 @@ impl ZoneSvc {
             .await
             .active
             .as_ref()
-            .map(|a| a.sha256.clone())
+            .map(|a| (a.sha256.clone(), active_identity_algorithm(a)))
             .unwrap_or_default();
         self.audit.record(
             rpc,
-            serde_json::json!({ "zone": vxid, "nodes": plans.len(), "workspace_sha256": workspace }),
+            serde_json::json!({
+                "zone": vxid, "nodes": plans.len(),
+                "workspace_sha256": workspace.0, "identity_algorithm": workspace.1,
+            }),
         );
         let shell = self.shell.clone();
         let runtime_dir = self.runtime_dir.clone();
@@ -1644,11 +1695,14 @@ impl ComputeSvc {
             .await
             .active
             .as_ref()
-            .map(|a| a.sha256.clone())
+            .map(|a| (a.sha256.clone(), active_identity_algorithm(a)))
             .unwrap_or_default();
         self.audit.record(
             rpc,
-            serde_json::json!({ "compute": vxid, "nodes": plans.len(), "workspace_sha256": workspace }),
+            serde_json::json!({
+                "compute": vxid, "nodes": plans.len(),
+                "workspace_sha256": workspace.0, "identity_algorithm": workspace.1,
+            }),
         );
         let shell = self.shell.clone();
         let runtime_dir = self.runtime_dir.clone();
@@ -2935,6 +2989,7 @@ mod tests {
                 dir: "/ws/a".into(),
                 bridge: "vxbr0".into(),
                 sha256: None,
+                identity_algorithm: None,
                 run_id: None,
                 started_unix_ms: None,
             })
