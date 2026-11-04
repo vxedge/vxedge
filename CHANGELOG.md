@@ -6,6 +6,15 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-11-04
+
+A workspace's identity no longer changes when it is its own git repository or an editor leaves a
+swap file, and every recorded identity names the rule that produced it. Identity values differ from
+0.5.2's by design: a run recorded by an older daemon reads as `vxws/1` and is still restored after an
+upgrade. The `.vxp` descriptor is now checked against the experiment it names. vxAPI stays
+`vxedge.v1`, additive only (`Run.workspace_identity_algorithm`). Release together with vxtelemetry
+0.3.0, which computes the same identities and archives every file they cover.
+
 ### Changed
 
 - A workspace's `.vxp` descriptor is now checked against its documents. Its `id` must equal the
