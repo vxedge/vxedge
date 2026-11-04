@@ -353,43 +353,39 @@ impl VehicleService for VehicleSvc {
         self.require_active("vehicle status", &model, dir.as_deref(), &nodes)
             .await?;
 
-        let gw = self.handles.gateway.observe(Some(gateway), None).await?;
-        let gw_status = gw.status.clone().unwrap_or_default();
-
         let unattached = unprovisioned(&model, &nodes);
         let shell = self.handles.zones.shell.clone();
         let runtime_dir = self.handles.zones.runtime_dir.clone();
-        let typed = tokio::task::spawn_blocking(move || {
-            nodes
-                .iter()
-                .map(|n| {
-                    let state = vxedge_core::zones::node_status(&shell, n, &runtime_dir);
-                    crate::status::observed_node(n, &state)
-                })
-                .collect::<Vec<_>>()
-        })
-        .await
-        .map_err(|e| Status::internal(format!("status task panicked: {e}")))?;
+        // Every part is observed at once: the gateway, the nodes, the services and the signal
+        // plane are independent reads, and doing them in turn made this call take seconds.
+        let services = async {
+            let mut out = Vec::new();
+            for service_type in vxedge_core::services::ServiceDef::declared_types(&model) {
+                let observed = self
+                    .handles
+                    .svcs
+                    .status(Request::new(SvcStatusRequest {
+                        service_type,
+                        experiment: inline(&yaml, dir.as_deref()),
+                        ..Default::default()
+                    }))
+                    .await?;
+                out.push(observed.into_inner());
+            }
+            Ok::<_, Status>(out)
+        };
+        let (gw, typed, services, signal_plane) = tokio::join!(
+            self.handles.gateway.observe(Some(gateway), None),
+            crate::services::observed_nodes(shell, runtime_dir, nodes),
+            services,
+            self.handles.signal_plane_component(&model, dir.as_deref()),
+        );
+        let (gw, typed) = (gw?, typed?);
+        let gw_status = gw.status.clone().unwrap_or_default();
         let mut components: Vec<ResourceStatus> =
             typed.iter().filter_map(|n| n.status.clone()).collect();
-
-        for service_type in vxedge_core::services::ServiceDef::declared_types(&model) {
-            let observed = self
-                .handles
-                .svcs
-                .status(Request::new(SvcStatusRequest {
-                    service_type,
-                    experiment: inline(&yaml, dir.as_deref()),
-                    ..Default::default()
-                }))
-                .await?;
-            components.push(observed.into_inner());
-        }
-        components.extend(
-            self.handles
-                .signal_plane_component(&model, dir.as_deref())
-                .await?,
-        );
+        components.extend(services?);
+        components.extend(signal_plane?);
 
         let (status, mut components) =
             crate::status::composite_rollup(&id, ResourceKind::Vehicle, gw_status, components);

@@ -10,7 +10,8 @@ All notable changes to this repo are documented here. Format follows
 
 Closes the vxAPI upgrade plan. `HostService.Capabilities` now answers from the checks `up` itself
 makes, so it cannot tell an agent a backend is available when `up` would refuse it, and it reports
-the GPU. `traffic up` refuses before starting when an endpoint is not on the host.
+the GPU. `traffic up` refuses before starting when an endpoint is not on the host, and status reads are
+four times faster. Verified live through `vxmcp`.
 
 ### Added
 
@@ -25,8 +26,10 @@ the GPU. `traffic up` refuses before starting when an endpoint is not on the hos
 - `HostService.Capabilities` and `WorkspaceService.Plan`'s backend checks report the container
   backend only where Podman answers, as the preflight requires, and probe the emulator the
   qemu-microvm backend starts. They checked only that `ip` and a fixed binary name were on `PATH`.
-- `RunService` reads one workspace status per call instead of the gateway and then the workspace,
-  and answers `STAGING` without observing while a lifecycle job runs.
+- Status is observed concurrently: each node in its own probe, and `vehicle status` reads the
+  gateway, nodes, services and signal plane at once. On `vx-vehicle-03`, `vehicle status` and
+  `RunService.List` went from 6.0 s to 1.6 s and `zone list` from 2.4 s to 1.3 s. `RunService` reads
+  one workspace status per call, and answers `STAGING` without observing while a lifecycle job runs.
 
 ## [0.5.1] - 2026-11-04
 

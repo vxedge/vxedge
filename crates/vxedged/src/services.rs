@@ -357,23 +357,33 @@ fn new_run_id(workspace_sha256: &str) -> String {
     format!("run-{}", &hash[..12])
 }
 
-/// Observe these nodes.
-async fn observed_nodes(
+/// Observe these nodes, each in its own blocking task: a probe is a few Podman, process and
+/// netlink reads, and probing one node after another made `vehicle status` on six nodes take
+/// seconds. The order of the result is the order of `plans`.
+pub(crate) async fn observed_nodes(
     shell: Shell,
     runtime_dir: PathBuf,
     plans: Vec<NodePlan>,
 ) -> Result<Vec<NodeStatus>, Status> {
-    tokio::task::spawn_blocking(move || {
-        plans
-            .iter()
-            .map(|np| {
-                let state = zones::node_status(&shell, np, &runtime_dir);
-                crate::status::observed_node(np, &state)
+    let probes: Vec<_> = plans
+        .into_iter()
+        .map(|np| {
+            let (shell, runtime_dir) = (shell.clone(), runtime_dir.clone());
+            tokio::task::spawn_blocking(move || {
+                let state = zones::node_status(&shell, &np, &runtime_dir);
+                crate::status::observed_node(&np, &state)
             })
-            .collect()
-    })
-    .await
-    .map_err(|e| Status::internal(format!("status task panicked: {e}")))
+        })
+        .collect();
+    let mut nodes = Vec::with_capacity(probes.len());
+    for probe in probes {
+        nodes.push(
+            probe
+                .await
+                .map_err(|e| Status::internal(format!("status task panicked: {e}")))?,
+        );
+    }
+    Ok(nodes)
 }
 
 /// The record, if it is there and reads.
