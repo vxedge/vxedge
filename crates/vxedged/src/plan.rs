@@ -83,6 +83,29 @@ pub(crate) async fn preflight(
     let mut pf = Preflight::default();
     let workspace = dir.unwrap_or_else(|| Path::new("."));
 
+    // The daemon reads a directory as joined documents, which carry no `.vxp`, so the
+    // descriptor's agreement with them is checked here, from the directory itself, with the
+    // same function `experiment validate` uses. Document errors are not repeated: the model
+    // build already reported them.
+    let package = dir.and_then(|d| match vxedge_core::Workspace::load(d) {
+        Ok(ws) => {
+            let problems = ws.package_problems();
+            (!problems.is_empty()).then(|| {
+                problems
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })
+        }
+        Err(vxedge_core::WorkspaceError::Package(e)) => Some(e.to_string()),
+        Err(_) => None,
+    });
+    pf.check(
+        "package descriptor",
+        package.map(|detail| (R::WorkspaceInvalid, model.id.clone(), detail)),
+    );
+
     let requires = crate::services::preflight_requires(dir).err();
     pf.check(
         "host requirements",

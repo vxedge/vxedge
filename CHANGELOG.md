@@ -6,6 +6,15 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Changed
+
+- A workspace's `.vxp` descriptor is now checked against its documents. Its `id` must equal the
+  experiment's id, and its `entry`, when given, must name the file holding the experiment.
+  `experiment validate`, `manifest validate`, `WorkspaceService.Plan` and `up` all run the check,
+  and the daemon refuses with `ERROR_REASON_WORKSPACE_INVALID` before provisioning anything.
+- `Workspace::load` reads the descriptor, so a malformed `.vxp`, or a second one, fails
+  validation instead of failing later at `experiment up`.
+
 ## [0.5.2] - 2026-11-04
 
 Closes the vxAPI upgrade plan. `HostService.Capabilities` now answers from the checks `up` itself

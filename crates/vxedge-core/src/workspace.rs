@@ -44,6 +44,9 @@ pub enum WorkspaceError {
         if .key == "vehicle" { "2" } else { "1" }
     )]
     LegacyManifest { path: PathBuf, key: String },
+    /// The directory holds a `.vxp` that cannot be read, or more than one.
+    #[error(transparent)]
+    Package(#[from] crate::package::DiscoverError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -130,6 +133,16 @@ pub enum WorkspaceValidationError {
          is not reproducible for anyone else. Pin it, or use a local path while iterating."
     )]
     PublishedRefWithoutDigest { baseline: String, part: String },
+    #[error(
+        "the `.vxp` id `{package}` does not match the experiment id `{experiment}` — a package \
+         is cited by one and run by the other, so they must be the same name"
+    )]
+    PackageIdMismatch { package: String, experiment: String },
+    #[error(
+        "the `.vxp` names `entry: {entry}`, but the `kind: experiment` document is in `{found}` \
+         — point `entry` at it, or drop `entry`"
+    )]
+    EntryWithoutExperiment { entry: String, found: String },
     #[error(
         "baseline `{baseline}`: `{part}` has digest `{digest}` — expected `sha256:` + 64 hex chars"
     )]
@@ -755,6 +768,12 @@ pub struct Workspace {
     pub baselines: Vec<BaselineDoc>,
     pub roads: Vec<String>,
     pub components: Vec<String>,
+    /// The `.vxp` descriptor, when the directory holds one. Always `None` for a workspace read
+    /// from text: an inline manifest carries no descriptor.
+    pub package: Option<crate::package::PackageDoc>,
+    /// The file each experiment document came from, in the same order as `experiments`:
+    /// a file name for a directory, `<inline>` for text.
+    pub experiment_sources: Vec<String>,
 }
 
 /// `component:port` → the component half. A bare id has no port and is returned as-is.
@@ -800,6 +819,15 @@ impl Workspace {
             })?;
             ws.absorb(&text, &path)?;
         }
+
+        // The descriptor is optional here (a bare directory of documents is a valid input to
+        // `manifest validate` and `vehicle up`), but one that exists must be readable, and there
+        // must not be two.
+        ws.package = match crate::package::discover(root) {
+            Ok(found) => Some(found.package),
+            Err(crate::package::DiscoverError::NotAWorkspace { .. }) => None,
+            Err(e) => return Err(e.into()),
+        };
 
         Ok(ws)
     }
@@ -898,6 +926,11 @@ impl Workspace {
                 Kind::Experiment => {
                     self.experiments.push(doc(value.clone(), path)?);
                     self.experiments_raw.push(value);
+                    self.experiment_sources.push(
+                        path.file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.display().to_string()),
+                    );
                 }
                 Kind::Vehicle => self.vehicles.push(doc(value, path)?),
                 Kind::Baseline => self.baselines.push(doc(value, path)?),
@@ -1202,6 +1235,36 @@ impl Workspace {
             }
         }
 
+        errors.extend(self.package_problems());
+        errors
+    }
+
+    /// The `.vxp` descriptor's agreement with the documents: its `id` is the experiment's id,
+    /// and its `entry`, when given, is the file holding the experiment. Empty without a
+    /// descriptor, or without exactly one experiment (that is reported on its own).
+    ///
+    /// Public so the daemon's preflight can run exactly these checks for a directory it was
+    /// given, which it otherwise reads as joined text with no descriptor.
+    pub fn package_problems(&self) -> Vec<WorkspaceValidationError> {
+        use WorkspaceValidationError as E;
+        let (Some(package), [experiment]) = (&self.package, self.experiments.as_slice()) else {
+            return Vec::new();
+        };
+        let mut errors = Vec::new();
+        if package.id != experiment.id {
+            errors.push(E::PackageIdMismatch {
+                package: package.id.clone(),
+                experiment: experiment.id.clone(),
+            });
+        }
+        if let (Some(entry), Some(found)) = (&package.entry, self.experiment_sources.first())
+            && entry != found
+        {
+            errors.push(E::EntryWithoutExperiment {
+                entry: entry.clone(),
+                found: found.clone(),
+            });
+        }
         errors
     }
 
@@ -2076,6 +2139,98 @@ id: stray
         .unwrap();
         let ws = Workspace::load(&root).unwrap();
         assert_eq!(ws.experiments.len(), 1, "results/ must be ignored");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    fn package_files(vxp: &str) -> Vec<(&str, &str)> {
+        vec![
+            ("main.yaml", GOOD_EXPERIMENT),
+            ("car1.yaml", GOOD_VEHICLE),
+            ("parts.yaml", GOOD_BASELINE),
+            ("exp1.vxp", vxp),
+        ]
+    }
+
+    #[test]
+    fn a_matching_descriptor_validates() {
+        let root = workspace(
+            "pkg-ok",
+            &package_files("id: exp1\nversion: 0.1.0\nentry: main.yaml\n"),
+        );
+        let ws = Workspace::load(&root).unwrap();
+        assert_eq!(ws.package.as_ref().map(|p| p.id.as_str()), Some("exp1"));
+        assert!(ws.validate().is_empty(), "{:?}", ws.validate());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_descriptor_id_must_name_the_experiment() {
+        // The package is cited by its `.vxp` id and run by its experiment id. Two names for one
+        // thing drift: archives record one, audit records the other.
+        let root = workspace("pkg-id", &package_files("id: something-else\n"));
+        let errors = Workspace::load(&root).unwrap().validate();
+        assert_eq!(
+            errors,
+            vec![WorkspaceValidationError::PackageIdMismatch {
+                package: "something-else".into(),
+                experiment: "exp1".into(),
+            }]
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_descriptor_entry_must_hold_the_experiment() {
+        // `entry` was parsed and never read, so it could name any file, or none.
+        let root = workspace("pkg-entry", &package_files("id: exp1\nentry: car1.yaml\n"));
+        let errors = Workspace::load(&root).unwrap().validate();
+        assert_eq!(
+            errors,
+            vec![WorkspaceValidationError::EntryWithoutExperiment {
+                entry: "car1.yaml".into(),
+                found: "main.yaml".into(),
+            }]
+        );
+        fs::remove_dir_all(&root).ok();
+
+        let root = workspace(
+            "pkg-entry-gone",
+            &package_files("id: exp1\nentry: nope.yaml\n"),
+        );
+        let errors = Workspace::load(&root).unwrap().validate();
+        assert!(matches!(
+            errors.as_slice(),
+            [WorkspaceValidationError::EntryWithoutExperiment { entry, .. }] if entry == "nope.yaml"
+        ));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_malformed_descriptor_fails_the_load() {
+        // `Workspace::load` never read the `.vxp`, so a broken descriptor validated and only
+        // failed later, at `experiment up`.
+        let root = workspace("pkg-bad", &package_files("id: exp1\nnot_a_field: 1\n"));
+        assert!(matches!(
+            Workspace::load(&root),
+            Err(WorkspaceError::Package(_))
+        ));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_directory_without_a_descriptor_has_no_package_checks() {
+        // `manifest validate` and `vehicle up` accept a bare directory of documents.
+        let root = workspace(
+            "pkg-none",
+            &[
+                ("main.yaml", GOOD_EXPERIMENT),
+                ("car1.yaml", GOOD_VEHICLE),
+                ("parts.yaml", GOOD_BASELINE),
+            ],
+        );
+        let ws = Workspace::load(&root).unwrap();
+        assert!(ws.package.is_none());
+        assert!(ws.validate().is_empty());
         fs::remove_dir_all(&root).ok();
     }
 }
