@@ -6,6 +6,19 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-04
+
+A run's state is now observed, not assumed. After a daemon stopped in the middle of `up`,
+`RunService` reported the half-built run as `RESOURCE_STATE_UP`, so an agent trusting the typed field
+would have taken it as ready. Verified live on `vx-vehicle-03` with the daemon stopped during the
+zone, compute and signal-plane stages.
+
+### Fixed
+
+- `Run.state` rolls up the workspace's status: `UP` only when every zone, compute node, service and
+  signal plane it declares is up, `DEGRADED` for a half-built run until `up` or `down` converges it,
+  and `STAGING` while a lifecycle job holds the host. It was the gateway's state alone.
+
 ## [0.5.0] - 2026-11-04
 
 vxAPI for agents. An agent can plan a workspace, bring it up, follow its jobs, read typed status,

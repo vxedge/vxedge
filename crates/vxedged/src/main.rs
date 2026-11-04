@@ -222,8 +222,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let plan_gateway = gateway.clone();
     let telemetry_engine = engine.clone();
     let telemetry_audit = audit.clone();
+    let experiments = Arc::new(experiment::ExperimentSvc {
+        audit: audit.clone(),
+        handles: handles.clone(),
+    });
+    let vehicles = Arc::new(vehicle::VehicleSvc {
+        audit: audit.clone(),
+        handles,
+    });
     let runs = runs::RunSvc {
         gateway: gateway.clone(),
+        experiments: experiments.clone(),
+        vehicles: vehicles.clone(),
         runtime_dir: args.runtime_dir.clone(),
     };
     Server::builder()
@@ -241,14 +251,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .add_service(ComputeServiceServer::from_arc(compute))
         .add_service(SvcServiceServer::from_arc(svcs))
         .add_service(NosCheckServiceServer::from_arc(nos_check))
-        .add_service(ExperimentServiceServer::new(experiment::ExperimentSvc {
-            audit: audit.clone(),
-            handles: handles.clone(),
-        }))
-        .add_service(VehicleServiceServer::new(vehicle::VehicleSvc {
-            audit: audit.clone(),
-            handles,
-        }))
+        .add_service(ExperimentServiceServer::from_arc(experiments))
+        .add_service(VehicleServiceServer::from_arc(vehicles))
         .add_service(TrafficServiceServer::new(services::TrafficSvc {
             engine: engine.clone(),
             audit,
