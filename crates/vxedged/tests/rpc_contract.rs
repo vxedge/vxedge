@@ -1182,6 +1182,39 @@ async fn plan_and_up_agree() {
     }
 }
 
+/// A `.vxp` whose id is not the experiment's is refused by `Plan` and by `experiment up`, with
+/// the same typed reason, before anything is provisioned.
+#[tokio::test]
+async fn plan_and_up_agree_on_a_mismatched_descriptor() {
+    let daemon = Daemon::start();
+    let channel = daemon.channel().await;
+    let (dir, id) = experiment_workspace();
+    std::fs::write(dir.join("pkg.vxp"), "id: not-the-experiment\n").unwrap();
+
+    let plan = plan_of(&channel, &dir).await;
+    assert!(!plan.valid);
+    let first = plan.problems.first().expect("refused");
+    assert_eq!(
+        first.reason,
+        vxedge_api::v1::ErrorReason::WorkspaceInvalid as i32
+    );
+    assert!(
+        first.detail.contains("not-the-experiment"),
+        "{}",
+        first.detail
+    );
+    assert!(first.detail.contains(&id), "{}", first.detail);
+
+    let refused = ExperimentServiceClient::new(channel)
+        .up(ExperimentUpRequest {
+            manifest: path_ref(&dir),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&refused), "ERROR_REASON_WORKSPACE_INVALID");
+}
+
 #[tokio::test]
 async fn plan_and_up_agree_on_the_wrong_workspace() {
     let (active, id) = experiment_workspace();
