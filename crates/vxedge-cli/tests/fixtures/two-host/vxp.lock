@@ -1,0 +1,18 @@
+schema: vxp-lock/1
+package:
+  id: vxedge/two-host
+  version: 0.1.0
+locked_with: 0.6.0
+files:
+  README.md: sha256:6b44a891af4357da0ab62e28c72219c88a07bcf2565caefc74cfad56b421f5d3
+  assets/README.md: sha256:31cc18793196fea418e5cdbcd43a2d90daea141a174d44004dd228c360d19ca1
+  main.yaml: sha256:3c8b1588cc126eb9f76a2723338452d1785d3272b1b7a8e33398db72f3884cf6
+  parts.yaml: sha256:5d8677ffc51b2fde12c31cdfb341c5ba60b8d742dadb3fd83420a04a3fc54811
+  parts/README.md: sha256:16508813a77fc2dbf9b8a949ecd87cbc58dc244559d24c31a4f25dbb0af0ce31
+  scripts/run.sh: sha256:acd9730a6cefac32b369368b18c6b100eda2ebb5b6f79c0045f396f581dd354a
+  tools/README.md: sha256:4ce066bf2938243e53d74ac839e81412db7ef8b14eccb6e733b4c189a89d228c
+  vehicle.yaml: sha256:e784eba54a119a3ed5e8e1ce5bc1f421ba65a00905b4556d2d06a931ef4cbd3a
+  vxp.yaml: sha256:b9cc3732acf91cd8570239abd7a792ed787670e9861dec64a2a0804865e9fe23
+parts: []
+images: []
+vendored: []

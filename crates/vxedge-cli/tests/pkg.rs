@@ -150,3 +150,75 @@ fn a_legacy_workspace_is_told_to_migrate() {
     assert!(err.contains("legacy descriptor"), "{err}");
     std::fs::remove_dir_all(&base).ok();
 }
+
+/// The committed package every host must pack to the same digest (X1.4's two-host proof). Each
+/// CI run is a fresh checkout on another machine, with its own umask, mtimes and file order, so
+/// this test passing there and on a developer's host is the proof. The fixture is packed from its
+/// committed lock, never re-locked: `locked_with` names the vxedge that wrote it, and the lock
+/// check ignores that field, so a later vxedge still accepts the lock and packs the same bytes.
+/// If this digest moves, every published package's digest moved with it.
+const TWO_HOST_DIGEST: &str =
+    "sha256:f95ef0a7c0dd7bb9a0b8dd25ae64048072290d3474d7124e14daff93f86b8c3b";
+
+fn fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
+}
+
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let dest = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &dest);
+        } else {
+            std::fs::copy(entry.path(), &dest).unwrap();
+        }
+    }
+}
+
+#[test]
+fn the_committed_package_packs_to_the_same_digest_on_every_host() {
+    let committed = fixture("two-host");
+    let (ok, out, err) = vxedge(&committed, &["pkg", "lock", "--check"]);
+    assert!(ok, "the committed lock matches the checkout: {out}{err}");
+    let (ok, out, err) = vxedge(&committed, &["pkg", "inspect"]);
+    assert!(ok, "{out}{err}");
+    assert_eq!(
+        digest_line(&out),
+        TWO_HOST_DIGEST,
+        "from the checkout as is"
+    );
+
+    // A copy that differs in everything the packed form must not see: modes, mtimes, creation
+    // order, version control, editor backups and results.
+    let base = scratch("two-host");
+    let copy = base.join("two-host");
+    copy_tree(&committed, &copy);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let set = |p: &str, mode: u32| {
+            std::fs::set_permissions(copy.join(p), std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        set("scripts/run.sh", 0o600);
+        set("main.yaml", 0o755);
+    }
+    std::fs::create_dir_all(copy.join(".git")).unwrap();
+    std::fs::write(copy.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(copy.join("main.yaml~"), "editor backup\n").unwrap();
+    std::fs::write(copy.join("results/rep1.zip"), "not an input").unwrap();
+
+    let (ok, out, err) = vxedge(&copy, &["pkg", "pack"]);
+    assert!(ok, "pkg pack: {out}{err}");
+    assert_eq!(digest_line(&out), TWO_HOST_DIGEST, "from a perturbed copy");
+    let bytes = std::fs::read(base.join("two-host-0.1.0.vxp")).unwrap();
+    assert_eq!(
+        vxedge_core::pkg::sha256(&bytes),
+        TWO_HOST_DIGEST,
+        "the digest is the SHA-256 of the file, as `sha256sum` reads it"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}

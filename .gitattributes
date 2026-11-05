@@ -1,0 +1,2 @@
+# The two-host proof fixture is hashed byte for byte: never convert its line endings.
+crates/vxedge-cli/tests/fixtures/** -text

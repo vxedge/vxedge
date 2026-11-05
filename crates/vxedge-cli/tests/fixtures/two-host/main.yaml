@@ -1,0 +1,32 @@
+kind: experiment
+id: two-host
+
+# What is under test, and which software is on it.
+vehicles: [car1]
+baseline: bl-local
+
+# The vehicle names a slice; this file defines what that name means. Changing only
+# this block gives a controlled comparison over a provably unchanged vehicle.
+network:
+  slices:
+    - { id: adas, mode: vlan, vlan: 101, qos: { min_rate_mbps: 100, priority: 1 } }
+
+traffic_profiles:
+  probe:
+    source: zonefl          # a component id; `internet` is the host-side reflector
+    target: internet
+    pps: 1000
+    payload_bytes: 200
+
+# Repetitions and a discarded warmup are what separate a measurement from an anecdote.
+method:
+  duration_s: 60
+  repetitions: 5
+  warmup_s: 10
+
+telemetry:
+  prometheus:
+    scrape_targets: ["127.0.0.1:9801"]   # vxprobe's live exporter (host:port)
+
+results:
+  artifact_dir: results/
