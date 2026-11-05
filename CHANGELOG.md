@@ -14,6 +14,11 @@ All notable changes to this repo are documented here. Format follows
   listed backend must be available here. `Plan` names every unmet requirement, not only the first.
   `kernel.preempt_rt: preferred` runs on any kernel; the run record does not yet note which kernel
   it was.
+- `vxedge-core::pkg`, the package lock, packed form and package digest of `ARCHITECTURE.md`
+  §6.0.7: a deterministic ustar writer and a reader that accepts only what it writes, `unpack`
+  checked by re-packing, and `vxp.lock` built offline from the documents (published parts and
+  images as the documents pin them). The packed-bytes test vector is frozen, and Python's
+  `tarfile` writes the same bytes.
 
 ### Changed
 
