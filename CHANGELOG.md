@@ -36,8 +36,8 @@ All notable changes to this repo are documented here. Format follows
 ### Fixed
 
 - A `libvirt` zone node now gets the host CPU (`<cpu mode='host-passthrough'/>`), as a
-  `qemu-microvm` node already does with `-cpu host`. libvirt defaulted to `qemu64`, so a guest
-  built for a newer x86-64 level stopped before its first console line.
+  `qemu-microvm` node already does with `-cpu host`. With no CPU named, libvirt defaulted to
+  `qemu64`, and a guest that needs the host's CPU features printed nothing.
 
 ## [0.6.0] - 2026-11-05
 

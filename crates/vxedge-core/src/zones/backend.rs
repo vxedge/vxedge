@@ -937,7 +937,7 @@ mod tests {
     }
 
     /// The guest sees the host CPU, as on qemu-microvm (`-cpu host` under KVM). Without a `<cpu>`
-    /// element libvirt picks `qemu64`, and a guest built for a newer x86-64 level never boots.
+    /// element libvirt picks `qemu64`, and a guest that needs the host's CPU features never boots.
     #[test]
     fn a_libvirt_guest_gets_the_host_cpu() {
         let np = NodePlan {
