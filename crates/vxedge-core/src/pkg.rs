@@ -100,6 +100,11 @@ pub fn entries(root: &Path) -> Result<Vec<(String, Vec<u8>)>, PkgError> {
             return Err(PkgError::NonUtf8Path { path: file });
         };
         let rel_str = rel_str.replace('\\', "/");
+        // A path ustar cannot hold is refused here, so `pkg validate` and `pkg lock` say so
+        // before `pkg pack` would.
+        if split_name(&rel_str).is_none() {
+            return Err(PkgError::PathTooLong { path: rel_str });
+        }
         // Every directory on the way, then the file: a symlinked directory makes its files look
         // regular, and the identity walk follows it.
         let mut at = root.to_path_buf();
@@ -742,6 +747,25 @@ mod tests {
         // A split path reads back whole.
         let bytes = pack_entries(&[(long.clone(), b"x".to_vec())]).unwrap();
         assert_eq!(read_packed(&bytes).unwrap(), vec![(long, b"x".to_vec())]);
+    }
+
+    /// A path too long to pack is refused when the inputs are read, so validation reports it.
+    #[test]
+    fn an_unpackable_path_is_refused_with_the_inputs() {
+        let long = "n".repeat(101);
+        let root = workspace(
+            "longname",
+            &[
+                ("vxp.yaml", DESCRIPTOR),
+                ("main.yaml", MAIN),
+                (long.as_str(), "x"),
+            ],
+        );
+        match entries(&root) {
+            Err(PkgError::PathTooLong { path }) => assert_eq!(path, long),
+            other => panic!("expected PathTooLong, got {other:?}"),
+        }
+        fs::remove_dir_all(&root).ok();
     }
 
     #[cfg(unix)]
