@@ -588,6 +588,7 @@ async fn experiment_up_does_not_skip_a_declared_signal_plane() {
         .up(ExperimentUpRequest {
             manifest: path_ref(&ws),
             stages: vec![ExperimentStage::SignalPlane as i32],
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -842,6 +843,7 @@ async fn experiment_up_refuses_a_workspace_that_is_not_active() {
         .up(ExperimentUpRequest {
             manifest: path_ref(&other),
             stages: Vec::new(),
+            ..Default::default()
         })
         .await
         .unwrap_err();
@@ -972,6 +974,7 @@ async fn vehicle_up_runs_only_the_stages_it_was_given() {
         .up(VehicleUpRequest {
             manifest: path_ref(&dir),
             stages: vec![ExperimentStage::Services as i32],
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -997,6 +1000,7 @@ async fn a_stage_the_daemon_does_not_know_is_refused() {
             .up(VehicleUpRequest {
                 manifest: path_ref(&dir),
                 stages: vec![stage],
+                ..Default::default()
             })
             .await
             .unwrap_err();
@@ -1139,6 +1143,7 @@ async fn plan_of(channel: &Channel, dir: &Path) -> vxedge_api::v1::WorkspacePlan
     vxedge_api::v1::workspace_service_client::WorkspaceServiceClient::new(channel.clone())
         .plan(vxedge_api::v1::WorkspacePlanRequest {
             manifest: path_ref(dir),
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -1440,6 +1445,7 @@ async fn experiment_up_runs_the_same_checks() {
         .up(ExperimentUpRequest {
             manifest: path_ref(&dir),
             stages: Vec::new(),
+            ..Default::default()
         })
         .await
         .unwrap_err();
@@ -1576,8 +1582,9 @@ fn fake_vxtelemetry(exit: i32) -> PathBuf {
     std::fs::write(
         &bin,
         format!(
-            "#!/bin/sh\necho \"$@\" > \"{}/args\"\nwhile [ $# -gt 0 ]; do [ \"$1\" = --out ] && \
-             printf archive > \"$2\"; shift; done\nexit {exit}\n",
+            "#!/bin/sh\necho \"$@\" > \"{0}/args\"\necho \"${{VXTELEMETRY_PACKAGE_LOCKED-unset}}\" > \
+             \"{0}/locked\"\nwhile [ $# -gt 0 ]; do [ \"$1\" = --out ] && printf archive > \"$2\"; \
+             shift; done\nexit {exit}\n",
             dir.display()
         ),
     )
@@ -1628,6 +1635,45 @@ async fn collect_returns_the_archive_and_its_digest() {
         args.contains("--record-image localhost/vxedge/probe:1"),
         "{args}"
     );
+    let locked = std::fs::read_to_string(bin.parent().unwrap().join("locked")).unwrap();
+    assert_eq!(locked.trim(), "unset", "no run, so nothing to say");
+}
+
+/// `collect` tells vxtelemetry whether the live run of this workspace checked its lock, and
+/// records the package digest in its audit line.
+#[tokio::test]
+async fn collect_passes_on_whether_the_run_was_locked() {
+    let (ws, id) = experiment_workspace();
+    let bin = fake_vxtelemetry(0);
+    let daemon = Daemon::start_env(
+        |run| {
+            std::fs::create_dir_all(run.join("ingest")).unwrap();
+            let record = serde_json::json!({
+                "id": id, "dir": ws, "bridge": "lo", "run_id": "run-l",
+                "package_id": "vxedge/x", "package_version": "1.0.0",
+                "package_digest": "sha256:abc", "package_locked": false,
+                "kernel_release": "6.1.0", "kernel_preempt_rt": false,
+            });
+            std::fs::write(run.join("active.json"), record.to_string()).unwrap();
+        },
+        &[("VXEDGE_VXTELEMETRY_BIN", &bin)],
+    );
+    let channel = daemon.channel().await;
+    let job =
+        vxedge_api::v1::telemetry_service_client::TelemetryServiceClient::new(channel.clone())
+            .collect(vxedge_api::v1::CollectRequest {
+                manifest: path_ref(&ws),
+                out_path: "results/run.zip".into(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+    assert_eq!(
+        wait_for_job(channel, job.id).await,
+        JobState::Succeeded as i32
+    );
+    let locked = std::fs::read_to_string(bin.parent().unwrap().join("locked")).unwrap();
+    assert_eq!(locked.trim(), "false");
 }
 
 #[tokio::test]
@@ -1661,4 +1707,170 @@ async fn a_failed_collect_fails_its_job_and_nothing_ingested_is_refused() {
     .await
     .unwrap_err();
     assert_eq!(reason(&refused), "ERROR_REASON_NOT_FOUND");
+}
+
+/// A `vxp/1` package as `experiment_workspace` writes it, with a lock that matches.
+fn locked_package() -> (PathBuf, String) {
+    let (dir, id) = experiment_workspace();
+    write_v1(&dir, &id, "vxp/1", "");
+    let lock = vxedge_core::pkg::lock(&dir, "0.0.0-test").unwrap();
+    vxedge_core::pkg::write_lock(&dir, &lock).unwrap();
+    (dir, id)
+}
+
+fn lock_problems(plan: &vxedge_api::v1::WorkspacePlan) -> Vec<String> {
+    plan.problems
+        .iter()
+        .filter(|p| p.reason == vxedge_api::v1::ErrorReason::LockMismatch as i32)
+        .map(|p| p.detail.clone())
+        .collect()
+}
+
+async fn plan_unlocked(channel: &Channel, dir: &Path) -> vxedge_api::v1::WorkspacePlan {
+    vxedge_api::v1::workspace_service_client::WorkspaceServiceClient::new(channel.clone())
+        .plan(vxedge_api::v1::WorkspacePlanRequest {
+            manifest: path_ref(dir),
+            unlocked: true,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+}
+
+/// `up` runs what the lock says: a changed file, an added one or a missing lock is refused by
+/// `Plan`, `experiment up` and `gateway up` alike, naming each difference, and `unlocked`
+/// skips the check. Nothing is provisioned: every refusal comes before the job.
+#[tokio::test]
+async fn plan_and_up_refuse_a_package_that_does_not_match_its_lock() {
+    let daemon = Daemon::start();
+    let channel = daemon.channel().await;
+    let (dir, _) = locked_package();
+    assert_eq!(
+        lock_problems(&plan_of(&channel, &dir).await),
+        Vec::<String>::new()
+    );
+
+    std::fs::write(dir.join("main.yaml"), {
+        let mut yaml = std::fs::read_to_string(dir.join("main.yaml")).unwrap();
+        yaml.push_str("# edited after locking\n");
+        yaml
+    })
+    .unwrap();
+    std::fs::write(dir.join("notes.txt"), "added\n").unwrap();
+    let problems = lock_problems(&plan_of(&channel, &dir).await);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(
+        problems[0].contains("`main.yaml` changed"),
+        "{}",
+        problems[0]
+    );
+    assert!(
+        problems[0].contains("`notes.txt` was added"),
+        "{}",
+        problems[0]
+    );
+    assert!(problems[0].contains("--unlocked"), "{}", problems[0]);
+    assert_eq!(
+        lock_problems(&plan_unlocked(&channel, &dir).await),
+        Vec::<String>::new()
+    );
+
+    let refused = ExperimentServiceClient::new(channel.clone())
+        .up(ExperimentUpRequest {
+            manifest: path_ref(&dir),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&refused), "ERROR_REASON_LOCK_MISMATCH");
+    let refused =
+        vxedge_api::v1::gateway_service_client::GatewayServiceClient::new(channel.clone())
+            .up(vxedge_api::v1::GatewayUpRequest {
+                manifest: path_ref(&dir),
+                unlocked: false,
+            })
+            .await
+            .unwrap_err();
+    assert_eq!(reason(&refused), "ERROR_REASON_LOCK_MISMATCH");
+    assert!(
+        refused.message().contains("Nothing was provisioned"),
+        "{}",
+        refused.message()
+    );
+
+    std::fs::remove_file(dir.join("vxp.lock")).unwrap();
+    let problems = lock_problems(&plan_of(&channel, &dir).await);
+    assert!(problems[0].contains("no `vxp.lock`"), "{problems:?}");
+}
+
+/// A legacy descriptor is never lock-checked.
+#[tokio::test]
+async fn a_legacy_package_is_not_lock_checked() {
+    let daemon = Daemon::start();
+    let channel = daemon.channel().await;
+    let (dir, id) = experiment_workspace();
+    std::fs::write(
+        dir.join(format!("{id}.vxp")),
+        format!("id: {id}\nversion: 0.1.0\n"),
+    )
+    .unwrap();
+    assert_eq!(
+        lock_problems(&plan_of(&channel, &dir).await),
+        Vec::<String>::new()
+    );
+}
+
+/// A run's package and kernel are read back from its record, and a record from before they were
+/// recorded reads as unset rather than as a guess.
+#[tokio::test]
+async fn run_service_reports_the_package_and_kernel_a_run_recorded() {
+    let ws = vehicle_workspace();
+    let daemon = Daemon::start_with(|run| {
+        write_run_record(run, &vehicle_id(), &ws, "run-p");
+        let path = run.join("active.json");
+        let mut record: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for (k, v) in [
+            ("package_id", serde_json::json!("vxedge/car")),
+            ("package_version", serde_json::json!("1.0.0")),
+            ("package_digest", serde_json::json!("sha256:abc")),
+            ("package_locked", serde_json::json!(false)),
+            ("kernel_release", serde_json::json!("6.12.0-rt")),
+            ("kernel_preempt_rt", serde_json::json!(true)),
+        ] {
+            record[k] = v;
+        }
+        std::fs::write(&path, record.to_string()).unwrap();
+    });
+    let run = RunServiceClient::new(daemon.channel().await)
+        .get(RunGetRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    let package = run.package.expect("package recorded");
+    assert_eq!(
+        (
+            package.id.as_str(),
+            package.version.as_str(),
+            package.digest.as_str()
+        ),
+        ("vxedge/car", "1.0.0", "sha256:abc")
+    );
+    assert!(!run.package_locked, "an unlocked run says so");
+    let kernel = run.kernel.expect("kernel recorded");
+    assert_eq!(
+        (kernel.release.as_str(), kernel.preempt_rt),
+        ("6.12.0-rt", true)
+    );
+
+    let older = Daemon::start_with(|run| write_run_record(run, &vehicle_id(), &ws, "run-o"));
+    let run = RunServiceClient::new(older.channel().await)
+        .get(RunGetRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        (run.package, run.kernel, run.package_locked),
+        (None, None, false)
+    );
 }

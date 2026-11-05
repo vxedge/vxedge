@@ -593,10 +593,14 @@ pub fn read_lock(root: &Path) -> Result<Option<Lock>, PkgError> {
 /// What `pkg validate` and `pkg lock --check` report about the lock: a missing lock, or each way
 /// the written one disagrees with the package. Empty when it holds.
 pub fn lock_problems(root: &Path) -> Result<Vec<String>, PkgError> {
-    let current = lock(root, "")?;
+    drift_from_written(root, &lock(root, "")?)
+}
+
+/// How the lock written at `root` differs from `current`; a missing lock is a difference.
+fn drift_from_written(root: &Path, current: &Lock) -> Result<Vec<String>, PkgError> {
     Ok(match read_lock(root)? {
         None => vec![format!("there is no `{LOCK_FILE}`; run `vxedge pkg lock`")],
-        Some(written) => written.drift(&current),
+        Some(written) => written.drift(current),
     })
 }
 
@@ -622,6 +626,59 @@ pub fn packed_descriptor_and_lock(bytes: &[u8]) -> Result<(String, Option<String
         reason: format!("it holds no `{DESCRIPTOR_FILE}`"),
     })?;
     Ok((descriptor, text(LOCK_FILE)))
+}
+
+/// What a run of a `vxp/1` package records about it (`ARCHITECTURE.md` §13).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunPackage {
+    pub id: String,
+    pub version: String,
+    /// The package digest of what runs: [`package_digest`] of the folder at `up`.
+    pub digest: String,
+    /// Whether `up` checked the lock. `false` only for `up --unlocked`.
+    pub locked: bool,
+}
+
+/// Why `up` refuses a `vxp/1` package before anything runs.
+#[derive(Debug, thiserror::Error)]
+pub enum RunRefusal {
+    #[error(
+        "the package does not match its `{LOCK_FILE}`: {}. Run `vxedge pkg lock` to record the \
+         change, or `up --unlocked` while authoring; an unlocked run is recorded as unlocked.",
+        .problems.join("; ")
+    )]
+    LockMismatch { problems: Vec<String> },
+    #[error(transparent)]
+    Package(#[from] PkgError),
+}
+
+/// The package a run from `root` records, after the checks `up` makes on it. `None` for a legacy
+/// descriptor, or for none at all, which record no package digest and have no lock. Unless
+/// `unlocked`, a lock that does not match is refused, naming each difference. Locked or not, a
+/// package that cannot be packed is refused with `pkg pack`'s error, since its run could not
+/// record a digest.
+pub fn run_package(root: &Path, unlocked: bool) -> Result<Option<RunPackage>, RunRefusal> {
+    let Ok(found) = crate::package::discover(root) else {
+        // Reported by the descriptor check, which runs first.
+        return Ok(None);
+    };
+    if !matches!(found.package, PackageDoc::V1(_)) {
+        return Ok(None);
+    }
+    let digest = package_digest(root)?;
+    let current = lock(root, "")?;
+    if !unlocked {
+        let problems = drift_from_written(root, &current)?;
+        if !problems.is_empty() {
+            return Err(RunRefusal::LockMismatch { problems });
+        }
+    }
+    Ok(Some(RunPackage {
+        id: current.package.id,
+        version: current.package.version,
+        digest,
+        locked: !unlocked,
+    }))
 }
 
 #[cfg(test)]
@@ -1092,5 +1149,76 @@ mod tests {
         assert_eq!(descriptor, DESCRIPTOR);
         assert_eq!(lock, None);
         fs::remove_dir_all(root.parent().unwrap()).ok();
+    }
+
+    /// What `up` runs is what the lock says, and a run records its package digest.
+    #[test]
+    fn a_run_records_the_package_and_refuses_a_lock_that_does_not_match() {
+        let root = locked_workspace("run");
+        // No lock yet: a mismatch, unless the run is unlocked.
+        match run_package(&root, false) {
+            Err(RunRefusal::LockMismatch { problems }) => {
+                assert!(problems[0].contains("no `vxp.lock`"), "{problems:?}")
+            }
+            other => panic!("{other:?}"),
+        }
+        let unlocked = run_package(&root, true).unwrap().unwrap();
+        assert!(!unlocked.locked);
+
+        write_lock(&root, &lock(&root, "0.7.0").unwrap()).unwrap();
+        let run = run_package(&root, false).unwrap().unwrap();
+        assert_eq!(
+            run,
+            RunPackage {
+                id: "vxedge/id-test".into(),
+                version: "1.0.0".into(),
+                digest: package_digest(&root).unwrap(),
+                locked: true,
+            }
+        );
+
+        fs::write(root.join("parts/p.bin"), "edited").unwrap();
+        match run_package(&root, false) {
+            Err(RunRefusal::LockMismatch { problems }) => {
+                assert_eq!(problems, ["`parts/p.bin` changed"])
+            }
+            other => panic!("{other:?}"),
+        }
+        let unlocked = run_package(&root, true).unwrap().unwrap();
+        assert_ne!(unlocked.digest, run.digest, "the digest is of what runs");
+        fs::remove_dir_all(root.parent().unwrap()).ok();
+    }
+
+    /// A run of a `vxp/1` package always records a digest, so one that cannot be packed does not
+    /// run, locked or not.
+    #[cfg(unix)]
+    #[test]
+    fn a_package_that_cannot_be_packed_does_not_run() {
+        let root = locked_workspace("run-unpackable");
+        write_lock(&root, &lock(&root, "0.7.0").unwrap()).unwrap();
+        std::os::unix::fs::symlink("p.bin", root.join("parts/link")).unwrap();
+        for unlocked in [false, true] {
+            match run_package(&root, unlocked) {
+                Err(RunRefusal::Package(PkgError::NotARegularFile { path, .. })) => {
+                    assert_eq!(path, "parts/link")
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        fs::remove_dir_all(root.parent().unwrap()).ok();
+    }
+
+    /// A legacy descriptor runs as before: no lock check, and no package digest to record.
+    #[test]
+    fn a_legacy_package_records_no_package() {
+        let root = workspace(
+            "run-legacy",
+            &[
+                ("demo.vxp", "id: demo\nversion: 0.1.0\n"),
+                ("main.yaml", MAIN),
+            ],
+        );
+        assert_eq!(run_package(&root, false).unwrap(), None);
+        fs::remove_dir_all(&root).ok();
     }
 }

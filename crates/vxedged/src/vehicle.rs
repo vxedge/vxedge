@@ -169,6 +169,7 @@ impl VehicleService for VehicleSvc {
     ) -> Result<Response<vxedge_api::v1::Job>, Status> {
         check_stages(&req.get_ref().stages)?;
         let stages = req.get_ref().stages.clone();
+        let unlocked = req.get_ref().unlocked;
         let Resolved {
             yaml,
             dir,
@@ -185,6 +186,7 @@ impl VehicleService for VehicleSvc {
             &model,
             &nodes,
             dir.as_deref(),
+            req.get_ref().unlocked,
             &self.handles.zones.runtime_dir,
             &self.handles.gateway,
         )
@@ -192,13 +194,17 @@ impl VehicleService for VehicleSvc {
         if let Some(refusal) = pf.refusal() {
             return Err(refusal);
         }
-        self.audit.record(
-            "VehicleService.Up",
-            serde_json::json!({
-                "vehicle": id, "workspace_sha256": sha256,
-                "workspace_identity_algorithm": crate::services::identity_algorithm(dir.as_deref()),
-            }),
-        );
+        let mut audit = serde_json::json!({
+            "vehicle": id, "workspace_sha256": sha256,
+            "workspace_identity_algorithm": crate::services::identity_algorithm(dir.as_deref()),
+        });
+        if let Some(fields) = audit.as_object_mut() {
+            fields.extend(crate::services::provenance(
+                pf.package.as_ref(),
+                &vxedge_core::package::RunningKernel::probe(),
+            ));
+        }
+        self.audit.record("VehicleService.Up", audit);
         let (zones, compute) = by_stage(&nodes);
         let svc = self.handles.clone();
         let job = self
@@ -214,7 +220,8 @@ impl VehicleService for VehicleSvc {
                     let mut done: Vec<String> = Vec::new();
                     p.checkpoint()?;
                     if wants(&stages, ExperimentStage::Gateway) {
-                        svc.stage_gateway(&yaml, dir.as_deref(), true, &p).await?;
+                        svc.stage_gateway(&yaml, dir.as_deref(), Some(unlocked), &p)
+                            .await?;
                         done.push("gateway".to_string());
                     }
                     p.checkpoint()?;
@@ -321,7 +328,7 @@ impl VehicleService for VehicleSvc {
                         failures.push(e);
                     }
                     if wants(&stages, ExperimentStage::Gateway)
-                        && let Err(e) = svc.stage_gateway(&yaml, dir.as_deref(), false, &p).await
+                        && let Err(e) = svc.stage_gateway(&yaml, dir.as_deref(), None, &p).await
                     {
                         failures.push(e);
                     }

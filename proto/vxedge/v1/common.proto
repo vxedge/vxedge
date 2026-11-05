@@ -121,6 +121,10 @@ enum ErrorReason {
   ERROR_REASON_PACKAGE_SCHEMA_UNSUPPORTED = 24;
   // The package's `requires.vxedge` range does not include this daemon's version.
   ERROR_REASON_VXEDGE_VERSION_UNSUPPORTED = 25;
+  // A `vxp/1` package does not match its `vxp.lock`: a file was added, removed or changed, a
+  // reference disagrees, or there is no lock. The detail names each difference. Run
+  // `vxedge pkg lock` to record the change, or set `unlocked` on the `Up` request while authoring.
+  ERROR_REASON_LOCK_MISMATCH = 26;
 }
 
 // Names one run. See `RunService`.

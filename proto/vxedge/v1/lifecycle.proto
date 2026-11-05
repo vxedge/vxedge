@@ -15,6 +15,10 @@ message GatewayApplyRequest {
 
 message GatewayUpRequest {
   ManifestRef manifest = 1;
+  // Skip the `vxp.lock` check while authoring (`up --unlocked`). The run records that it ran
+  // unlocked (`Run.package_locked`), so its result is never mistaken for a locked one. Ignored
+  // for a legacy descriptor or an inline manifest, which are never lock-checked.
+  bool unlocked = 2;
 }
 
 message GatewayDownRequest {
@@ -269,6 +273,10 @@ message VehicleUpRequest {
   ManifestRef manifest = 1;
   // Restrict to specific stages (empty = all, in dependency order).
   repeated ExperimentStage stages = 2;
+  // Skip the `vxp.lock` check while authoring (`up --unlocked`). The run records that it ran
+  // unlocked (`Run.package_locked`), so its result is never mistaken for a locked one. Ignored
+  // for a legacy descriptor or an inline manifest, which are never lock-checked.
+  bool unlocked = 3;
 }
 
 message VehicleDownRequest {
@@ -320,6 +328,10 @@ message ExperimentUpRequest {
   // Restrict to specific stages (empty = all, in dependency order). Individual devices are
   // still addressed with ZoneService.Up, which is how a campaign runs one arm at a time.
   repeated ExperimentStage stages = 2;
+  // Skip the `vxp.lock` check while authoring (`up --unlocked`). The run records that it ran
+  // unlocked (`Run.package_locked`), so its result is never mistaken for a locked one. Ignored
+  // for a legacy descriptor or an inline manifest, which are never lock-checked.
+  bool unlocked = 3;
 }
 
 message ExperimentDownRequest {

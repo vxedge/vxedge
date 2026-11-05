@@ -208,26 +208,28 @@ async fn resolve_once(mref: Option<&ManifestRef>) -> Result<String, Status> {
 }
 
 impl Handles {
+    /// Bring the gateway up (`Some(unlocked)`) or down (`None`).
     pub(crate) async fn stage_gateway(
         &self,
         yaml: &str,
         dir: Option<&std::path::Path>,
-        up: bool,
+        up: Option<bool>,
         p: &Progress,
     ) -> Result<String, JobFailure> {
         p.update(
             10,
-            if up {
+            if up.is_some() {
                 "gateway: bridge, slices, endpoints"
             } else {
                 "gateway: removing bridge, slices, endpoints"
             },
         );
-        let job = if up {
+        let job = if let Some(unlocked) = up {
             self.gateway
                 .up(stage(
                     GatewayUpRequest {
                         manifest: inline(yaml, dir),
+                        unlocked,
                     },
                     p.job_id(),
                 ))
@@ -659,6 +661,7 @@ impl ExperimentService for ExperimentSvc {
             &model,
             &nodes,
             dir.as_deref(),
+            req.get_ref().unlocked,
             &self.handles.zones.runtime_dir,
             &self.handles.gateway,
         )
@@ -666,13 +669,18 @@ impl ExperimentService for ExperimentSvc {
         if let Some(refusal) = pf.refusal() {
             return Err(refusal);
         }
-        self.audit.record(
-            "ExperimentService.Up",
-            serde_json::json!({ "experiment": model.id }),
-        );
+        let mut fields = serde_json::Map::new();
+        fields.insert("experiment".into(), model.id.clone().into());
+        fields.extend(crate::services::provenance(
+            pf.package.as_ref(),
+            &vxedge_core::package::RunningKernel::probe(),
+        ));
+        self.audit
+            .record("ExperimentService.Up", serde_json::Value::Object(fields));
         let id = model.id.clone();
         let svc = self.handles.clone();
         let stages = req.get_ref().stages.clone();
+        let unlocked = req.get_ref().unlocked;
         let job = self
             .handles
             .engine
@@ -683,7 +691,8 @@ impl ExperimentService for ExperimentSvc {
                     let mut done: Vec<String> = Vec::new();
                     p.checkpoint()?;
                     if wants(&stages, ExperimentStage::Gateway) {
-                        svc.stage_gateway(&yaml, dir.as_deref(), true, &p).await?;
+                        svc.stage_gateway(&yaml, dir.as_deref(), Some(unlocked), &p)
+                            .await?;
                         done.push("gateway".to_string());
                     }
                     p.checkpoint()?;
@@ -786,7 +795,7 @@ impl ExperimentService for ExperimentSvc {
                         failures.push(e);
                     }
                     if wants(&stages, ExperimentStage::Gateway)
-                        && let Err(e) = svc.stage_gateway(&yaml, dir.as_deref(), false, &p).await
+                        && let Err(e) = svc.stage_gateway(&yaml, dir.as_deref(), None, &p).await
                     {
                         failures.push(e);
                     }

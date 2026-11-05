@@ -369,6 +369,29 @@ pub fn kernel_is_preempt_rt(realtime: Option<&str>, version: &str) -> bool {
     }
 }
 
+/// The kernel this process runs on, as every run records it (`ARCHITECTURE.md` §13):
+/// `kernel.preempt_rt: preferred` runs on either kind, so the result has to say which.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningKernel {
+    /// `/proc/sys/kernel/osrelease`, as `uname -r` prints it. Empty when it cannot be read.
+    pub release: String,
+    /// See [`kernel_is_preempt_rt`].
+    pub preempt_rt: bool,
+}
+
+impl RunningKernel {
+    pub fn probe() -> Self {
+        let read = |path: &str| std::fs::read_to_string(path).ok();
+        let version = read("/proc/sys/kernel/version").unwrap_or_default();
+        Self {
+            release: read("/proc/sys/kernel/osrelease")
+                .map(|r| r.trim().to_string())
+                .unwrap_or_default(),
+            preempt_rt: kernel_is_preempt_rt(read("/sys/kernel/realtime").as_deref(), &version),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GpuCapability {
     pub compute_cap: f32,
@@ -401,12 +424,10 @@ impl HostCapabilities {
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
             .unwrap_or_default();
-        let realtime = std::fs::read_to_string("/sys/kernel/realtime").ok();
-        let version = std::fs::read_to_string("/proc/sys/kernel/version").unwrap_or_default();
         Self {
             gpu: Self::best_gpu(&out),
             kvm: Path::new("/dev/kvm").exists(),
-            preempt_rt: kernel_is_preempt_rt(realtime.as_deref(), &version),
+            preempt_rt: RunningKernel::probe().preempt_rt,
             backends: Vec::new(),
         }
     }
