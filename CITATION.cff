@@ -9,8 +9,8 @@ authors:
     affiliation: "Independent Researcher"
 repository-code: "https://github.com/vxedge/vxedge"
 url: "https://vxedge.dev"
-version: "0.5.3"
-date-released: "2026-11-04"
+version: "0.6.0"
+date-released: "2026-11-05"
 license: "Apache-2.0"
 keywords:
   - sdv

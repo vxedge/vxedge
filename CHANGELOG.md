@@ -6,7 +6,14 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
-Main now carries the `vxp/1` package format, so the next vxedge release is 0.6.0.
+## [0.6.0] - 2026-11-05
+
+An experiment can now be described by a `vxp/1` package descriptor, `vxp.yaml`, with a namespaced
+id, a SemVer version and the host it requires. A daemon refuses a descriptor schema it does not read
+and a package whose `requires.vxedge` range excludes it, each with its own error reason. Legacy
+`<name>.vxp` descriptors still load. qemu-microvm guests now each get their own MAC and the
+virtio-mmio transport Zephyr needs, so several qemu guests on one slice all answer unicast; earlier
+multi-guest qemu measurements may have been affected. vxAPI stays `vxedge.v1`, additive only.
 
 ### Added
 
