@@ -646,7 +646,7 @@ mod tests {
 
     /// The packed-bytes **shared test vector**: the `vxws/2` fixture with a `vxp/1` descriptor and
     /// a literal lock. A packed file's digest is a public identity, so this value is frozen like
-    /// the workspace identity's; `vxtelemetry` will assert the same value over the same fixture.
+    /// the workspace identity's; `vxtelemetry` asserts the same value over the same fixture.
     /// Python's `tarfile` (ustar format, mode 0644, mtime 0, no user or group names) writes the
     /// same bytes for these entries, up to its padding to a 10 KiB record.
     #[test]
@@ -675,6 +675,59 @@ mod tests {
             "the packed form changed; vxtelemetry must move with it"
         );
         assert_eq!(package_digest(&root).unwrap(), digest);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The second **shared test vector**, for the header edge cases the first does not reach: a
+    /// path over 100 bytes that splits at the shortest prefix (not the longest), a name of exactly
+    /// 100 bytes with no terminating NUL, an empty file (no data block) and a file of exactly one
+    /// block (no padding). `vxtelemetry` pins the same value, and Python's `tarfile` writes the same
+    /// bytes, up to its 10 KiB record padding.
+    #[test]
+    fn packed_bytes_split_vector() {
+        let long = format!(
+            "parts/{}/{}/{}/file.txt",
+            "a".repeat(40),
+            "b".repeat(40),
+            "c".repeat(40)
+        );
+        let exact = format!("parts/{}", "d".repeat(94));
+        let block = "x".repeat(BLOCK);
+        let root = workspace(
+            "split-vector",
+            &[
+                (
+                    "vxp.yaml",
+                    "schema: vxp/1\nid: vxedge/split-test\nversion: 1.0.0\nentry: main.yaml\n",
+                ),
+                ("vxp.lock", "schema: vxp-lock/1\n"),
+                ("main.yaml", "kind: experiment\nid: split-test\n"),
+                (&long, "split at the shortest prefix\n"),
+                (&exact, "a name of exactly 100 bytes\n"),
+                ("parts/empty", ""),
+                ("parts/block", &block),
+            ],
+        );
+        assert_eq!((long.len(), exact.len()), (137, 100));
+        let bytes = pack(&root).unwrap();
+        // Seven headers, six data blocks (the empty file has none), two zero blocks.
+        assert_eq!(bytes.len(), (7 + 6 + 2) * BLOCK);
+        let at = |path: &str| {
+            let (_, header) = bytes
+                .chunks(BLOCK)
+                .enumerate()
+                .find(|(_, h)| h[257..263] == *b"ustar\0" && h[..100].starts_with(path.as_bytes()))
+                .unwrap();
+            header.to_vec()
+        };
+        let split = at("bbbb");
+        assert!(split[345..].starts_with(format!("parts/{}\0", "a".repeat(40)).as_bytes()));
+        assert_eq!(at(&exact)[..100], *exact.as_bytes());
+        assert_eq!(
+            sha256(&bytes),
+            "sha256:c1e0906cd96c16c02c3bdc814982767c582573d4b3707cc56f20048c6d1c76b3",
+            "the packed form changed; vxtelemetry must move with it"
+        );
         fs::remove_dir_all(&root).ok();
     }
 

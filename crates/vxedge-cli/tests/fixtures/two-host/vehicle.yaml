@@ -1,0 +1,53 @@
+kind: vehicle
+id: car1
+class: road          # road | air | marine | rail — the axis that keeps other mobility
+subtype: car         # entities expressible; nothing is built on it yet
+
+# Zones are REGIONS of the entity, not devices. Named rather than chosen from an enum,
+# because front-left/rear-right are road conventions and an eVTOL has nacelles.
+zones:
+  front-left: {}
+  central: {}
+
+# Devices are units LOCATED IN zones. `role` says what one is; `backend` says how it is
+# realised — H3's experimental variable, and required for anything on a slice, because
+# the planner must know whether to build a veth or a tap.
+devices:
+  zonefl: { role: zone-controller, zone: front-left, backend: container }
+  hpc1:   { role: hpc, zone: central, backend: container, resources: { cpu: 4, memory: 8 } }
+  gw1:    { role: gateway, backend: container }
+
+# Functions are units of BEHAVIOUR, deployed ONTO devices. Software attaches here, so one
+# device can host several and a study can redeploy without rewriting `channels`.
+# `parts.yaml` targets these ids.
+functions:
+  adas:    { deployed_on: zonefl }
+  percept: { deployed_on: hpc1 }
+  tcu:     { deployed_on: gw1 }
+
+# Transport: how bytes move. This is the wiring harness (ARCHITECTURE.md §7).
+#
+# A slice-bound link may add an `impairments:` block to emulate the PHY it stands for,
+# which is what makes harness topology an experimental variable rather than a drawing:
+#
+#   impairments: { rate_mbps: 100, delay_us: 250, jitter_us: 40, loss_pct: 0.01 }
+#
+# Every value is per traversal, one direction, so a round trip pays the delay twice.
+# Left off below on purpose: an unimpaired link is a clean virtual wire, and that is the
+# right baseline to measure against before you start varying the harness.
+#
+# Any link — impaired or not — may also carry a `harness:` block (medium, length_m,
+# weight_g): the declarative record a zonal-vs-domain harness-reduction study reports on.
+links:
+  - { id: trunk-fl,  endpoints: [gw1:eth0, zonefl:eth0], slice: adas }
+  - { id: trunk-hpc, endpoints: [gw1:eth2, hpc1:eth0] }
+
+# Interaction: what is exchanged, between FUNCTIONS. `carried_by` binds a channel to the
+# links carrying it — what makes latency attributable per topic per slice, not just per
+# link.
+channels:
+  - id: adas.probe
+    from: adas
+    to: [percept]
+    protocol: udp
+    carried_by: [trunk-fl, trunk-hpc]

@@ -1,0 +1,23 @@
+kind: baseline
+id: bl-local
+
+# A published ref is pinned by digest; a local ref needs none — it is content-hashed
+# into the results archive instead. So a local run is reproducible for you, and
+# publishing is what makes it reproducible for anyone else.
+#
+# `kind:` says what a loadable *is*, and it is checked against the device's `backend:`
+# — a container backend boots a container image, libvirt, qemu-microvm and
+# cloud-hypervisor boot a guest bundle, wasm-capsule runs a `kind: wasm` module. State it wherever the ref does not: a published vxparts ref names the kind of
+# node a part loads onto, not how it is packaged.
+parts:
+  - ref: local/vxprobe:host-process
+    kind: container            # these devices run `backend: container`
+    target_ids: [adas]     # one declaration, however many nodes share the part
+
+  - ref: ./parts/hpc-reflector
+    kind: container
+    target_ids: percept
+
+  - ref: ./parts/gw-tcu
+    kind: container
+    target_ids: tcu
