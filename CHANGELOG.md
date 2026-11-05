@@ -23,6 +23,10 @@ All notable changes to this repo are documented here. Format follows
   tells vxtelemetry whether the live run was locked, in `VXTELEMETRY_PACKAGE_LOCKED`: the next
   vxtelemetry records it in `metadata.json`, and 0.3.0 ignores it.
 
+### Changed
+
+- Lockfile update: the semver-compatible dependency updates `cargo update` offers (49 crates). No `Cargo.toml` change and no source change; build, test, clippy `-D warnings`, fmt and `cargo deny` pass. `wasmtime` and `wasmtime-wasi` stay pinned at `=49.0.5`.
+
 ## [0.6.1] - 2026-11-05
 
 The toolchain moves to Rust 1.99.1, and `vxedge doctor` now compares versions against the pin instead
