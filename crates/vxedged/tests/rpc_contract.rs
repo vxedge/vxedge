@@ -1338,6 +1338,72 @@ async fn plan_and_up_refuse_a_package_for_another_vxedge() {
     assert_eq!(reason(&refused), "ERROR_REASON_VXEDGE_VERSION_UNSUPPORTED");
 }
 
+/// `kernel.preempt_rt: required` refuses a kernel without it, in `Plan` and `up` alike, under
+/// the reason the GPU tier already uses. Skipped on a real-time host, where it is met.
+#[tokio::test]
+async fn plan_and_up_refuse_a_package_needing_a_realtime_kernel() {
+    if vxedge_core::package::HostCapabilities::probe().preempt_rt {
+        return;
+    }
+    let daemon = Daemon::start();
+    let channel = daemon.channel().await;
+    let (dir, id) = experiment_workspace();
+    write_v1(
+        &dir,
+        &id,
+        "vxp/1",
+        "requires:\n  kernel: { preempt_rt: required }\n",
+    );
+    let plan = plan_of(&channel, &dir).await;
+    assert!(!plan.valid);
+    assert!(
+        plan.problems.iter().any(|p| p.reason
+            == vxedge_api::v1::ErrorReason::HostRequirementUnmet as i32
+            && p.detail.contains("PREEMPT_RT")),
+        "{:?}",
+        plan.problems
+    );
+    assert!(
+        plan.host_checks
+            .iter()
+            .any(|c| c.name == "host requirements" && !c.passed),
+        "{:?}",
+        plan.host_checks
+    );
+    let refused = ExperimentServiceClient::new(channel)
+        .up(ExperimentUpRequest {
+            manifest: path_ref(&dir),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&refused), "ERROR_REASON_HOST_REQUIREMENT_UNMET");
+}
+
+/// What asks for nothing refuses nothing: `kvm: false` and `preempt_rt: preferred` plan on any
+/// host.
+#[tokio::test]
+async fn soft_host_requirements_plan_on_any_host() {
+    let daemon = Daemon::start();
+    let channel = daemon.channel().await;
+    let (dir, id) = experiment_workspace();
+    write_v1(
+        &dir,
+        &id,
+        "vxp/1",
+        "requires:\n  kvm: false\n  kernel: { preempt_rt: preferred }\n",
+    );
+    let plan = plan_of(&channel, &dir).await;
+    assert!(
+        !plan
+            .problems
+            .iter()
+            .any(|p| p.reason == vxedge_api::v1::ErrorReason::HostRequirementUnmet as i32),
+        "{:?}",
+        plan.problems
+    );
+}
+
 #[tokio::test]
 async fn plan_and_up_agree_on_the_wrong_workspace() {
     let (active, id) = experiment_workspace();

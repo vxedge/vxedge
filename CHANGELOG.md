@@ -6,6 +6,20 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- The preflight that `Plan`, `experiment up` and `vehicle up` run now enforces the rest of a
+  `vxp/1` package's `requires`, under `ERROR_REASON_HOST_REQUIREMENT_UNMET` as `gpu` already was:
+  `kvm: true` needs `/dev/kvm`, `kernel.preempt_rt: required` needs a PREEMPT_RT kernel, and each
+  listed backend must be available here. `Plan` names every unmet requirement, not only the first.
+  `kernel.preempt_rt: preferred` runs on any kernel; the run record does not yet note which kernel
+  it was.
+
+### Changed
+
+- `Plan`'s per-backend host checks are named with the manifest's backend names
+  (`backend qemu-microvm`, not `backend qemu_microvm`).
+
 ## [0.6.0] - 2026-11-05
 
 An experiment can now be described by a `vxp/1` package descriptor, `vxp.yaml`, with a namespaced

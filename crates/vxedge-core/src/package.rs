@@ -97,12 +97,15 @@ impl PackageDoc {
         }
     }
 
-    /// The host requirements [`Requires::check`] enforces today: the GPU tier. `kvm`, `kernel`
-    /// and `backends` are read and validated, not yet enforced.
+    /// What [`Requires::check`] holds the host to. A legacy descriptor can only ask for a GPU
+    /// tier.
     pub fn host_requires(&self) -> Requires {
         match self {
             Self::V1(d) => Requires {
                 gpu: d.requires.gpu.map(|g| g.as_str().to_string()),
+                kvm: d.requires.kvm.unwrap_or(false),
+                preempt_rt: d.requires.kernel.as_ref().and_then(|k| k.preempt_rt),
+                backends: d.requires.backends.clone(),
             },
             Self::Legacy(d) => d.requires.clone(),
         }
@@ -231,8 +234,8 @@ pub struct GeneratedBy {
     pub model_digest: Option<String>,
 }
 
-/// `requires` under `vxp/1`. Every value is checked for shape when read; see
-/// [`PackageDoc::host_requires`] for which are enforced.
+/// `requires` under `vxp/1`. Every value is checked for shape when read, and the daemon's
+/// preflight holds the host to it through [`PackageDoc::host_requires`].
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequiresV1 {
@@ -307,6 +310,16 @@ pub struct Requires {
     /// `none` | `tier2`, per `TESTBED-SETUP.md`'s host tiers.
     #[serde(default)]
     pub gpu: Option<String>,
+    /// `vxp/1` only, like the two below: skipped by serde, so the legacy form keeps refusing
+    /// these keys as it did in vxedge 0.5.x.
+    #[serde(skip)]
+    pub kvm: bool,
+    /// `required` refuses a kernel without PREEMPT_RT; `preferred` and `any` run on any kernel.
+    #[serde(skip)]
+    pub preempt_rt: Option<PreemptRt>,
+    /// Every backend listed must be available on this host.
+    #[serde(skip)]
+    pub backends: Vec<Backend>,
 }
 
 /// Tier 2's GPU floor, from `TESTBED-SETUP.md`: RTX-class, >= 12 GB VRAM.
@@ -330,6 +343,30 @@ pub struct HostCapabilities {
     /// NVIDIA GPU, but a *Pascal* one with 2 GB, so it fails Tier 2 on both counts. A presence check would have let `exp-011` start there and fail deep inside
     /// CARLA, which is exactly what the preflight exists to prevent.
     pub gpu: Option<GpuCapability>,
+    /// `/dev/kvm` exists.
+    pub kvm: bool,
+    /// The running kernel is a PREEMPT_RT one ([`kernel_is_preempt_rt`]).
+    pub preempt_rt: bool,
+    /// The backends the daemon probed. [`HostCapabilities::probe`] leaves this empty: whether
+    /// Podman answers is an async question the daemon asks, so it fills this in. A backend not
+    /// listed counts as unavailable, never as present.
+    pub backends: Vec<BackendProbe>,
+}
+
+/// One backend as the daemon found it: `unavailable` says why it cannot run here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BackendProbe {
+    pub backend: Backend,
+    pub unavailable: Option<String>,
+}
+
+/// Whether the running kernel is PREEMPT_RT, from what it exposes. `/sys/kernel/realtime` decides
+/// when present; a kernel without it says so only in its version string (`uname -v`). Pure.
+pub fn kernel_is_preempt_rt(realtime: Option<&str>, version: &str) -> bool {
+    match realtime {
+        Some(flag) => flag.trim() == "1",
+        None => version.contains("PREEMPT_RT"),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -352,7 +389,7 @@ impl GpuCapability {
 }
 
 impl HostCapabilities {
-    /// Probe the host this process runs on.
+    /// Probe the host this process runs on: everything but [`Self::backends`].
     pub fn probe() -> Self {
         let out = std::process::Command::new("nvidia-smi")
             .args([
@@ -364,8 +401,13 @@ impl HostCapabilities {
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
             .unwrap_or_default();
+        let realtime = std::fs::read_to_string("/sys/kernel/realtime").ok();
+        let version = std::fs::read_to_string("/proc/sys/kernel/version").unwrap_or_default();
         Self {
             gpu: Self::best_gpu(&out),
+            kvm: Path::new("/dev/kvm").exists(),
+            preempt_rt: kernel_is_preempt_rt(realtime.as_deref(), &version),
+            backends: Vec::new(),
         }
     }
 
@@ -406,29 +448,84 @@ pub enum RequirementError {
          was provisioned, because a requirement nobody can evaluate is not a safe default."
     )]
     UnknownGpu { workspace: String, value: String },
+    #[error(
+        "`{workspace}` requires `kvm: true`, and this host has no `/dev/kvm`. Nothing was \
+         provisioned. Enable virtualization in the firmware and load the kvm module, or run it on \
+         a host with KVM."
+    )]
+    UnmetKvm { workspace: String },
+    #[error(
+        "`{workspace}` requires a PREEMPT_RT kernel (`kernel.preempt_rt: required`), and this \
+         host's kernel is not one. Nothing was provisioned. Boot a real-time kernel, or declare \
+         `preferred` if the experiment may run without one and report the kernel as a caveat."
+    )]
+    UnmetPreemptRt { workspace: String },
+    #[error(
+        "`{workspace}` requires backends this host cannot run: {missing}. Nothing was \
+         provisioned. `HostService.Capabilities` lists what this host runs and why not."
+    )]
+    UnmetBackends { workspace: String, missing: String },
 }
 
 impl Requires {
-    /// Whether `host` can run this workspace. Pure.
-    pub fn check(&self, workspace: &str, host: &HostCapabilities) -> Result<(), RequirementError> {
+    /// Whether `host` can run this workspace: every unmet requirement, not only the first, so
+    /// `Plan` can name them all. Pure.
+    pub fn check(
+        &self,
+        workspace: &str,
+        host: &HostCapabilities,
+    ) -> Result<(), Vec<RequirementError>> {
+        let workspace = workspace.to_string();
+        let mut unmet = Vec::new();
         match self.gpu.as_deref() {
-            None | Some("none") => Ok(()),
+            None | Some("none") => {}
             Some("tier2") => match host.gpu {
-                Some(gpu) if gpu.meets_tier2() => Ok(()),
-                Some(gpu) => Err(RequirementError::UnmetGpu {
-                    workspace: workspace.to_string(),
+                Some(gpu) if gpu.meets_tier2() => {}
+                Some(gpu) => unmet.push(RequirementError::UnmetGpu {
+                    workspace: workspace.clone(),
                     found: gpu.describe(),
                 }),
-                None => Err(RequirementError::UnmetGpu {
-                    workspace: workspace.to_string(),
+                None => unmet.push(RequirementError::UnmetGpu {
+                    workspace: workspace.clone(),
                     found: "no NVIDIA GPU the driver can see".to_string(),
                 }),
             },
-            Some(other) => Err(RequirementError::UnknownGpu {
-                workspace: workspace.to_string(),
+            Some(other) => unmet.push(RequirementError::UnknownGpu {
+                workspace: workspace.clone(),
                 value: other.to_string(),
             }),
         }
+        if self.kvm && !host.kvm {
+            unmet.push(RequirementError::UnmetKvm {
+                workspace: workspace.clone(),
+            });
+        }
+        if self.preempt_rt == Some(PreemptRt::Required) && !host.preempt_rt {
+            unmet.push(RequirementError::UnmetPreemptRt {
+                workspace: workspace.clone(),
+            });
+        }
+        let missing: Vec<String> = self
+            .backends
+            .iter()
+            .filter_map(|b| match host.backends.iter().find(|p| p.backend == *b) {
+                Some(BackendProbe {
+                    unavailable: None, ..
+                }) => None,
+                Some(BackendProbe {
+                    unavailable: Some(why),
+                    ..
+                }) => Some(format!("{} ({why})", b.as_str())),
+                None => Some(format!("{} (not probed)", b.as_str())),
+            })
+            .collect();
+        if !missing.is_empty() {
+            unmet.push(RequirementError::UnmetBackends {
+                workspace,
+                missing: missing.join(", "),
+            });
+        }
+        if unmet.is_empty() { Ok(()) } else { Err(unmet) }
     }
 }
 
@@ -969,25 +1066,28 @@ mod tests {
     fn a_tier2_workspace_is_refused_on_a_host_that_cannot_meet_it() {
         let needs_gpu = Requires {
             gpu: Some("tier2".into()),
+            ..Default::default()
         };
-        let bare = HostCapabilities { gpu: None };
+        let bare = HostCapabilities::default();
         let gt1030 = HostCapabilities {
             gpu: Some(GpuCapability {
                 compute_cap: 6.1,
                 vram_mib: 2048,
             }),
+            ..Default::default()
         };
         let equipped = HostCapabilities {
             gpu: Some(GpuCapability {
                 compute_cap: 8.9,
                 vram_mib: 24564,
             }),
+            ..Default::default()
         };
 
         assert!(
             matches!(
                 needs_gpu.check("exp-011", &gt1030),
-                Err(RequirementError::UnmetGpu { ref found, .. }) if found.contains("6.1")
+                Err(ref e) if matches!(&e[..], [RequirementError::UnmetGpu { found, .. }] if found.contains("6.1"))
             ),
             "a pre-Turing 2 GB card must not satisfy tier2"
         );
@@ -998,12 +1098,13 @@ mod tests {
                 compute_cap: 6.1,
                 vram_mib: 24564,
             }),
+            ..Default::default()
         };
         assert!(needs_gpu.check("exp-011", &big_pascal).is_err());
 
         assert!(matches!(
-            needs_gpu.check("exp-011", &bare),
-            Err(RequirementError::UnmetGpu { .. })
+            needs_gpu.check("exp-011", &bare).unwrap_err()[..],
+            [RequirementError::UnmetGpu { .. }]
         ));
         assert!(needs_gpu.check("exp-011", &equipped).is_ok());
 
@@ -1011,7 +1112,8 @@ mod tests {
         assert!(Requires::default().check("exp-001", &bare).is_ok());
         assert!(
             Requires {
-                gpu: Some("none".into())
+                gpu: Some("none".into()),
+                ..Default::default()
             }
             .check("exp-001", &bare)
             .is_ok()
@@ -1021,10 +1123,12 @@ mod tests {
         // nobody can evaluate is not a safe default.
         assert!(matches!(
             Requires {
-                gpu: Some("tier9".into())
+                gpu: Some("tier9".into()),
+                ..Default::default()
             }
-            .check("exp-x", &equipped),
-            Err(RequirementError::UnknownGpu { .. })
+            .check("exp-x", &equipped)
+            .unwrap_err()[..],
+            [RequirementError::UnknownGpu { .. }]
         ));
     }
 
@@ -1040,5 +1144,134 @@ mod tests {
         assert_eq!(one.compute_cap, 6.1);
         assert!(HostCapabilities::best_gpu("").is_none());
         assert!(HostCapabilities::best_gpu("no devices found").is_none());
+    }
+
+    /// The legacy form reads `requires: { gpu }` and nothing else, as vxedge 0.5.x did: the
+    /// `vxp/1` keys must not leak into it.
+    #[test]
+    fn a_legacy_descriptor_still_refuses_the_vxp1_requirements() {
+        for key in [
+            "kvm: true",
+            "kernel: { preempt_rt: required }",
+            "backends: [container]",
+        ] {
+            let d = tmp("legacy-requires");
+            write_vxp(&d, "x.vxp", &format!("id: x\nrequires:\n  {key}\n"));
+            match discover(&d) {
+                Err(DiscoverError::Parse { .. }) => {}
+                other => panic!("`{key}` in a legacy descriptor: expected Parse, got {other:?}"),
+            }
+            std::fs::remove_dir_all(&d).ok();
+        }
+    }
+
+    fn probe(backend: Backend, unavailable: Option<&str>) -> BackendProbe {
+        BackendProbe {
+            backend,
+            unavailable: unavailable.map(str::to_string),
+        }
+    }
+
+    /// What `vxp/1` declares is what the preflight checks: `kvm`, `kernel.preempt_rt` and
+    /// `backends` beside `gpu`.
+    #[test]
+    fn a_vxp1_descriptor_hands_every_host_requirement_to_the_check() {
+        let d = tmp("v1-host-requires");
+        let ws = v1_with(&d, V1).unwrap();
+        let r = ws.package.host_requires();
+        assert_eq!(r.gpu.as_deref(), Some("none"));
+        assert!(r.kvm);
+        assert_eq!(r.preempt_rt, Some(PreemptRt::Preferred));
+        assert_eq!(r.backends, vec![Backend::Container, Backend::QemuMicrovm]);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// Each unmet requirement is its own error, all of them reported, so `Plan` can name every
+    /// one instead of the first.
+    #[test]
+    fn every_unmet_host_requirement_is_reported() {
+        let needs = Requires {
+            kvm: true,
+            preempt_rt: Some(PreemptRt::Required),
+            backends: vec![Backend::QemuMicrovm, Backend::Libvirt, Backend::Container],
+            ..Default::default()
+        };
+        let host = HostCapabilities {
+            backends: vec![
+                probe(Backend::QemuMicrovm, Some("needs /dev/kvm")),
+                probe(Backend::Container, None),
+            ],
+            ..Default::default()
+        };
+        let errors = needs.check("exp-x", &host).unwrap_err();
+        assert!(errors.contains(&RequirementError::UnmetKvm {
+            workspace: "exp-x".into()
+        }));
+        assert!(errors.contains(&RequirementError::UnmetPreemptRt {
+            workspace: "exp-x".into()
+        }));
+        let backends = errors
+            .iter()
+            .find(|e| matches!(e, RequirementError::UnmetBackends { .. }))
+            .expect("backends reported")
+            .to_string();
+        // The probe's reason travels with the name; a backend nobody probed is unavailable, never
+        // assumed present.
+        assert!(
+            backends.contains("qemu-microvm (needs /dev/kvm)"),
+            "{backends}"
+        );
+        assert!(backends.contains("libvirt"), "{backends}");
+        assert!(!backends.contains("container"), "{backends}");
+        assert_eq!(errors.len(), 3, "{errors:?}");
+    }
+
+    #[test]
+    fn met_or_soft_host_requirements_pass() {
+        let host = HostCapabilities {
+            kvm: true,
+            preempt_rt: false,
+            backends: vec![probe(Backend::Container, None)],
+            ..Default::default()
+        };
+        // `preferred` and `any` run on any kernel; `kvm: false` asks for nothing.
+        for preempt_rt in [None, Some(PreemptRt::Preferred), Some(PreemptRt::Any)] {
+            let r = Requires {
+                kvm: true,
+                preempt_rt,
+                backends: vec![Backend::Container],
+                ..Default::default()
+            };
+            assert_eq!(r.check("exp-x", &host), Ok(()));
+        }
+        assert_eq!(
+            Requires::default().check("exp-x", &HostCapabilities::default()),
+            Ok(())
+        );
+        let rt = HostCapabilities {
+            preempt_rt: true,
+            ..Default::default()
+        };
+        let required = Requires {
+            preempt_rt: Some(PreemptRt::Required),
+            ..Default::default()
+        };
+        assert_eq!(required.check("exp-x", &rt), Ok(()));
+    }
+
+    /// `/sys/kernel/realtime` decides when the kernel has it; older real-time kernels only say so
+    /// in their version string.
+    #[test]
+    fn a_preempt_rt_kernel_is_recognised() {
+        assert!(kernel_is_preempt_rt(Some("1\n"), ""));
+        assert!(!kernel_is_preempt_rt(Some("0\n"), "#1 SMP PREEMPT_RT"));
+        assert!(kernel_is_preempt_rt(
+            None,
+            "#1 SMP PREEMPT_RT Fri Jun  6 10:00:00 UTC 2025"
+        ));
+        assert!(!kernel_is_preempt_rt(
+            None,
+            "#42-Ubuntu SMP PREEMPT_DYNAMIC Tue Oct 14 2026"
+        ));
     }
 }
