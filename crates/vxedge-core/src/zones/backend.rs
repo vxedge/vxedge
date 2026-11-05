@@ -447,6 +447,10 @@ fn microvm_up(sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneB
             "-smp",
             "1",
             "-nodefaults",
+            // QEMU's virtio-mmio is the legacy (version 1) transport unless told otherwise.
+            // Linux speaks both; Zephyr's driver refuses version 1.
+            "-global",
+            "virtio-mmio.force-legacy=false",
             "-no-user-config",
             "-nographic",
             "-monitor",

@@ -8,6 +8,9 @@ All notable changes to this repo are documented here. Format follows
 
 ### Fixed
 
+- qemu-microvm guests get a non-legacy virtio-mmio transport. QEMU's default is the legacy
+  (version 1) one, which Zephyr's driver refuses, so a Zephyr guest found no network device. Linux
+  guests speak both versions and are unchanged.
 - qemu-microvm guests get a stable, unique MAC. QEMU gave every guest `52:54:00:12:34:56`, so on a
   vehicle with several qemu guests on one slice the bridge delivered unicast to one of them and the
   others answered nothing, while ARP still worked. The MAC comes from the node id, as it already did
