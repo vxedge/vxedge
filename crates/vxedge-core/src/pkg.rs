@@ -960,7 +960,6 @@ mod tests {
                 .unwrap()
                 .write(&parent)
                 .unwrap();
-        fs::remove_file(root.join("id-test.vxp")).unwrap();
         fs::write(root.join("vxp.yaml"), DESCRIPTOR).unwrap();
         let parts = fs::read_to_string(root.join("parts.yaml"))
             .unwrap()

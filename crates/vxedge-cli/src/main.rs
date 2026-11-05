@@ -115,6 +115,12 @@ enum Command {
         #[command(subcommand)]
         cmd: ExperimentCmd,
     },
+    /// `vxp/1` packages: scaffold, validate, lock, pack, unpack and inspect (local and offline,
+    /// ARCHITECTURE.md §6.0.7).
+    Pkg {
+        #[command(subcommand)]
+        cmd: PkgCmd,
+    },
     /// Traffic generation per manifest profiles.
     Traffic {
         #[command(subcommand)]
@@ -317,6 +323,10 @@ enum ExperimentCmd {
         /// Parent directory to create the workspace in.
         #[arg(long, default_value = ".")]
         path: String,
+        /// The organisation that will publish the package: the `namespace` in its
+        /// `namespace/name` id. `local` means not yet published.
+        #[arg(long, default_value = vxedge_core::scaffold::DEFAULT_NAMESPACE)]
+        namespace: String,
     },
     /// Load and cross-check the workspace here (local — no daemon, no network).
     Validate,
@@ -339,6 +349,57 @@ enum ExperimentCmd {
     },
     /// Show status for the workspace here.
     Status,
+}
+
+#[derive(Subcommand, Debug)]
+enum PkgCmd {
+    /// Scaffold a `vxp/1` package and write its first `vxp.lock` (same as `experiment new`).
+    New {
+        /// Directory to create. Also the experiment id, and the package name, unless `--id`
+        /// overrides it.
+        name: String,
+        #[arg(long, value_name = "EXPERIMENT_ID")]
+        id: Option<String>,
+        #[arg(long, value_enum, default_value_t = TemplateArg::Minimal)]
+        template: TemplateArg,
+        /// Parent directory to create the package in.
+        #[arg(long, default_value = ".")]
+        path: String,
+        /// The organisation that will publish the package. `local` means not yet published.
+        #[arg(long, default_value = vxedge_core::scaffold::DEFAULT_NAMESPACE)]
+        namespace: String,
+    },
+    /// Every check `experiment validate` makes, plus the package's own: regular files only,
+    /// packable paths, and a `vxp.lock` that matches.
+    Validate,
+    /// Write `vxp.lock` for the package here.
+    Lock {
+        /// Report whether the lock matches, without writing it. Exits non-zero when it does not.
+        #[arg(long)]
+        check: bool,
+    },
+    /// Write `<name>-<version>.vxp` and print its digest. Refuses a package whose lock does not
+    /// match.
+    Pack {
+        /// Directory to write into (default: the folder that holds the package). Never inside
+        /// the package: the file would be an input to its own next pack.
+        #[arg(long, value_name = "DIR")]
+        out: Option<String>,
+    },
+    /// Restore a source folder from a packed `.vxp`.
+    Unpack {
+        /// The packed file.
+        file: String,
+        /// Directory to create (default: the file's name without `.vxp`, here). Must not exist
+        /// or be empty.
+        #[arg(long, value_name = "DIR")]
+        into: Option<String>,
+    },
+    /// Print a package's descriptor, lock and digest, from a packed file or the source here.
+    Inspect {
+        /// A packed `.vxp`. Without it, the package in the current directory.
+        file: Option<String>,
+    },
 }
 
 /// Mirrors `vxedge_core::Template`. Kept here so the domain library stays free of a clap
@@ -527,6 +588,239 @@ fn scaffold_notice(what: &str) {
 /// The directory an experiment verb is addressed against. Always the process working
 /// directory — `--chdir` has already moved it by the time this is called, so there is exactly
 /// one notion of "here" and no second code path to keep in agreement.
+/// Scaffold a `vxp/1` package and write its first lock: `experiment new` and `pkg new`.
+fn scaffold_package(
+    name: &str,
+    id: Option<&str>,
+    template: TemplateArg,
+    path: &str,
+    namespace: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let template: vxedge_core::Template = template.into();
+    let ws = vxedge_core::WorkspacePlan::plan_with_id(name, id.unwrap_or(name), template)?
+        .with_namespace(namespace)?;
+    let root = ws.write(std::path::Path::new(path))?;
+    let lock = vxedge_core::pkg::lock(&root, env!("CARGO_PKG_VERSION"))?;
+    vxedge_core::pkg::write_lock(&root, &lock)?;
+    println!("created {}", root.display());
+    for file in &ws.files {
+        println!("  {}", file.path.display());
+    }
+    println!("  {}", vxedge_core::package::LOCK_FILE);
+    println!(
+        "\nnext:  cd {} && $EDITOR main.yaml\n       vxedge pkg lock after editing, so the lock \
+         matches\nsee:   {}/README.md",
+        root.display(),
+        root.display()
+    );
+    if template.requires_gpu() {
+        // Stated at scaffold time so the requirement is known before a long build rather than
+        // after one.
+        eprintln!(
+            "note: this template needs a Tier 2 GPU host (RTX-class, >=12 GB VRAM, tensor cores)"
+        );
+    }
+    Ok(())
+}
+
+/// The `pkg` verbs. All local: no daemon, no network.
+fn pkg(cmd: &PkgCmd, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use vxedge_core::pkg;
+    let fail = |problems: &[String], root: &std::path::Path| -> ! {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "workspace": root.display().to_string(), "valid": false, "problems": problems,
+                })
+            );
+        } else {
+            eprintln!("problem(s) in {}:", root.display());
+            for p in problems {
+                eprintln!("  - {p}");
+            }
+        }
+        std::process::exit(1);
+    };
+    match cmd {
+        PkgCmd::New {
+            name,
+            id,
+            template,
+            path,
+            namespace,
+        } => scaffold_package(name, id.as_deref(), *template, path, namespace)?,
+        PkgCmd::Validate => {
+            let root = vxedge_core::discover(&here()?)?.root;
+            let mut problems = Vec::new();
+            if let Err(e) = validate_workspace_dir(&root) {
+                problems.push(e);
+            }
+            if let Err(e) = pkg::entries(&root) {
+                problems.push(e.to_string());
+            }
+            if problems.is_empty() {
+                match pkg::lock_problems(&root) {
+                    Ok(p) => problems.extend(p),
+                    Err(e) => problems.push(e.to_string()),
+                }
+            }
+            if !problems.is_empty() {
+                fail(&problems, &root);
+            }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "workspace": root.display().to_string(), "valid": true })
+                );
+            } else {
+                println!(
+                    "ok: {} is a valid package and its lock matches",
+                    root.display()
+                );
+            }
+        }
+        PkgCmd::Lock { check } => {
+            let root = vxedge_core::discover(&here()?)?.root;
+            if *check {
+                let problems = pkg::lock_problems(&root)?;
+                if !problems.is_empty() {
+                    fail(&problems, &root);
+                }
+                println!("ok: the lock matches");
+            } else {
+                let lock = pkg::lock(&root, env!("CARGO_PKG_VERSION"))?;
+                pkg::write_lock(&root, &lock)?;
+                println!(
+                    "wrote {}: {} files, {} parts, {} images",
+                    root.join(vxedge_core::package::LOCK_FILE).display(),
+                    lock.files.len(),
+                    lock.parts.len(),
+                    lock.images.len()
+                );
+            }
+        }
+        PkgCmd::Pack { out } => {
+            let root = vxedge_core::discover(&here()?)?.root;
+            let problems = pkg::lock_problems(&root)?;
+            if !problems.is_empty() {
+                return Err(format!(
+                    "the lock does not match the package ({}); run `vxedge pkg lock` and pack again",
+                    problems.join("; ")
+                )
+                .into());
+            }
+            let dir = match out {
+                Some(d) => std::path::PathBuf::from(d),
+                None => root
+                    .parent()
+                    .map(std::path::Path::to_path_buf)
+                    .ok_or("the package has no parent folder to pack into; pass --out")?,
+            };
+            let inside = std::fs::canonicalize(&dir)
+                .ok()
+                .zip(std::fs::canonicalize(&root).ok())
+                .is_some_and(|(d, r)| d.starts_with(r));
+            if inside {
+                return Err(format!(
+                    "{} is inside the package; a packed file there would be an input to its own \
+                     next pack. Pass --out with a folder outside it.",
+                    dir.display()
+                )
+                .into());
+            }
+            let bytes = pkg::pack(&root)?;
+            let file = dir.join(pkg::packed_file_name(&root)?);
+            std::fs::write(&file, &bytes)?;
+            let digest = pkg::sha256(&bytes);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "file": file.display().to_string(), "digest": digest })
+                );
+            } else {
+                println!("packed {}\ndigest {digest}", file.display());
+            }
+        }
+        PkgCmd::Unpack { file, into } => {
+            let bytes = std::fs::read(file)?;
+            let dest = match into {
+                Some(d) => std::path::PathBuf::from(d),
+                None => here()?.join(
+                    std::path::Path::new(file)
+                        .file_stem()
+                        .ok_or("the packed file has no name")?,
+                ),
+            };
+            pkg::unpack(&bytes, &dest)?;
+            let digest = pkg::sha256(&bytes);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "workspace": dest.display().to_string(), "digest": digest })
+                );
+            } else {
+                println!("unpacked {}\ndigest {digest}", dest.display());
+            }
+        }
+        PkgCmd::Inspect { file } => {
+            let (descriptor, lock, digest) = match file {
+                Some(f) => {
+                    let bytes = std::fs::read(f)?;
+                    let (d, l) = pkg::packed_descriptor_and_lock(&bytes)?;
+                    (d, l, pkg::sha256(&bytes))
+                }
+                None => {
+                    let found = vxedge_core::discover(&here()?)?;
+                    let digest = pkg::package_digest(&found.root)?;
+                    let d = std::fs::read_to_string(&found.descriptor_path)?;
+                    let l =
+                        std::fs::read_to_string(found.root.join(vxedge_core::package::LOCK_FILE))
+                            .ok();
+                    (d, l, digest)
+                }
+            };
+            let value: serde_yaml_ng::Value = serde_yaml_ng::from_str(&descriptor)?;
+            let field = |k: &str| {
+                value
+                    .get(k)
+                    .and_then(|v| {
+                        v.as_str().map(str::to_string).or_else(|| {
+                            serde_yaml_ng::to_string(v)
+                                .ok()
+                                .map(|s| s.trim().to_string())
+                        })
+                    })
+                    .unwrap_or_default()
+            };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "id": field("id"), "version": field("version"), "digest": digest,
+                        "descriptor": descriptor, "lock": lock,
+                    })
+                );
+            } else {
+                println!(
+                    "package {} {}\ndigest {digest}",
+                    field("id"),
+                    field("version")
+                );
+                println!(
+                    "\n--- {}\n{descriptor}",
+                    vxedge_core::package::DESCRIPTOR_FILE
+                );
+                match lock {
+                    Some(l) => println!("--- {}\n{l}", vxedge_core::package::LOCK_FILE),
+                    None => println!("--- no {}", vxedge_core::package::LOCK_FILE),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn here() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
     Ok(std::env::current_dir()?)
 }
@@ -954,32 +1248,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 id,
                 template,
                 path,
-            } => {
-                let template: vxedge_core::Template = (*template).into();
-                let ws = vxedge_core::WorkspacePlan::plan_with_id(
-                    name,
-                    id.as_deref().unwrap_or(name),
-                    template,
-                )?;
-                let root = ws.write(std::path::Path::new(path))?;
-                println!("created {}", root.display());
-                for file in &ws.files {
-                    println!("  {}", file.path.display());
-                }
-                println!(
-                    "\nnext:  cd {} && $EDITOR main.yaml\nsee:   {}/README.md",
-                    root.display(),
-                    root.display()
-                );
-                if template.requires_gpu() {
-                    // Stated at scaffold time so the requirement is known before a long
-                    // build rather than after one.
-                    eprintln!(
-                        "note: this template needs a Tier 2 GPU host \
-                         (RTX-class, >=12 GB VRAM, tensor cores)"
-                    );
-                }
-            }
+                namespace,
+            } => scaffold_package(name, id.as_deref(), *template, path, namespace)?,
             ExperimentCmd::Validate => {
                 // Every cross-file join, *then* every model invariant — found live 2026-08-04:
                 // this used to stop at `ws.validate()` (cross-file joins only) and never called
@@ -1126,6 +1396,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 watch_job(channel, job, cli.json).await?;
             }
         },
+        Command::Pkg { cmd } => pkg(cmd, cli.json)?,
         Command::Manifest { cmd } => match cmd {
             ManifestCmd::Validate { manifest } => {
                 // A §6.0 workspace: a directory, or one file of `---`-separated documents.
