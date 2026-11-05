@@ -33,6 +33,12 @@ All notable changes to this repo are documented here. Format follows
   `--namespace <org>`) and its first `vxp.lock`, instead of a legacy `<id>.vxp`. Legacy
   workspaces still run; the `pkg` verbs tell them how to migrate.
 
+### Fixed
+
+- A `libvirt` zone node now gets the host CPU (`<cpu mode='host-passthrough'/>`), as a
+  `qemu-microvm` node already does with `-cpu host`. With no CPU named, libvirt defaulted to
+  `qemu64`, and a guest that needs the host's CPU features printed nothing.
+
 ## [0.6.0] - 2026-11-05
 
 An experiment can now be described by a `vxp/1` package descriptor, `vxp.yaml`, with a namespaced
