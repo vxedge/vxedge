@@ -11,6 +11,7 @@ pub mod gateway;
 pub mod identity;
 pub mod model;
 pub mod package;
+pub mod pkg;
 pub mod registry;
 pub mod scaffold;
 pub mod services;

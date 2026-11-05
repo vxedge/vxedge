@@ -136,6 +136,17 @@ pub fn compute(
     })
 }
 
+/// The files the current rule (`vxws/2`) covers, as `(relative path, file)` in the sorted order
+/// [`compute`] hashes them: exactly what a package's lock lists and its packed form holds
+/// (`ARCHITECTURE.md` §6.0.7).
+pub fn inputs(root: &Path) -> Result<Vec<(String, PathBuf)>, IdentityError> {
+    let rules = rules(root)?;
+    let mut files = Vec::new();
+    walk(root, root, Some(&rules), &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
 /// Which of `names`, top-level files in `root`, the current rule would leave out of the
 /// identity. Validation uses it to refuse a `.vxpignore` that excludes the descriptor, the lock
 /// or a document: the identity would then be blind to what the experiment is made of.
@@ -281,6 +292,18 @@ mod tests {
         fs::write(root.join("scratch/junk"), "rebuilt\n").unwrap();
         fs::write(root.join("main.yaml~"), "older backup\n").unwrap();
         assert_eq!(id(&root, IdentityAlgorithm::Vxws2), v2);
+
+        // `inputs` lists exactly what the identity hashes.
+        let listed: Vec<String> = inputs(&root).unwrap().into_iter().map(|(r, _)| r).collect();
+        assert_eq!(
+            listed,
+            [
+                ".vxpignore",
+                "main.yaml",
+                "parts/local-thing",
+                "scripts/run.sh"
+            ]
+        );
 
         // ...the inputs do, and so does the ignore file.
         fs::write(root.join(".vxpignore"), "scratch/\n*.tmp\n").unwrap();
