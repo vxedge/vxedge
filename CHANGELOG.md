@@ -25,6 +25,7 @@ All notable changes to this repo are documented here. Format follows
 
 ### Changed
 
+- `rtnetlink` 0.23 -> 0.24 (with `netlink-packet-route` 0.34 and `netlink-proto` 0.14), the netlink client behind bridge, veth, address and route setup. No source change was needed; the privileged `netns-integration` job covers it.
 - Lockfile update: the semver-compatible dependency updates `cargo update` offers (49 crates). No `Cargo.toml` change and no source change; build, test, clippy `-D warnings`, fmt and `cargo deny` pass. `wasmtime` and `wasmtime-wasi` stay pinned at `=49.0.5`.
 
 ## [0.6.1] - 2026-11-05

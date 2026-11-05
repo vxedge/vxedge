@@ -36,7 +36,7 @@ sha2 = "0.11"
 ignore = "0.4"
 semver = { version = "1", features = ["serde"] }
 tower = "0.5"
-rtnetlink = "0.23"
+rtnetlink = "0.24"
 futures-util = "0.3"
 nix = { version = "0.31", features = ["sched", "user"] }
 tun = "0.8"
