@@ -94,15 +94,20 @@ fn node_payload(np: &NodePlan) -> NodePayload {
     }
 }
 
-/// One node as the workspace plans it: the typed form of [`node_detail`].
-pub fn node_spec(np: &NodePlan) -> NodeSpec {
-    let backend = match np.backend {
+/// The vxAPI form of a backend.
+pub fn node_backend(backend: Backend) -> NodeBackend {
+    match backend {
         Backend::Container => NodeBackend::Container,
         Backend::QemuMicrovm => NodeBackend::QemuMicrovm,
         Backend::Libvirt => NodeBackend::Libvirt,
         Backend::CloudHypervisor => NodeBackend::CloudHypervisor,
         Backend::WasmCapsule => NodeBackend::WasmCapsule,
-    };
+    }
+}
+
+/// One node as the workspace plans it: the typed form of [`node_detail`].
+pub fn node_spec(np: &NodePlan) -> NodeSpec {
+    let backend = node_backend(np.backend);
     NodeSpec {
         vxid: np.node_id.clone(),
         zone: np.zone_id.clone(),

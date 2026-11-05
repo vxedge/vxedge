@@ -12,12 +12,13 @@ use tonic::{Request, Response, Status};
 use vxedge_api::v1::host_service_server::HostService;
 use vxedge_api::v1::workspace_service_server::WorkspaceService;
 use vxedge_api::v1::{
-    BackendCapability, HostCapabilities, HostCapabilitiesRequest, HostCheck, HostGpu, NodeBackend,
-    PlanProblem, PlannedService, WorkspacePlan, WorkspacePlanRequest,
+    BackendCapability, HostCapabilities, HostCapabilitiesRequest, HostCheck, HostGpu, PlanProblem,
+    PlannedService, WorkspacePlan, WorkspacePlanRequest,
 };
 use vxedge_core::containers::LazyClient;
 use vxedge_core::gateway::GatewayPlan;
 use vxedge_core::model::{Backend, Experiment};
+use vxedge_core::package::BackendProbe;
 use vxedge_core::zones::NodePlan;
 
 use crate::errors::{self, R};
@@ -28,6 +29,8 @@ use crate::services::GatewaySvc;
 pub(crate) struct Preflight {
     pub problems: Vec<PlanProblem>,
     pub checks: Vec<HostCheck>,
+    /// The backends probed for `requires.backends`, kept so `Plan` asks Podman once.
+    pub backends: Option<Vec<BackendProbe>>,
 }
 
 impl Preflight {
@@ -124,16 +127,11 @@ pub(crate) async fn preflight(
         }),
     );
 
-    let requires = crate::services::preflight_requires(dir).err();
+    let (unmet, probed) = host_requirements(dir).await;
+    pf.backends = probed;
     pf.check(
         "host requirements",
-        requires.map(|s| {
-            (
-                R::HostRequirementUnmet,
-                model.id.clone(),
-                s.message().to_string(),
-            )
-        }),
+        unmet.map(|detail| (R::HostRequirementUnmet, model.id.clone(), detail)),
     );
 
     let active = gateway.active_on_host().await;
@@ -297,6 +295,43 @@ fn all_images(model: &Experiment, nodes: &[NodePlan]) -> BTreeSet<String> {
     payloads.chain(placed).collect()
 }
 
+/// What a package's `requires` asks of this host and does not get, **before** anything is
+/// provisioned: every unmet requirement, joined, and the backend probes taken on the way.
+///
+/// Daemon-side on purpose: the host that matters is the one doing the provisioning, and a
+/// CLI-side check asks the wrong machine the moment `--endpoint` points elsewhere. An inline
+/// manifest, or a bare directory of documents, has no descriptor, so nothing is checked and
+/// nothing is claimed.
+async fn host_requirements(dir: Option<&Path>) -> (Option<String>, Option<Vec<BackendProbe>>) {
+    let Some(found) = dir.and_then(|d| vxedge_core::discover(d).ok()) else {
+        return (None, None);
+    };
+    let requires = found.package.host_requires();
+    // Podman is asked only when the package names backends.
+    let probed = if requires.backends.is_empty() {
+        None
+    } else {
+        Some(backend_probes().await)
+    };
+    let host = vxedge_core::package::HostCapabilities {
+        backends: probed.clone().unwrap_or_default(),
+        ..tokio::task::spawn_blocking(vxedge_core::package::HostCapabilities::probe)
+            .await
+            .unwrap_or_default()
+    };
+    let unmet = requires
+        .check(found.package.id(), &host)
+        .err()
+        .map(|unmet| {
+            unmet
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
+    (unmet, probed)
+}
+
 pub struct PlanSvc {
     pub gateway: Arc<GatewaySvc>,
     pub runtime_dir: PathBuf,
@@ -311,30 +346,42 @@ fn on_path(binary: &str) -> bool {
 /// preflight's image check), the emulator the qemu-microvm backend starts, and the GPU probe a
 /// workspace's `requires` is checked against.
 async fn backends() -> (Vec<BackendCapability>, Option<HostGpu>) {
+    let probes = backend_probes().await;
+    let gpu = tokio::task::spawn_blocking(|| vxedge_core::package::HostCapabilities::probe().gpu)
+        .await
+        .unwrap_or_default()
+        .map(|g| HostGpu {
+            compute_capability: g.compute_cap,
+            vram_mib: g.vram_mib,
+        });
+    (probes.iter().map(capability).collect(), gpu)
+}
+
+fn capability(p: &BackendProbe) -> BackendCapability {
+    BackendCapability {
+        backend: crate::status::node_backend(p.backend) as i32,
+        available: p.unavailable.is_none(),
+        detail: p.unavailable.clone().unwrap_or_default(),
+    }
+}
+
+/// Whether each backend can run here, and why not when it cannot.
+async fn backend_probes() -> Vec<BackendProbe> {
     let podman = LazyClient::user()
         .get()
         .await
         .map(|_| ())
         .map_err(|e| e.to_string());
-    tokio::task::spawn_blocking(move || {
-        let gpu = vxedge_core::package::HostCapabilities::probe()
-            .gpu
-            .map(|g| HostGpu {
-                compute_capability: g.compute_cap,
-                vram_mib: g.vram_mib,
-            });
-        (probe_backends(podman), gpu)
-    })
-    .await
-    .unwrap_or_default()
+    tokio::task::spawn_blocking(move || probe_backends(podman))
+        .await
+        .unwrap_or_default()
 }
 
-fn probe_backends(podman: Result<(), String>) -> Vec<BackendCapability> {
+fn probe_backends(podman: Result<(), String>) -> Vec<BackendProbe> {
     let kvm = Path::new("/dev/kvm").exists();
-    let entry = |backend: NodeBackend, available: bool, detail: String| BackendCapability {
-        backend: backend as i32,
-        available,
-        detail: if available { String::new() } else { detail },
+    let entry = |backend: Backend, available: bool, detail: String| BackendProbe {
+        backend,
+        unavailable: (!available).then_some(detail),
     };
     let qemu = vxedge_core::zones::QEMU_MICROVM_BIN;
     let container = match (&podman, on_path("ip")) {
@@ -343,27 +390,27 @@ fn probe_backends(podman: Result<(), String>) -> Vec<BackendCapability> {
     };
     vec![
         entry(
-            NodeBackend::Container,
+            Backend::Container,
             podman.is_ok() && on_path("ip"),
             container,
         ),
         entry(
-            NodeBackend::QemuMicrovm,
+            Backend::QemuMicrovm,
             kvm && on_path(qemu),
             format!("needs /dev/kvm and `{qemu}` on PATH"),
         ),
         entry(
-            NodeBackend::Libvirt,
+            Backend::Libvirt,
             on_path("virsh"),
             "`virsh` is not on PATH".to_string(),
         ),
         entry(
-            NodeBackend::CloudHypervisor,
+            Backend::CloudHypervisor,
             kvm && vxedge_core::zones::ch_available(),
             "needs /dev/kvm and cloud-hypervisor".to_string(),
         ),
         entry(
-            NodeBackend::WasmCapsule,
+            Backend::WasmCapsule,
             vxedge_core::zones::capsule_runner_available(),
             "no `vxcapsule` runner beside vxedged, on PATH or in VXEDGE_CAPSULE_BIN".to_string(),
         ),
@@ -420,28 +467,19 @@ impl WorkspaceService for PlanSvc {
             &self.gateway,
         )
         .await;
+        let probes = match pf.backends {
+            Some(p) => p,
+            None => backend_probes().await,
+        };
         let mut host_checks = pf.checks;
-        let used: BTreeSet<i32> = nodes
-            .iter()
-            .map(|n| crate::status::node_spec(n).backend)
-            .collect();
-        for b in backends()
-            .await
-            .0
+        for p in probes
             .into_iter()
-            .filter(|b| used.contains(&b.backend))
+            .filter(|p| nodes.iter().any(|n| n.backend == p.backend))
         {
-            let name = NodeBackend::try_from(b.backend)
-                .map(|n| {
-                    n.as_str_name()
-                        .trim_start_matches("NODE_BACKEND_")
-                        .to_lowercase()
-                })
-                .unwrap_or_default();
             host_checks.push(HostCheck {
-                name: format!("backend {name}"),
-                passed: b.available,
-                detail: b.detail,
+                name: format!("backend {}", p.backend.as_str()),
+                passed: p.unavailable.is_none(),
+                detail: p.unavailable.unwrap_or_default(),
             });
         }
         let mut services: Vec<PlannedService> = model
