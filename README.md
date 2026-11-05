@@ -35,7 +35,7 @@ Real provisioning (`vehicle up`, `zone up`) needs `CAP_NET_ADMIN`, plus `CAP_SYS
 
 ## Build from source
 
-Requires Rust 1.96+ (pinned by `rust-toolchain.toml`; rustup fetches it on the first `cargo` command) and `protoc`.
+Requires Rust 1.99+ (pinned by `rust-toolchain.toml`; rustup fetches it on the first `cargo` command) and `protoc`.
 
 ```bash
 cargo build --workspace

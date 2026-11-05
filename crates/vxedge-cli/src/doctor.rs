@@ -1,11 +1,61 @@
 //! `vxedge doctor` — host preflight per docs/TESTBED-SETUP.md tiers. Local
 //! only (no daemon connection): its whole job is checking whether the host
-//! can even run one. Presence/version checks are best-effort (shell out,
-//! parse loosely) — precise semver enforcement isn't worth the complexity
-//! for a human-facing report; TESTBED-SETUP.md documents the exact minimums.
+//! can even run one. Presence checks shell out and parse loosely; the Rust,
+//! protoc and buf checks compare numeric versions against the minimums that
+//! docs/TESTBED-SETUP.md documents. The Rust minimum is read from
+//! `rust-toolchain.toml` at build time (see build.rs), so it follows the pin.
 
 use serde::Serialize;
 use std::process::Command;
+
+/// Minimum Rust, from the workspace pin (`rust-toolchain.toml`) via build.rs.
+const MIN_RUSTC: &str = env!("VXEDGE_MIN_RUSTC");
+/// Floors for the other build tools (docs/TESTBED-SETUP.md, Tier 0).
+const MIN_PROTOC: &str = "3.21";
+const MIN_BUF: &str = "1.71";
+
+/// A parsed `major.minor.patch` version; `pre` marks a pre-release (`-nightly`, `-beta.1`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Version {
+    nums: (u32, u32, u32),
+    pre: bool,
+}
+
+/// Parses `1.99`, `1.99.1` or `1.99.1-nightly`; missing components are 0.
+fn parse_token(token: &str) -> Option<Version> {
+    let (core, pre) = match token.split_once(['-', '+']) {
+        Some((core, _)) => (core, true),
+        None => (token, false),
+    };
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().map_or(Some(0), |p| p.parse().ok())?;
+    let patch = parts.next().map_or(Some(0), |p| p.parse().ok())?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(Version {
+        nums: (major, minor, patch),
+        pre,
+    })
+}
+
+/// The first version-looking word of a tool's `--version` line
+/// (`rustc 1.99.1 (...)`, `libprotoc 3.21.12`, `1.71.0`).
+fn parse_version(line: &str) -> Option<Version> {
+    line.split_whitespace()
+        .find(|w| w.starts_with(|c: char| c.is_ascii_digit()))
+        .and_then(parse_token)
+}
+
+/// True when `line` reports a version at or above `min`. A pre-release of exactly
+/// the minimum (`1.99.1-nightly`) is below the release.
+fn meets_floor(line: &str, min: &str) -> bool {
+    match (parse_version(line), parse_token(min)) {
+        (Some(have), Some(min)) => have.nums > min.nums || (have.nums == min.nums && !have.pre),
+        _ => false,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -111,15 +161,18 @@ fn tier0() -> Vec<Check> {
     let rustc = cmd_version("rustc", &["--version"]).unwrap_or_default();
     c.push(check(
         0,
-        "Rust toolchain",
+        concat!("Rust >= ", env!("VXEDGE_MIN_RUSTC")),
         true,
-        rustc.contains("1.96"),
+        meets_floor(&rustc, MIN_RUSTC),
         if rustc.is_empty() {
             "not found".to_string()
         } else {
             rustc
         },
-        Some("rustup handles this automatically from rust-toolchain.toml — just run cargo build"),
+        Some(&format!(
+            "rustup installs the pinned toolchain from rust-toolchain.toml on the first cargo \
+             command in the repo (or: rustup toolchain install {MIN_RUSTC})"
+        )),
     ));
 
     let protoc = cmd_version("protoc", &["--version"]).unwrap_or_default();
@@ -127,7 +180,7 @@ fn tier0() -> Vec<Check> {
         0,
         "protoc >= 3.21",
         true,
-        !protoc.is_empty(),
+        meets_floor(&protoc, MIN_PROTOC),
         if protoc.is_empty() {
             "not found".to_string()
         } else {
@@ -141,7 +194,7 @@ fn tier0() -> Vec<Check> {
         0,
         "buf >= 1.71",
         false,
-        !buf.is_empty(),
+        meets_floor(&buf, MIN_BUF),
         if buf.is_empty() {
             "not found — only needed for proto lint/breaking-check".to_string()
         } else {
@@ -457,4 +510,86 @@ pub fn run(target_tier: u8, json: bool) -> Result<(), Box<dyn std::error::Error>
         std::process::exit(1);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_tool_version_lines() {
+        let v = |s: &str| parse_version(s).map(|v| (v.nums, v.pre));
+        assert_eq!(
+            v("rustc 1.99.1 (58cf8f9c3 2026-10-13)"),
+            Some(((1, 99, 1), false))
+        );
+        assert_eq!(
+            v("rustc 1.93.1 (01f6ddf75 2026-02-11) (built from a source tarball)"),
+            Some(((1, 93, 1), false))
+        );
+        assert_eq!(
+            v("rustc 1.100.0-nightly (abc 2026-11-01)"),
+            Some(((1, 100, 0), true))
+        );
+        assert_eq!(v("libprotoc 3.21.12"), Some(((3, 21, 12), false)));
+        assert_eq!(v("libprotoc 36.0"), Some(((36, 0, 0), false)));
+        assert_eq!(v("1.71.0"), Some(((1, 71, 0), false)));
+        assert_eq!(v(""), None);
+        assert_eq!(v("not found"), None);
+    }
+
+    #[test]
+    fn rust_floor_compares_numbers_not_substrings() {
+        assert!(meets_floor("rustc 1.99.1 (x 2026-10-13)", "1.99.1"));
+        assert!(meets_floor("rustc 1.99.2 (x 2026-10-20)", "1.99.1"));
+        assert!(meets_floor("rustc 1.100.0 (x 2026-11-20)", "1.99.1"));
+        assert!(meets_floor("rustc 2.0.0 (x 2030-01-01)", "1.99.1"));
+        // The old `contains("1.96")` test got these wrong in both directions.
+        assert!(!meets_floor("rustc 1.99.0 (x 2026-09-01)", "1.99.1"));
+        assert!(!meets_floor("rustc 1.96.1 (x 2026-06-26)", "1.99.1"));
+        assert!(!meets_floor("rustc 1.9.0 (x 2018-01-01)", "1.99.1"));
+        assert!(!meets_floor(
+            "rustc 1.93.1 (x 2026-02-11) (built from a source tarball)",
+            "1.99.1"
+        ));
+    }
+
+    #[test]
+    fn prerelease_of_the_minimum_does_not_count() {
+        assert!(!meets_floor(
+            "rustc 1.99.1-nightly (x 2026-10-01)",
+            "1.99.1"
+        ));
+        assert!(meets_floor(
+            "rustc 1.100.0-nightly (x 2026-11-01)",
+            "1.99.1"
+        ));
+    }
+
+    #[test]
+    fn unparseable_or_missing_output_fails() {
+        assert!(!meets_floor("", "1.99.1"));
+        assert!(!meets_floor("not found", "1.99.1"));
+        assert!(!meets_floor("rustc 1.99.1", "garbage"));
+    }
+
+    #[test]
+    fn protoc_and_buf_floors() {
+        assert!(meets_floor("libprotoc 3.21.12", MIN_PROTOC));
+        assert!(meets_floor("libprotoc 36.0", MIN_PROTOC));
+        assert!(!meets_floor("libprotoc 3.20.3", MIN_PROTOC));
+        assert!(meets_floor("1.71.0", MIN_BUF));
+        assert!(!meets_floor("1.70.9", MIN_BUF));
+    }
+
+    #[test]
+    fn rust_minimum_follows_the_toolchain_pin() {
+        let pin = include_str!("../../../rust-toolchain.toml");
+        let channel = pin
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("channel"))
+            .and_then(|l| l.split('"').nth(1))
+            .expect("rust-toolchain.toml has a channel");
+        assert_eq!(MIN_RUSTC, channel);
+    }
 }

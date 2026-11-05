@@ -27,6 +27,12 @@ All notable changes to this repo are documented here. Format follows
 
 ### Changed
 
+- The toolchain moves from Rust 1.96.1 to 1.99.1 (`rust-toolchain.toml`, `rust-version` 1.99).
+  `vxedge doctor` now compares versions instead of matching the text `1.96`: it requires a rustc
+  at or above the pin in `rust-toolchain.toml` (read at build time, so the check follows the pin)
+  and enforces the protoc 3.21 and buf 1.71 floors it already named, so a protoc older than 3.21
+  now fails the check. `vxedge-api` allows two clippy lints that 1.99 raises in tonic and pbjson
+  generated code.
 - `Plan`'s per-backend host checks are named with the manifest's backend names
   (`backend qemu-microvm`, not `backend qemu_microvm`).
 - `experiment new` scaffolds a `vxp/1` package: `vxp.yaml` with id `local/<id>` (or
