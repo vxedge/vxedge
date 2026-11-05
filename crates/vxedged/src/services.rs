@@ -104,14 +104,38 @@ pub(crate) fn preflight_requires(dir: Option<&std::path::Path>) -> Result<(), St
     };
     found
         .package
-        .requires
+        .host_requires()
         .check(
-            &found.package.id,
+            found.package.id(),
             &vxedge_core::package::HostCapabilities::probe(),
         )
         .map_err(|e| {
             crate::errors::precondition(crate::errors::R::HostRequirementUnmet, e.to_string())
         })
+}
+
+/// Refuse a package whose `requires.vxedge` range excludes this daemon. Pure: the version is
+/// this binary's own.
+pub(crate) fn preflight_vxedge_version(dir: Option<&std::path::Path>) -> Result<(), Status> {
+    let Some(found) = dir.and_then(|d| vxedge_core::discover(d).ok()) else {
+        return Ok(());
+    };
+    let Some(range) = found.package.vxedge_range() else {
+        return Ok(());
+    };
+    let ours = semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version is SemVer");
+    if range.matches(&ours) {
+        return Ok(());
+    }
+    Err(crate::errors::precondition(
+        crate::errors::R::VxedgeVersionUnsupported,
+        format!(
+            "package `{}` requires vxedge `{range}`, and this daemon is {ours}. Nothing was \
+             provisioned. Run it on a vxedge inside that range, or use a package version built \
+             for this one.",
+            found.package.id()
+        ),
+    ))
 }
 
 /// The algorithm behind the identity [`resolve_manifest`] computes: the workspace rule when there
@@ -211,28 +235,13 @@ pub(crate) async fn read_workspace(dir: &str) -> Result<String, Status> {
                 format!("workspace `{}`: {e}", root.display()),
             )
         };
-        let mut paths: Vec<PathBuf> = std::fs::read_dir(&root)
-            .map_err(|e| bad(e.to_string()))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("yaml"))
-            .collect();
-        // Sorted, so the same workspace always produces the same document and the same hash.
-        paths.sort();
-        if paths.is_empty() {
+        // The same document set `Workspace::load` reads, so the `vxp.yaml` descriptor is never
+        // joined as a document.
+        let text = Workspace::read_text(&root).map_err(|e| bad(e.to_string()))?;
+        if text.is_empty() {
             return Err(bad("no `*.yaml` documents here".to_string()));
         }
-        let mut out = String::new();
-        for path in paths {
-            let text = std::fs::read_to_string(&path).map_err(|e| bad(e.to_string()))?;
-            if !out.is_empty() {
-                out.push_str("---\n");
-            }
-            out.push_str(&text);
-            if !out.ends_with('\n') {
-                out.push('\n');
-            }
-        }
-        Ok(out)
+        Ok(text)
     })
     .await
     .map_err(|e| Status::internal(format!("workspace task panicked: {e}")))?

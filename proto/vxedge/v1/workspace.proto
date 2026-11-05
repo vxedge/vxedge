@@ -64,6 +64,9 @@ message HostCapabilities {
   // The best NVIDIA GPU the driver reports, the probe a workspace's `requires` is checked
   // against. Unset when there is none.
   HostGpu gpu = 4;
+  // The package descriptor schemas this daemon reads, such as `vxp/1` (`ARCHITECTURE.md`
+  // §6.0.3). A legacy descriptor has no schema and is not listed.
+  repeated string package_schemas = 5;
 }
 
 message HostGpu {

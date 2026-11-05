@@ -1245,6 +1245,99 @@ async fn plan_and_up_agree_on_a_mismatched_descriptor() {
     assert_eq!(reason(&refused), "ERROR_REASON_WORKSPACE_INVALID");
 }
 
+/// A `vxp/1` descriptor for the workspace `experiment_workspace` writes, with `extra` appended.
+fn write_v1(dir: &Path, id: &str, schema: &str, extra: &str) {
+    std::fs::write(
+        dir.join("vxp.yaml"),
+        format!("schema: {schema}\nid: vxedge/{id}\nversion: 1.0.0\nentry: main.yaml\n{extra}"),
+    )
+    .unwrap();
+}
+
+/// A descriptor this daemon reads plans clean: `vxp.yaml` is not joined as a document.
+#[tokio::test]
+async fn a_vxp1_package_plans_and_its_descriptor_is_not_a_document() {
+    let daemon = Daemon::start();
+    let channel = daemon.channel().await;
+    let (dir, id) = experiment_workspace();
+    let ours = env!("CARGO_PKG_VERSION");
+    write_v1(
+        &dir,
+        &id,
+        "vxp/1",
+        &format!("requires:\n  vxedge: \"={ours}\"\n"),
+    );
+    let plan = plan_of(&channel, &dir).await;
+    assert!(
+        !plan.problems.iter().any(|p| p.reason
+            == vxedge_api::v1::ErrorReason::WorkspaceInvalid as i32
+            || p.reason == vxedge_api::v1::ErrorReason::PackageSchemaUnsupported as i32
+            || p.reason == vxedge_api::v1::ErrorReason::VxedgeVersionUnsupported as i32),
+        "{:?}",
+        plan.problems
+    );
+}
+
+/// A newer schema is a typed refusal an agent can branch on, from `Plan` and from `up` alike.
+#[tokio::test]
+async fn plan_and_up_refuse_an_unsupported_schema_by_reason() {
+    let daemon = Daemon::start();
+    let channel = daemon.channel().await;
+    let (dir, id) = experiment_workspace();
+    write_v1(&dir, &id, "vxp/9", "");
+    let plan = plan_of(&channel, &dir).await;
+    assert!(!plan.valid);
+    let first = plan.problems.first().expect("refused");
+    assert_eq!(
+        first.reason,
+        vxedge_api::v1::ErrorReason::PackageSchemaUnsupported as i32,
+        "{}",
+        first.detail
+    );
+    assert!(first.detail.contains("vxp/1"), "{}", first.detail);
+    let refused = ExperimentServiceClient::new(channel)
+        .up(ExperimentUpRequest {
+            manifest: path_ref(&dir),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&refused), "ERROR_REASON_PACKAGE_SCHEMA_UNSUPPORTED");
+}
+
+/// A package whose `requires.vxedge` excludes this daemon is refused before anything runs.
+/// The range is built from this build's own version, so the test holds across releases.
+#[tokio::test]
+async fn plan_and_up_refuse_a_package_for_another_vxedge() {
+    let daemon = Daemon::start();
+    let channel = daemon.channel().await;
+    let (dir, id) = experiment_workspace();
+    let ours = env!("CARGO_PKG_VERSION");
+    write_v1(
+        &dir,
+        &id,
+        "vxp/1",
+        &format!("requires:\n  vxedge: \">{ours}\"\n"),
+    );
+    let plan = plan_of(&channel, &dir).await;
+    assert!(!plan.valid);
+    assert!(
+        plan.problems.iter().any(|p| p.reason
+            == vxedge_api::v1::ErrorReason::VxedgeVersionUnsupported as i32
+            && p.detail.contains(ours)),
+        "{:?}",
+        plan.problems
+    );
+    let refused = ExperimentServiceClient::new(channel)
+        .up(ExperimentUpRequest {
+            manifest: path_ref(&dir),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&refused), "ERROR_REASON_VXEDGE_VERSION_UNSUPPORTED");
+}
+
 #[tokio::test]
 async fn plan_and_up_agree_on_the_wrong_workspace() {
     let (active, id) = experiment_workspace();
@@ -1328,6 +1421,7 @@ async fn host_capabilities_cover_every_backend() {
     );
     assert_eq!(caps.part_kinds, ["container", "bundle", "wasm"]);
     assert_eq!(caps.max_runs, 1);
+    assert_eq!(caps.package_schemas, ["vxp/1"]);
     // The container backend is available only where `up`'s own Podman check would pass.
     let container = caps
         .backends

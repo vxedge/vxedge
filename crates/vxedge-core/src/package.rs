@@ -16,25 +16,281 @@
 //! The descriptor is separate from `main.yaml` so a version bump never touches experiment
 //! content — the identity of a package and the content of an experiment change for different
 //! reasons and at different times.
+//!
+//! **Two descriptor forms** (`ARCHITECTURE.md` §6.0, §6.0.3). `vxp.yaml` with `schema: vxp/1`
+//! is the package format; a `<name>.vxp` YAML file without `schema` is the legacy form vxedge
+//! 0.5.x reads, still loaded through 0.7.x. `.vxp` now names the packed file, so a `*.vxp`
+//! holding a tar archive is refused here rather than parsed.
+//!
+//! The `schema` is read from the raw mapping before anything else, so a newer schema is a
+//! typed refusal ([`DiscoverError::UnsupportedSchema`]) and never a parse error.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// A `.vxp` package descriptor: what this workspace *is*, as distinct from what it *does*.
+use crate::model::Backend;
+
+/// The fixed descriptor name (`ARCHITECTURE.md` §6.0, decision X-1).
+pub const DESCRIPTOR_FILE: &str = "vxp.yaml";
+/// The lock `vxedge pkg lock` writes beside the descriptor (§6.0.7).
+pub const LOCK_FILE: &str = "vxp.lock";
+/// The package format this build reads and writes.
+pub const SCHEMA_V1: &str = "vxp/1";
+/// Every `schema` this build reads, as `HostService.Capabilities` reports them.
+pub const KNOWN_SCHEMAS: &[&str] = &[SCHEMA_V1];
+
+/// A package descriptor, in either form: what this workspace *is*, as distinct from what it
+/// *does*.
+#[derive(Debug, Clone)]
+pub enum PackageDoc {
+    V1(Box<DescriptorV1>),
+    Legacy(LegacyDescriptor),
+}
+
+impl PackageDoc {
+    /// The package id as written: `namespace/name` under `vxp/1`, a bare id for a legacy one.
+    pub fn id(&self) -> &str {
+        match self {
+            Self::V1(d) => d.id.as_str(),
+            Self::Legacy(d) => &d.id,
+        }
+    }
+
+    /// The id the `kind: experiment` document must carry: the `name` half under `vxp/1`, the
+    /// whole id for a legacy descriptor.
+    pub fn experiment_id(&self) -> &str {
+        match self {
+            Self::V1(d) => d.id.name(),
+            Self::Legacy(d) => &d.id,
+        }
+    }
+
+    pub fn version(&self) -> Option<String> {
+        match self {
+            Self::V1(d) => Some(d.version.to_string()),
+            Self::Legacy(d) => d.version.clone(),
+        }
+    }
+
+    /// The file named as holding the experiment: required under `vxp/1`, optional for legacy.
+    pub fn entry(&self) -> Option<&str> {
+        match self {
+            Self::V1(d) => Some(&d.entry),
+            Self::Legacy(d) => d.entry.as_deref(),
+        }
+    }
+
+    /// `vxp/1`, or `None` for a legacy descriptor.
+    pub fn schema(&self) -> Option<&'static str> {
+        match self {
+            Self::V1(_) => Some(SCHEMA_V1),
+            Self::Legacy(_) => None,
+        }
+    }
+
+    /// The vxedge versions this package runs on, when it says.
+    pub fn vxedge_range(&self) -> Option<&semver::VersionReq> {
+        match self {
+            Self::V1(d) => d.requires.vxedge.as_ref(),
+            Self::Legacy(_) => None,
+        }
+    }
+
+    /// The host requirements [`Requires::check`] enforces today: the GPU tier. `kvm`, `kernel`
+    /// and `backends` are read and validated, not yet enforced.
+    pub fn host_requires(&self) -> Requires {
+        match self {
+            Self::V1(d) => Requires {
+                gpu: d.requires.gpu.map(|g| g.as_str().to_string()),
+            },
+            Self::Legacy(d) => d.requires.clone(),
+        }
+    }
+}
+
+/// A legacy `<name>.vxp` descriptor, read exactly as vxedge 0.5.x reads it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PackageDoc {
+pub struct LegacyDescriptor {
     pub id: String,
     #[serde(default)]
     pub version: Option<String>,
-    /// The experiment document, when the workspace wants to be explicit. Discovery does not
-    /// need it — files are routed by `kind`, not by path (§6.0) — so it stays advisory.
+    /// The experiment document, when the workspace wants to be explicit.
     #[serde(default)]
     pub entry: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
     pub requires: Requires,
+}
+
+/// A `vxp/1` descriptor (`ARCHITECTURE.md` §6.0.3).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DescriptorV1 {
+    pub id: PackageId,
+    pub version: semver::Version,
+    pub entry: String,
+    pub title: Option<String>,
+    pub license: Option<String>,
+    pub authors: Vec<Author>,
+    pub requires: RequiresV1,
+    pub provenance: Option<Provenance>,
+    /// `x-` keys, carried and ignored.
+    pub extensions: BTreeMap<String, serde_yaml_ng::Value>,
+}
+
+/// The `vxp/1` fields, without `schema` and the `x-` keys, which are split off first.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct V1Fields {
+    id: PackageId,
+    version: semver::Version,
+    entry: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    license: Option<String>,
+    #[serde(default)]
+    authors: Vec<Author>,
+    #[serde(default)]
+    requires: RequiresV1,
+    #[serde(default)]
+    provenance: Option<Provenance>,
+}
+
+/// `namespace/name`: the namespace is the publishing organisation, the name the experiment id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct PackageId {
+    full: String,
+    slash: usize,
+}
+
+impl PackageId {
+    pub fn as_str(&self) -> &str {
+        &self.full
+    }
+    pub fn namespace(&self) -> &str {
+        &self.full[..self.slash]
+    }
+    pub fn name(&self) -> &str {
+        &self.full[self.slash + 1..]
+    }
+}
+
+impl TryFrom<String> for PackageId {
+    type Error = String;
+    fn try_from(full: String) -> Result<Self, String> {
+        let component = |c: &str| {
+            c.bytes()
+                .next()
+                .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+                && c.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        };
+        match full.split_once('/') {
+            Some((ns, name)) if component(ns) && component(name) => Ok(Self {
+                slash: ns.len(),
+                full,
+            }),
+            _ => Err(format!(
+                "package id `{full}` must be `namespace/name`, each lower-case letters, digits \
+                 and `-`, starting with a letter or digit (e.g. `vxedge/h1-slice-isolation`)"
+            )),
+        }
+    }
+}
+
+impl From<PackageId> for String {
+    fn from(id: PackageId) -> String {
+        id.full
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Author {
+    pub org: String,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Provenance {
+    pub generated_by: GeneratedBy,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GeneratedBy {
+    pub tool: String,
+    pub version: String,
+    #[serde(default)]
+    pub model_digest: Option<String>,
+}
+
+/// `requires` under `vxp/1`. Every value is checked for shape when read; see
+/// [`PackageDoc::host_requires`] for which are enforced.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequiresV1 {
+    #[serde(default)]
+    pub vxedge: Option<semver::VersionReq>,
+    #[serde(default)]
+    pub gpu: Option<GpuTier>,
+    #[serde(default)]
+    pub kvm: Option<bool>,
+    #[serde(default)]
+    pub kernel: Option<KernelRequires>,
+    #[serde(default, deserialize_with = "backends")]
+    pub backends: Vec<Backend>,
+}
+
+fn backends<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Backend>, D::Error> {
+    Vec::<String>::deserialize(d)?
+        .iter()
+        .map(|s| {
+            s.parse().map_err(|_| {
+                serde::de::Error::custom(format!(
+                    "unknown backend `{s}`; expected one of {}",
+                    Backend::ALL.map(Backend::as_str).join(", ")
+                ))
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GpuTier {
+    None,
+    Tier2,
+}
+
+impl GpuTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Tier2 => "tier2",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KernelRequires {
+    #[serde(default)]
+    pub preempt_rt: Option<PreemptRt>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PreemptRt {
+    Required,
+    Preferred,
+    Any,
 }
 
 /// What a workspace needs from its host, checked by [`Requires::check`] before `up` provisions
@@ -179,12 +435,45 @@ impl Requires {
 #[derive(Debug, thiserror::Error)]
 pub enum DiscoverError {
     #[error(
-        "no vxedge experiment workspace found in {}: expected a `.vxp` file here. \
-         Run `vxedge experiment new <name>` to create one, `cd` into an existing workspace, \
-         or point at one with `--chdir <dir>`.",
+        "no vxedge experiment workspace found in {}: expected a `vxp.yaml` (or a legacy \
+         `<name>.vxp`) here. Run `vxedge experiment new <name>` to create one, `cd` into an \
+         existing workspace, or point at one with `--chdir <dir>`.",
         .dir.display()
     )]
     NotAWorkspace { dir: PathBuf },
+    #[error(
+        "{} holds both `vxp.yaml` and {} — a package has one descriptor. `vxp.yaml` is the \
+         current form: delete the legacy `<name>.vxp`, or move a packed `.vxp` out of the \
+         source folder (it would be an input to its own next pack).",
+        .dir.display(), .found.join(", ")
+    )]
+    BothDescriptors { dir: PathBuf, found: Vec<String> },
+    #[error(
+        "{} is a packed package, not a descriptor. Run it from a source folder: \
+         `vxedge pkg unpack` restores one.",
+        .path.display()
+    )]
+    PackedPackage { path: PathBuf },
+    #[error(
+        "{} has no `schema`. `vxp.yaml` is the `vxp/1` descriptor: add `schema: vxp/1` as its \
+         first line.",
+        .path.display()
+    )]
+    MissingSchema { path: PathBuf },
+    #[error(
+        "{} declares `schema: {found}`, which this vxedge does not read (it reads {}). \
+         Upgrade vxedge, or use a package built for this version.",
+        .path.display(), KNOWN_SCHEMAS.join(", ")
+    )]
+    UnsupportedSchema { path: PathBuf, found: String },
+    #[error(
+        "{} declares a `schema`, so it is a `vxp/1` descriptor with a legacy name: rename it \
+         to `vxp.yaml`.",
+        .path.display()
+    )]
+    SchemaInLegacyFile { path: PathBuf },
+    #[error("{} is not a valid package descriptor: {reason}", .path.display())]
+    Invalid { path: PathBuf, reason: String },
     #[error(
         "{} contains {} `.vxp` files ({}) — a workspace is exactly one experiment. \
          Split them into separate directories, or move the extras out.",
@@ -210,67 +499,181 @@ pub enum DiscoverError {
 #[derive(Debug, Clone)]
 pub struct DiscoveredWorkspace {
     pub root: PathBuf,
-    pub vxp_path: PathBuf,
+    /// `vxp.yaml`, or the legacy `<name>.vxp`.
+    pub descriptor_path: PathBuf,
     pub package: PackageDoc,
 }
 
-/// Find the single `.vxp` in `dir` and read it. Does not read the rest of the workspace —
+/// Find the descriptor in `dir` and read it. Does not read the rest of the workspace —
 /// [`crate::Workspace::load`] does that, and keeping the two separate means a broken experiment
 /// document still produces a *good* "which workspace is this" error.
 pub fn discover(dir: &Path) -> Result<DiscoveredWorkspace, DiscoverError> {
-    let entries = std::fs::read_dir(dir).map_err(|source| DiscoverError::Io {
-        path: dir.to_path_buf(),
-        source,
-    })?;
-
-    let mut found: Vec<PathBuf> = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|source| DiscoverError::Io {
-            path: dir.to_path_buf(),
-            source,
-        })?;
-        let path = entry.path();
+    let io = |path: &Path| {
+        let path = path.to_path_buf();
+        move |source| DiscoverError::Io { path, source }
+    };
+    let mut legacy: Vec<PathBuf> = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(io(dir))? {
+        let path = entry.map_err(io(dir))?.path();
         if path.is_file() && path.extension().is_some_and(|e| e == "vxp") {
-            found.push(path);
+            legacy.push(path);
         }
     }
     // Directory order is filesystem-defined; sort so the "many" error reads the same twice.
-    found.sort();
-
-    let vxp_path = match found.len() {
-        0 => {
-            return Err(DiscoverError::NotAWorkspace {
-                dir: dir.to_path_buf(),
-            });
-        }
-        1 => found.remove(0),
-        _ => {
-            return Err(DiscoverError::Ambiguous {
-                dir: dir.to_path_buf(),
-                found: found
-                    .iter()
-                    .filter_map(|p| p.file_name())
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .collect(),
-            });
-        }
+    legacy.sort();
+    let names = |paths: &[PathBuf]| -> Vec<String> {
+        paths
+            .iter()
+            .filter_map(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .collect()
     };
 
-    let text = std::fs::read_to_string(&vxp_path).map_err(|source| DiscoverError::Io {
-        path: vxp_path.clone(),
-        source,
-    })?;
-    let package: PackageDoc =
-        serde_yaml_ng::from_str(&text).map_err(|source| DiscoverError::Parse {
-            path: vxp_path.clone(),
-            source,
-        })?;
+    let current = dir.join(DESCRIPTOR_FILE);
+    let (descriptor_path, package) = if current.is_file() {
+        if !legacy.is_empty() {
+            return Err(DiscoverError::BothDescriptors {
+                dir: dir.to_path_buf(),
+                found: names(&legacy),
+            });
+        }
+        let text = std::fs::read_to_string(&current).map_err(io(&current))?;
+        let package = read_current(&current, &text)?;
+        (current, package)
+    } else {
+        let path = match legacy.len() {
+            0 => {
+                return Err(DiscoverError::NotAWorkspace {
+                    dir: dir.to_path_buf(),
+                });
+            }
+            1 => legacy.remove(0),
+            _ => {
+                return Err(DiscoverError::Ambiguous {
+                    dir: dir.to_path_buf(),
+                    found: names(&legacy),
+                });
+            }
+        };
+        let bytes = std::fs::read(&path).map_err(io(&path))?;
+        if is_tar(&bytes) {
+            return Err(DiscoverError::PackedPackage { path });
+        }
+        let package = read_legacy(&path, &bytes)?;
+        (path, package)
+    };
 
     Ok(DiscoveredWorkspace {
         root: dir.to_path_buf(),
-        vxp_path,
+        descriptor_path,
         package,
     })
+}
+
+/// A ustar header carries `ustar` at offset 257 of its first block.
+fn is_tar(bytes: &[u8]) -> bool {
+    bytes.get(257..262) == Some(b"ustar")
+}
+
+/// Read `vxp.yaml`: dispatch on `schema` from the raw mapping, then parse what that schema says.
+fn read_current(path: &Path, text: &str) -> Result<PackageDoc, DiscoverError> {
+    let parse = |source| DiscoverError::Parse {
+        path: path.to_path_buf(),
+        source,
+    };
+    let invalid = |reason: String| DiscoverError::Invalid {
+        path: path.to_path_buf(),
+        reason,
+    };
+    let serde_yaml_ng::Value::Mapping(mut map) =
+        serde_yaml_ng::from_str::<serde_yaml_ng::Value>(text).map_err(parse)?
+    else {
+        return Err(invalid("expected a mapping of keys".to_string()));
+    };
+    match map.remove("schema") {
+        None => Err(DiscoverError::MissingSchema {
+            path: path.to_path_buf(),
+        }),
+        Some(serde_yaml_ng::Value::String(s)) if s == SCHEMA_V1 => {
+            read_v1(map, path).map(|d| PackageDoc::V1(Box::new(d)))
+        }
+        Some(serde_yaml_ng::Value::String(found)) => Err(DiscoverError::UnsupportedSchema {
+            path: path.to_path_buf(),
+            found,
+        }),
+        Some(other) => Err(invalid(format!(
+            "`schema` must be a string such as `{SCHEMA_V1}`, found `{}`",
+            serde_yaml_ng::to_string(&other).unwrap_or_default().trim()
+        ))),
+    }
+}
+
+fn read_v1(map: serde_yaml_ng::Mapping, path: &Path) -> Result<DescriptorV1, DiscoverError> {
+    let invalid = |reason: String| DiscoverError::Invalid {
+        path: path.to_path_buf(),
+        reason,
+    };
+    let mut fields = serde_yaml_ng::Mapping::new();
+    let mut extensions = BTreeMap::new();
+    for (key, value) in map {
+        match key.as_str() {
+            Some(k) if k.starts_with("x-") => {
+                extensions.insert(k.to_string(), value);
+            }
+            _ => {
+                fields.insert(key, value);
+            }
+        }
+    }
+    let f: V1Fields =
+        serde_yaml_ng::from_value(serde_yaml_ng::Value::Mapping(fields)).map_err(|source| {
+            DiscoverError::Parse {
+                path: path.to_path_buf(),
+                source,
+            }
+        })?;
+    // `entry` names a top-level document: the loader reads only those, and the descriptor is
+    // not one.
+    if f.entry.contains('/')
+        || !f.entry.ends_with(".yaml")
+        || f.entry == DESCRIPTOR_FILE
+        || f.entry.starts_with('.')
+    {
+        return Err(invalid(format!(
+            "`entry: {}` must name a top-level `*.yaml` document other than `{DESCRIPTOR_FILE}`",
+            f.entry
+        )));
+    }
+    Ok(DescriptorV1 {
+        id: f.id,
+        version: f.version,
+        entry: f.entry,
+        title: f.title,
+        license: f.license,
+        authors: f.authors,
+        requires: f.requires,
+        provenance: f.provenance,
+        extensions,
+    })
+}
+
+/// Read a legacy `<name>.vxp` as vxedge 0.5.x does, after pointing a misnamed `vxp/1` file at
+/// its name.
+fn read_legacy(path: &Path, bytes: &[u8]) -> Result<PackageDoc, DiscoverError> {
+    let parse = |source| DiscoverError::Parse {
+        path: path.to_path_buf(),
+        source,
+    };
+    let value: serde_yaml_ng::Value = serde_yaml_ng::from_slice(bytes).map_err(parse)?;
+    if value.get("schema").is_some() {
+        return Err(DiscoverError::SchemaInLegacyFile {
+            path: path.to_path_buf(),
+        });
+    }
+    // Parsed again from the bytes, not the value, so an error keeps its line and column.
+    serde_yaml_ng::from_slice(bytes)
+        .map(PackageDoc::Legacy)
+        .map_err(parse)
 }
 
 #[cfg(test)]
@@ -297,8 +700,8 @@ mod tests {
             "id: demo\nversion: 0.1.0\nrequires:\n  gpu: none\n",
         );
         let ws = discover(&d).unwrap();
-        assert_eq!(ws.package.id, "demo");
-        assert_eq!(ws.package.requires.gpu.as_deref(), Some("none"));
+        assert_eq!(ws.package.id(), "demo");
+        assert_eq!(ws.package.host_requires().gpu.as_deref(), Some("none"));
         std::fs::remove_dir_all(&d).ok();
     }
 
@@ -354,6 +757,204 @@ mod tests {
             Err(DiscoverError::Parse { .. }) => {}
             other => panic!("expected Parse, got {other:?}"),
         }
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    const V1: &str = "schema: vxp/1\n\
+                      id: vxedge/h1-slice-isolation\n\
+                      version: 1.2.0\n\
+                      entry: main.yaml\n\
+                      title: Slice isolation under background load\n\
+                      license: Apache-2.0\n\
+                      authors: [{ org: vxedge }]\n\
+                      requires:\n  \
+                        vxedge: \">=0.6.0, <0.8.0\"\n  \
+                        gpu: none\n  \
+                        kvm: true\n  \
+                        kernel: { preempt_rt: preferred }\n  \
+                        backends: [container, qemu-microvm]\n\
+                      provenance:\n  \
+                        generated_by: { tool: vxmodel, version: 0.3.0 }\n\
+                      x-oem-acme: { cost_centre: 4711 }\n";
+
+    fn v1_with(dir: &Path, body: &str) -> Result<DiscoveredWorkspace, DiscoverError> {
+        std::fs::write(dir.join(DESCRIPTOR_FILE), body).unwrap();
+        discover(dir)
+    }
+
+    /// The `ARCHITECTURE.md` §6.0.3 example, whole: every field read, `x-` keys carried.
+    #[test]
+    fn a_vxp1_descriptor_is_read_whole() {
+        let d = tmp("v1-whole");
+        let ws = v1_with(&d, V1).unwrap();
+        let PackageDoc::V1(v1) = &ws.package else {
+            panic!("expected vxp/1, got {:?}", ws.package)
+        };
+        assert_eq!(ws.package.id(), "vxedge/h1-slice-isolation");
+        assert_eq!(ws.package.experiment_id(), "h1-slice-isolation");
+        assert_eq!(ws.package.entry(), Some("main.yaml"));
+        assert_eq!(ws.package.schema(), Some(SCHEMA_V1));
+        assert_eq!(v1.version, semver::Version::new(1, 2, 0));
+        assert_eq!(v1.id.namespace(), "vxedge");
+        let range = ws.package.vxedge_range().expect("range");
+        assert!(range.matches(&semver::Version::new(0, 7, 3)));
+        assert!(!range.matches(&semver::Version::new(0, 8, 0)));
+        assert_eq!(v1.requires.kvm, Some(true));
+        assert_eq!(
+            v1.requires.backends,
+            vec![
+                crate::model::Backend::Container,
+                crate::model::Backend::QemuMicrovm
+            ]
+        );
+        assert!(v1.extensions.contains_key("x-oem-acme"));
+        assert_eq!(ws.descriptor_path, d.join(DESCRIPTOR_FILE));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// Within a known schema a typo is a mistake; an `x-` key is an annotation.
+    #[test]
+    fn vxp1_refuses_unknown_keys_but_carries_x_keys() {
+        let d = tmp("v1-unknown");
+        let typo = V1.replace("title:", "titel:");
+        assert!(matches!(
+            v1_with(&d, &typo),
+            Err(DiscoverError::Parse { .. })
+        ));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A newer schema is a typed refusal naming what this build reads, never a parse error.
+    #[test]
+    fn an_unknown_schema_is_refused_as_unsupported() {
+        let d = tmp("v1-schema");
+        let newer = V1.replace("schema: vxp/1", "schema: vxp/9");
+        match v1_with(&d, &newer) {
+            Err(e @ DiscoverError::UnsupportedSchema { .. }) => {
+                let msg = e.to_string();
+                assert!(msg.contains("vxp/9") && msg.contains("vxp/1"), "{msg}");
+            }
+            other => panic!("expected UnsupportedSchema, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// The file name already declares the new format, so a missing `schema` is a mistake.
+    #[test]
+    fn vxp_yaml_without_a_schema_is_refused() {
+        let d = tmp("v1-noschema");
+        let bare = V1.replace("schema: vxp/1\n", "");
+        assert!(matches!(
+            v1_with(&d, &bare),
+            Err(DiscoverError::MissingSchema { .. })
+        ));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn vxp1_checks_id_version_range_and_backends() {
+        for (what, from, to) in [
+            (
+                "bare id",
+                "id: vxedge/h1-slice-isolation",
+                "id: h1-slice-isolation",
+            ),
+            (
+                "upper case",
+                "id: vxedge/h1-slice-isolation",
+                "id: VxEdge/h1",
+            ),
+            ("three parts", "id: vxedge/h1-slice-isolation", "id: a/b/c"),
+            (
+                "leading dash",
+                "id: vxedge/h1-slice-isolation",
+                "id: vxedge/-h1",
+            ),
+            ("version", "version: 1.2.0", "version: 1.2"),
+            ("range", "\">=0.6.0, <0.8.0\"", "\"at least six\""),
+            (
+                "backend",
+                "[container, qemu-microvm]",
+                "[container, firecracker]",
+            ),
+            ("gpu", "gpu: none", "gpu: tier9"),
+            ("preempt_rt", "preempt_rt: preferred", "preempt_rt: maybe"),
+            ("entry", "entry: main.yaml", "entry: docs/main.yaml"),
+            ("entry", "entry: main.yaml", "entry: vxp.yaml"),
+            (
+                "author",
+                "authors: [{ org: vxedge }]",
+                "authors: [{ name: someone }]",
+            ),
+        ] {
+            let d = tmp("v1-bad");
+            let body = V1.replace(from, to);
+            assert_ne!(body, V1, "{what}: fixture did not change");
+            assert!(v1_with(&d, &body).is_err(), "{what}: `{to}` was accepted");
+            std::fs::remove_dir_all(&d).ok();
+        }
+    }
+
+    /// `vxp.yaml` beside a legacy descriptor is two answers to one question.
+    #[test]
+    fn vxp_yaml_beside_a_legacy_descriptor_is_refused() {
+        let d = tmp("v1-both");
+        write_vxp(&d, "h1-slice-isolation.vxp", "id: h1-slice-isolation\n");
+        match v1_with(&d, V1) {
+            Err(e @ DiscoverError::BothDescriptors { .. }) => {
+                let msg = e.to_string();
+                assert!(msg.contains("h1-slice-isolation.vxp"), "{msg}");
+            }
+            other => panic!("expected BothDescriptors, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A packed package found where a descriptor is looked for is never parsed as YAML.
+    #[test]
+    fn a_packed_vxp_is_not_read_as_a_descriptor() {
+        let d = tmp("packed");
+        let mut block = vec![0u8; 512];
+        block[..9].copy_from_slice(b"main.yaml");
+        block[257..263].copy_from_slice(b"ustar\0");
+        std::fs::write(d.join("h1-slice-isolation-1.2.0.vxp"), &block).unwrap();
+        match discover(&d) {
+            Err(e @ DiscoverError::PackedPackage { .. }) => {
+                assert!(e.to_string().contains("pkg unpack"), "{e}");
+            }
+            other => panic!("expected PackedPackage, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A legacy file that declares a schema is a `vxp.yaml` with the wrong name.
+    #[test]
+    fn a_legacy_descriptor_with_a_schema_is_told_to_rename() {
+        let d = tmp("legacy-schema");
+        write_vxp(&d, "h1.vxp", "schema: vxp/1\nid: vxedge/h1\n");
+        match discover(&d) {
+            Err(e @ DiscoverError::SchemaInLegacyFile { .. }) => {
+                assert!(e.to_string().contains(DESCRIPTOR_FILE), "{e}");
+            }
+            other => panic!("expected SchemaInLegacyFile, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// Legacy descriptors still load as vxedge 0.5.x read them: the whole id is the experiment id.
+    #[test]
+    fn a_legacy_descriptor_still_loads() {
+        let d = tmp("legacy");
+        write_vxp(
+            &d,
+            "exp-002.vxp",
+            "id: exp-002\nversion: 0.1.0\nentry: main.yaml\n",
+        );
+        let ws = discover(&d).unwrap();
+        assert!(matches!(ws.package, PackageDoc::Legacy(_)));
+        assert_eq!(ws.package.experiment_id(), "exp-002");
+        assert_eq!(ws.package.schema(), None);
+        assert!(ws.package.vxedge_range().is_none());
         std::fs::remove_dir_all(&d).ok();
     }
 

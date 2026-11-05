@@ -6,6 +6,32 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+Main now carries the `vxp/1` package format, so the next vxedge release is 0.6.0.
+
+### Added
+
+- `vxp/1` package descriptors (`ARCHITECTURE.md` §6.0.3): `vxp.yaml` with `schema: vxp/1`, a
+  `namespace/name` id whose name is the experiment id, a SemVer `version`, a required `entry`, and
+  `title`, `license`, `authors`, `requires` and `provenance`. Unknown keys are refused, and `x-`
+  keys are carried and ignored. The document glob skips `vxp.yaml`, in the CLI and the daemon alike.
+- `ERROR_REASON_PACKAGE_SCHEMA_UNSUPPORTED`: `Plan`, `experiment up` and `vehicle up` refuse a
+  descriptor whose `schema` this build does not read, naming the ones it does.
+  `HostCapabilities.package_schemas` lists them.
+- `ERROR_REASON_VXEDGE_VERSION_UNSUPPORTED`: a package whose `requires.vxedge` range excludes
+  the daemon is refused before anything is provisioned.
+- Validation refuses a `.vxpignore` that excludes the descriptor, `vxp.lock` or a document, which
+  would leave the workspace identity blind to what the experiment is made of.
+
+### Changed
+
+- Legacy `<name>.vxp` descriptors load as before, and are refused beside a `vxp.yaml`. A `*.vxp`
+  holding a tar archive is reported as a packed package rather than parsed, and a legacy file that
+  declares a `schema` is told to become `vxp.yaml`.
+- `requires.kvm`, `requires.kernel.preempt_rt` and `requires.backends` are read and checked for
+  shape, but not yet enforced by the preflight; `requires.vxedge` and `requires.gpu` are.
+- Backend names come from one table (`Backend::as_str`), which the manifest reader and the
+  descriptor both use.
+
 ### Fixed
 
 - qemu-microvm guests get a stable, unique MAC. QEMU gave every guest `52:54:00:12:34:56`, so on a

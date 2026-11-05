@@ -116,6 +116,11 @@ enum ErrorReason {
   // A traffic endpoint is not on the host: its node's zone is up, which moves the gateway-side
   // veth into the node. Bring the run up with the gateway stage only for host-side traffic.
   ERROR_REASON_ENDPOINT_NOT_ON_HOST = 23;
+  // The package descriptor declares a `schema` this daemon does not read. The detail names the
+  // schemas it does; `HostCapabilities.package_schemas` lists them too.
+  ERROR_REASON_PACKAGE_SCHEMA_UNSUPPORTED = 24;
+  // The package's `requires.vxedge` range does not include this daemon's version.
+  ERROR_REASON_VXEDGE_VERSION_UNSUPPORTED = 25;
 }
 
 // Names one run. See `RunService`.

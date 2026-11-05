@@ -218,15 +218,13 @@ fn str_of<'a>(spec: &'a Value, key: &str) -> Option<&'a str> {
 fn backend_of(device: &str, spec: &Value) -> Result<Option<Backend>, ModelError> {
     match str_of(spec, "backend") {
         None => Ok(None),
-        Some("container") => Ok(Some(Backend::Container)),
-        Some("qemu-microvm") => Ok(Some(Backend::QemuMicrovm)),
-        Some("libvirt") => Ok(Some(Backend::Libvirt)),
-        Some("cloud-hypervisor") => Ok(Some(Backend::CloudHypervisor)),
-        Some("wasm-capsule") => Ok(Some(Backend::WasmCapsule)),
-        Some(other) => Err(ModelError::UnknownBackend {
-            device: device.to_string(),
-            backend: other.to_string(),
-        }),
+        Some(name) => name
+            .parse()
+            .map(Some)
+            .map_err(|()| ModelError::UnknownBackend {
+                device: device.to_string(),
+                backend: name.to_string(),
+            }),
     }
 }
 
@@ -364,14 +362,7 @@ fn part_kind(
                 PartKind::Bundle => "bundle",
                 PartKind::Wasm => "wasm",
             },
-            backend: match backend {
-                Some(Backend::Container) => "container",
-                Some(Backend::QemuMicrovm) => "qemu-microvm",
-                Some(Backend::Libvirt) => "libvirt",
-                Some(Backend::CloudHypervisor) => "cloud-hypervisor",
-                Some(Backend::WasmCapsule) => "wasm-capsule",
-                None => "none",
-            },
+            backend: backend.map_or("none", Backend::as_str),
         });
     }
     Ok(kind)

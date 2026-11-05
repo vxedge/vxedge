@@ -91,19 +91,37 @@ pub(crate) async fn preflight(
         Ok(ws) => {
             let problems = ws.package_problems();
             (!problems.is_empty()).then(|| {
-                problems
+                let detail = problems
                     .iter()
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
-                    .join("; ")
+                    .join("; ");
+                (R::WorkspaceInvalid, detail)
             })
         }
-        Err(vxedge_core::WorkspaceError::Package(e)) => Some(e.to_string()),
+        // A newer schema is its own reason, so an agent can tell "upgrade vxedge" from "fix the
+        // descriptor" without reading the sentence.
+        Err(vxedge_core::WorkspaceError::Package(
+            e @ vxedge_core::DiscoverError::UnsupportedSchema { .. },
+        )) => Some((R::PackageSchemaUnsupported, e.to_string())),
+        Err(vxedge_core::WorkspaceError::Package(e)) => Some((R::WorkspaceInvalid, e.to_string())),
         Err(_) => None,
     });
     pf.check(
         "package descriptor",
-        package.map(|detail| (R::WorkspaceInvalid, model.id.clone(), detail)),
+        package.map(|(reason, detail)| (reason, model.id.clone(), detail)),
+    );
+
+    let version = crate::services::preflight_vxedge_version(dir).err();
+    pf.check(
+        "vxedge version",
+        version.map(|s| {
+            (
+                R::VxedgeVersionUnsupported,
+                model.id.clone(),
+                s.message().to_string(),
+            )
+        }),
     );
 
     let requires = crate::services::preflight_requires(dir).err();
@@ -467,6 +485,10 @@ impl HostService for PlanSvc {
             part_kinds: vec!["container".into(), "bundle".into(), "wasm".into()],
             max_runs: 1,
             gpu,
+            package_schemas: vxedge_core::package::KNOWN_SCHEMAS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         }))
     }
 }
