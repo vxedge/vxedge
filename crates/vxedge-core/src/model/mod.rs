@@ -151,6 +151,34 @@ pub enum Backend {
     WasmCapsule,
 }
 
+impl Backend {
+    pub const ALL: [Backend; 5] = [
+        Self::Container,
+        Self::QemuMicrovm,
+        Self::Libvirt,
+        Self::CloudHypervisor,
+        Self::WasmCapsule,
+    ];
+
+    /// The name a manifest uses: the one table every reader of a backend name goes through.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Container => "container",
+            Self::QemuMicrovm => "qemu-microvm",
+            Self::Libvirt => "libvirt",
+            Self::CloudHypervisor => "cloud-hypervisor",
+            Self::WasmCapsule => "wasm-capsule",
+        }
+    }
+}
+
+impl std::str::FromStr for Backend {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, ()> {
+        Self::ALL.into_iter().find(|b| b.as_str() == s).ok_or(())
+    }
+}
+
 /// What a device is *allocated*. Distinct from a part's `requires`, which is what the software
 /// *needs* — validating one against the other is what catches an under-provisioned host before
 /// a run rather than during one.

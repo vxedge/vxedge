@@ -141,10 +141,24 @@ pub enum WorkspaceValidationError {
     )]
     PackageIdMismatch { package: String, experiment: String },
     #[error(
-        "the `.vxp` names `entry: {entry}`, but the `kind: experiment` document is in `{found}` \
-         — point `entry` at it, or drop `entry`"
+        "the package `{package}` has name `{name}`, but the experiment id is `{experiment}` — \
+         under `vxp/1` the part after the `/` is the experiment id, so they must be the same"
+    )]
+    PackageNameMismatch {
+        package: String,
+        name: String,
+        experiment: String,
+    },
+    #[error(
+        "the descriptor names `entry: {entry}`, but the `kind: experiment` document is in \
+         `{found}` — point `entry` at it"
     )]
     EntryWithoutExperiment { entry: String, found: String },
+    #[error(
+        "`.vxpignore` excludes `{file}`, which the experiment is made of — the workspace \
+         identity would not change when it does. Narrow the pattern."
+    )]
+    IgnoredInput { file: String },
     #[error(
         "baseline `{baseline}`: `{part}` has digest `{digest}` — expected `sha256:` + 64 hex chars"
     )]
@@ -776,6 +790,27 @@ pub struct Workspace {
     /// The file each experiment document came from, in the same order as `experiments`:
     /// a file name for a directory, `<inline>` for text.
     pub experiment_sources: Vec<String>,
+    /// Top-level inputs (documents, descriptor, lock) that `.vxpignore` would leave out of the
+    /// identity. Reported by [`Workspace::validate`]. Empty for a workspace read from text.
+    pub ignored_inputs: Vec<String>,
+}
+
+/// The workspace documents in `root`: every top-level `*.yaml` except the `vxp.yaml`
+/// descriptor, sorted by path. Non-recursive, so a `results/` archive is never absorbed. The one
+/// definition every reader of a workspace directory uses.
+pub fn document_paths(root: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("yaml")
+            && path.file_name().and_then(|n| n.to_str()) != Some(crate::package::DESCRIPTOR_FILE)
+        {
+            paths.push(path);
+        }
+    }
+    // Sorted so the joined text, its hash and error output are stable run to run.
+    paths.sort();
+    Ok(paths)
 }
 
 /// `component:port` → the component half. A bare id has no port and is returned as-is.
@@ -794,61 +829,52 @@ impl Workspace {
             ..Default::default()
         };
 
-        let entries = std::fs::read_dir(root).map_err(|source| WorkspaceError::Io {
+        let paths = document_paths(root).map_err(|source| WorkspaceError::Io {
             path: root.to_path_buf(),
             source,
         })?;
-
-        let mut paths: Vec<PathBuf> = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|source| WorkspaceError::Io {
-                path: root.to_path_buf(),
-                source,
-            })?;
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("yaml") {
-                paths.push(path);
-            }
-        }
-        // Sorted so error output is stable run to run — an unstable error list is miserable
-        // to diff in CI.
-        paths.sort();
-
+        let mut inputs: Vec<String> = Vec::new();
         for path in paths {
             let text = std::fs::read_to_string(&path).map_err(|source| WorkspaceError::Io {
                 path: path.clone(),
                 source,
             })?;
             ws.absorb(&text, &path)?;
+            if let Some(name) = path.file_name() {
+                inputs.push(name.to_string_lossy().into_owned());
+            }
         }
 
         // The descriptor is optional here (a bare directory of documents is a valid input to
         // `manifest validate` and `vehicle up`), but one that exists must be readable, and there
         // must not be two.
         ws.package = match crate::package::discover(root) {
-            Ok(found) => Some(found.package),
+            Ok(found) => {
+                if let Some(name) = found.descriptor_path.file_name() {
+                    inputs.push(name.to_string_lossy().into_owned());
+                }
+                Some(found.package)
+            }
             Err(crate::package::DiscoverError::NotAWorkspace { .. }) => None,
             Err(e) => return Err(e.into()),
         };
+        inputs.push(crate::package::LOCK_FILE.to_string());
+        ws.ignored_inputs =
+            crate::identity::excluded_top_level(root, inputs.iter().map(String::as_str))?;
 
         Ok(ws)
     }
 
-    /// Every `*.yaml` in `root` (non-recursive), sorted by path and joined with `---`: the
-    /// one-document form of a workspace directory. Same shape `vxedged` reads for a path
-    /// manifest, so a caller holding only a directory can hand the result to text-based entry
-    /// points such as [`crate::model::synthesize_vehicle_workspace`].
+    /// The workspace documents ([`document_paths`]) joined with `---`: the one-document form of
+    /// a workspace directory. `vxedged` reads a path manifest through this, so a caller holding
+    /// only a directory can hand the result to text-based entry points such as
+    /// [`crate::model::synthesize_vehicle_workspace`].
     pub fn read_text(root: &Path) -> Result<String, WorkspaceError> {
         let io = |path: &Path, source| WorkspaceError::Io {
             path: path.to_path_buf(),
             source,
         };
-        let mut paths: Vec<PathBuf> = std::fs::read_dir(root)
-            .map_err(|e| io(root, e))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("yaml"))
-            .collect();
-        paths.sort();
+        let paths = document_paths(root).map_err(|e| io(root, e))?;
         let mut out = String::new();
         for path in paths {
             let text = std::fs::read_to_string(&path).map_err(|e| io(&path, e))?;
@@ -1249,21 +1275,32 @@ impl Workspace {
     /// given, which it otherwise reads as joined text with no descriptor.
     pub fn package_problems(&self) -> Vec<WorkspaceValidationError> {
         use WorkspaceValidationError as E;
+        let mut errors: Vec<_> = self
+            .ignored_inputs
+            .iter()
+            .map(|file| E::IgnoredInput { file: file.clone() })
+            .collect();
         let (Some(package), [experiment]) = (&self.package, self.experiments.as_slice()) else {
-            return Vec::new();
+            return errors;
         };
-        let mut errors = Vec::new();
-        if package.id != experiment.id {
-            errors.push(E::PackageIdMismatch {
-                package: package.id.clone(),
-                experiment: experiment.id.clone(),
+        if package.experiment_id() != experiment.id {
+            errors.push(match package {
+                crate::package::PackageDoc::V1(_) => E::PackageNameMismatch {
+                    package: package.id().to_string(),
+                    name: package.experiment_id().to_string(),
+                    experiment: experiment.id.clone(),
+                },
+                crate::package::PackageDoc::Legacy(_) => E::PackageIdMismatch {
+                    package: package.id().to_string(),
+                    experiment: experiment.id.clone(),
+                },
             });
         }
-        if let (Some(entry), Some(found)) = (&package.entry, self.experiment_sources.first())
+        if let (Some(entry), Some(found)) = (package.entry(), self.experiment_sources.first())
             && entry != found
         {
             errors.push(E::EntryWithoutExperiment {
-                entry: entry.clone(),
+                entry: entry.to_string(),
                 found: found.clone(),
             });
         }
@@ -2134,7 +2171,7 @@ id: stray
             &package_files("id: exp1\nversion: 0.1.0\nentry: main.yaml\n"),
         );
         let ws = Workspace::load(&root).unwrap();
-        assert_eq!(ws.package.as_ref().map(|p| p.id.as_str()), Some("exp1"));
+        assert_eq!(ws.package.as_ref().map(|p| p.id()), Some("exp1"));
         assert!(ws.validate().is_empty(), "{:?}", ws.validate());
         fs::remove_dir_all(&root).ok();
     }
@@ -2207,6 +2244,79 @@ id: stray
         let ws = Workspace::load(&root).unwrap();
         assert!(ws.package.is_none());
         assert!(ws.validate().is_empty());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    fn v1_files(descriptor: &str) -> Vec<(&str, &str)> {
+        vec![
+            ("main.yaml", GOOD_EXPERIMENT),
+            ("car1.yaml", GOOD_VEHICLE),
+            ("parts.yaml", GOOD_BASELINE),
+            ("vxp.yaml", descriptor),
+        ]
+    }
+
+    const V1_EXP1: &str = "schema: vxp/1\nid: vxedge/exp1\nversion: 0.1.0\nentry: main.yaml\n";
+
+    /// `vxp.yaml` is a `*.yaml` at the top level, but it is the descriptor, not a document: the
+    /// document glob must skip it, or every `vxp/1` package fails to load for want of a `kind`.
+    #[test]
+    fn vxp_yaml_is_the_descriptor_not_a_document() {
+        let root = workspace("v1-ok", &v1_files(V1_EXP1));
+        let ws = Workspace::load(&root).unwrap();
+        assert_eq!(ws.experiments.len(), 1);
+        assert_eq!(ws.package.as_ref().map(|p| p.id()), Some("vxedge/exp1"));
+        assert!(ws.validate().is_empty(), "{:?}", ws.validate());
+        let text = Workspace::read_text(&root).unwrap();
+        assert!(
+            !text.contains("schema: vxp/1"),
+            "read_text joined the descriptor"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Under `vxp/1` the `name` half of `namespace/name` is the experiment id.
+    #[test]
+    fn the_vxp1_name_must_be_the_experiment_id() {
+        let root = workspace(
+            "v1-name",
+            &v1_files("schema: vxp/1\nid: vxedge/other\nversion: 0.1.0\nentry: main.yaml\n"),
+        );
+        let errors = Workspace::load(&root).unwrap().validate();
+        assert_eq!(
+            errors,
+            vec![WorkspaceValidationError::PackageNameMismatch {
+                package: "vxedge/other".into(),
+                name: "other".into(),
+                experiment: "exp1".into(),
+            }]
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The spec says the descriptor, the lock and the documents are identity inputs. A
+    /// `.vxpignore` that excludes one would make a run's identity blind to what it ran.
+    #[test]
+    fn vxpignore_cannot_exclude_the_descriptor_or_a_document() {
+        for pattern in ["vxp.yaml\n", "main.yaml\n", "*.yaml\n"] {
+            let mut files = v1_files(V1_EXP1);
+            files.push((".vxpignore", pattern));
+            let root = workspace("v1-ignored", &files);
+            let errors = Workspace::load(&root).unwrap().validate();
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| matches!(e, WorkspaceValidationError::IgnoredInput { .. })),
+                "`{}` was allowed: {errors:?}",
+                pattern.trim()
+            );
+            fs::remove_dir_all(&root).ok();
+        }
+        // Excluding content the experiment does not need stays allowed.
+        let mut files = v1_files(V1_EXP1);
+        files.push((".vxpignore", "scratch/\n"));
+        let root = workspace("v1-ignored-ok", &files);
+        assert!(Workspace::load(&root).unwrap().validate().is_empty());
         fs::remove_dir_all(&root).ok();
     }
 }

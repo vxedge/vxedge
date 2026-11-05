@@ -136,6 +136,21 @@ pub fn compute(
     })
 }
 
+/// Which of `names`, top-level files in `root`, the current rule would leave out of the
+/// identity. Validation uses it to refuse a `.vxpignore` that excludes the descriptor, the lock
+/// or a document: the identity would then be blind to what the experiment is made of.
+pub fn excluded_top_level<'a>(
+    root: &Path,
+    names: impl IntoIterator<Item = &'a str>,
+) -> Result<Vec<String>, IdentityError> {
+    let rules = rules(root)?;
+    Ok(names
+        .into_iter()
+        .filter(|n| rules.matched(Path::new(n), false).is_ignore())
+        .map(str::to_string)
+        .collect())
+}
+
 /// The `vxws/2` matcher: [`DEFAULT_EXCLUDES`], then the root `.vxpignore` if there is one.
 fn rules(root: &Path) -> Result<Gitignore, IdentityError> {
     let ignore_file = root.join(IGNORE_FILE);

@@ -11,6 +11,7 @@ repository.workspace = true
 [dependencies]
 vxedge-api = { workspace = true }
 vxedge-core = { workspace = true }
+semver = { workspace = true }
 tonic = { workspace = true }
 tonic-types = { workspace = true }
 tokio = { workspace = true }
