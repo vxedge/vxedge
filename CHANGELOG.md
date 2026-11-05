@@ -6,6 +6,23 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- `up` runs what the lock says. `experiment up`, `vehicle up`, `gateway up` and `Plan` refuse a
+  `vxp/1` package that does not match its `vxp.lock` under the new
+  `ERROR_REASON_LOCK_MISMATCH`, naming each file added, removed or changed and each reference that
+  disagrees; a missing lock is a mismatch. `--unlocked` (`unlocked` on `GatewayUpRequest`,
+  `ExperimentUpRequest`, `VehicleUpRequest` and `WorkspacePlanRequest`) skips the check while
+  authoring. Locked or not, a `vxp/1` package that `pkg pack` refuses is refused by `up` too.
+  Legacy descriptors and inline manifests are not checked.
+- A run records its package and its kernel (`ARCHITECTURE.md` §13). The run record and the `Up`
+  audit records gain `package_id`, `package_version`, `package_digest` and `package_locked` for a
+  `vxp/1` package, and `kernel_release` and `kernel_preempt_rt` for every run, so a
+  `kernel.preempt_rt: preferred` result says which kernel it came from. `Run` gains `package`
+  (`PackageRef`: id, version, digest), `package_locked` and `kernel`. `TelemetryService.Collect`
+  tells vxtelemetry whether the live run was locked, in `VXTELEMETRY_PACKAGE_LOCKED`: the next
+  vxtelemetry records it in `metadata.json`, and 0.3.0 ignores it.
+
 ## [0.6.1] - 2026-11-05
 
 The toolchain moves to Rust 1.99.1, and `vxedge doctor` now compares versions against the pin instead

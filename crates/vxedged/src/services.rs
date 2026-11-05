@@ -35,6 +35,8 @@ use vxedge_core::Workspace;
 use vxedge_core::containers::LazyClient;
 use vxedge_core::fiveg::{self, FiveGLifecycleConfig, FiveGPlan};
 use vxedge_core::gateway::{self, GatewayPlan, Shell};
+use vxedge_core::package::RunningKernel;
+use vxedge_core::pkg::RunPackage;
 use vxedge_core::traffic::{self, TrafficPlan};
 use vxedge_core::zones::{self, NodePlan};
 
@@ -268,7 +270,10 @@ fn zone_failure(e: zones::backend::ZoneBackendError) -> crate::jobs::JobFailure 
 #[derive(Clone, Copy)]
 enum Verb {
     Apply,
-    Up,
+    /// `unlocked` skips the `vxp.lock` check (`up --unlocked`).
+    Up {
+        unlocked: bool,
+    },
     Down,
 }
 
@@ -311,6 +316,49 @@ pub(crate) struct ActiveRecord {
     pub identity_algorithm: Option<String>,
     pub run_id: Option<String>,
     pub started_unix_ms: Option<i64>,
+    /// The `vxp/1` package the run came from. `None` for a legacy descriptor, an inline manifest,
+    /// or a record written before packages were recorded.
+    pub package: Option<RunPackage>,
+    /// The kernel the run came up on. `None` in a record written before kernels were recorded.
+    pub kernel: Option<RunningKernel>,
+}
+
+/// What a run records beside its workspace identity (`ARCHITECTURE.md` §13), as the fields of
+/// its run record and of the audit records about it: the package, when there is one, and the
+/// kernel, always.
+pub(crate) fn provenance(
+    package: Option<&RunPackage>,
+    kernel: &RunningKernel,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut fields = serde_json::Map::new();
+    if let Some(p) = package {
+        fields.insert("package_id".into(), p.id.clone().into());
+        fields.insert("package_version".into(), p.version.clone().into());
+        fields.insert("package_digest".into(), p.digest.clone().into());
+        fields.insert("package_locked".into(), p.locked.into());
+    }
+    fields.insert("kernel_release".into(), kernel.release.clone().into());
+    fields.insert("kernel_preempt_rt".into(), kernel.preempt_rt.into());
+    fields
+}
+
+/// [`provenance`] read back from a run record. Each half is `None` when its fields are absent.
+fn provenance_of(v: &serde_json::Value) -> (Option<RunPackage>, Option<RunningKernel>) {
+    let package = (|| {
+        Some(RunPackage {
+            id: v["package_id"].as_str()?.to_string(),
+            version: v["package_version"].as_str()?.to_string(),
+            digest: v["package_digest"].as_str()?.to_string(),
+            locked: v["package_locked"].as_bool()?,
+        })
+    })();
+    let kernel = (|| {
+        Some(RunningKernel {
+            release: v["kernel_release"].as_str()?.to_string(),
+            preempt_rt: v["kernel_preempt_rt"].as_bool()?,
+        })
+    })();
+    (package, kernel)
 }
 
 impl ActiveRecord {
@@ -402,6 +450,7 @@ pub(crate) async fn observed_nodes(
 fn read_active_record(runtime_dir: &Path) -> Option<ActiveRecord> {
     let text = std::fs::read_to_string(active_record(runtime_dir)).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let (package, kernel) = provenance_of(&v);
     Some(ActiveRecord {
         id: v["id"].as_str()?.to_string(),
         dir: PathBuf::from(v["dir"].as_str()?),
@@ -410,6 +459,8 @@ fn read_active_record(runtime_dir: &Path) -> Option<ActiveRecord> {
         identity_algorithm: v["identity_algorithm"].as_str().map(str::to_string),
         run_id: v["run_id"].as_str().map(str::to_string),
         started_unix_ms: v["started_unix_ms"].as_i64(),
+        package,
+        kernel,
     })
 }
 
@@ -553,8 +604,32 @@ impl GatewaySvc {
         verb: Verb,
     ) -> Result<Response<Job>, Status> {
         let (yaml, sha256, manifest_dir) = resolve_manifest(mref).await?;
-        self.audit
-            .record(rpc, serde_json::json!({ "manifest_sha256": sha256 }));
+        // `up` checks the package itself, not only through `experiment up`'s preflight: a
+        // `GatewayService.Up` call is an `up` too. What passes is what the run records.
+        let (package, kernel) = match verb {
+            Verb::Up { unlocked } => {
+                let dir = manifest_dir.clone();
+                let package = tokio::task::spawn_blocking(move || {
+                    crate::plan::package_run(dir.as_deref(), unlocked)
+                })
+                .await
+                .map_err(|e| Status::internal(format!("package check panicked: {e}")))?
+                .map_err(|(reason, detail)| {
+                    crate::errors::precondition(
+                        reason,
+                        format!("{detail} Nothing was provisioned."),
+                    )
+                })?;
+                (package, Some(RunningKernel::probe()))
+            }
+            _ => (None, None),
+        };
+        let mut fields = serde_json::Map::new();
+        fields.insert("manifest_sha256".into(), sha256.clone().into());
+        if let Some(kernel) = &kernel {
+            fields.extend(provenance(package.as_ref(), kernel));
+        }
+        self.audit.record(rpc, serde_json::Value::Object(fields));
         let shell = self.shell.clone();
         let state = self.state.clone();
         let runtime_dir = self.runtime_dir.clone();
@@ -574,7 +649,7 @@ impl GatewaySvc {
                         "validated and planned — {} (nothing started; apply is plan-only)",
                         plan.summary()
                     )),
-                    Verb::Up => {
+                    Verb::Up { .. } => {
                         // Converging reconciler (`docs/ROADMAP.md` #16 / vxedge/TASKS.md §2):
                         // `apply_links`/`apply_slices`/`apply_endpoints` are each individually
                         // idempotent (the netns integration test proves double-apply is a
@@ -766,7 +841,7 @@ impl GatewaySvc {
                         let started = previous
                             .and_then(|r| r.started_unix_ms)
                             .unwrap_or_else(now_ms);
-                        let record = serde_json::json!({
+                        let mut record = serde_json::json!({
                             "id": model.id,
                             "dir": dir,
                             "bridge": plan.bridge,
@@ -775,6 +850,9 @@ impl GatewaySvc {
                             "run_id": run_id,
                             "started_unix_ms": started,
                         });
+                        if let (Some(fields), Some(kernel)) = (record.as_object_mut(), &kernel) {
+                            fields.extend(provenance(package.as_ref(), kernel));
+                        }
                         tokio::fs::write(active_record(&runtime_dir), record.to_string())
                             .await
                             .map_err(|e| format!("cannot record the active workspace: {e}"))?;
@@ -903,7 +981,9 @@ impl GatewayService for GatewaySvc {
             "GatewayService.Up",
             "gateway.up",
             req.get_ref().manifest.as_ref(),
-            Verb::Up,
+            Verb::Up {
+                unlocked: req.get_ref().unlocked,
+            },
         )
         .await
     }
@@ -2977,6 +3057,8 @@ mod tests {
                 identity_algorithm: None,
                 run_id: None,
                 started_unix_ms: None,
+                package: None,
+                kernel: None,
             })
         );
         std::fs::remove_dir_all(&dir).unwrap();
@@ -3008,5 +3090,29 @@ mod tests {
         let status = lost.expect("the stream reports the loss");
         assert_eq!(status.code(), tonic::Code::DataLoss);
         assert!(stream.next().await.is_none(), "and then ends");
+    }
+
+    /// What `up` writes into the run record reads back as written, and a run of a legacy
+    /// package records the kernel and nothing about a package.
+    #[test]
+    fn provenance_round_trips_through_the_run_record() {
+        let package = RunPackage {
+            id: "vxedge/x".into(),
+            version: "1.0.0".into(),
+            digest: "sha256:abc".into(),
+            locked: true,
+        };
+        let kernel = RunningKernel {
+            release: "6.12.0".into(),
+            preempt_rt: false,
+        };
+        let record = serde_json::Value::Object(provenance(Some(&package), &kernel));
+        assert_eq!(
+            provenance_of(&record),
+            (Some(package), Some(kernel.clone()))
+        );
+        let legacy = serde_json::Value::Object(provenance(None, &kernel));
+        assert!(legacy.get("package_digest").is_none());
+        assert_eq!(provenance_of(&legacy), (None, Some(kernel)));
     }
 }

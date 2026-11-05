@@ -91,13 +91,23 @@ impl TelemetryService for TelemetrySvc {
         }));
         images.sort();
         images.dedup();
-        self.audit.record(
-            "TelemetryService.Collect",
-            serde_json::json!({
-                "workspace_sha256": sha256, "out": out,
-                "workspace_identity_algorithm": crate::services::identity_algorithm(Some(&workspace)),
-            }),
-        );
+        // Whether the run being archived checked its lock is the daemon's to say: vxtelemetry
+        // records what it is told and nothing when told nothing. Only the live run of this same
+        // workspace counts. Passed in the environment, which an older vxtelemetry ignores.
+        let same = |a: &Path, b: &Path| a.canonicalize().ok() == b.canonicalize().ok();
+        let run_package = crate::services::active_run(&self.runtime_dir)
+            .filter(|r| same(&r.dir, &workspace))
+            .and_then(|r| r.package);
+        let mut audit = serde_json::json!({
+            "workspace_sha256": sha256, "out": out,
+            "workspace_identity_algorithm": crate::services::identity_algorithm(Some(&workspace)),
+        });
+        if let (Some(fields), Some(p)) = (audit.as_object_mut(), &run_package) {
+            fields.insert("package_digest".into(), p.digest.clone().into());
+            fields.insert("package_locked".into(), p.locked.into());
+        }
+        self.audit.record("TelemetryService.Collect", audit);
+        let package_locked = run_package.map(|p| p.locked);
         let bin = self.vxtelemetry_bin.clone();
         let log = self.runtime_dir.join("collect.log");
         let job = self
@@ -118,6 +128,9 @@ impl TelemetryService for TelemetrySvc {
                     .arg(&out);
                 for image in &images {
                     cmd.arg("--record-image").arg(image);
+                }
+                if let Some(locked) = package_locked {
+                    cmd.env("VXTELEMETRY_PACKAGE_LOCKED", locked.to_string());
                 }
                 let output = cmd
                     .output()

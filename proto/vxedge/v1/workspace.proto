@@ -28,6 +28,8 @@ message HostCheck {
 
 message WorkspacePlanRequest {
   ManifestRef manifest = 1;
+  // Plan as `up --unlocked` would run: no `ERROR_REASON_LOCK_MISMATCH` problem.
+  bool unlocked = 2;
 }
 
 message WorkspacePlan {

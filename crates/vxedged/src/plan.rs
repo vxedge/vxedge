@@ -19,6 +19,7 @@ use vxedge_core::containers::LazyClient;
 use vxedge_core::gateway::GatewayPlan;
 use vxedge_core::model::{Backend, Experiment};
 use vxedge_core::package::BackendProbe;
+use vxedge_core::pkg::{RunPackage, RunRefusal};
 use vxedge_core::zones::NodePlan;
 
 use crate::errors::{self, R};
@@ -31,6 +32,8 @@ pub(crate) struct Preflight {
     pub checks: Vec<HostCheck>,
     /// The backends probed for `requires.backends`, kept so `Plan` asks Podman once.
     pub backends: Option<Vec<BackendProbe>>,
+    /// What the run will record about its `vxp/1` package, when the package checks passed.
+    pub package: Option<RunPackage>,
 }
 
 impl Preflight {
@@ -73,13 +76,34 @@ fn lines(paths: &[PathBuf]) -> String {
         .join("\n")
 }
 
+/// The `vxp/1` package checks `up` makes, as a refusal: the lock (unless `unlocked`) and whether
+/// the package packs. Shared by the preflight and the gateway's own `up`, which records the
+/// result. Legacy descriptors and inline manifests pass with nothing to record.
+pub(crate) fn package_run(
+    dir: Option<&Path>,
+    unlocked: bool,
+) -> Result<Option<RunPackage>, (R, String)> {
+    let Some(dir) = dir else {
+        return Ok(None);
+    };
+    vxedge_core::pkg::run_package(dir, unlocked).map_err(|e| {
+        let reason = match e {
+            RunRefusal::LockMismatch { .. } => R::LockMismatch,
+            RunRefusal::Package(_) => R::WorkspaceInvalid,
+        };
+        (reason, e.to_string())
+    })
+}
+
 /// Every check `up` makes before it touches the host, in the order it makes them.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn preflight(
     verb: &str,
     who: &str,
     model: &Experiment,
     nodes: &[NodePlan],
     dir: Option<&Path>,
+    unlocked: bool,
     runtime_dir: &Path,
     gateway: &GatewaySvc,
 ) -> Preflight {
@@ -133,6 +157,21 @@ pub(crate) async fn preflight(
         "host requirements",
         unmet.map(|detail| (R::HostRequirementUnmet, model.id.clone(), detail)),
     );
+
+    // After the descriptor and host checks, so `up` refuses a package this daemon cannot run for
+    // that reason first. Hashes every input once, as `pkg lock --check` does.
+    let owned = dir.map(Path::to_path_buf);
+    let package = tokio::task::spawn_blocking(move || package_run(owned.as_deref(), unlocked))
+        .await
+        .unwrap_or_else(|e| Err((R::WorkspaceInvalid, format!("package check panicked: {e}"))));
+    let package = match package {
+        Ok(found) => {
+            pf.package = found;
+            None
+        }
+        Err((reason, detail)) => Some((reason, model.id.clone(), detail)),
+    };
+    pf.check("package lock", package);
 
     let active = gateway.active_on_host().await;
     let target = crate::experiment::check_active_target(
@@ -463,6 +502,7 @@ impl WorkspaceService for PlanSvc {
             &model,
             &nodes,
             dir.as_deref(),
+            req.get_ref().unlocked,
             &self.runtime_dir,
             &self.gateway,
         )

@@ -18,8 +18,8 @@ use vxedge_api::v1::manifest_ref::Source;
 use vxedge_api::v1::run_service_server::RunService;
 use vxedge_api::v1::vehicle_service_server::VehicleService;
 use vxedge_api::v1::{
-    ExperimentStatusRequest, GatewayStatusRequest, ManifestRef, ResourceKind, ResourceState, Run,
-    RunGetRequest, RunListRequest, RunListResponse, VehicleStatusRequest,
+    ExperimentStatusRequest, GatewayStatusRequest, Kernel, ManifestRef, PackageRef, ResourceKind,
+    ResourceState, Run, RunGetRequest, RunListRequest, RunListResponse, VehicleStatusRequest,
 };
 
 use crate::experiment::ExperimentSvc;
@@ -133,6 +133,16 @@ impl RunSvc {
             kind: kind as i32,
             target_id,
             workspace_identity_algorithm: record.identity_algorithm().to_string(),
+            package_locked: record.package.as_ref().is_some_and(|p| p.locked),
+            package: record.package.map(|p| PackageRef {
+                id: p.id,
+                version: p.version,
+                digest: p.digest,
+            }),
+            kernel: record.kernel.map(|k| Kernel {
+                release: k.release,
+                preempt_rt: k.preempt_rt,
+            }),
             workspace_sha256: record.sha256.unwrap_or_default(),
             state: run_state(gateway_state, workspace, busy),
             started_unix_ms: record.started_unix_ms.unwrap_or_default(),

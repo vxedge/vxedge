@@ -77,6 +77,9 @@ enum Command {
         /// Experiment manifest declaring the slices (path readable by the daemon).
         #[arg(long)]
         manifest: Option<String>,
+        /// Skip the `vxp.lock` check while authoring. The run records that it ran unlocked.
+        #[arg(long)]
+        unlocked: bool,
     },
     /// Tear the edge gateway down.
     Down {
@@ -340,6 +343,9 @@ enum ExperimentCmd {
         /// `vxedge zone up --vxid <device>`.
         #[arg(long = "stage", value_enum)]
         stages: Vec<StageArg>,
+        /// Skip the `vxp.lock` check while authoring. The run records that it ran unlocked.
+        #[arg(long)]
+        unlocked: bool,
     },
     /// Tear the workspace here down.
     Down {
@@ -448,6 +454,9 @@ enum ManifestLifecycleCmd {
         /// Restrict to specific stages, repeatable (default: all, in dependency order).
         #[arg(long = "stage", value_enum)]
         stages: Vec<StageArg>,
+        /// Skip the `vxp.lock` check while authoring. The run records that it ran unlocked.
+        #[arg(long)]
+        unlocked: bool,
     },
     Down {
         #[arg(long)]
@@ -917,12 +926,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("gateway: no status reported");
             }
         }
-        Command::Up { manifest } => {
+        Command::Up { manifest, unlocked } => {
             let channel = connect(&cli.endpoint).await?;
             let mut gw = GatewayServiceClient::new(channel.clone());
             let job = gw
                 .up(GatewayUpRequest {
                     manifest: manifest_ref(manifest),
+                    unlocked: *unlocked,
                 })
                 .await?
                 .into_inner();
@@ -1220,11 +1230,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         print_vehicle_status(&st);
                     }
                 }
-                ManifestLifecycleCmd::Up { manifest, stages } => {
+                ManifestLifecycleCmd::Up {
+                    manifest,
+                    stages,
+                    unlocked,
+                } => {
                     let job = veh
                         .up(VehicleUpRequest {
                             manifest: manifest_ref(&Some(manifest.clone())),
                             stages: stages.iter().map(|s| s.as_proto()).collect(),
+                            unlocked: *unlocked,
                         })
                         .await?
                         .into_inner();
@@ -1339,11 +1354,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
-                    ExperimentCmd::Up { stages } => {
+                    ExperimentCmd::Up { stages, unlocked } => {
                         let job = exp
                             .up(ExperimentUpRequest {
                                 manifest: manifest_ref(&Some(workspace)),
                                 stages: stages.iter().map(|s| s.as_proto()).collect(),
+                                unlocked: *unlocked,
                             })
                             .await?
                             .into_inner();
