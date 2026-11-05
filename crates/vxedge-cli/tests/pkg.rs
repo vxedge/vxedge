@@ -113,20 +113,26 @@ fn an_author_scaffolds_validates_packs_relocks_and_unpacks() {
     std::fs::remove_dir_all(&base).ok();
 }
 
-/// `experiment new` scaffolds the same `vxp/1` package `pkg new` does.
+/// `experiment new` scaffolds the same `vxp/1` package `pkg new` does, from every template:
+/// writing the lock builds the model, so a template that does not build fails here.
 #[test]
 fn experiment_new_scaffolds_a_locked_vxp1_package() {
-    let base = scratch("expnew");
-    let (ok, out, err) = vxedge(&base, &["experiment", "new", "demo"]);
-    assert!(ok, "{out}{err}");
-    let root = base.join("demo");
-    assert!(!root.join("demo.vxp").exists(), "no legacy descriptor");
-    let descriptor = std::fs::read_to_string(root.join("vxp.yaml")).unwrap();
-    assert!(descriptor.starts_with("schema: vxp/1\n"), "{descriptor}");
-    assert!(descriptor.contains("id: local/demo"), "{descriptor}");
-    assert!(vxedge(&root, &["pkg", "validate"]).0);
-    assert!(vxedge(&root, &["experiment", "validate"]).0);
-    std::fs::remove_dir_all(&base).ok();
+    for template in ["minimal", "slicing"] {
+        let base = scratch(&format!("expnew-{template}"));
+        let (ok, out, err) = vxedge(
+            &base,
+            &["experiment", "new", "demo", "--template", template],
+        );
+        assert!(ok, "{template}: {out}{err}");
+        let root = base.join("demo");
+        assert!(!root.join("demo.vxp").exists(), "no legacy descriptor");
+        let descriptor = std::fs::read_to_string(root.join("vxp.yaml")).unwrap();
+        assert!(descriptor.starts_with("schema: vxp/1\n"), "{descriptor}");
+        assert!(descriptor.contains("id: local/demo"), "{descriptor}");
+        assert!(vxedge(&root, &["pkg", "validate"]).0, "{template}");
+        assert!(vxedge(&root, &["experiment", "validate"]).0, "{template}");
+        std::fs::remove_dir_all(&base).ok();
+    }
 }
 
 /// A legacy descriptor still runs, but the package verbs say how to migrate it.
