@@ -19,11 +19,19 @@ All notable changes to this repo are documented here. Format follows
   checked by re-packing, and `vxp.lock` built offline from the documents (published parts and
   images as the documents pin them). The packed-bytes test vector is frozen, and Python's
   `tarfile` writes the same bytes.
+- `vxedge pkg new | validate | lock | pack | unpack | inspect`, local and offline. `pkg validate`
+  adds the package checks to `experiment validate`'s and names each file the lock does not
+  match; `pkg lock --check` reports without writing; `pkg pack` refuses a stale lock and a target
+  inside the package, writes `<name>-<version>.vxp` beside it and prints the digest; `pkg inspect`
+  prints descriptor, lock and digest from either form.
 
 ### Changed
 
 - `Plan`'s per-backend host checks are named with the manifest's backend names
   (`backend qemu-microvm`, not `backend qemu_microvm`).
+- `experiment new` scaffolds a `vxp/1` package: `vxp.yaml` with id `local/<id>` (or
+  `--namespace <org>`) and its first `vxp.lock`, instead of a legacy `<id>.vxp`. Legacy
+  workspaces still run; the `pkg` verbs tell them how to migrate.
 
 ## [0.6.0] - 2026-11-05
 
