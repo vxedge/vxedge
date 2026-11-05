@@ -6,6 +6,14 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-05
+
+The toolchain moves to Rust 1.99.1, and `vxedge doctor` now compares versions against the pin instead
+of matching the text `1.96`, so it keeps working as the pin moves. A `vxp/1` package can now be
+created, locked, packed, unpacked and inspected offline with `vxedge pkg`, and the preflight enforces
+what a package `requires`: KVM, a PREEMPT_RT kernel and each listed backend. A `libvirt` zone node now
+runs with the host CPU, as a `qemu-microvm` node already did. vxAPI stays `vxedge.v1`, additive only.
+
 ### Added
 
 - The preflight that `Plan`, `experiment up` and `vehicle up` run now enforces the rest of a
