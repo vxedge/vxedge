@@ -635,6 +635,7 @@ fn libvirt_domain_xml(np: &NodePlan, kernel: &str, initrd: &str) -> String {
   <memory unit='MiB'>128</memory>
   <vcpu>1</vcpu>
   {cputune}
+  <cpu mode='host-passthrough'/>
   <os>
     <type arch='x86_64' machine='q35'>hvm</type>
     <kernel>{kernel}</kernel>
@@ -933,6 +934,19 @@ mod tests {
             module: None,
             pinned_cpus: Vec::new(),
         }
+    }
+
+    /// The guest sees the host CPU, as on qemu-microvm (`-cpu host` under KVM). Without a `<cpu>`
+    /// element libvirt picks `qemu64`, and a guest built for a newer x86-64 level never boots.
+    #[test]
+    fn a_libvirt_guest_gets_the_host_cpu() {
+        let np = NodePlan {
+            backend: Backend::Libvirt,
+            image: None,
+            ..image_node()
+        };
+        let xml = libvirt_domain_xml(&np, "/b/vmlinuz", "/b/initrd.img");
+        assert!(xml.contains("<cpu mode='host-passthrough'/>"), "{xml}");
     }
 
     /// `status` reports and never fails: with no socket (CI) or no such group (a dev host), an
