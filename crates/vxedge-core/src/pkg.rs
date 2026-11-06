@@ -68,6 +68,8 @@ pub enum PkgError {
     Workspace(String),
     #[error("`{LOCK_FILE}`: {0}")]
     Lock(String),
+    #[error("cannot vendor: {0}")]
+    Vendor(String),
     #[error("not a packed vxp/1 package{}: {reason}", .entry.as_ref().map(|e| format!(" (entry `{e}`)")).unwrap_or_default())]
     Packed {
         entry: Option<String>,
@@ -681,6 +683,294 @@ pub fn run_package(root: &Path, unlocked: bool) -> Result<Option<RunPackage>, Ru
     }))
 }
 
+/// What [`vendor`] did.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VendorReport {
+    /// The entries written to the lock's `vendored`, one per copied document.
+    pub copied: Vec<Vendored>,
+    /// What the source holds that was not copied, with why: `(name, reason)`.
+    pub left_behind: Vec<(String, &'static str)>,
+    /// Set when the package no longer builds after the copy, so the lock could not be rebuilt in
+    /// full: the `vendored` entries and `files` are written, and the documents need fixing before
+    /// `pkg lock`.
+    pub relock_error: Option<String>,
+    /// Local references the package makes and does not hold: a `./` bundle or artifact
+    /// directory, or a `localhost/` image built per host. `up` refuses without them. Empty when
+    /// the package does not build.
+    pub local_refs: Vec<String>,
+}
+
+/// Why something in a vendoring source is not copied.
+fn left_behind_reason(name: &str, is_dir: bool) -> &'static str {
+    if is_dir {
+        "directory: build output or content, not a document"
+    } else if name.ends_with(".sh") {
+        "host recipe: a script may reach outside its folder"
+    } else if name == DESCRIPTOR_FILE || name == LOCK_FILE || name.ends_with(".vxp") {
+        "package descriptor or lock"
+    } else {
+        "not a document"
+    }
+}
+
+/// Copy the vxedge documents of `source` into the package at `root`, record each in the lock's
+/// `vendored` under `source_id`, and re-lock (`ARCHITECTURE.md` §6.0.7, decision X-5). Documents
+/// only: scripts, directories and descriptors stay behind and are listed. A destination that
+/// exists and was not vendored from `source_id` is refused unless `replace`.
+///
+/// The `vendored` entries are written even when the package stops building, which is the usual
+/// first step (the scaffold's `main.yaml` names the vehicle the copy replaced); the report says
+/// so and the full re-lock waits for `pkg lock`.
+pub fn vendor(
+    root: &Path,
+    source: &Path,
+    source_id: &str,
+    replace: bool,
+    locked_with: &str,
+) -> Result<VendorReport, PkgError> {
+    let PackageDoc::V1(descriptor) = require_v1(root)? else {
+        unreachable!("require_v1 refuses legacy descriptors")
+    };
+    let canonical = |p: &Path| p.canonicalize().map_err(io(p));
+    let (root_c, source_c) = (canonical(root)?, canonical(source)?);
+    if source_c.starts_with(&root_c) {
+        return Err(PkgError::Vendor(format!(
+            "`{}` is inside the package; vendor from a folder outside it",
+            source.display()
+        )));
+    }
+    if source_id.trim().is_empty() || source_id.contains(char::is_whitespace) {
+        return Err(PkgError::Vendor(format!(
+            "`{source_id}` is not a source name; use `<owner>/<repo>/<path>`"
+        )));
+    }
+    // The source must read as a workspace's documents, as `vehicle up` reads a vehicle folder.
+    crate::workspace::Workspace::load(source)
+        .map_err(|e| PkgError::Vendor(format!("`{}`: {e}", source.display())))?;
+    let documents = crate::workspace::document_paths(source).map_err(io(source))?;
+    if documents.is_empty() {
+        return Err(PkgError::Vendor(format!(
+            "`{}` holds no vxedge documents (`*.yaml`)",
+            source.display()
+        )));
+    }
+    let names: Vec<String> = documents
+        .iter()
+        .map(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(str::to_string)
+                .ok_or_else(|| PkgError::NonUtf8Path { path: p.clone() })
+        })
+        .collect::<Result<_, _>>()?;
+
+    let written = read_lock(root)?;
+    let previous = written
+        .as_ref()
+        .map(|l| l.vendored.clone())
+        .unwrap_or_default();
+    let ours = |file: &str| {
+        previous
+            .iter()
+            .any(|v| v.file == file && v.source == source_id)
+    };
+    let conflicts: Vec<&str> = names
+        .iter()
+        .filter(|n| root.join(n).exists() && !ours(n))
+        .map(String::as_str)
+        .collect();
+    if !conflicts.is_empty() && !replace {
+        return Err(PkgError::Vendor(format!(
+            "the package already has {}, not vendored from `{source_id}`. Pass `--replace` to \
+             overwrite them with the copies.",
+            conflicts
+                .iter()
+                .map(|n| format!("`{n}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+
+    let mut copied = Vec::new();
+    for (path, name) in documents.iter().zip(&names) {
+        let bytes = std::fs::read(path).map_err(io(path))?;
+        let dest = root.join(name);
+        std::fs::write(&dest, &bytes).map_err(io(&dest))?;
+        copied.push(Vendored {
+            file: name.clone(),
+            source: source_id.to_string(),
+            digest: sha256(&bytes),
+        });
+    }
+    let mut vendored: Vec<Vendored> = previous
+        .into_iter()
+        .filter(|v| !names.contains(&v.file))
+        .chain(copied.iter().cloned())
+        .collect();
+    vendored.sort_by(|a, b| a.file.cmp(&b.file));
+
+    // First the lock that needs no model: `files` and `vendored` current, the rest as written.
+    let files = entries(root)?
+        .into_iter()
+        .filter(|(path, _)| path != LOCK_FILE)
+        .map(|(path, bytes)| (path, sha256(&bytes)))
+        .collect();
+    let interim = Lock {
+        schema: LOCK_SCHEMA.to_string(),
+        package: LockedPackage {
+            id: descriptor.id.as_str().to_string(),
+            version: descriptor.version.to_string(),
+        },
+        locked_with: locked_with.to_string(),
+        files,
+        parts: written
+            .as_ref()
+            .map(|l| l.parts.clone())
+            .unwrap_or_default(),
+        images: written
+            .as_ref()
+            .map(|l| l.images.clone())
+            .unwrap_or_default(),
+        vendored,
+    };
+    write_lock(root, &interim)?;
+
+    let mut left_behind = Vec::new();
+    let mut listing: Vec<_> = std::fs::read_dir(source)
+        .map_err(io(source))?
+        .filter_map(Result::ok)
+        .collect();
+    listing.sort_by_key(|e| e.file_name());
+    for entry in listing {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if names.contains(&name) {
+            continue;
+        }
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        left_behind.push((name.clone(), left_behind_reason(&name, is_dir)));
+    }
+
+    let (relock_error, local_refs) = match lock(root, locked_with) {
+        Ok(full) => {
+            write_lock(root, &full)?;
+            (None, local_refs(root))
+        }
+        Err(e) => (
+            Some(format!(
+                "{e}. The copies are in place and recorded in `{LOCK_FILE}`; fix the documents \
+                 that still refer to what they replaced (often `main.yaml`), then run \
+                 `vxedge pkg lock`."
+            )),
+            Vec::new(),
+        ),
+    };
+    Ok(VendorReport {
+        copied,
+        left_behind,
+        relock_error,
+        local_refs,
+    })
+}
+
+/// Local references the package at `root` makes and does not hold, as `up`'s preflight would find
+/// them: `./` guest bundles, `config.artifacts` directories, and `localhost/` images, which are
+/// built per host and so always listed. Empty when the package does not build.
+pub fn local_refs(root: &Path) -> Vec<String> {
+    let Ok(ws) = crate::workspace::Workspace::load(root) else {
+        return Vec::new();
+    };
+    let Ok(model) = crate::model::build(&ws) else {
+        return Vec::new();
+    };
+    let mut refs = BTreeSet::new();
+    for path in crate::zones::missing_local_bundles(&model, root) {
+        let shown = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        refs.insert(format!("./{shown} (a guest bundle, not in the package)"));
+    }
+    for def in model.services.values() {
+        if let Some(store) = crate::services::ota_artifacts(def)
+            && !root.join(&store).is_dir()
+        {
+            let shown = format!("./{}", store.trim_start_matches("./"));
+            refs.insert(format!(
+                "{shown} (the artifact store of service `{}`, not in the package)",
+                def.id
+            ));
+        }
+    }
+    let images = model
+        .entities
+        .iter()
+        .flat_map(|e| e.functions.values())
+        .filter_map(|f| f.part.as_ref())
+        .filter(|p| p.kind == PartKind::Container)
+        .map(|p| p.reference.clone())
+        .chain(model.placements().map(|p| p.image.url.clone()));
+    for image in images.filter(|i| i.starts_with("localhost/")) {
+        refs.insert(format!("{image} (built per host)"));
+    }
+    refs.into_iter().collect()
+}
+
+/// What [`vendor_check`] found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VendorCheck {
+    /// Each way the package's vendored copies disagree with what was recorded or with their
+    /// sources. Empty when they agree.
+    pub problems: Vec<String>,
+    /// Vendored files whose source could not be found here, so drift from it was not checked.
+    pub unchecked: Vec<String>,
+}
+
+/// Check every vendored copy: against the digest recorded when it was copied (a local edit), and,
+/// when `resolve` finds the source folder, against the source as it is now (drift). Source lookup
+/// is the caller's, since it depends on the checkout around the package.
+pub fn vendor_check(
+    root: &Path,
+    resolve: &dyn Fn(&str) -> Option<PathBuf>,
+) -> Result<VendorCheck, PkgError> {
+    let mut out = VendorCheck::default();
+    let Some(lock) = read_lock(root)? else {
+        return Ok(out);
+    };
+    for v in &lock.vendored {
+        let here = root.join(&v.file);
+        match std::fs::read(&here) {
+            Ok(bytes) if sha256(&bytes) != v.digest => out.problems.push(format!(
+                "`{}` was edited in the package since it was vendored from `{}`",
+                v.file, v.source
+            )),
+            Ok(_) => {}
+            Err(_) => out.problems.push(format!(
+                "`{}` was vendored from `{}` and is no longer in the package",
+                v.file, v.source
+            )),
+        }
+        match resolve(&v.source) {
+            None => out
+                .unchecked
+                .push(format!("`{}` (source `{}` is not here)", v.file, v.source)),
+            Some(dir) => match std::fs::read(dir.join(&v.file)) {
+                Ok(bytes) if sha256(&bytes) != v.digest => out.problems.push(format!(
+                    "`{}` changed at its source `{}` since it was vendored; run `vxedge pkg \
+                     vendor` again to take the change",
+                    v.file, v.source
+                )),
+                Ok(_) => {}
+                Err(_) => out.problems.push(format!(
+                    "`{}` is gone from its source `{}`",
+                    v.file, v.source
+                )),
+            },
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1220,5 +1510,143 @@ mod tests {
         );
         assert_eq!(run_package(&root, false).unwrap(), None);
         fs::remove_dir_all(&root).ok();
+    }
+
+    /// A source folder like a reference vehicle: documents, a script and a build output.
+    fn vehicle_source(name: &str, vehicle_id: &str) -> PathBuf {
+        let scratch = locked_workspace(&format!("{name}-src"));
+        let src = scratch.parent().unwrap().join("vehicles").join(name);
+        fs::create_dir_all(src.join("bundle")).unwrap();
+        let vehicle = fs::read_to_string(scratch.join("vehicle.yaml"))
+            .unwrap()
+            .replace("id: car1", &format!("id: {vehicle_id}"));
+        fs::write(src.join("vehicle.yaml"), vehicle).unwrap();
+        fs::copy(scratch.join("parts.yaml"), src.join("parts.yaml")).unwrap();
+        fs::write(src.join("build.sh"), "#!/bin/sh\n../other/build.sh\n").unwrap();
+        fs::write(src.join("README.md"), "a vehicle\n").unwrap();
+        src
+    }
+
+    #[test]
+    fn vendoring_copies_documents_records_them_and_says_what_to_fix() {
+        let root = locked_workspace("vendor");
+        write_lock(&root, &lock(&root, "0.7.0").unwrap()).unwrap();
+        let src = vehicle_source("vendor", "car2");
+        let id = "vxedge/vxperiments/vehicles/car2";
+
+        // The scaffold's own documents are in the way.
+        let refused = vendor(&root, &src, id, false, "0.7.0")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains("`parts.yaml`, `vehicle.yaml`") && refused.contains("--replace"),
+            "{refused}"
+        );
+
+        let report = vendor(&root, &src, id, true, "0.7.0").unwrap();
+        assert_eq!(
+            report
+                .copied
+                .iter()
+                .map(|v| v.file.as_str())
+                .collect::<Vec<_>>(),
+            ["parts.yaml", "vehicle.yaml"]
+        );
+        assert_eq!(
+            fs::read(root.join("vehicle.yaml")).unwrap(),
+            fs::read(src.join("vehicle.yaml")).unwrap()
+        );
+        let behind: Vec<&str> = report.left_behind.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(behind, ["README.md", "build.sh", "bundle"]);
+        assert!(report.left_behind[1].1.starts_with("host recipe"));
+        // `main.yaml` still names `car1`, so the package does not build, and the copies are
+        // recorded anyway.
+        let fix = report
+            .relock_error
+            .expect("main.yaml names the replaced vehicle");
+        assert!(
+            fix.contains("main.yaml") && fix.contains("pkg lock"),
+            "{fix}"
+        );
+        let written = read_lock(&root).unwrap().unwrap();
+        assert_eq!(written.vendored, report.copied);
+        assert_eq!(written.vendored[1].source, id);
+
+        // Fixed, a plain re-lock keeps the provenance and the lock holds.
+        let main = fs::read_to_string(root.join("main.yaml"))
+            .unwrap()
+            .replace("[car1]", "[car2]");
+        fs::write(root.join("main.yaml"), main).unwrap();
+        write_lock(&root, &lock(&root, "0.7.0").unwrap()).unwrap();
+        assert_eq!(read_lock(&root).unwrap().unwrap().vendored, report.copied);
+        assert_eq!(lock_problems(&root).unwrap(), Vec::<String>::new());
+
+        // Vendoring the same source again needs no `--replace`, and builds now.
+        let again = vendor(&root, &src, id, false, "0.7.0").unwrap();
+        assert_eq!(again.relock_error, None);
+        fs::remove_dir_all(root.parent().unwrap()).ok();
+        fs::remove_dir_all(src.parent().unwrap().parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn vendor_check_catches_a_local_edit_and_drift_at_the_source() {
+        let root = locked_workspace("vcheck");
+        let src = vehicle_source("vcheck", "car1");
+        let id = "vxedge/vxperiments/vehicles/car1";
+        vendor(&root, &src, id, true, "0.7.0").unwrap();
+        let at_src = |want: &str| -> Option<PathBuf> { (want == id).then(|| src.clone()) };
+        assert_eq!(
+            vendor_check(&root, &at_src).unwrap(),
+            VendorCheck::default()
+        );
+
+        let nowhere = |_: &str| -> Option<PathBuf> { None };
+        assert_eq!(vendor_check(&root, &nowhere).unwrap().unchecked.len(), 2);
+
+        fs::write(
+            root.join("parts.yaml"),
+            format!(
+                "{}# local\n",
+                fs::read_to_string(root.join("parts.yaml")).unwrap()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            src.join("vehicle.yaml"),
+            format!(
+                "{}# upstream\n",
+                fs::read_to_string(src.join("vehicle.yaml")).unwrap()
+            ),
+        )
+        .unwrap();
+        let found = vendor_check(&root, &at_src).unwrap().problems;
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(
+            found[0].contains("`parts.yaml` was edited in the package"),
+            "{found:?}"
+        );
+        assert!(
+            found[1].contains("`vehicle.yaml` changed at its source"),
+            "{found:?}"
+        );
+        fs::remove_dir_all(root.parent().unwrap()).ok();
+        fs::remove_dir_all(src.parent().unwrap().parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_source_inside_the_package_or_without_documents_is_refused() {
+        let root = locked_workspace("vrefuse");
+        fs::create_dir_all(root.join("parts/vehicle")).unwrap();
+        let inside =
+            vendor(&root, &root.join("parts/vehicle"), "a/b/c", true, "0.7.0").unwrap_err();
+        assert!(
+            inside.to_string().contains("inside the package"),
+            "{inside}"
+        );
+        let empty = root.parent().unwrap().join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        let none = vendor(&root, &empty, "a/b/c", true, "0.7.0").unwrap_err();
+        assert!(none.to_string().contains("no vxedge documents"), "{none}");
+        fs::remove_dir_all(root.parent().unwrap()).ok();
     }
 }

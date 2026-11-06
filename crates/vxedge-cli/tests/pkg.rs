@@ -222,3 +222,95 @@ fn the_committed_package_packs_to_the_same_digest_on_every_host() {
     );
     std::fs::remove_dir_all(&base).ok();
 }
+
+fn git(dir: &Path, args: &[&str]) {
+    let ok = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .expect("git runs")
+        .status
+        .success();
+    assert!(ok, "git {args:?}");
+}
+
+/// A catalogue repository as `vxperiments` is: a reference vehicle under `vehicles/` and a package
+/// under `experiments/`, in one checkout. `pkg vendor` names the source from git, and `--check`
+/// finds it again in the same checkout.
+#[test]
+fn a_package_vendors_a_vehicle_and_flags_drift_from_it() {
+    let repo = scratch("vendor");
+    git(&repo, &["init", "-q"]);
+    git(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:acme/catalogue.git",
+        ],
+    );
+    let (ok, out, err) = vxedge(&repo, &["pkg", "new", "vehicle-src", "--path", "."]);
+    assert!(ok, "{out}{err}");
+    let source = repo.join("vehicles/sedan");
+    std::fs::create_dir_all(&source).unwrap();
+    for f in ["vehicle.yaml", "parts.yaml"] {
+        std::fs::copy(repo.join("vehicle-src").join(f), source.join(f)).unwrap();
+    }
+    std::fs::write(source.join("build.sh"), "#!/bin/sh\n").unwrap();
+    std::fs::remove_dir_all(repo.join("vehicle-src")).unwrap();
+    std::fs::create_dir_all(repo.join("experiments")).unwrap();
+    let (ok, _, _) = vxedge(&repo.join("experiments"), &["pkg", "new", "demo"]);
+    assert!(ok);
+    let pkg = repo.join("experiments/demo");
+
+    let (ok, _, err) = vxedge(&pkg, &["pkg", "vendor", "../../vehicles/sedan"]);
+    assert!(!ok && err.contains("--replace"), "{err}");
+    let (ok, out, err) = vxedge(
+        &pkg,
+        &["pkg", "vendor", "../../vehicles/sedan", "--replace"],
+    );
+    assert!(ok, "{out}{err}");
+    assert!(
+        out.contains("vendored vehicle.yaml from acme/catalogue/vehicles/sedan"),
+        "{out}"
+    );
+    assert!(out.contains("not vendored: build.sh (host recipe"), "{out}");
+    let lock = std::fs::read_to_string(pkg.join("vxp.lock")).unwrap();
+    assert!(
+        lock.contains("source: acme/catalogue/vehicles/sedan"),
+        "{lock}"
+    );
+    assert!(
+        vxedge(&pkg, &["pkg", "lock", "--check"]).0,
+        "the copies are the vehicle `demo` names"
+    );
+
+    let (ok, out, err) = vxedge(&pkg, &["pkg", "vendor", "--check"]);
+    assert!(ok, "{out}{err}");
+    assert!(
+        !out.contains("not checked"),
+        "the source is in this checkout: {out}"
+    );
+
+    let vehicle = std::fs::read_to_string(source.join("vehicle.yaml")).unwrap();
+    std::fs::write(
+        source.join("vehicle.yaml"),
+        format!("{vehicle}# changed upstream\n"),
+    )
+    .unwrap();
+    let (ok, out, err) = vxedge(&pkg, &["pkg", "vendor", "--check"]);
+    assert!(!ok, "{out}{err}");
+    assert!(
+        format!("{out}{err}").contains("`vehicle.yaml` changed at its source"),
+        "{out}{err}"
+    );
+
+    // Outside a checkout the source cannot be named, and the error says how to name it.
+    let loose = scratch("vendor-loose");
+    let (ok, _, err) = vxedge(&pkg, &["pkg", "vendor", loose.to_str().unwrap()]);
+    assert!(!ok && err.contains("--as"), "{err}");
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&loose).ok();
+}

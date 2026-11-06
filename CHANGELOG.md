@@ -6,6 +6,19 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- `vxedge pkg vendor <dir>` copies another folder's vxedge documents into the package here, such as
+  a reference vehicle from `vxperiments/vehicles/` (`ARCHITECTURE.md` §6.0.7, decision X-5), and
+  records each copy in `vxp.lock` under `vendored` with its source (`<owner>/<repo>/<path>`, read
+  from git, or `--as`) and digest. Scripts and build outputs stay behind and are listed. A document
+  the package already has is overwritten only with `--replace`, unless it was vendored from the
+  same source. When the copy leaves the package unbuildable (the scaffold's `main.yaml` names the
+  vehicle it replaced), the lock still records the copies and the command says what to fix. Local
+  references the package lacks (`./` bundles and artifact stores, `localhost/` images) are listed.
+  `pkg vendor --check` reports a copy edited in the package and, when the source is in the same
+  checkout, a source that changed since.
+
 ## [0.7.0] - 2026-11-06
 
 `up` now runs what a package's lock says. A `vxp/1` package whose files no longer match its
