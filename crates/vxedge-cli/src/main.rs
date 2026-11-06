@@ -406,6 +406,75 @@ enum PkgCmd {
         /// A packed `.vxp`. Without it, the package in the current directory.
         file: Option<String>,
     },
+    /// Copy another folder's vxedge documents into the package here, such as a reference vehicle,
+    /// and record where they came from in `vxp.lock`. Documents only: scripts and build outputs
+    /// stay behind and are listed.
+    Vendor {
+        /// The folder to copy from, for example `../../vehicles/vx-reference-sedan-01`.
+        #[arg(required_unless_present = "check", conflicts_with = "check")]
+        source: Option<String>,
+        /// The source's name in the lock, `<owner>/<repo>/<path>`. Default: read from the
+        /// source's git checkout.
+        #[arg(long = "as", value_name = "SOURCE")]
+        as_id: Option<String>,
+        /// Overwrite documents the package has that were not vendored from this source.
+        #[arg(long)]
+        replace: bool,
+        /// Report vendored copies edited here, or changed at a source found in this checkout.
+        /// Exits non-zero when there are any.
+        #[arg(long)]
+        check: bool,
+    },
+}
+
+/// `git -C dir args`, trimmed, when it succeeds.
+fn git(dir: &std::path::Path, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// `owner/repo` from a remote URL: `https://host/o/r(.git)`, `ssh://git@host/o/r`, `git@host:o/r`,
+/// or a local path ending in `o/r`.
+fn owner_repo(url: &str) -> Option<String> {
+    let url = url.trim_end_matches('/').trim_end_matches(".git");
+    let path = match url.split_once("://") {
+        Some((_, rest)) => rest.split_once('/')?.1,
+        None => url.split_once(':').map_or(url, |(_, rest)| rest),
+    };
+    let mut parts = path.rsplit('/');
+    let (repo, owner) = (parts.next()?, parts.next()?);
+    (!repo.is_empty() && !owner.is_empty()).then(|| format!("{owner}/{repo}"))
+}
+
+/// `<owner>/<repo>/<path>` for a folder in a git checkout with an `origin` remote.
+fn source_id(dir: &std::path::Path) -> Option<String> {
+    let repo = owner_repo(&git(dir, &["remote", "get-url", "origin"])?)?;
+    let prefix = git(dir, &["rev-parse", "--show-prefix"])?;
+    let prefix = prefix.trim_end_matches('/');
+    Some(if prefix.is_empty() {
+        repo
+    } else {
+        format!("{repo}/{prefix}")
+    })
+}
+
+/// The folder a vendored `source` names, when the package sits in a checkout of that repository.
+fn resolve_source(root: &std::path::Path, source: &str) -> Option<std::path::PathBuf> {
+    let repo = owner_repo(&git(root, &["remote", "get-url", "origin"])?)?;
+    let top = std::path::PathBuf::from(git(root, &["rev-parse", "--show-toplevel"])?);
+    let dir = match source.strip_prefix(repo.as_str()) {
+        Some("") => top,
+        Some(rest) => top.join(rest.strip_prefix('/')?),
+        None => return None,
+    };
+    dir.is_dir().then_some(dir)
 }
 
 /// Mirrors `vxedge_core::Template`. Kept here so the domain library stays free of a clap
@@ -687,6 +756,84 @@ fn pkg(cmd: &PkgCmd, json: bool) -> Result<(), Box<dyn std::error::Error>> {
                     "ok: {} is a valid package and its lock matches",
                     root.display()
                 );
+            }
+        }
+        PkgCmd::Vendor { check: true, .. } => {
+            let root = vxedge_core::discover(&here()?)?.root;
+            let found = pkg::vendor_check(&root, &|source| resolve_source(&root, source))?;
+            if !found.problems.is_empty() {
+                fail(&found.problems, &root);
+            }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "workspace": root.display().to_string(), "valid": true,
+                        "unchecked": found.unchecked,
+                    })
+                );
+            } else {
+                println!("ok: every vendored copy matches what was recorded");
+                for u in &found.unchecked {
+                    println!("  not checked against its source: {u}");
+                }
+            }
+        }
+        PkgCmd::Vendor {
+            source,
+            as_id,
+            replace,
+            ..
+        } => {
+            let root = vxedge_core::discover(&here()?)?.root;
+            let source = std::path::PathBuf::from(source.as_deref().expect("clap requires it"));
+            let id = match as_id {
+                Some(id) => id.clone(),
+                None => source_id(&source).ok_or_else(|| {
+                    format!(
+                        "`{}` is not in a git checkout with an `origin` remote, so its source name \
+                         cannot be read; pass `--as <owner>/<repo>/<path>`",
+                        source.display()
+                    )
+                })?,
+            };
+            let report = pkg::vendor(&root, &source, &id, *replace, env!("CARGO_PKG_VERSION"))?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "workspace": root.display().to_string(),
+                        "source": id,
+                        "vendored": report.copied.iter().map(|v| serde_json::json!({
+                            "file": v.file, "digest": v.digest,
+                        })).collect::<Vec<_>>(),
+                        "not_vendored": report.left_behind.iter().map(|(n, why)| serde_json::json!({
+                            "name": n, "reason": why,
+                        })).collect::<Vec<_>>(),
+                        "relock_error": report.relock_error,
+                        "local_refs": report.local_refs,
+                    })
+                );
+            } else {
+                for v in &report.copied {
+                    println!("vendored {} from {id}", v.file);
+                }
+                for (name, why) in &report.left_behind {
+                    println!("  not vendored: {name} ({why})");
+                }
+                match &report.relock_error {
+                    Some(fix) => println!("the package no longer builds: {fix}"),
+                    None => println!(
+                        "wrote {}",
+                        root.join(vxedge_core::package::LOCK_FILE).display()
+                    ),
+                }
+                if !report.local_refs.is_empty() {
+                    println!("the package needs these here before `up`:");
+                    for r in &report.local_refs {
+                        println!("  {r}");
+                    }
+                }
             }
         }
         PkgCmd::Lock { check } => {
@@ -1800,6 +1947,24 @@ impl From<&Job> for JsonJob {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_remote_url_names_its_owner_and_repo() {
+        for url in [
+            "https://github.com/vxedge/vxperiments.git",
+            "https://github.com/vxedge/vxperiments",
+            "ssh://git@github.com/vxedge/vxperiments.git",
+            "git@github.com:vxedge/vxperiments.git",
+            "/srv/git/vxedge/vxperiments/",
+        ] {
+            assert_eq!(
+                owner_repo(url).as_deref(),
+                Some("vxedge/vxperiments"),
+                "{url}"
+            );
+        }
+        assert_eq!(owner_repo("https://github.com/"), None);
+    }
+
     use super::*;
     use vxedge_api::v1::{ResourceKind, ResourceState, ResourceStatus, VehicleStatus};
 

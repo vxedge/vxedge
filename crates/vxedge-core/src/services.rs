@@ -174,6 +174,14 @@ struct OtaConfig {
     listen: String,
 }
 
+/// The artifact store an `ota` service serves, as its `config.artifacts` writes it (relative to the
+/// workspace). `None` for another service type or a config without one.
+pub fn ota_artifacts(def: &ServiceDef) -> Option<String> {
+    (def.service_type == ServiceType::Ota)
+        .then(|| typed_config::<OtaConfig>(def, "").ok().map(|c| c.artifacts))
+        .flatten()
+}
+
 fn default_listen() -> String {
     "0.0.0.0:9900".to_string()
 }
