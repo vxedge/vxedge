@@ -25,6 +25,7 @@ All notable changes to this repo are documented here. Format follows
 
 ### Changed
 
+- `wasmtime` and `wasmtime-wasi` 49.0.5 -> 50.0.1 (still pinned exactly), the runtime behind `vxcapsule`. No source change was needed. The same reflector capsule answers 199 of 200 probes with the same latency on both, and the startup line and error texts are identical.
 - `rtnetlink` 0.23 -> 0.24 (with `netlink-packet-route` 0.34 and `netlink-proto` 0.14), the netlink client behind bridge, veth, address and route setup. No source change was needed; the privileged `netns-integration` job covers it.
 - Lockfile update: the semver-compatible dependency updates `cargo update` offers (49 crates). No `Cargo.toml` change and no source change; build, test, clippy `-D warnings`, fmt and `cargo deny` pass. `wasmtime` and `wasmtime-wasi` stay pinned at `=49.0.5`.
 
