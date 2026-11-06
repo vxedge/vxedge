@@ -6,6 +6,23 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-06
+
+`up` now runs what a package's lock says. A `vxp/1` package whose files no longer match its
+`vxp.lock`, or that has no lock, is refused with `ERROR_REASON_LOCK_MISMATCH`, naming each
+difference; `--unlocked` runs it anyway while authoring and the run records that it was unlocked.
+Every run now records the package it came from (id, version, package digest, locked or not) and the
+kernel it ran on, in the run record, the audit log and `Run`, so a result can be cited by the
+package digest and a `kernel.preempt_rt: preferred` result says which kernel it had. The netlink and
+WebAssembly runtimes move up a version with no behaviour change. vxAPI stays `vxedge.v1`, additive
+only.
+
+**Upgrading from 0.6.x.** A `vxp/1` package that ran on 0.6.1 without a matching lock is refused
+now: run `vxedge pkg lock` in it, or pass `--unlocked`. Packages made by `pkg new` or `experiment
+new` already carry their lock. Legacy `<name>.vxp` descriptors are not lock-checked. Rust callers
+that build `GatewayUpRequest`, `ExperimentUpRequest`, `VehicleUpRequest` or `WorkspacePlanRequest`
+with a struct literal add `..Default::default()` for the new `unlocked` field.
+
 ### Added
 
 - `up` runs what the lock says. `experiment up`, `vehicle up`, `gateway up` and `Plan` refuse a
@@ -22,12 +39,15 @@ All notable changes to this repo are documented here. Format follows
   (`PackageRef`: id, version, digest), `package_locked` and `kernel`. `TelemetryService.Collect`
   tells vxtelemetry whether the live run was locked, in `VXTELEMETRY_PACKAGE_LOCKED`: the next
   vxtelemetry records it in `metadata.json`, and 0.3.0 ignores it.
+- A committed package, `crates/vxedge-cli/tests/fixtures/two-host`, packs to a frozen digest on
+  every host CI runs on, and a second packed-bytes test vector covers long paths split at the
+  shortest prefix, a 100-byte name, an empty file and a one-block file. vxtelemetry pins both.
 
 ### Changed
 
 - `wasmtime` and `wasmtime-wasi` 49.0.5 -> 50.0.1 (still pinned exactly), the runtime behind `vxcapsule`. No source change was needed. The same reflector capsule answers 199 of 200 probes with the same latency on both, and the startup line and error texts are identical.
 - `rtnetlink` 0.23 -> 0.24 (with `netlink-packet-route` 0.34 and `netlink-proto` 0.14), the netlink client behind bridge, veth, address and route setup. No source change was needed; the privileged `netns-integration` job covers it.
-- Lockfile update: the semver-compatible dependency updates `cargo update` offers (49 crates). No `Cargo.toml` change and no source change; build, test, clippy `-D warnings`, fmt and `cargo deny` pass. `wasmtime` and `wasmtime-wasi` stay pinned at `=49.0.5`.
+- Lockfile update: the semver-compatible dependency updates `cargo update` offers (49 crates). No `Cargo.toml` change and no source change; build, test, clippy `-D warnings`, fmt and `cargo deny` pass. `wasmtime` and `wasmtime-wasi`, pinned exactly, moved separately (above).
 
 ## [0.6.1] - 2026-11-05
 
