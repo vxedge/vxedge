@@ -531,6 +531,18 @@ pub fn lock(root: &Path, locked_with: &str) -> Result<Lock, PkgError> {
             PartKind::Bundle | PartKind::Wasm => parts.insert(r),
         };
     }
+    // A published artifact store is fetched into the part cache like a guest bundle, so it is a
+    // part; a local one is content, already in `files`.
+    for def in model.services.values() {
+        if let Some(crate::services::ArtifactStore::Published { reference, digest }) =
+            crate::services::ota_store(def)
+        {
+            parts.insert(LockedRef {
+                reference,
+                digest: Some(digest),
+            });
+        }
+    }
     if let Some(nos) = &model.nos_check
         && let Some(reference) = &nos.part_ref
     {
@@ -1371,6 +1383,34 @@ mod tests {
         fs::create_dir_all(root.join("parts")).unwrap();
         fs::write(root.join("parts/p.bin"), "p").unwrap();
         root
+    }
+
+    /// A published artifact store is a part like any other: the lock lists it by ref and digest,
+    /// so a pull or an offline copy knows to fetch it. A local store is content, in `files`.
+    #[test]
+    fn a_published_artifact_store_is_locked_as_a_part() {
+        let root = locked_workspace("store");
+        let store = format!("ghcr.io/vxedge/parts/svc/ota/config/gate-store@{PINNED}");
+        let vehicle = fs::read_to_string(root.join("vehicle.yaml")).unwrap();
+        fs::write(
+            root.join("vehicle.yaml"),
+            format!(
+                "{vehicle}services:\n  ota:\n    id: ota-01\n    type: ota\n    image: {{ url: \
+                 ghcr.io/vxedge/parts/svc/ota/app/vxota@{PINNED}, kind: container }}\n    on: hpc1\n    \
+                 config:\n      artifacts: {store}\n"
+            ),
+        )
+        .unwrap();
+        let locked = lock(&root, "0.8.0").unwrap();
+        assert!(
+            locked.parts.contains(&LockedRef {
+                reference: "ghcr.io/vxedge/parts/svc/ota/config/gate-store".into(),
+                digest: Some(PINNED.into()),
+            }),
+            "{:?}",
+            locked.parts
+        );
+        fs::remove_dir_all(root.parent().unwrap()).ok();
     }
 
     #[test]

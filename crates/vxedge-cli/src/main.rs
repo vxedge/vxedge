@@ -1005,9 +1005,33 @@ fn resolve_experiment_arg(
 /// discarded that way. So `main` handles the error itself and walks the `source` chain, which
 /// also surfaces the underlying cause (an io error, a YAML parse position) that
 /// `Box<dyn Error>`'s own `Display` stops short of.
+/// A daemon refusal as a person reads it: the daemon's sentence, then the typed reason an agent
+/// branches on (`google.rpc.ErrorInfo`) and the gRPC code. `tonic::Status`'s own `Display` leads
+/// with the code's generic description instead.
+fn describe_status(status: &tonic::Status) -> String {
+    use tonic_types::StatusExt;
+    let reason = status
+        .get_error_details()
+        .error_info()
+        .map(|info| info.reason.clone())
+        .filter(|r| !r.is_empty());
+    match reason {
+        Some(reason) => format!(
+            "{}\n  reason: {reason} ({:?})",
+            status.message(),
+            status.code()
+        ),
+        None => format!("{} ({:?})", status.message(), status.code()),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(e) = run().await {
+        if let Some(status) = e.downcast_ref::<tonic::Status>() {
+            eprintln!("error: {}", describe_status(status));
+            std::process::exit(1);
+        }
         eprintln!("error: {e}");
         let mut source = e.source();
         while let Some(cause) = source {
@@ -1947,6 +1971,26 @@ impl From<&Job> for JsonJob {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_refusal_prints_the_daemons_sentence_and_its_reason() {
+        use tonic_types::{ErrorDetails, StatusExt};
+        let status = tonic::Status::with_error_details(
+            tonic::Code::FailedPrecondition,
+            "the package does not match its `vxp.lock`: `main.yaml` changed.",
+            ErrorDetails::with_error_info("ERROR_REASON_LOCK_MISMATCH", "vxedge.v1", []),
+        );
+        assert_eq!(
+            describe_status(&status),
+            "the package does not match its `vxp.lock`: `main.yaml` changed.\n  reason: \
+             ERROR_REASON_LOCK_MISMATCH (FailedPrecondition)"
+        );
+        let plain = tonic::Status::unavailable("vxedged is not answering");
+        assert_eq!(
+            describe_status(&plain),
+            "vxedged is not answering (Unavailable)"
+        );
+    }
+
     #[test]
     fn a_remote_url_names_its_owner_and_repo() {
         for url in [
