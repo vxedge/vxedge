@@ -8,6 +8,11 @@ All notable changes to this repo are documented here. Format follows
 
 ### Added
 
+- An `ota` service's `config.artifacts` can name a published config part pinned by digest
+  (`ghcr.io/vxedge/parts/svc/ota/config/<name>@sha256:<hex>`) as well as a workspace directory. `up` fetches
+  it into the part cache, as it does a guest bundle, and mounts it read-only; planning does not need it on
+  disk. A host-process service (no `on:`) refuses a published store. `pkg vendor` and the package checks
+  no longer list such a store as a missing local directory.
 - `vxedge pkg vendor <dir>` copies another folder's vxedge documents into the package here, such as
   a reference vehicle from `vxperiments/vehicles/` (`ARCHITECTURE.md` §6.0.7, decision X-5), and
   records each copy in `vxp.lock` under `vendored` with its source (`<owner>/<repo>/<path>`, read

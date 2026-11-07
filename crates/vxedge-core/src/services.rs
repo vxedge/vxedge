@@ -130,6 +130,11 @@ pub enum ServiceBackendError {
          group and never as a host process"
     )]
     Placed { svc: String, device: String },
+    #[error("service `{svc}`: cannot fetch its artifact store: {source}")]
+    Fetch {
+        svc: String,
+        source: crate::registry::RegistryFetchError,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,12 +179,56 @@ struct OtaConfig {
     listen: String,
 }
 
-/// The artifact store an `ota` service serves, as its `config.artifacts` writes it (relative to the
-/// workspace). `None` for another service type or a config without one.
-pub fn ota_artifacts(def: &ServiceDef) -> Option<String> {
+/// Where an `ota` service's artifact store comes from, read from `config.artifacts` by shape, as a
+/// part ref is: a published config part pinned by digest (`<ref>@sha256:<hex>`), fetched into the
+/// part cache like a guest bundle, or else a directory relative to the workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtifactStore {
+    Local(String),
+    Published { reference: String, digest: String },
+}
+
+impl ArtifactStore {
+    pub fn parse(artifacts: &str) -> Self {
+        match artifacts.split_once('@') {
+            Some((reference, digest)) if digest.starts_with("sha256:") => Self::Published {
+                reference: reference.to_string(),
+                digest: digest.to_string(),
+            },
+            _ => Self::Local(artifacts.to_string()),
+        }
+    }
+}
+
+fn ota_store(def: &ServiceDef) -> Option<ArtifactStore> {
     (def.service_type == ServiceType::Ota)
-        .then(|| typed_config::<OtaConfig>(def, "").ok().map(|c| c.artifacts))
+        .then(|| typed_config::<OtaConfig>(def, "").ok())
         .flatten()
+        .map(|c| ArtifactStore::parse(&c.artifacts))
+}
+
+/// The local artifact store an `ota` service serves, as its `config.artifacts` writes it (relative
+/// to the workspace). `None` for another service type, a config without one, or a published store,
+/// which the part cache provides.
+pub fn ota_artifacts(def: &ServiceDef) -> Option<String> {
+    match ota_store(def)? {
+        ArtifactStore::Local(dir) => Some(dir),
+        ArtifactStore::Published { .. } => None,
+    }
+}
+
+/// Fetches a published artifact store into `cache_dir` before its service starts. A no-op for a
+/// local store, for another service type, and for a store already in the cache.
+pub fn fetch_artifact_store(def: &ServiceDef, cache_dir: &Path) -> Result<(), ServiceBackendError> {
+    if let Some(ArtifactStore::Published { reference, digest }) = ota_store(def) {
+        crate::registry::fetch(&reference, &digest, cache_dir).map_err(|source| {
+            ServiceBackendError::Fetch {
+                svc: def.id.clone(),
+                source,
+            }
+        })?;
+    }
+    Ok(())
 }
 
 fn default_listen() -> String {
@@ -268,6 +317,12 @@ impl ServiceBackend for OtaBackend {
         _runtime_dir: &Path,
     ) -> Result<SpawnSpec, ServiceBackendError> {
         let cfg: OtaConfig = typed_config(def, "config.artifacts is required for an ota service")?;
+        if let ArtifactStore::Published { .. } = ArtifactStore::parse(&cfg.artifacts) {
+            return Err(ServiceBackendError::BadConfig {
+                svc: def.id.clone(),
+                detail: "a published artifact store needs a placed service (`on:`)".into(),
+            });
+        }
         Ok(SpawnSpec {
             bin: bins.vxota.clone(),
             args: vec![
@@ -437,22 +492,35 @@ const PLACED_ARTIFACTS: &str = "/srv/vxedge/artifacts";
 
 /// The container a service placed with `on:` runs as. Takes the service's image with the
 /// arguments its host-process form would get, so its entrypoint is the service binary. The
-/// artifact store is on the host, so it is resolved here and mounted read-only.
+/// artifact store is on the host, so it is resolved here and mounted read-only: a local store from
+/// the workspace, which must exist, or a published one from `cache_dir`, which
+/// [`fetch_artifact_store`] fills before the service starts.
 pub fn placed_spec(
     def: &ServiceDef,
     workspace_dir: &Path,
+    cache_dir: &Path,
 ) -> Result<crate::containers::ContainerSpec, ServiceBackendError> {
     if def.service_type != ServiceType::Ota {
         return Err(ServiceBackendError::Unsupported(def.id.clone()));
     }
     let cfg: OtaConfig = typed_config(def, "config.artifacts is required for an ota service")?;
-    let host = workspace_dir.join(&cfg.artifacts);
-    if !host.is_dir() {
-        return Err(ServiceBackendError::BadConfig {
-            svc: def.id.clone(),
-            detail: format!("artifact store {} is not a directory", host.display()),
-        });
-    }
+    let host = match ArtifactStore::parse(&cfg.artifacts) {
+        ArtifactStore::Local(dir) => {
+            let host = workspace_dir.join(dir);
+            if !host.is_dir() {
+                return Err(ServiceBackendError::BadConfig {
+                    svc: def.id.clone(),
+                    detail: format!("artifact store {} is not a directory", host.display()),
+                });
+            }
+            host
+        }
+        ArtifactStore::Published { digest, .. } => crate::registry::cache_path(cache_dir, &digest)
+            .map_err(|e| ServiceBackendError::BadConfig {
+                svc: def.id.clone(),
+                detail: e.to_string(),
+            })?,
+    };
     Ok(crate::containers::ContainerSpec {
         name: def.id.clone(),
         image: def.image.url.clone(),
@@ -721,7 +789,7 @@ mod tests {
         std::fs::create_dir(dir.path().join("store")).unwrap();
         let mut def = ota_def("artifacts: ./store\nlisten: 0.0.0.0:9900\n");
         def.on = Some("hpc1".into());
-        let spec = placed_spec(&def, dir.path()).unwrap();
+        let spec = placed_spec(&def, dir.path(), dir.path()).unwrap();
         assert_eq!(
             spec.cmd,
             [
@@ -741,7 +809,61 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let def = ota_def("artifacts: ./missing\n");
         assert!(matches!(
-            placed_spec(&def, dir.path()),
+            placed_spec(&def, dir.path(), dir.path()),
+            Err(ServiceBackendError::BadConfig { .. })
+        ));
+    }
+
+    const STORE_DIGEST: &str =
+        "sha256:0000000000000000000000000000000000000000000000000000000000000abc";
+
+    #[test]
+    fn a_digest_pinned_store_is_published_and_anything_else_is_local() {
+        assert_eq!(
+            ArtifactStore::parse(&format!(
+                "ghcr.io/vxedge/parts/svc/ota/config/gate-store@{STORE_DIGEST}"
+            )),
+            ArtifactStore::Published {
+                reference: "ghcr.io/vxedge/parts/svc/ota/config/gate-store".into(),
+                digest: STORE_DIGEST.into(),
+            }
+        );
+        assert_eq!(
+            ArtifactStore::parse("./ota-store"),
+            ArtifactStore::Local("./ota-store".into())
+        );
+        assert_eq!(
+            ArtifactStore::parse("./a@b"),
+            ArtifactStore::Local("./a@b".into())
+        );
+    }
+
+    /// A published store mounts from the part cache, keyed by digest, and is not a missing local
+    /// one: `up` fetches it before the service starts, so planning does not need it on disk.
+    #[test]
+    fn a_placed_service_mounts_a_published_store_from_the_part_cache() {
+        let workspace = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut def = ota_def(&format!(
+            "artifacts: ghcr.io/vxedge/parts/svc/ota/config/gate-store@{STORE_DIGEST}\n"
+        ));
+        def.on = Some("hpc1".into());
+        let spec = placed_spec(&def, workspace.path(), cache.path()).unwrap();
+        assert_eq!(
+            spec.binds[0].host,
+            crate::registry::cache_path(cache.path(), STORE_DIGEST).unwrap()
+        );
+        assert_eq!(ota_artifacts(&def), None);
+    }
+
+    #[test]
+    fn a_host_process_cannot_serve_a_published_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let def = ota_def(&format!(
+            "artifacts: ghcr.io/vxedge/parts/svc/ota/config/gate-store@{STORE_DIGEST}\n"
+        ));
+        assert!(matches!(
+            svc_up(&def, &bins(), dir.path(), dir.path()),
             Err(ServiceBackendError::BadConfig { .. })
         ));
     }

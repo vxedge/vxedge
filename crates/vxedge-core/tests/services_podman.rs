@@ -106,7 +106,7 @@ fn a_placed_service_joins_its_device_namespace_and_leaves_without_taking_the_nod
     apply(&sh, &plan).unwrap();
     let nodes = plan_nodes_from_model(&model, &plan, &dir).unwrap();
     let node = &nodes[0];
-    let spec = placed_spec(&model.services["ota"], &dir).unwrap();
+    let spec = placed_spec(&model.services["ota"], &dir, &dir).unwrap();
 
     // Before the node exists there is nothing to join.
     assert!(member_up(&sh, node, &dir, &spec).is_err());

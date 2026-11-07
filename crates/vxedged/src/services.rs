@@ -1957,6 +1957,8 @@ pub struct SvcSvc {
     /// ARCHITECTURE.md §8). A struct rather than one path per service, so a new service type
     /// adds a field instead of a parameter to every caller.
     pub bins: vxedge_core::services::ServiceBinaries,
+    /// Where a published artifact store is fetched to: the part cache zones and compute use.
+    pub cache_dir: PathBuf,
 }
 
 impl SvcSvc {
@@ -2045,8 +2047,12 @@ impl SvcSvc {
             .service_def(service_type, Some(experiment))
             .await
             .ok()?;
-        let spec =
-            vxedge_core::services::placed_spec(&declared.def, &declared.workspace_dir).ok()?;
+        let spec = vxedge_core::services::placed_spec(
+            &declared.def,
+            &declared.workspace_dir,
+            &self.cache_dir,
+        )
+        .ok()?;
         Some((declared.node?, spec))
     }
 }
@@ -2075,6 +2081,7 @@ impl SvcService for SvcSvc {
         );
         let bins = self.bins.clone();
         let runtime_dir = self.runtime_dir.clone();
+        let cache_dir = self.cache_dir.clone();
         let shell = self.shell.clone();
         let service_type = req.service_type.clone();
         let events = self.engine.events().clone();
@@ -2089,11 +2096,19 @@ impl SvcService for SvcSvc {
                     ..
                 } = declared;
                 let probe = match &node {
-                    Some(np) => Some((
-                        np.clone(),
-                        vxedge_core::services::placed_spec(&def, &workspace_dir)
-                            .map_err(|e| e.to_string())?,
-                    )),
+                    Some(np) => {
+                        let (fetch_def, fetch_cache) = (def.clone(), cache_dir.clone());
+                        blocking(move || {
+                            vxedge_core::services::fetch_artifact_store(&fetch_def, &fetch_cache)
+                                .map_err(|e| e.to_string())
+                        })
+                        .await?;
+                        Some((
+                            np.clone(),
+                            vxedge_core::services::placed_spec(&def, &workspace_dir, &cache_dir)
+                                .map_err(|e| e.to_string())?,
+                        ))
+                    }
                     None => None,
                 };
                 let (watched, watched_dir, watched_type) =
@@ -2971,6 +2986,7 @@ mod tests {
                 vxota: "vxota".into(),
                 vxtelemetry: "vxtelemetry".into(),
             },
+            cache_dir: PathBuf::from("/nonexistent/vxedged-svc-test-cache"),
         }
     }
 
