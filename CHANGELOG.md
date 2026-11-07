@@ -6,13 +6,19 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-07
+
+A package can now carry a reference vehicle as a copy: `vxedge pkg vendor` copies another folder's
+vxedge documents into a package, records each copy and its source in the lock, and `--check` reports a
+copy edited in the package or a source that moved since. A vehicle no longer needs a host-built OTA
+store either: an `ota` service's `config.artifacts` can name a published config part pinned by digest,
+fetched into the part cache at `up` like a guest bundle. vxAPI stays `vxedge.v1`, unchanged.
+
+**Upgrading from 0.7.x.** No manifest or vxAPI change. Rust callers of `vxedge-core` pass the part cache
+directory to `services::placed_spec`, which takes it as a third argument.
+
 ### Added
 
-- An `ota` service's `config.artifacts` can name a published config part pinned by digest
-  (`ghcr.io/vxedge/parts/svc/ota/config/<name>@sha256:<hex>`) as well as a workspace directory. `up` fetches
-  it into the part cache, as it does a guest bundle, and mounts it read-only; planning does not need it on
-  disk. A host-process service (no `on:`) refuses a published store. `pkg vendor` and the package checks
-  no longer list such a store as a missing local directory.
 - `vxedge pkg vendor <dir>` copies another folder's vxedge documents into the package here, such as
   a reference vehicle from `vxperiments/vehicles/` (`ARCHITECTURE.md` §6.0.7, decision X-5), and
   records each copy in `vxp.lock` under `vendored` with its source (`<owner>/<repo>/<path>`, read
@@ -23,6 +29,11 @@ All notable changes to this repo are documented here. Format follows
   references the package lacks (`./` bundles and artifact stores, `localhost/` images) are listed.
   `pkg vendor --check` reports a copy edited in the package and, when the source is in the same
   checkout, a source that changed since.
+- An `ota` service's `config.artifacts` can name a published config part pinned by digest
+  (`ghcr.io/vxedge/parts/svc/ota/config/<name>@sha256:<hex>`) as well as a workspace directory. `up` fetches
+  it into the part cache, as it does a guest bundle, and mounts it read-only; planning does not need it on
+  disk. A host-process service (no `on:`) refuses a published store. `pkg vendor` and the package checks
+  no longer list such a store as a missing local directory.
 
 ## [0.7.0] - 2026-11-06
 
