@@ -105,6 +105,7 @@ pub(crate) async fn preflight(
     dir: Option<&Path>,
     unlocked: bool,
     runtime_dir: &Path,
+    cache_dir: &Path,
     gateway: &GatewaySvc,
 ) -> Preflight {
     let mut pf = Preflight::default();
@@ -213,7 +214,7 @@ pub(crate) async fn preflight(
         .services
         .values()
         .filter(|s| s.on.is_some())
-        .find_map(|def| vxedge_core::services::placed_spec(def, workspace).err());
+        .find_map(|def| vxedge_core::services::placed_spec(def, workspace, cache_dir).err());
     pf.check(
         "placed services",
         placed.map(|e| {
@@ -374,6 +375,8 @@ async fn host_requirements(dir: Option<&Path>) -> (Option<String>, Option<Vec<Ba
 pub struct PlanSvc {
     pub gateway: Arc<GatewaySvc>,
     pub runtime_dir: PathBuf,
+    /// The part cache, where a published artifact store would be fetched to.
+    pub cache_dir: PathBuf,
 }
 
 fn on_path(binary: &str) -> bool {
@@ -504,6 +507,7 @@ impl WorkspaceService for PlanSvc {
             dir.as_deref(),
             req.get_ref().unlocked,
             &self.runtime_dir,
+            &self.cache_dir,
             &self.gateway,
         )
         .await;

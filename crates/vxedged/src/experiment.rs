@@ -663,6 +663,7 @@ impl ExperimentService for ExperimentSvc {
             dir.as_deref(),
             req.get_ref().unlocked,
             &self.handles.zones.runtime_dir,
+            &self.handles.zones.cache_dir,
             &self.handles.gateway,
         )
         .await;

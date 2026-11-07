@@ -199,6 +199,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             vxota: args.vxota_bin.clone(),
             vxtelemetry: args.vxtelemetry_bin.clone(),
         },
+        cache_dir: cache_dir.clone(),
     });
     let nos_check = Arc::new(services::NosCheckSvc {
         engine: engine.clone(),
@@ -242,10 +243,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .add_service(WorkspaceServiceServer::new(plan::PlanSvc {
             gateway: plan_gateway.clone(),
             runtime_dir: args.runtime_dir.clone(),
+            cache_dir: cache_dir.clone(),
         }))
         .add_service(HostServiceServer::new(plan::PlanSvc {
             gateway: plan_gateway,
             runtime_dir: args.runtime_dir.clone(),
+            cache_dir: cache_dir.clone(),
         }))
         .add_service(ZoneServiceServer::from_arc(zones))
         .add_service(ComputeServiceServer::from_arc(compute))
