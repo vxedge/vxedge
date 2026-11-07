@@ -200,7 +200,9 @@ impl ArtifactStore {
     }
 }
 
-fn ota_store(def: &ServiceDef) -> Option<ArtifactStore> {
+/// An `ota` service's artifact store, local or published. `None` for another service type or a
+/// config without one.
+pub fn ota_store(def: &ServiceDef) -> Option<ArtifactStore> {
     (def.service_type == ServiceType::Ota)
         .then(|| typed_config::<OtaConfig>(def, "").ok())
         .flatten()

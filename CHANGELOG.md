@@ -6,6 +6,18 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Changed
+
+- `pkg lock` lists a published `ota` artifact store (`config.artifacts: <ref>@sha256:<hex>`, vxedge
+  0.8.0) under `parts` with its digest, as it lists guest bundles, so a pull or an offline copy
+  knows to fetch it. It was already pinned through the document's digest in `files`. A package
+  locked by 0.8.0 with a published store reports a lock mismatch until it is re-locked with
+  `vxedge pkg lock`.
+- A daemon refusal prints the daemon's sentence and then its typed reason and gRPC code
+  (`reason: ERROR_REASON_LOCK_MISMATCH (FailedPrecondition)`), instead of starting with the
+  code's generic description (`The system is not in a state required for the operation's
+  execution`). The reason is the same one an agent branches on.
+
 ## [0.8.0] - 2026-11-07
 
 A package can now carry a reference vehicle as a copy: `vxedge pkg vendor` copies another folder's

@@ -16,6 +16,7 @@ path = "src/main.rs"
 vxedge-api = { workspace = true }
 vxedge-core = { workspace = true }
 tonic = { workspace = true }
+tonic-types = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true }
 hyper-util = { workspace = true }

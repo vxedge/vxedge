@@ -2525,6 +2525,7 @@ dependencies = [
  "serde_yaml_ng",
  "tokio",
  "tonic",
+ "tonic-types",
  "tower",
  "vxedge-api",
  "vxedge-core",
