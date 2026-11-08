@@ -8,6 +8,11 @@ All notable changes to this repo are documented here. Format follows
 
 ### Added
 
+- `vxedge pkg vendor` also copies the local part folders the copied documents reference (`./…` in
+  a part `ref` or an artifact store) when the source's git checkout tracks their files, such as a
+  vehicle's committed attach adapter (`./aaos`), and records each copied file in `vendored`, so
+  `pkg vendor --check` flags drift in them too. Untracked files, such as build outputs, stay behind
+  and are listed as build outputs; outside a git checkout no folder is copied.
 - `vxedge pkg pack --offline` also writes an OCI layout beside the packed file,
   `<name>-<version>.parts/`, with every published part and image the lock lists, copied with
   `oras` under the tag `sha256-<hex>` of each digest, and a `vxedge-parts.json` naming each ref,

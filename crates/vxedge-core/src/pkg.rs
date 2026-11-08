@@ -733,12 +733,54 @@ fn left_behind_reason(name: &str, is_dir: bool) -> &'static str {
 /// The `vendored` entries are written even when the package stops building, which is the usual
 /// first step (the scaffold's `main.yaml` names the vehicle the copy replaced); the report says
 /// so and the full re-lock waits for `pkg lock`.
+/// The local paths the documents at `paths` reference as parts or artifact stores: every `ref` or
+/// `artifacts` string that starts with `./`, as a `/`-separated path inside the folder. A path
+/// that would leave the folder is ignored: a document cannot vendor what is outside it.
+fn referenced_local_paths(paths: &[PathBuf]) -> Vec<String> {
+    fn walk(v: &serde_yaml_ng::Value, out: &mut BTreeSet<String>) {
+        match v {
+            serde_yaml_ng::Value::Mapping(m) => {
+                for (k, v) in m {
+                    if let (Some("ref" | "artifacts"), Some(s)) = (k.as_str(), v.as_str())
+                        && let Some(rel) = s.strip_prefix("./")
+                    {
+                        let rel = rel.trim_end_matches('/');
+                        let safe = !rel.is_empty()
+                            && rel
+                                .split('/')
+                                .all(|c| !c.is_empty() && c != "." && c != "..");
+                        if safe {
+                            out.insert(rel.to_string());
+                        }
+                    }
+                    walk(v, out);
+                }
+            }
+            serde_yaml_ng::Value::Sequence(items) => items.iter().for_each(|i| walk(i, out)),
+            _ => {}
+        }
+    }
+    let mut out = BTreeSet::new();
+    for path in paths {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        for doc in serde_yaml_ng::Deserializer::from_str(&text) {
+            if let Ok(v) = serde_yaml_ng::Value::deserialize(doc) {
+                walk(&v, &mut out);
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
 pub fn vendor(
     root: &Path,
     source: &Path,
     source_id: &str,
     replace: bool,
     locked_with: &str,
+    tracked: Option<&[String]>,
 ) -> Result<VendorReport, PkgError> {
     let PackageDoc::V1(descriptor) = require_v1(root)? else {
         unreachable!("require_v1 refuses legacy descriptors")
@@ -774,7 +816,29 @@ pub fn vendor(
                 .map(str::to_string)
                 .ok_or_else(|| PkgError::NonUtf8Path { path: p.clone() })
         })
-        .collect::<Result<_, _>>()?;
+        .collect::<Result<Vec<String>, _>>()?;
+    // Local parts the documents reference travel with them when they are content: files the
+    // source's git checkout tracks. Untracked ones are build outputs and stay behind.
+    let referenced = referenced_local_paths(&documents);
+    let part_files: Vec<String> = tracked
+        .unwrap_or_default()
+        .iter()
+        .filter(|t| {
+            referenced
+                .iter()
+                .any(|r| *t == r || t.starts_with(&format!("{r}/")))
+        })
+        .filter(|t| source.join(t).is_file())
+        .cloned()
+        .collect();
+    let names: Vec<String> = names
+        .into_iter()
+        .chain(part_files.iter().cloned())
+        .collect();
+    let documents: Vec<PathBuf> = documents
+        .into_iter()
+        .chain(part_files.iter().map(|t| source.join(t)))
+        .collect();
 
     let written = read_lock(root)?;
     let previous = written
@@ -807,6 +871,9 @@ pub fn vendor(
     for (path, name) in documents.iter().zip(&names) {
         let bytes = std::fs::read(path).map_err(io(path))?;
         let dest = root.join(name);
+        if let Some(dir) = dest.parent() {
+            std::fs::create_dir_all(dir).map_err(io(dir))?;
+        }
         std::fs::write(&dest, &bytes).map_err(io(&dest))?;
         copied.push(Vendored {
             file: name.clone(),
@@ -855,11 +922,28 @@ pub fn vendor(
     listing.sort_by_key(|e| e.file_name());
     for entry in listing {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if names.contains(&name) {
+        if names.contains(&name)
+            || part_files
+                .iter()
+                .any(|f| f.starts_with(&format!("{name}/")))
+        {
             continue;
         }
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        left_behind.push((name.clone(), left_behind_reason(&name, is_dir)));
+        let reason = if referenced
+            .iter()
+            .any(|r| r == &name || r.starts_with(&format!("{name}/")))
+        {
+            if tracked.is_some() {
+                "a local part the documents reference, not tracked in git: a build output"
+            } else {
+                "a local part the documents reference; with no git checkout to tell content \
+                 from build output, it is not copied"
+            }
+        } else {
+            left_behind_reason(&name, is_dir)
+        };
+        left_behind.push((name.clone(), reason));
     }
 
     let (relock_error, local_refs) = match lock(root, locked_with) {
@@ -1575,7 +1659,7 @@ mod tests {
         let id = "vxedge/vxperiments/vehicles/car2";
 
         // The scaffold's own documents are in the way.
-        let refused = vendor(&root, &src, id, false, "0.7.0")
+        let refused = vendor(&root, &src, id, false, "0.7.0", None)
             .unwrap_err()
             .to_string();
         assert!(
@@ -1583,7 +1667,7 @@ mod tests {
             "{refused}"
         );
 
-        let report = vendor(&root, &src, id, true, "0.7.0").unwrap();
+        let report = vendor(&root, &src, id, true, "0.7.0", None).unwrap();
         assert_eq!(
             report
                 .copied
@@ -1622,7 +1706,7 @@ mod tests {
         assert_eq!(lock_problems(&root).unwrap(), Vec::<String>::new());
 
         // Vendoring the same source again needs no `--replace`, and builds now.
-        let again = vendor(&root, &src, id, false, "0.7.0").unwrap();
+        let again = vendor(&root, &src, id, false, "0.7.0", None).unwrap();
         assert_eq!(again.relock_error, None);
         fs::remove_dir_all(root.parent().unwrap()).ok();
         fs::remove_dir_all(src.parent().unwrap().parent().unwrap()).ok();
@@ -1633,7 +1717,7 @@ mod tests {
         let root = locked_workspace("vcheck");
         let src = vehicle_source("vcheck", "car1");
         let id = "vxedge/vxperiments/vehicles/car1";
-        vendor(&root, &src, id, true, "0.7.0").unwrap();
+        vendor(&root, &src, id, true, "0.7.0", None).unwrap();
         let at_src = |want: &str| -> Option<PathBuf> { (want == id).then(|| src.clone()) };
         assert_eq!(
             vendor_check(&root, &at_src).unwrap(),
@@ -1677,16 +1761,106 @@ mod tests {
     fn a_source_inside_the_package_or_without_documents_is_refused() {
         let root = locked_workspace("vrefuse");
         fs::create_dir_all(root.join("parts/vehicle")).unwrap();
-        let inside =
-            vendor(&root, &root.join("parts/vehicle"), "a/b/c", true, "0.7.0").unwrap_err();
+        let inside = vendor(
+            &root,
+            &root.join("parts/vehicle"),
+            "a/b/c",
+            true,
+            "0.7.0",
+            None,
+        )
+        .unwrap_err();
         assert!(
             inside.to_string().contains("inside the package"),
             "{inside}"
         );
         let empty = root.parent().unwrap().join("empty");
         fs::create_dir_all(&empty).unwrap();
-        let none = vendor(&root, &empty, "a/b/c", true, "0.7.0").unwrap_err();
+        let none = vendor(&root, &empty, "a/b/c", true, "0.7.0", None).unwrap_err();
         assert!(none.to_string().contains("no vxedge documents"), "{none}");
         fs::remove_dir_all(root.parent().unwrap()).ok();
+    }
+
+    /// A part folder the documents reference travels with them when git tracks it, as a vehicle's
+    /// committed adapter does, and a build output the documents reference stays behind.
+    #[test]
+    fn vendoring_copies_the_part_folders_git_tracks() {
+        let root = locked_workspace("vparts");
+        let src = vehicle_source("vparts", "car1");
+        fs::create_dir_all(src.join("aaos")).unwrap();
+        fs::write(src.join("aaos/attach.yaml"), "interface: eth0\n").unwrap();
+        fs::write(src.join("aaos/start.sh"), "#!/bin/sh\n").unwrap();
+        fs::write(src.join("aaos/scratch.log"), "untracked\n").unwrap();
+        fs::write(src.join("bundle/vmlinuz"), "kernel").unwrap();
+        let parts = fs::read_to_string(src.join("parts.yaml")).unwrap();
+        fs::write(
+            src.join("parts.yaml"),
+            format!(
+                "{parts}  - {{ ref: ./aaos, kind: attach, target_ids: [adas] }}\n  - {{ ref: ./bundle, kind: bundle, target_ids: [adas] }}\n  - {{ ref: ./../outside, kind: bundle, target_ids: [adas] }}\n"
+            ),
+        )
+        .unwrap();
+        let tracked: Vec<String> = [
+            "aaos/attach.yaml",
+            "aaos/start.sh",
+            "parts.yaml",
+            "vehicle.yaml",
+        ]
+        .map(String::from)
+        .to_vec();
+        let id = "vxedge/vxperiments/vehicles/car1";
+        let report = vendor(&root, &src, id, true, "0.7.0", Some(&tracked)).unwrap();
+        let files: Vec<&str> = report.copied.iter().map(|v| v.file.as_str()).collect();
+        assert_eq!(
+            files,
+            [
+                "parts.yaml",
+                "vehicle.yaml",
+                "aaos/attach.yaml",
+                "aaos/start.sh"
+            ]
+        );
+        assert_eq!(
+            fs::read(root.join("aaos/attach.yaml")).unwrap(),
+            b"interface: eth0\n"
+        );
+        assert!(
+            !root.join("aaos/scratch.log").exists(),
+            "untracked files stay behind"
+        );
+        assert!(!root.join("bundle").exists());
+        let bundle = report
+            .left_behind
+            .iter()
+            .find(|(n, _)| n == "bundle")
+            .unwrap();
+        assert!(bundle.1.contains("build output"), "{bundle:?}");
+        assert!(!report.left_behind.iter().any(|(n, _)| n == "aaos"));
+
+        let at_src = |want: &str| -> Option<PathBuf> { (want == id).then(|| src.clone()) };
+        assert_eq!(
+            vendor_check(&root, &at_src).unwrap(),
+            VendorCheck::default()
+        );
+        fs::write(src.join("aaos/start.sh"), "#!/bin/sh\necho changed\n").unwrap();
+        let found = vendor_check(&root, &at_src).unwrap().problems;
+        assert!(
+            found[0].contains("`aaos/start.sh` changed at its source"),
+            "{found:?}"
+        );
+
+        // Without a git checkout nothing tells content from build output, so no folder is copied.
+        let root2 = locked_workspace("vparts-nogit");
+        let report = vendor(&root2, &src, id, true, "0.7.0", None).unwrap();
+        assert!(!root2.join("aaos").exists());
+        let aaos = report
+            .left_behind
+            .iter()
+            .find(|(n, _)| n == "aaos")
+            .unwrap();
+        assert!(aaos.1.contains("no git checkout"), "{aaos:?}");
+        fs::remove_dir_all(root.parent().unwrap()).ok();
+        fs::remove_dir_all(root2.parent().unwrap()).ok();
+        fs::remove_dir_all(src.parent().unwrap().parent().unwrap()).ok();
     }
 }

@@ -259,6 +259,11 @@ fn a_package_vendors_a_vehicle_and_flags_drift_from_it() {
         std::fs::copy(repo.join("vehicle-src").join(f), source.join(f)).unwrap();
     }
     std::fs::write(source.join("build.sh"), "#!/bin/sh\n").unwrap();
+    // A local part the documents reference: committed, so it travels; a build output does not.
+    std::fs::create_dir_all(source.join("parts/gw-tcu")).unwrap();
+    std::fs::write(source.join("parts/gw-tcu/Containerfile"), "FROM scratch\n").unwrap();
+    std::fs::write(source.join("parts/gw-tcu/build.log"), "untracked\n").unwrap();
+    git(&repo, &["add", "vehicles/sedan/parts/gw-tcu/Containerfile"]);
     std::fs::remove_dir_all(repo.join("vehicle-src")).unwrap();
     std::fs::create_dir_all(repo.join("experiments")).unwrap();
     let (ok, _, _) = vxedge(&repo.join("experiments"), &["pkg", "new", "demo"]);
@@ -277,6 +282,14 @@ fn a_package_vendors_a_vehicle_and_flags_drift_from_it() {
         "{out}"
     );
     assert!(out.contains("not vendored: build.sh (host recipe"), "{out}");
+    assert!(
+        out.contains("vendored parts/gw-tcu/Containerfile from acme/catalogue/vehicles/sedan"),
+        "{out}"
+    );
+    assert!(
+        !pkg.join("parts/gw-tcu/build.log").exists(),
+        "untracked files stay behind"
+    );
     let lock = std::fs::read_to_string(pkg.join("vxp.lock")).unwrap();
     assert!(
         lock.contains("source: acme/catalogue/vehicles/sedan"),
