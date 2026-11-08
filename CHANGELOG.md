@@ -19,6 +19,15 @@ All notable changes to this repo are documented here. Format follows
   package is refused before any tool runs.
 - Both shell out: `cosign` (3.x; checked with 3.1.4) and `gh attestation`, as packages already use
   `oras`. Neither is needed by anything else.
+- A host trust policy (`vxedged --trust-policy <file>`, or `/etc/vxedge/trust.yaml` when it exists):
+  `require_signed` and the allowed signers, a GitHub repository (optionally one workflow) or a
+  public key by fingerprint or file. With `require_signed`, `Plan`, `experiment up`, `vehicle up`
+  and `gateway up` refuse a package whose digest has no verification record from an allowed
+  signer in the daemon's part cache, and a legacy descriptor or inline manifest, under the new
+  `ERROR_REASON_SIGNATURE_INVALID`, before anything is provisioned. A package changed after it was
+  verified has another digest and no record. Without a policy, nothing changes. A policy that
+  requires signatures and allows no signer is refused at start. `pkg verify` and `pkg pull` take
+  `--cache-dir` (or `VXEDGE_CACHE_DIR`) to write where the daemon reads.
 
 ## [0.11.0] - 2026-11-08
 

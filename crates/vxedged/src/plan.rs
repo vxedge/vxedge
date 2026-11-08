@@ -99,23 +99,38 @@ fn lines(paths: &[PathBuf]) -> String {
         .join("\n")
 }
 
-/// The `vxp/1` package checks `up` makes, as a refusal: the lock (unless `unlocked`) and whether
-/// the package packs. Shared by the preflight and the gateway's own `up`, which records the
-/// result. Legacy descriptors and inline manifests pass with nothing to record.
+/// The host trust policy and the cache its verification records live in, set once at start.
+static HOST_TRUST: std::sync::OnceLock<(vxedge_core::trust::TrustPolicy, PathBuf)> =
+    std::sync::OnceLock::new();
+
+pub(crate) fn set_host_trust(policy: vxedge_core::trust::TrustPolicy, cache_dir: PathBuf) {
+    let _ = HOST_TRUST.set((policy, cache_dir));
+}
+
+/// The `vxp/1` package checks `up` makes, as a refusal: the lock (unless `unlocked`), whether the
+/// package packs, and the host trust policy. Shared by the preflight and the gateway's own `up`,
+/// which records the result. Legacy descriptors and inline manifests pass the package checks
+/// with nothing to record, and are refused only by a policy that requires signatures.
 pub(crate) fn package_run(
     dir: Option<&Path>,
     unlocked: bool,
 ) -> Result<Option<RunPackage>, (R, String)> {
-    let Some(dir) = dir else {
-        return Ok(None);
+    let package = match dir {
+        None => None,
+        Some(dir) => vxedge_core::pkg::run_package(dir, unlocked).map_err(|e| {
+            let reason = match e {
+                RunRefusal::LockMismatch { .. } => R::LockMismatch,
+                RunRefusal::Package(_) => R::WorkspaceInvalid,
+            };
+            (reason, e.to_string())
+        })?,
     };
-    vxedge_core::pkg::run_package(dir, unlocked).map_err(|e| {
-        let reason = match e {
-            RunRefusal::LockMismatch { .. } => R::LockMismatch,
-            RunRefusal::Package(_) => R::WorkspaceInvalid,
-        };
-        (reason, e.to_string())
-    })
+    if let Some((policy, cache_dir)) = HOST_TRUST.get() {
+        policy
+            .check(cache_dir, package.as_ref().map(|p| p.digest.as_str()))
+            .map_err(|detail| (R::SignatureInvalid, detail))?;
+    }
+    Ok(package)
 }
 
 /// The vxAPI reason for a typed-intent problem.

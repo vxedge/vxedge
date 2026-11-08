@@ -255,6 +255,128 @@ pub fn verify_github(
     Ok(record)
 }
 
+/// One signer a host trusts, as its trust policy names it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum AllowedSigner {
+    /// A repository whose workflow attests packages. With `workflow`, only that workflow counts.
+    Github {
+        repo: String,
+        #[serde(default)]
+        workflow: Option<String>,
+    },
+    /// A public key, by the fingerprint `pkg verify` prints (`sha256:…` of the key file), or by
+    /// the key file itself, read when the policy loads.
+    Key {
+        #[serde(default)]
+        fingerprint: Option<String>,
+        #[serde(default)]
+        public_key: Option<PathBuf>,
+    },
+}
+
+/// A host's trust policy (`ARCHITECTURE.md` §6.0.8). Without one, any package runs.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustPolicy {
+    /// Refuse a package whose digest has no verification record from an allowed signer.
+    #[serde(default)]
+    pub require_signed: bool,
+    #[serde(default)]
+    pub signers: Vec<AllowedSigner>,
+}
+
+impl TrustPolicy {
+    /// Read a policy file, resolving each `public_key` to its fingerprint. A policy that requires
+    /// signatures and allows no signer is refused: it would refuse everything.
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let shown = path.display();
+        let text = std::fs::read_to_string(path).map_err(|e| format!("`{shown}`: {e}"))?;
+        let mut policy: Self =
+            serde_yaml_ng::from_str(&text).map_err(|e| format!("`{shown}`: {e}"))?;
+        for signer in &mut policy.signers {
+            if let AllowedSigner::Key {
+                fingerprint,
+                public_key,
+            } = signer
+            {
+                match (fingerprint.as_ref(), public_key.as_ref()) {
+                    (None, Some(key)) => {
+                        let key = path.parent().unwrap_or(Path::new(".")).join(key);
+                        let Signer::Key { fingerprint: f } =
+                            key_signer(&key).map_err(|e| format!("`{shown}`: {e}"))?
+                        else {
+                            unreachable!("key_signer returns a key signer")
+                        };
+                        *fingerprint = Some(f);
+                    }
+                    (Some(_), None) => {}
+                    _ => {
+                        return Err(format!(
+                            "`{shown}`: a key signer names exactly one of `fingerprint` and \
+                             `public_key`"
+                        ));
+                    }
+                }
+            }
+        }
+        if policy.require_signed && policy.signers.is_empty() {
+            return Err(format!(
+                "`{shown}` requires signed packages and allows no signer, so it would refuse \
+                 every package; list the signers this host trusts"
+            ));
+        }
+        Ok(policy)
+    }
+
+    /// Whether `signer` is one this policy allows.
+    pub fn allows(&self, signer: &Signer) -> bool {
+        self.signers.iter().any(|allowed| match (allowed, signer) {
+            (
+                AllowedSigner::Github { repo, workflow },
+                Signer::Github {
+                    repo: r,
+                    workflow: w,
+                },
+            ) => repo == r && workflow.as_ref().is_none_or(|wf| w.as_ref() == Some(wf)),
+            (AllowedSigner::Key { fingerprint, .. }, Signer::Key { fingerprint: f }) => {
+                fingerprint.as_ref() == Some(f)
+            }
+            _ => false,
+        })
+    }
+
+    /// The check `up` and `Plan` make: under `require_signed`, the package with `digest` must have
+    /// a verification record here from an allowed signer. `None` is a run with no package digest
+    /// (a legacy descriptor or an inline manifest), which cannot be verified.
+    pub fn check(&self, cache_dir: &Path, digest: Option<&str>) -> Result<(), String> {
+        if !self.require_signed {
+            return Ok(());
+        }
+        let Some(digest) = digest else {
+            return Err(
+                "this host requires signed packages, and only a `vxp/1` package has a \
+                        package digest to verify; a legacy descriptor or an inline manifest \
+                        cannot run here"
+                    .to_string(),
+            );
+        };
+        match read_record(cache_dir, digest) {
+            None => Err(format!(
+                "this host requires signed packages, and package `{digest}` has not been \
+                 verified here. Run `vxedge pkg verify` on its packed file (with `--cache-dir` \
+                 set to the daemon's) and try again. Nothing was provisioned."
+            )),
+            Some(record) if !self.allows(&record.signer) => Err(format!(
+                "package `{digest}` was verified as signed by {}, which this host's trust policy \
+                 does not allow. Nothing was provisioned.",
+                record.signer
+            )),
+            Some(_) => Ok(()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,5 +434,81 @@ mod tests {
             bundle_path(Path::new("/x/demo-0.1.0.vxp")),
             PathBuf::from("/x/demo-0.1.0.vxp.sigstore.json")
         );
+    }
+
+    #[test]
+    fn a_policy_allows_named_signers_and_requires_a_record() {
+        let dir = std::env::temp_dir().join(format!("vxtrust-policy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("lab.pub"), "public").unwrap();
+        std::fs::write(
+            dir.join("trust.yaml"),
+            "require_signed: true\nsigners:\n  - { kind: github, repo: vxedge/vxperiments, \
+             workflow: .github/workflows/release.yml }\n  - { kind: key, public_key: lab.pub }\n",
+        )
+        .unwrap();
+        let policy = TrustPolicy::load(&dir.join("trust.yaml")).unwrap();
+        let lab = key_signer(&dir.join("lab.pub")).unwrap();
+        assert!(policy.allows(&lab));
+        assert!(policy.allows(&Signer::Github {
+            repo: "vxedge/vxperiments".into(),
+            workflow: Some(".github/workflows/release.yml".into())
+        }));
+        assert!(
+            !policy.allows(&Signer::Github {
+                repo: "vxedge/vxperiments".into(),
+                workflow: None
+            }),
+            "the policy names a workflow"
+        );
+        assert!(!policy.allows(&Signer::Key {
+            fingerprint: "sha256:other".into()
+        }));
+
+        let cache = dir.join("cache");
+        let unverified = policy.check(&cache, Some(DIGEST)).unwrap_err();
+        assert!(unverified.contains("has not been verified"), "{unverified}");
+        assert!(policy.check(&cache, None).unwrap_err().contains("legacy"));
+        let record = |signer| VerificationRecord {
+            package_digest: DIGEST.into(),
+            method: Method::SigstoreKey,
+            signer,
+            verified_at_unix_ms: 1,
+        };
+        write_record(
+            &cache,
+            &record(Signer::Key {
+                fingerprint: "sha256:other".into(),
+            }),
+        )
+        .unwrap();
+        assert!(
+            policy
+                .check(&cache, Some(DIGEST))
+                .unwrap_err()
+                .contains("does not allow")
+        );
+        write_record(&cache, &record(lab)).unwrap();
+        assert_eq!(policy.check(&cache, Some(DIGEST)), Ok(()));
+        assert_eq!(
+            TrustPolicy::default().check(&cache, None),
+            Ok(()),
+            "no policy, no check"
+        );
+
+        std::fs::write(dir.join("empty.yaml"), "require_signed: true\n").unwrap();
+        assert!(
+            TrustPolicy::load(&dir.join("empty.yaml"))
+                .unwrap_err()
+                .contains("allows no signer")
+        );
+        std::fs::write(
+            dir.join("both.yaml"),
+            "signers:\n  - { kind: key, fingerprint: x, public_key: lab.pub }\n",
+        )
+        .unwrap();
+        assert!(TrustPolicy::load(&dir.join("both.yaml")).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

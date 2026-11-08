@@ -125,7 +125,10 @@ enum ErrorReason {
   // reference disagrees, or there is no lock. The detail names each difference. Run
   // `vxedge pkg lock` to record the change, or set `unlocked` on the `Up` request while authoring.
   ERROR_REASON_LOCK_MISMATCH = 26;
-  // 27 is reserved for the package trust policy.
+  // This host's trust policy requires signed packages, and the package's digest has no
+  // verification record from an allowed signer (`vxedge pkg verify`), or the run has no package
+  // digest to verify (a legacy descriptor or an inline manifest). Nothing was provisioned.
+  ERROR_REASON_SIGNATURE_INVALID = 27;
   // An experiment's typed intent names a parameter wrongly: a type, unit, bound or `binds` path
   // that does not hold, two parameters binding one field, or an arm, sweep or profile that sets
   // an undeclared parameter or a value out of bounds. The detail names the document and field.

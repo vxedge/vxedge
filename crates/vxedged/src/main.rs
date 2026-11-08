@@ -89,6 +89,11 @@ struct Args {
     /// since a pulled artifact should survive a restart rather than re-pulling every time.
     #[arg(long, env = "VXEDGE_CACHE_DIR")]
     cache_dir: Option<std::path::PathBuf>,
+
+    /// The host trust policy (`ARCHITECTURE.md` §6.0.8): whether packages must be signed and by
+    /// whom. Default: `/etc/vxedge/trust.yaml` when it exists; without one, any package runs.
+    #[arg(long, env = "VXEDGE_TRUST_POLICY")]
+    trust_policy: Option<std::path::PathBuf>,
 }
 
 #[tokio::main]
@@ -131,6 +136,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .or_else(vxedge_core::registry::default_cache_dir)
         .unwrap_or_else(|| args.runtime_dir.join("cache/parts"));
     let _ = std::fs::create_dir_all(&cache_dir);
+    let policy_path = args.trust_policy.clone().or_else(|| {
+        let default = std::path::PathBuf::from("/etc/vxedge/trust.yaml");
+        default.is_file().then_some(default)
+    });
+    let policy = match &policy_path {
+        Some(p) => vxedge_core::trust::TrustPolicy::load(p)?,
+        None => vxedge_core::trust::TrustPolicy::default(),
+    };
+    info!(policy = ?policy_path, require_signed = policy.require_signed, "trust policy");
+    plan::set_host_trust(policy, cache_dir.clone());
 
     let bus = events::EventBus::with_runtime_dir(args.runtime_dir.clone());
     let engine = jobs::JobEngine::with_runtime_dir(bus.clone(), args.runtime_dir.clone());

@@ -1952,3 +1952,108 @@ async fn typed_intent_that_holds_plans_clean() {
         plan.problems
     );
 }
+
+fn signature_problems(plan: &vxedge_api::v1::WorkspacePlan) -> Vec<String> {
+    plan.problems
+        .iter()
+        .filter(|p| p.reason == vxedge_api::v1::ErrorReason::SignatureInvalid as i32)
+        .map(|p| p.detail.clone())
+        .collect()
+}
+
+/// A verification record as `pkg verify` writes it, in the daemon's part cache.
+fn write_verification(cache: &Path, digest: &str, fingerprint: &str) {
+    let dir = cache.join("packages");
+    std::fs::create_dir_all(&dir).unwrap();
+    let record = serde_json::json!({
+        "package_digest": digest, "method": "sigstore-key",
+        "signer": { "kind": "key", "fingerprint": fingerprint },
+        "verified_at_unix_ms": 1,
+    });
+    std::fs::write(
+        dir.join(format!(
+            "{}.verified.json",
+            digest.trim_start_matches("sha256:")
+        )),
+        record.to_string(),
+    )
+    .unwrap();
+}
+
+/// Under `require_signed`, `Plan` and `up` refuse a package nobody verified here, one verified
+/// as signed by a signer the policy does not name, and a legacy workspace, all before anything
+/// is provisioned, and accept one an allowed signer verified.
+#[tokio::test]
+async fn a_host_that_requires_signatures_refuses_what_is_not_verified() {
+    let policy_dir = scratch();
+    let policy = policy_dir.join("trust.yaml");
+    std::fs::write(
+        &policy,
+        "require_signed: true\nsigners:\n  - { kind: key, fingerprint: \"sha256:lab\" }\n",
+    )
+    .unwrap();
+    let daemon = Daemon::start_env(|_| {}, &[("VXEDGE_TRUST_POLICY", &policy)]);
+    let channel = daemon.channel().await;
+    let cache = daemon.root.join("cache");
+    let (dir, _) = locked_package();
+    let digest = vxedge_core::pkg::package_digest(&dir).unwrap();
+
+    let problems = signature_problems(&plan_of(&channel, &dir).await);
+    assert!(
+        problems[0].contains("has not been verified"),
+        "{problems:?}"
+    );
+    let refused = ExperimentServiceClient::new(channel.clone())
+        .up(ExperimentUpRequest {
+            manifest: path_ref(&dir),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&refused), "ERROR_REASON_SIGNATURE_INVALID");
+    let refused =
+        vxedge_api::v1::gateway_service_client::GatewayServiceClient::new(channel.clone())
+            .up(vxedge_api::v1::GatewayUpRequest {
+                manifest: path_ref(&dir),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+    assert_eq!(reason(&refused), "ERROR_REASON_SIGNATURE_INVALID");
+
+    write_verification(&cache, &digest, "sha256:someone-else");
+    let problems = signature_problems(&plan_of(&channel, &dir).await);
+    assert!(problems[0].contains("does not allow"), "{problems:?}");
+
+    write_verification(&cache, &digest, "sha256:lab");
+    assert_eq!(
+        signature_problems(&plan_of(&channel, &dir).await),
+        Vec::<String>::new()
+    );
+
+    // A change after verification is another digest, so the record no longer counts.
+    std::fs::write(dir.join("notes.txt"), "edited\n").unwrap();
+    let edited =
+        vxedge_api::v1::workspace_service_client::WorkspaceServiceClient::new(channel.clone())
+            .plan(vxedge_api::v1::WorkspacePlanRequest {
+                manifest: path_ref(&dir),
+                unlocked: true,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+    assert!(
+        !signature_problems(&edited).is_empty(),
+        "{:?}",
+        edited.problems
+    );
+
+    let (legacy, id) = experiment_workspace();
+    std::fs::write(
+        legacy.join(format!("{id}.vxp")),
+        format!("id: {id}\nversion: 0.1.0\n"),
+    )
+    .unwrap();
+    let problems = signature_problems(&plan_of(&channel, &legacy).await);
+    assert!(problems[0].contains("legacy"), "{problems:?}");
+}
