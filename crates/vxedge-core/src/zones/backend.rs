@@ -629,8 +629,6 @@ fn microvm_argv(
             &serial,
             "-kernel",
             kernel,
-            "-initrd",
-            initrd,
             "-append",
             &append,
             "-netdev",
@@ -644,6 +642,11 @@ fn microvm_argv(
         .iter()
         .map(|s| s.to_string()),
     );
+    // An empty `initrd.img` is a bundle whose kernel needs none, as a QNX image that carries its
+    // whole system in itself. QEMU's arm loader refuses an empty file, so it is not passed at all.
+    if std::fs::metadata(initrd).is_ok_and(|m| m.len() > 0) {
+        args.extend(["-initrd".to_string(), initrd.to_string()]);
+    }
     if kvm {
         args.push("-enable-kvm".into());
     }
@@ -1164,6 +1167,37 @@ mod tests {
         assert_eq!(arg_after(&x86, "-cpu"), "host");
         assert!(arg_after(&x86, "-append").starts_with("console=ttyS0 "));
         assert_eq!(x86.last().map(String::as_str), Some("-enable-kvm"));
+        assert!(x86.iter().any(|a| a == "-daemonize"));
+    }
+
+    /// A bundle's initrd is passed when it has content, and left out when it is the empty stub
+    /// of a kernel that needs none.
+    #[test]
+    fn an_empty_initrd_is_left_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let (full, empty) = (dir.path().join("full.img"), dir.path().join("empty.img"));
+        std::fs::write(&full, b"initramfs").unwrap();
+        std::fs::write(&empty, b"").unwrap();
+        let np = microvm_node(None);
+        let rt = Path::new("/run/vx");
+        let with = microvm_argv(
+            &np,
+            rt,
+            "k",
+            full.to_str().unwrap(),
+            GuestArch::Aarch64,
+            Acceleration::Tcg,
+        );
+        assert_eq!(arg_after(&with, "-initrd"), full.to_str().unwrap());
+        let without = microvm_argv(
+            &np,
+            rt,
+            "k",
+            empty.to_str().unwrap(),
+            GuestArch::Aarch64,
+            Acceleration::Tcg,
+        );
+        assert!(!without.iter().any(|a| a == "-initrd"));
     }
 
     /// KVM runs a guest only on a host of the same instruction set.

@@ -13,7 +13,8 @@ All notable changes to this repo are documented here. Format follows
   an aarch64 node runs `qemu-system-aarch64` on the `virt` machine: virtio-mmio, as on `microvm`, and the PL011
   console (`console=ttyAMA0`). KVM is used only on a host of the guest's own instruction set; anywhere else QEMU
   emulates the guest's CPU (TCG), so its results are functional only. `up` names the missing emulator if it is
-  not installed.
+  not installed. An empty `initrd.img`, the stub a bundle whose kernel needs no initramfs carries (a QNX image),
+  is left off the command line: QEMU's arm loader refuses an empty file.
 - vxAPI: `NodeStatus.arch` and `NodeStatus.acceleration` (`kvm` or `tcg`) say what a running `qemu-microvm`
   guest actually runs on, read from its emulator's command line. Additive string fields: older clients ignore
   them.
