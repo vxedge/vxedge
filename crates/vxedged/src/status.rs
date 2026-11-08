@@ -135,7 +135,11 @@ fn node_detail(np: &NodePlan) -> String {
 
 /// One node, observed. The one place that builds a node's status, so the text and the typed
 /// fields cannot disagree.
-pub fn observed_node(np: &NodePlan, state: &NodeState) -> NodeStatus {
+pub fn observed_node(
+    np: &NodePlan,
+    state: &NodeState,
+    platform: Option<vxedge_core::zones::GuestPlatform>,
+) -> NodeStatus {
     NodeStatus {
         status: Some(resource_status(
             np.node_id.clone(),
@@ -144,6 +148,12 @@ pub fn observed_node(np: &NodePlan, state: &NodeState) -> NodeStatus {
             node_detail(np),
         )),
         spec: Some(node_spec(np)),
+        arch: platform
+            .map(|p| p.arch.as_str().to_string())
+            .unwrap_or_default(),
+        acceleration: platform
+            .map(|p| p.acceleration.as_str().to_string())
+            .unwrap_or_default(),
     }
 }
 

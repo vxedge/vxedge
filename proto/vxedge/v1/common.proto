@@ -197,4 +197,12 @@ message ResourceStatus {
 message NodeStatus {
   ResourceStatus status = 1;
   NodeSpec spec = 2;
+  // The instruction set of the machine a running VM guest runs on (`x86_64`, `aarch64`; a 32-bit
+  // x86 guest runs on an `x86_64` machine), read from the guest's own emulator. Empty when the node
+  // is not a running `qemu-microvm` guest.
+  string arch = 3;
+  // How that guest's CPU runs: `kvm`, or `tcg` (QEMU's emulator, on a host of another
+  // instruction set). A `tcg` result is functional evidence only and is never timed. Empty when
+  // `arch` is.
+  string acceleration = 4;
 }

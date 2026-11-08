@@ -6,6 +6,22 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- `qemu-microvm` boots aarch64 guests. A bundle names its instruction set in `meta.json` (`"arch": "aarch64"`, or
+  the `org.vxedge.arch` a published vxparts bundle carries; a bundle that names none is x86_64, as before), and
+  an aarch64 node runs `qemu-system-aarch64` on the `virt` machine: virtio-mmio, as on `microvm`, and the PL011
+  console (`console=ttyAMA0`). KVM is used only on a host of the guest's own instruction set; anywhere else QEMU
+  emulates the guest's CPU (TCG), so its results are functional only. `up` names the missing emulator if it is
+  not installed. An empty `initrd.img`, the stub a bundle carries when its kernel image holds the whole system,
+  is left off the command line: QEMU's arm loader refuses an empty file.
+- A `qemu-microvm` bundle chooses its virtio-mmio transport: `"virtio_mmio": "legacy"` in `meta.json` for a
+  guest whose virtio-net driver speaks only the version 1 transport. The default
+  stays `modern`, which Zephyr's driver requires.
+- vxAPI: `NodeStatus.arch` and `NodeStatus.acceleration` (`kvm` or `tcg`) say what a running `qemu-microvm`
+  guest actually runs on, read from its emulator's command line. Additive string fields: older clients ignore
+  them.
+
 ## [0.9.1] - 2026-11-08
 
 Two fixes found by the first gate on a vehicle with an AAOS zone: `down` now stops an attach zone last, and

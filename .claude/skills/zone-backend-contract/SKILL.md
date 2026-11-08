@@ -23,7 +23,9 @@ isolation mechanism differs — that is exactly the H3 variable." Concretely:
   manifest. With a digest-pinned or `localhost/` part, the netns belongs to a container group's
   infra container and the image runs as a member.
 - `qemu-microvm`: raw QEMU `microvm` machine, direct kernel boot from the bundle
-  (`vmlinuz`+`initrd.img`), virtio-net on a tap.
+  (`vmlinuz`+`initrd.img`), virtio-net on a tap. An aarch64 bundle (`meta.json` `"arch": "aarch64"`)
+  boots `qemu-system-aarch64 -M virt` instead: virtio-mmio too, console `ttyAMA0`. KVM only on a
+  host of the same instruction set, else TCG; `NodeStatus.acceleration` says which.
 - `libvirt`: full QEMU machine via `virsh` (`qemu:///system`), same bundle/cmdline
   contract, precreated tap (`managed='no'`).
 - `cloud-hypervisor`: the same guest bundle under Cloud Hypervisor, driven over its REST API on a
@@ -46,7 +48,14 @@ must follow, not just imitate loosely:
 - `vmlinuz` + `initrd.img`, boots from the kernel cmdline `vx.ip=<address>` — guest init
   reads it and payload autostarts; no interactive provisioning step.
 - SHA256-digested `meta.json` alongside the bundle (§13 reproducibility: no `latest`,
-  every artifact traceable to a digest).
+  every artifact traceable to a digest). Its `arch` (or the published `org.vxedge.arch`) names the instruction set
+  (`x86_64`, the default, or `aarch64`); one image ID per instruction set, never one bundle for two.
+- `vmlinuz` is a kernel QEMU's `-kernel` loads directly: on aarch64 a plain `Image` (a distribution
+  kernel's EFI zboot wrapper with zstd inside is refused, so the recipe unwraps it).
+- `initrd.img` is always present, and may be empty when the kernel needs no initramfs (an image that
+  carries its whole system). `qemu-microvm` then leaves `-initrd` off; QEMU's arm loader refuses an empty file.
+- `meta.json` `virtio_mmio`: `modern` (default, version 2; Zephyr requires it) or `legacy` (version 1, for a
+  driver that speaks only that). The bundle states what its driver speaks.
 - Document, in the recipe's own README, exactly which `backend:` values the image
   supports — QNX's recipe in particular must state the QNX-Hypervisor-inversion fidelity
   caveat (`vxparts/AGENTS.md`) inline, not leave it implicit.
