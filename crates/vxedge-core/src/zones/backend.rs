@@ -115,32 +115,56 @@ fn on_path(bin: &str) -> bool {
     })
 }
 
-/// The guest bundle's instruction set. `meta.json` is optional; an `arch` it names must be one
-/// vxedge can boot.
-fn bundle_arch(np: &NodePlan) -> Result<GuestArch, ZoneBackendError> {
+/// What a VM guest bundle's `meta.json` says about how it boots. The file is optional, and every
+/// key has the default every bundle had before it existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BundleBoot {
+    /// `arch`, or the `org.vxedge.arch` a published vxparts bundle carries. Default x86_64.
+    arch: GuestArch,
+    /// `"virtio_mmio": "legacy"`: the guest's driver speaks only the version 1 (legacy) virtio-mmio
+    /// transport, as QNX's `vtnet_mmio` does. Default `modern`, the version 2 transport, which
+    /// Zephyr's driver requires.
+    legacy_mmio: bool,
+}
+
+fn bundle_boot(np: &NodePlan) -> Result<BundleBoot, ZoneBackendError> {
+    let default = BundleBoot {
+        arch: GuestArch::X86_64,
+        legacy_mmio: false,
+    };
     let Some(dir) = np.bundle.as_deref() else {
-        return Ok(GuestArch::X86_64);
+        return Ok(default);
     };
     let Ok(text) = std::fs::read_to_string(dir.join("meta.json")) else {
-        return Ok(GuestArch::X86_64);
+        return Ok(default);
     };
-    let meta: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| ZoneBackendError::Runtime {
-            node: np.node_id.clone(),
-            detail: format!("the bundle's meta.json is not JSON: {e}"),
-        })?;
+    let refuse = |detail: String| ZoneBackendError::Runtime {
+        node: np.node_id.clone(),
+        detail,
+    };
+    let meta: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| refuse(format!("the bundle's meta.json is not JSON: {e}")))?;
     let named = ["arch", "org.vxedge.arch"]
         .iter()
         .find_map(|key| meta.get(*key).and_then(|a| a.as_str()));
-    match named {
-        None => Ok(GuestArch::X86_64),
-        Some(name) => GuestArch::from_name(name).ok_or_else(|| ZoneBackendError::Runtime {
-            node: np.node_id.clone(),
-            detail: format!(
+    let arch = match named {
+        None => GuestArch::X86_64,
+        Some(name) => GuestArch::from_name(name).ok_or_else(|| {
+            refuse(format!(
                 "the bundle's meta.json names arch `{name}`; qemu-microvm boots x86 (x86_64, i386) and aarch64"
-            ),
-        }),
-    }
+            ))
+        })?,
+    };
+    let legacy_mmio = match meta.get("virtio_mmio").and_then(|v| v.as_str()) {
+        None | Some("modern") => false,
+        Some("legacy") => true,
+        Some(other) => {
+            return Err(refuse(format!(
+                "the bundle's meta.json names virtio_mmio `{other}`; it is `legacy` or `modern`"
+            )));
+        }
+    };
+    Ok(BundleBoot { arch, legacy_mmio })
 }
 
 use super::cloud_hypervisor;
@@ -535,7 +559,8 @@ fn microvm_up(sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneB
         return Ok(()); // idempotent
     }
     let (kernel, initrd) = bundle_paths(np)?;
-    let arch = bundle_arch(np)?;
+    let boot = bundle_boot(np)?;
+    let arch = boot.arch;
     let accel = Acceleration::for_guest(arch, Path::new("/dev/kvm").exists());
     if !on_path(arch.qemu_bin()) {
         return Err(ZoneBackendError::Runtime {
@@ -547,7 +572,7 @@ fn microvm_up(sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneB
             ),
         });
     }
-    let args = microvm_argv(np, runtime_dir, &kernel, &initrd, arch, accel);
+    let args = microvm_argv(np, runtime_dir, &kernel, &initrd, boot, accel);
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     // Deliberately not `sh.run()` unchanged: qemu itself needs no privilege beyond `/dev/kvm`
     // (granted via the `kvm` group, not root) and an already-owned tap
@@ -574,9 +599,11 @@ fn microvm_argv(
     runtime_dir: &Path,
     kernel: &str,
     initrd: &str,
-    arch: GuestArch,
+    boot: BundleBoot,
     accel: Acceleration,
 ) -> Vec<String> {
+    let arch = boot.arch;
+    let transport = format!("virtio-mmio.force-legacy={}", boot.legacy_mmio);
     let name = np.runtime_name();
     let pidfile = runtime_dir.join(format!("{name}.pid"));
     let serial = format!(
@@ -619,9 +646,10 @@ fn microvm_argv(
             "1",
             "-nodefaults",
             // QEMU's virtio-mmio is the legacy (version 1) transport unless told otherwise.
-            // Linux speaks both; Zephyr's driver refuses version 1.
+            // Linux speaks both; Zephyr's driver refuses version 1, and QNX's speaks only it,
+            // so the bundle chooses ([`BundleBoot::legacy_mmio`]).
             "-global",
-            "virtio-mmio.force-legacy=false",
+            &transport,
             "-no-user-config",
             "-nographic",
             "-monitor",
@@ -1138,6 +1166,13 @@ mod tests {
         }
     }
 
+    fn boot(arch: GuestArch) -> BundleBoot {
+        BundleBoot {
+            arch,
+            legacy_mmio: false,
+        }
+    }
+
     fn arg_after<'a>(argv: &'a [String], flag: &str) -> &'a str {
         let i = argv.iter().position(|a| a == flag).expect(flag);
         &argv[i + 1]
@@ -1149,7 +1184,14 @@ mod tests {
     fn an_aarch64_guest_boots_virt_with_its_console_under_tcg() {
         let np = microvm_node(None);
         let rt = Path::new("/run/vx");
-        let argv = microvm_argv(&np, rt, "k", "i", GuestArch::Aarch64, Acceleration::Tcg);
+        let argv = microvm_argv(
+            &np,
+            rt,
+            "k",
+            "i",
+            boot(GuestArch::Aarch64),
+            Acceleration::Tcg,
+        );
         assert_eq!(argv[0], "qemu-system-aarch64");
         assert_eq!(arg_after(&argv, "-M"), "virt");
         assert_eq!(arg_after(&argv, "-cpu"), "cortex-a57");
@@ -1162,7 +1204,14 @@ mod tests {
         );
         assert!(!argv.iter().any(|a| a == "-enable-kvm"));
 
-        let x86 = microvm_argv(&np, rt, "k", "i", GuestArch::X86_64, Acceleration::Kvm);
+        let x86 = microvm_argv(
+            &np,
+            rt,
+            "k",
+            "i",
+            boot(GuestArch::X86_64),
+            Acceleration::Kvm,
+        );
         assert_eq!(x86[0], "qemu-system-x86_64");
         assert_eq!(arg_after(&x86, "-M"), "microvm,acpi=off");
         assert_eq!(arg_after(&x86, "-cpu"), "host");
@@ -1186,7 +1235,7 @@ mod tests {
             rt,
             "k",
             full.to_str().unwrap(),
-            GuestArch::Aarch64,
+            boot(GuestArch::Aarch64),
             Acceleration::Tcg,
         );
         assert_eq!(arg_after(&with, "-initrd"), full.to_str().unwrap());
@@ -1195,10 +1244,34 @@ mod tests {
             rt,
             "k",
             empty.to_str().unwrap(),
-            GuestArch::Aarch64,
+            boot(GuestArch::Aarch64),
             Acceleration::Tcg,
         );
         assert!(!without.iter().any(|a| a == "-initrd"));
+    }
+
+    /// The bundle picks the virtio-mmio transport: modern by default, legacy when it says so.
+    #[test]
+    fn a_bundle_picks_its_virtio_mmio_transport() {
+        let dir = tempfile::tempdir().unwrap();
+        let np = microvm_node(Some(dir.path().to_path_buf()));
+        let rt = Path::new("/run/vx");
+        for (meta, legacy) in [
+            (r#"{"arch":"aarch64"}"#, false),
+            (r#"{"arch":"aarch64","virtio_mmio":"modern"}"#, false),
+            (r#"{"arch":"aarch64","virtio_mmio":"legacy"}"#, true),
+        ] {
+            std::fs::write(dir.path().join("meta.json"), meta).unwrap();
+            let b = bundle_boot(&np).unwrap();
+            assert_eq!(b.legacy_mmio, legacy, "{meta}");
+            let argv = microvm_argv(&np, rt, "k", "i", b, Acceleration::Tcg);
+            assert_eq!(
+                arg_after(&argv, "-global"),
+                format!("virtio-mmio.force-legacy={legacy}")
+            );
+        }
+        std::fs::write(dir.path().join("meta.json"), r#"{"virtio_mmio":"v3"}"#).unwrap();
+        assert!(bundle_boot(&np).unwrap_err().to_string().contains("v3"));
     }
 
     /// KVM runs a guest only on a host of the same instruction set.
@@ -1241,7 +1314,11 @@ mod tests {
     fn a_bundles_arch_comes_from_its_meta_json() {
         let dir = tempfile::tempdir().unwrap();
         let np = microvm_node(Some(dir.path().to_path_buf()));
-        assert_eq!(bundle_arch(&np).unwrap(), GuestArch::X86_64, "no meta.json");
+        assert_eq!(
+            bundle_boot(&np).unwrap().arch,
+            GuestArch::X86_64,
+            "no meta.json"
+        );
         for (meta, want) in [
             (r#"{"bundle":"linux-probe"}"#, GuestArch::X86_64),
             (r#"{"arch":"x86_64"}"#, GuestArch::X86_64),
@@ -1252,10 +1329,10 @@ mod tests {
             (r#"{"org.vxedge.arch":"i386"}"#, GuestArch::X86_64),
         ] {
             std::fs::write(dir.path().join("meta.json"), meta).unwrap();
-            assert_eq!(bundle_arch(&np).unwrap(), want, "{meta}");
+            assert_eq!(bundle_boot(&np).unwrap().arch, want, "{meta}");
         }
         std::fs::write(dir.path().join("meta.json"), r#"{"arch":"riscv64"}"#).unwrap();
-        let e = bundle_arch(&np).unwrap_err().to_string();
+        let e = bundle_boot(&np).unwrap_err().to_string();
         assert!(e.contains("riscv64"), "{e}");
     }
 

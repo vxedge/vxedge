@@ -15,6 +15,9 @@ All notable changes to this repo are documented here. Format follows
   emulates the guest's CPU (TCG), so its results are functional only. `up` names the missing emulator if it is
   not installed. An empty `initrd.img`, the stub a bundle whose kernel needs no initramfs carries (a QNX image),
   is left off the command line: QEMU's arm loader refuses an empty file.
+- A `qemu-microvm` bundle chooses its virtio-mmio transport: `"virtio_mmio": "legacy"` in `meta.json` for a
+  guest whose driver speaks only the version 1 transport (QNX's `vtnet_mmio` hangs on version 2). The default
+  stays `modern`, which Zephyr's driver requires.
 - vxAPI: `NodeStatus.arch` and `NodeStatus.acceleration` (`kvm` or `tcg`) say what a running `qemu-microvm`
   guest actually runs on, read from its emulator's command line. Additive string fields: older clients ignore
   them.

@@ -54,6 +54,8 @@ must follow, not just imitate loosely:
   kernel's EFI zboot wrapper with zstd inside is refused, so the recipe unwraps it).
 - `initrd.img` is always present, and may be empty when the kernel needs no initramfs (a QNX IFS
   carries its whole system). `qemu-microvm` then leaves `-initrd` off; QEMU's arm loader refuses an empty file.
+- `meta.json` `virtio_mmio`: `modern` (default, version 2; Zephyr requires it) or `legacy` (version 1;
+  QNX's `vtnet_mmio` requires it). The bundle states what its driver speaks.
 - Document, in the recipe's own README, exactly which `backend:` values the image
   supports — QNX's recipe in particular must state the QNX-Hypervisor-inversion fidelity
   caveat (`vxparts/AGENTS.md`) inline, not leave it implicit.
