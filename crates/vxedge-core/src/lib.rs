@@ -6,6 +6,7 @@
 //! Open5GS, traffic) as they land.
 
 pub mod containers;
+pub mod distribution;
 pub mod fiveg;
 pub mod gateway;
 pub mod identity;

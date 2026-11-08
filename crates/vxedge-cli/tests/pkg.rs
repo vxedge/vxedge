@@ -339,3 +339,131 @@ fn experiment_validate_reports_typed_intent_problems() {
     );
     std::fs::remove_dir_all(&base).ok();
 }
+
+/// A stand-in `oras` that keeps pushed layers in a folder by digest and serves them back from
+/// `blob fetch`, recording each call's arguments.
+fn fake_oras(dir: &Path) {
+    std::fs::create_dir_all(dir.join("blobs")).unwrap();
+    let script = format!(
+        r#"#!/bin/sh
+echo "$@" >> "{d}/calls"
+case "$1" in
+  push)
+    layer=$(echo "$7" | sed 's/:application.*//')
+    sum=$(sha256sum "$layer" | cut -d' ' -f1)
+    cp "$layer" "{d}/blobs/$sum"
+    cp config.json "{d}/config.json"
+    ;;
+  blob)
+    out="$4"; hex=$(echo "$5" | sed 's/.*@sha256://')
+    [ -f "{d}/blobs/$hex" ] || {{ echo "not found" >&2; exit 1; }}
+    cp "{d}/blobs/$hex" "$out"
+    ;;
+esac
+"#,
+        d = dir.display()
+    );
+    let bin = dir.join("oras");
+    std::fs::write(&bin, script).unwrap();
+    std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+}
+
+fn vxedge_with(dir: &Path, fake: &Path, cache: &Path, args: &[&str]) -> (bool, String, String) {
+    let path = format!(
+        "{}:{}",
+        fake.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_vxedge"))
+        .arg("--chdir")
+        .arg(dir)
+        .args(args)
+        .env("PATH", path)
+        .env("XDG_CACHE_HOME", cache)
+        .output()
+        .expect("run vxedge");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// A package pushed and pulled back is the same bytes: the layer is the packed file, its digest
+/// is the package digest, and the pull checks both before the cache keeps anything.
+#[test]
+fn a_package_is_pushed_and_pulled_back_by_its_digest() {
+    let base = scratch("push");
+    let (fake, cache) = (base.join("fake"), base.join("cache"));
+    fake_oras(&fake);
+    let (ok, _, _) = vxedge(&base, &["pkg", "new", "demo", "--namespace", "acme"]);
+    assert!(ok);
+    let root = base.join("demo");
+    let (_, out, _) = vxedge(&root, &["pkg", "inspect"]);
+    let digest = digest_line(&out);
+
+    let (ok, out, err) = vxedge_with(&root, &fake, &cache, &["pkg", "push", "ghcr.io/acme/demo"]);
+    assert!(ok, "{out}{err}");
+    assert!(out.contains("pushed ghcr.io/acme/demo:0.1.0"), "{out}");
+    assert_eq!(
+        digest_line(&out),
+        digest,
+        "the layer digest is the package digest"
+    );
+    let calls = std::fs::read_to_string(fake.join("calls")).unwrap();
+    assert!(calls.contains("--artifact-type application/vnd.vxedge.vxp.v1 --config config.json:application/vnd.vxedge.vxp.config.v1+json demo-0.1.0.vxp:application/vnd.vxedge.vxp.v1.tar"), "{calls}");
+    let config = std::fs::read_to_string(fake.join("config.json")).unwrap();
+    assert!(
+        config.contains(r#""id":"acme/demo""#) && config.contains(r#""version":"0.1.0""#),
+        "{config}"
+    );
+
+    let reference = format!("ghcr.io/acme/demo@{digest}");
+    let into = base.join("restored");
+    let (ok, out, err) = vxedge_with(
+        &base,
+        &fake,
+        &cache,
+        &["pkg", "pull", &reference, "--into", into.to_str().unwrap()],
+    );
+    assert!(ok, "{out}{err}");
+    let cached = cache
+        .join("vxedge/parts/packages")
+        .join(format!("{}.vxp", digest.trim_start_matches("sha256:")));
+    assert_eq!(
+        vxedge_core::pkg::sha256(&std::fs::read(&cached).unwrap()),
+        digest
+    );
+    assert_eq!(
+        std::fs::read(into.join("vxp.yaml")).unwrap(),
+        std::fs::read(root.join("vxp.yaml")).unwrap()
+    );
+
+    // A tag alone is refused, and so are bytes that do not hash to the digest asked for.
+    let (ok, _, err) = vxedge_with(
+        &base,
+        &fake,
+        &cache,
+        &["pkg", "pull", "ghcr.io/acme/demo:0.1.0"],
+    );
+    assert!(
+        !ok && err.contains("does not name a package digest"),
+        "{err}"
+    );
+    let other = format!("sha256:{}", "0".repeat(64));
+    std::fs::write(fake.join("blobs").join("0".repeat(64)), b"tampered").unwrap();
+    let (ok, _, err) = vxedge_with(
+        &base,
+        &fake,
+        &cache,
+        &["pkg", "pull", &format!("ghcr.io/acme/demo@{other}")],
+    );
+    assert!(!ok && err.contains("hash to"), "{err}");
+    assert!(
+        !cache
+            .join("vxedge/parts/packages")
+            .join(format!("{}.vxp", "0".repeat(64)))
+            .exists()
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
