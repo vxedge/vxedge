@@ -529,6 +529,24 @@ fn owner_repo(url: &str) -> Option<String> {
     (!repo.is_empty() && !owner.is_empty()).then(|| format!("{owner}/{repo}"))
 }
 
+/// The files git tracks under `dir`, relative to it, or `None` outside a git checkout.
+fn tracked_files(dir: &std::path::Path) -> Option<Vec<String>> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["ls-files", "-z", "--", "."])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    Some(
+        out.stdout
+            .split(|&b| b == 0)
+            .filter(|p| !p.is_empty())
+            .map(|p| String::from_utf8_lossy(p).into_owned())
+            .collect(),
+    )
+}
+
 /// `<owner>/<repo>/<path>` for a folder in a git checkout with an `origin` remote.
 fn source_id(dir: &std::path::Path) -> Option<String> {
     let repo = owner_repo(&git(dir, &["remote", "get-url", "origin"])?)?;
@@ -871,7 +889,15 @@ fn pkg(cmd: &PkgCmd, json: bool) -> Result<(), Box<dyn std::error::Error>> {
                     )
                 })?,
             };
-            let report = pkg::vendor(&root, &source, &id, *replace, env!("CARGO_PKG_VERSION"))?;
+            let tracked = tracked_files(&source);
+            let report = pkg::vendor(
+                &root,
+                &source,
+                &id,
+                *replace,
+                env!("CARGO_PKG_VERSION"),
+                tracked.as_deref(),
+            )?;
             if json {
                 println!(
                     "{}",
