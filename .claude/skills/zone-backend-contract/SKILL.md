@@ -52,10 +52,10 @@ must follow, not just imitate loosely:
   (`x86_64`, the default, or `aarch64`); one image ID per instruction set, never one bundle for two.
 - `vmlinuz` is a kernel QEMU's `-kernel` loads directly: on aarch64 a plain `Image` (a distribution
   kernel's EFI zboot wrapper with zstd inside is refused, so the recipe unwraps it).
-- `initrd.img` is always present, and may be empty when the kernel needs no initramfs (a QNX IFS
+- `initrd.img` is always present, and may be empty when the kernel needs no initramfs (an image that
   carries its whole system). `qemu-microvm` then leaves `-initrd` off; QEMU's arm loader refuses an empty file.
-- `meta.json` `virtio_mmio`: `modern` (default, version 2; Zephyr requires it) or `legacy` (version 1;
-  QNX's `vtnet_mmio` requires it). The bundle states what its driver speaks.
+- `meta.json` `virtio_mmio`: `modern` (default, version 2; Zephyr requires it) or `legacy` (version 1, for a
+  driver that speaks only that). The bundle states what its driver speaks.
 - Document, in the recipe's own README, exactly which `backend:` values the image
   supports — QNX's recipe in particular must state the QNX-Hypervisor-inversion fidelity
   caveat (`vxparts/AGENTS.md`) inline, not leave it implicit.

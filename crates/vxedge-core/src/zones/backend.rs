@@ -122,7 +122,7 @@ struct BundleBoot {
     /// `arch`, or the `org.vxedge.arch` a published vxparts bundle carries. Default x86_64.
     arch: GuestArch,
     /// `"virtio_mmio": "legacy"`: the guest's driver speaks only the version 1 (legacy) virtio-mmio
-    /// transport, as QNX's `vtnet_mmio` does. Default `modern`, the version 2 transport, which
+    /// transport. Default `modern`, the version 2 transport, which
     /// Zephyr's driver requires.
     legacy_mmio: bool,
 }
@@ -646,8 +646,8 @@ fn microvm_argv(
             "1",
             "-nodefaults",
             // QEMU's virtio-mmio is the legacy (version 1) transport unless told otherwise.
-            // Linux speaks both; Zephyr's driver refuses version 1, and QNX's speaks only it,
-            // so the bundle chooses ([`BundleBoot::legacy_mmio`]).
+            // Linux speaks both; Zephyr's driver refuses version 1, and some drivers speak only
+            // it, so the bundle chooses ([`BundleBoot::legacy_mmio`]).
             "-global",
             &transport,
             "-no-user-config",
@@ -671,8 +671,8 @@ fn microvm_argv(
         .iter()
         .map(|s| s.to_string()),
     );
-    // An empty `initrd.img` is a bundle whose kernel needs none, as a QNX image that carries its
-    // whole system in itself. QEMU's arm loader refuses an empty file, so it is not passed at all.
+    // An empty `initrd.img` is a bundle whose kernel needs none: its image carries the whole
+    // system. QEMU's arm loader refuses an empty file, so it is not passed at all.
     if std::fs::metadata(initrd).is_ok_and(|m| m.len() > 0) {
         args.extend(["-initrd".to_string(), initrd.to_string()]);
     }
