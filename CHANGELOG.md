@@ -8,6 +8,16 @@ All notable changes to this repo are documented here. Format follows
 
 ### Added
 
+- `vxedge pkg pack --offline` also writes an OCI layout beside the packed file,
+  `<name>-<version>.parts/`, with every published part and image the lock lists, copied with
+  `oras` under the tag `sha256-<hex>` of each digest, and a `vxedge-parts.json` naming each ref,
+  digest and kind (`ARCHITECTURE.md` §6.0.8). The packed file and its digest are unchanged. A
+  reference pinned by tag only is refused before anything is written. A multi-platform image is
+  carried whole.
+- `vxedge pkg pull --layout <dir>` loads such a layout on a host with no network: parts into the
+  part cache (`--cache-dir`), images into the Podman store with `skopeo copy --preserve-digests`
+  under the ref and digest the documents use (inside `podman unshare` when rootless), so Podman
+  resolves them, multi-platform index digests included. What is already there is skipped.
 - `vxedge pkg sign <file> --key <cosign.key>` signs a packed package for an air-gapped lab: a
   key-pair signature in Sigstore bundle format, written beside it as `<file>.sigstore.json`, with
   no transparency log (`ARCHITECTURE.md` §6.0.8).

@@ -580,3 +580,142 @@ fn a_package_is_signed_verified_and_recorded_by_its_digest() {
     assert!(!ok && err.contains("packed"), "{err}");
     std::fs::remove_dir_all(&base).ok();
 }
+
+/// Stand-ins for the offline tools: `oras copy` records into a layout folder, `skopeo` records
+/// which image it stored, and `podman image exists` answers from that record.
+fn fake_offline_tools(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    let d = dir.display();
+    let scripts = [
+        (
+            "oras",
+            format!(
+                r#"#!/bin/sh
+echo "oras $@" >> "{d}/calls"
+[ "$1" = copy ] && {{ layout=$(echo "$4" | cut -d: -f1); mkdir -p "$layout"; echo "$3" >> "$layout/copied"; }}
+[ "$1" = pull ] && {{ mkdir -p "$5"; echo part > "$5/meta.json"; }}
+exit 0
+"#
+            ),
+        ),
+        (
+            "skopeo",
+            format!(
+                "#!/bin/sh\necho \"skopeo $@\" >> \"{d}/calls\"\necho \"$4\" | sed 's/^containers-storage://' >> \"{d}/images\"\n"
+            ),
+        ),
+        (
+            "podman",
+            format!(
+                r#"#!/bin/sh
+case "$1" in
+  image) grep -qx "$3" "{d}/images" 2>/dev/null;;
+  unshare) shift; exec "$@";;
+esac
+"#
+            ),
+        ),
+    ];
+    for (name, body) in scripts {
+        let bin = dir.join(name);
+        std::fs::write(&bin, body).unwrap();
+        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+    }
+}
+
+/// `pack --offline` carries what the lock pins beside the package, and refuses a tag-only ref;
+/// `pull --layout` loads parts and images, and a second load finds them already there.
+#[test]
+fn an_offline_layout_carries_the_lock_and_loads_without_a_registry() {
+    let base = scratch("offline");
+    let (fake, cache) = (base.join("fake"), base.join("cache"));
+    fake_offline_tools(&fake);
+    let (ok, _, _) = vxedge(&base, &["pkg", "new", "demo"]);
+    assert!(ok);
+    let root = base.join("demo");
+    let parts = std::fs::read_to_string(root.join("parts.yaml")).unwrap();
+    let digest = format!("sha256:{}", "1".repeat(64));
+    let pinned = parts.replace(
+        "  - ref: local/vxprobe:host-process\n",
+        &format!("  - ref: ghcr.io/vxedge/parts/vxprobe\n    digest: \"{digest}\"\n"),
+    );
+    assert_ne!(pinned, parts, "the scaffold names the local probe");
+    std::fs::write(root.join("parts.yaml"), &pinned).unwrap();
+    assert!(vxedge(&root, &["pkg", "lock"]).0);
+
+    let (ok, out, err) = vxedge_with(&root, &fake, &cache, &["pkg", "pack", "--offline"]);
+    assert!(ok, "{out}{err}");
+    let layout = base.join("demo-0.1.0.parts");
+    assert!(out.contains("(1 parts and images)"), "{out}");
+    let index = std::fs::read_to_string(layout.join("vxedge-parts.json")).unwrap();
+    assert!(
+        index.contains(r#""kind": "image""#) && index.contains(&digest),
+        "{index}"
+    );
+    let calls = std::fs::read_to_string(fake.join("calls")).unwrap();
+    assert!(
+        calls.contains(&format!(
+            "oras copy --to-oci-layout ghcr.io/vxedge/parts/vxprobe@{digest} {}:sha256-{}",
+            layout.display(),
+            "1".repeat(64)
+        )),
+        "{calls}"
+    );
+
+    let (ok, out, err) = vxedge_with(
+        &base,
+        &fake,
+        &cache,
+        &["pkg", "pull", "--layout", layout.to_str().unwrap()],
+    );
+    assert!(ok, "{out}{err}");
+    assert!(
+        out.contains(&format!(
+            "loaded: image ghcr.io/vxedge/parts/vxprobe@{digest}"
+        )),
+        "{out}"
+    );
+    let calls = std::fs::read_to_string(fake.join("calls")).unwrap();
+    assert!(
+        calls.contains("skopeo copy --preserve-digests oci:"),
+        "{calls}"
+    );
+    let (ok, out, _) = vxedge_with(
+        &base,
+        &fake,
+        &cache,
+        &["pkg", "pull", "--layout", layout.to_str().unwrap()],
+    );
+    assert!(ok && out.contains("already here: image"), "{out}");
+
+    // A reference pinned by tag only cannot travel.
+    std::fs::write(
+        root.join("parts.yaml"),
+        parts.replace(
+            "  - ref: local/vxprobe:host-process\n",
+            "  - ref: ghcr.io/vxedge/parts/vxprobe:0.1.1\n",
+        ),
+    )
+    .unwrap();
+    assert!(vxedge(&root, &["pkg", "lock"]).0);
+    std::fs::create_dir_all(base.join("again")).unwrap();
+    let (ok, _, err) = vxedge_with(
+        &root,
+        &fake,
+        &cache,
+        &[
+            "pkg",
+            "pack",
+            "--offline",
+            "--out",
+            base.join("again").to_str().unwrap(),
+        ],
+    );
+    assert!(!ok && err.contains("pinned by tag only"), "{err}");
+    assert!(
+        !base.join("again/demo-0.1.0.vxp").exists(),
+        "nothing is written when the layout cannot be made"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}

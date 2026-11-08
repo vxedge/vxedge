@@ -391,6 +391,11 @@ enum PkgCmd {
         /// the package: the file would be an input to its own next pack.
         #[arg(long, value_name = "DIR")]
         out: Option<String>,
+        /// Also copy every published part and image the lock lists into an OCI layout beside the
+        /// packed file, `<name>-<version>.parts/`, for an air-gapped host (`pkg pull --layout`).
+        /// The packed file and its digest are unchanged.
+        #[arg(long)]
+        offline: bool,
     },
     /// Restore a source folder from a packed `.vxp`.
     Unpack {
@@ -419,7 +424,12 @@ enum PkgCmd {
     /// it and are a canonical packed package.
     Pull {
         /// `<repository>@sha256:<hex>`, the digest `pkg pack` or `pkg push` printed.
-        reference: String,
+        #[arg(required_unless_present = "layout")]
+        reference: Option<String>,
+        /// Load a layout written by `pkg pack --offline`: parts into the part cache, images into
+        /// the Podman store under the refs and digests the documents use. Needs no network.
+        #[arg(long, value_name = "DIR")]
+        layout: Option<String>,
         /// Also restore a source folder here (must not exist or be empty).
         #[arg(long, value_name = "DIR")]
         into: Option<String>,
@@ -986,6 +996,7 @@ fn pkg(cmd: &PkgCmd, json: bool) -> Result<(), Box<dyn std::error::Error>> {
         }
         PkgCmd::Pull {
             reference,
+            layout,
             into,
             cache_dir,
         } => {
@@ -995,6 +1006,31 @@ fn pkg(cmd: &PkgCmd, json: bool) -> Result<(), Box<dyn std::error::Error>> {
                 .map(std::path::PathBuf::from)
                 .or_else(vxedge_core::registry::default_cache_dir)
                 .ok_or("no cache directory: pass --cache-dir, or set XDG_CACHE_HOME or HOME")?;
+            if let Some(layout) = layout {
+                let loaded = vxedge_core::offline::load(std::path::Path::new(layout), &cache)?;
+                for (e, state) in &loaded {
+                    let what = match state {
+                        vxedge_core::offline::Loaded::Loaded => "loaded",
+                        vxedge_core::offline::Loaded::AlreadyHere => "already here",
+                    };
+                    let kind = match e.kind {
+                        vxedge_core::offline::Kind::Part => "part",
+                        vxedge_core::offline::Kind::Image => "image",
+                    };
+                    if !json {
+                        println!("{what}: {kind} {}@{}", e.reference, e.digest);
+                    }
+                }
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({ "layout": layout, "entries": loaded.len() })
+                    );
+                }
+            }
+            let Some(reference) = reference else {
+                return Ok(());
+            };
             let file = distribution::pull(reference, &cache)?;
             let (_, digest) = distribution::split_pull_ref(reference)?;
             if let Some(dir) = into {
@@ -1034,7 +1070,7 @@ fn pkg(cmd: &PkgCmd, json: bool) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
-        PkgCmd::Pack { out } => {
+        PkgCmd::Pack { out, offline } => {
             let root = vxedge_core::discover(&here()?)?.root;
             let problems = pkg::lock_problems(&root)?;
             if !problems.is_empty() {
@@ -1063,17 +1099,42 @@ fn pkg(cmd: &PkgCmd, json: bool) -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .into());
             }
+            // Refuse what cannot travel before writing anything.
+            let offline_lock = if *offline {
+                let lock = pkg::read_lock(&root)?.ok_or("the package has no lock")?;
+                vxedge_core::offline::entries(&lock)?;
+                Some(lock)
+            } else {
+                None
+            };
             let bytes = pkg::pack(&root)?;
             let file = dir.join(pkg::packed_file_name(&root)?);
             std::fs::write(&file, &bytes)?;
             let digest = pkg::sha256(&bytes);
+            let carried = if let Some(lock) = offline_lock {
+                let layout = vxedge_core::offline::layout_path(&file);
+                let entries = vxedge_core::offline::pack(&lock, &layout)?;
+                Some((layout, entries))
+            } else {
+                None
+            };
             if json {
                 println!(
                     "{}",
-                    serde_json::json!({ "file": file.display().to_string(), "digest": digest })
+                    serde_json::json!({
+                        "file": file.display().to_string(), "digest": digest,
+                        "layout": carried.as_ref().map(|(l, _)| l.display().to_string()),
+                    })
                 );
             } else {
                 println!("packed {}\ndigest {digest}", file.display());
+                if let Some((layout, entries)) = &carried {
+                    println!(
+                        "offline layout {} ({} parts and images)",
+                        layout.display(),
+                        entries.len()
+                    );
+                }
             }
         }
         PkgCmd::Unpack { file, into } => {
