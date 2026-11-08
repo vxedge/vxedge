@@ -13,7 +13,8 @@ pub mod plan;
 mod wasm_capsule;
 
 pub use backend::{
-    QEMU_MICROVM_BIN, member_down, member_status, member_up, node_down, node_status, node_up,
+    Acceleration, GuestArch, GuestPlatform, QEMU_MICROVM_BIN, guest_platform, member_down,
+    member_status, member_up, node_down, node_status, node_up,
 };
 pub use cloud_hypervisor::{socket_too_long as ch_socket_too_long, vmm_available as ch_available};
 pub use foreign::foreign_objects;

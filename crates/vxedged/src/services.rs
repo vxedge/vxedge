@@ -431,7 +431,8 @@ pub(crate) async fn observed_nodes(
             let (shell, runtime_dir) = (shell.clone(), runtime_dir.clone());
             tokio::task::spawn_blocking(move || {
                 let state = zones::node_status(&shell, &np, &runtime_dir);
-                crate::status::observed_node(&np, &state)
+                let platform = zones::guest_platform(&np, &runtime_dir);
+                crate::status::observed_node(&np, &state, platform)
             })
         })
         .collect();

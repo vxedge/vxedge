@@ -562,7 +562,8 @@ parts:
         let m = model(WS);
         let (_, nodes) = plan_vehicle(&m, None).unwrap();
         let hpc = nodes.iter().find(|n| n.node_id == "hpc1").unwrap();
-        let node = crate::status::observed_node(hpc, &vxedge_core::zones::backend::NodeState::Up);
+        let node =
+            crate::status::observed_node(hpc, &vxedge_core::zones::backend::NodeState::Up, None);
         let c = node.status.unwrap();
         assert_eq!(c.kind, ResourceKind::Compute as i32);
         assert_eq!(c.state, ResourceState::Up as i32);

@@ -25,9 +25,122 @@
 
 use std::path::Path;
 
-/// The emulator a `qemu-microvm` node runs. x86_64 only today; `HostService.Capabilities` probes
-/// this same name, so it cannot report a backend the backend itself would not start.
+/// The emulator an x86_64 `qemu-microvm` node runs. `HostService.Capabilities` probes this same
+/// name, so it cannot report a backend the backend itself would not start for an x86_64 guest.
+/// An aarch64 guest runs [`GuestArch::Aarch64`]'s emulator, which `up` checks for itself.
 pub const QEMU_MICROVM_BIN: &str = "qemu-system-x86_64";
+
+/// The instruction set of a VM guest bundle, from its `meta.json`: `arch`, or the
+/// `org.vxedge.arch` a published vxparts bundle carries (ARCHITECTURE.md §9). A bundle that names
+/// none is x86_64, as every bundle was before the key existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestArch {
+    X86_64,
+    Aarch64,
+}
+
+impl GuestArch {
+    /// The name `meta.json` and `NodeSpec.arch` use.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GuestArch::X86_64 => "x86_64",
+            GuestArch::Aarch64 => "aarch64",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "x86_64" => Some(GuestArch::X86_64),
+            "aarch64" | "arm64" => Some(GuestArch::Aarch64),
+            _ => None,
+        }
+    }
+
+    /// The QEMU system emulator for this instruction set.
+    pub fn qemu_bin(self) -> &'static str {
+        match self {
+            GuestArch::X86_64 => QEMU_MICROVM_BIN,
+            GuestArch::Aarch64 => "qemu-system-aarch64",
+        }
+    }
+
+    /// The host's own instruction set, the only one KVM can run.
+    pub fn host() -> Option<Self> {
+        Self::from_name(std::env::consts::ARCH)
+    }
+}
+
+/// How a VM guest's CPU runs: KVM on a host of the same instruction set, otherwise QEMU's
+/// emulator (TCG). A `tcg` run is functional evidence only and is never timed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Acceleration {
+    Kvm,
+    Tcg,
+}
+
+impl Acceleration {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Acceleration::Kvm => "kvm",
+            Acceleration::Tcg => "tcg",
+        }
+    }
+
+    fn for_guest(arch: GuestArch, kvm_device: bool) -> Self {
+        if kvm_device && GuestArch::host() == Some(arch) {
+            Acceleration::Kvm
+        } else {
+            Acceleration::Tcg
+        }
+    }
+}
+
+/// What a running VM guest runs on, read from its own QEMU command line, so it reports what
+/// actually started and not what the bundle asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestPlatform {
+    pub arch: GuestArch,
+    pub acceleration: Acceleration,
+}
+
+/// Whether `bin` is an executable file on `PATH`.
+fn on_path(bin: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| {
+            std::fs::metadata(dir.join(bin))
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+    })
+}
+
+/// The guest bundle's instruction set. `meta.json` is optional; an `arch` it names must be one
+/// vxedge can boot.
+fn bundle_arch(np: &NodePlan) -> Result<GuestArch, ZoneBackendError> {
+    let Some(dir) = np.bundle.as_deref() else {
+        return Ok(GuestArch::X86_64);
+    };
+    let Ok(text) = std::fs::read_to_string(dir.join("meta.json")) else {
+        return Ok(GuestArch::X86_64);
+    };
+    let meta: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| ZoneBackendError::Runtime {
+            node: np.node_id.clone(),
+            detail: format!("the bundle's meta.json is not JSON: {e}"),
+        })?;
+    let named = ["arch", "org.vxedge.arch"]
+        .iter()
+        .find_map(|key| meta.get(*key).and_then(|a| a.as_str()));
+    match named {
+        None => Ok(GuestArch::X86_64),
+        Some(name) => GuestArch::from_name(name).ok_or_else(|| ZoneBackendError::Runtime {
+            node: np.node_id.clone(),
+            detail: format!(
+                "the bundle's meta.json names arch `{name}`; qemu-microvm boots x86_64 and aarch64"
+            ),
+        }),
+    }
+}
 
 use super::cloud_hypervisor;
 use super::plan::NodePlan;
@@ -99,9 +212,19 @@ impl crate::status::Observable for NodeState {
 }
 
 pub(super) fn kernel_cmdline(np: &NodePlan) -> String {
+    kernel_cmdline_for(np, GuestArch::X86_64)
+}
+
+/// The guest's console is the machine's first serial port: the 8250 `ttyS0` on x86_64, the
+/// PL011 `ttyAMA0` on an aarch64 `virt` machine.
+fn kernel_cmdline_for(np: &NodePlan, arch: GuestArch) -> String {
     let ip = np.ip_cidr.as_deref().unwrap_or("");
+    let console = match arch {
+        GuestArch::X86_64 => "ttyS0",
+        GuestArch::Aarch64 => "ttyAMA0",
+    };
     format!(
-        "console=ttyS0 reboot=t panic=-1 quiet vx.ip={ip} vx.node={}",
+        "console={console} reboot=t panic=-1 quiet vx.ip={ip} vx.node={}",
         np.node_id
     )
 }
@@ -411,72 +534,19 @@ fn microvm_up(sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneB
         return Ok(()); // idempotent
     }
     let (kernel, initrd) = bundle_paths(np)?;
-    let name = np.runtime_name();
-    let pidfile = runtime_dir.join(format!("{name}.pid"));
-    let serial = format!(
-        "file:{}",
-        runtime_dir.join(format!("{name}.serial.log")).display()
-    );
-    let netdev = format!("tap,id=n0,ifname={},script=no,downscript=no", np.endpoint);
-    let nic = format!("virtio-net-device,netdev=n0,mac={}", np.guest_mac());
-    let append = kernel_cmdline(np);
-    let kvm = Path::new("/dev/kvm").exists();
-
-    let mut args: Vec<String> = Vec::new();
-    if !np.pinned_cpus.is_empty() {
-        // taskset wrapper keeps the whole QEMU thread group on the cell CPUs.
-        args.extend([
-            "taskset".into(),
-            "-c".into(),
-            np.pinned_cpus
-                .iter()
-                .map(u32::to_string)
-                .collect::<Vec<_>>()
-                .join(","),
-        ]);
+    let arch = bundle_arch(np)?;
+    let accel = Acceleration::for_guest(arch, Path::new("/dev/kvm").exists());
+    if !on_path(arch.qemu_bin()) {
+        return Err(ZoneBackendError::Runtime {
+            node: np.node_id.clone(),
+            detail: format!(
+                "an {} guest needs `{}` on PATH",
+                arch.as_str(),
+                arch.qemu_bin()
+            ),
+        });
     }
-    args.push(QEMU_MICROVM_BIN.into());
-    args.extend(
-        [
-            "-M",
-            "microvm,acpi=off",
-            "-cpu",
-            if kvm { "host" } else { "max" },
-            "-m",
-            "128m",
-            "-smp",
-            "1",
-            "-nodefaults",
-            // QEMU's virtio-mmio is the legacy (version 1) transport unless told otherwise.
-            // Linux speaks both; Zephyr's driver refuses version 1.
-            "-global",
-            "virtio-mmio.force-legacy=false",
-            "-no-user-config",
-            "-nographic",
-            "-monitor",
-            "none",
-            "-serial",
-            &serial,
-            "-kernel",
-            &kernel,
-            "-initrd",
-            &initrd,
-            "-append",
-            &append,
-            "-netdev",
-            &netdev,
-            "-device",
-            &nic,
-            "-pidfile",
-            &pidfile.display().to_string(),
-            "-daemonize",
-        ]
-        .iter()
-        .map(|s| s.to_string()),
-    );
-    if kvm {
-        args.push("-enable-kvm".into());
-    }
+    let args = microvm_argv(np, runtime_dir, &kernel, &initrd, arch, accel);
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     // Deliberately not `sh.run()` unchanged: qemu itself needs no privilege beyond `/dev/kvm`
     // (granted via the `kvm` group, not root) and an already-owned tap
@@ -494,6 +564,120 @@ fn microvm_up(sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneB
     };
     qemu_sh.run(argv[0], &argv[1..])?;
     Ok(())
+}
+
+/// The QEMU command line of a `qemu-microvm` node: a minimal virtio-mmio machine with direct
+/// kernel boot, `microvm` on x86_64 and `virt` on aarch64. Pure, so both are tested.
+fn microvm_argv(
+    np: &NodePlan,
+    runtime_dir: &Path,
+    kernel: &str,
+    initrd: &str,
+    arch: GuestArch,
+    accel: Acceleration,
+) -> Vec<String> {
+    let name = np.runtime_name();
+    let pidfile = runtime_dir.join(format!("{name}.pid"));
+    let serial = format!(
+        "file:{}",
+        runtime_dir.join(format!("{name}.serial.log")).display()
+    );
+    let netdev = format!("tap,id=n0,ifname={},script=no,downscript=no", np.endpoint);
+    let nic = format!("virtio-net-device,netdev=n0,mac={}", np.guest_mac());
+    let append = kernel_cmdline_for(np, arch);
+    let kvm = accel == Acceleration::Kvm;
+    let (machine, cpu, memory) = match arch {
+        GuestArch::X86_64 => ("microvm,acpi=off", if kvm { "host" } else { "max" }, "128m"),
+        // A distribution arm64 kernel unpacks to about 70 MB, so the guest gets more room.
+        GuestArch::Aarch64 => ("virt", if kvm { "host" } else { "cortex-a57" }, "256m"),
+    };
+
+    let mut args: Vec<String> = Vec::new();
+    if !np.pinned_cpus.is_empty() {
+        // taskset wrapper keeps the whole QEMU thread group on the cell CPUs.
+        args.extend([
+            "taskset".into(),
+            "-c".into(),
+            np.pinned_cpus
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        ]);
+    }
+    args.push(arch.qemu_bin().into());
+    args.extend(
+        [
+            "-M",
+            machine,
+            "-cpu",
+            cpu,
+            "-m",
+            memory,
+            "-smp",
+            "1",
+            "-nodefaults",
+            // QEMU's virtio-mmio is the legacy (version 1) transport unless told otherwise.
+            // Linux speaks both; Zephyr's driver refuses version 1.
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-no-user-config",
+            "-nographic",
+            "-monitor",
+            "none",
+            "-serial",
+            &serial,
+            "-kernel",
+            kernel,
+            "-initrd",
+            initrd,
+            "-append",
+            &append,
+            "-netdev",
+            &netdev,
+            "-device",
+            &nic,
+            "-pidfile",
+            &pidfile.display().to_string(),
+            "-daemonize",
+        ]
+        .iter()
+        .map(|s| s.to_string()),
+    );
+    if kvm {
+        args.push("-enable-kvm".into());
+    }
+    args
+}
+
+/// What this node's running QEMU runs on: the emulator names the instruction set, and
+/// `-enable-kvm` the acceleration. `None` when the node has no running guest.
+pub fn guest_platform(np: &NodePlan, runtime_dir: &Path) -> Option<GuestPlatform> {
+    if np.backend != Backend::QemuMicrovm {
+        return None;
+    }
+    let pid = guest_pid(np, runtime_dir)?;
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    platform_of(&cmdline)
+}
+
+fn platform_of(cmdline: &[u8]) -> Option<GuestPlatform> {
+    let cmdline = String::from_utf8_lossy(cmdline);
+    let mut args = cmdline.split('\0');
+    let bin = args.next()?;
+    let arch = if bin.ends_with("qemu-system-aarch64") {
+        GuestArch::Aarch64
+    } else if bin.ends_with("qemu-system-x86_64") {
+        GuestArch::X86_64
+    } else {
+        return None;
+    };
+    let acceleration = if args.any(|a| a == "-enable-kvm") {
+        Acceleration::Kvm
+    } else {
+        Acceleration::Tcg
+    };
+    Some(GuestPlatform { arch, acceleration })
 }
 
 fn read_pid(np: &NodePlan, runtime_dir: &Path) -> Option<i32> {
@@ -936,6 +1120,107 @@ mod tests {
             module: None,
             pinned_cpus: Vec::new(),
         }
+    }
+
+    fn microvm_node(bundle: Option<std::path::PathBuf>) -> NodePlan {
+        NodePlan {
+            backend: Backend::QemuMicrovm,
+            endpoint: "vz-arm".into(),
+            peer: "vz-arm".into(),
+            kind: crate::gateway::plan::EndpointKind::Tap,
+            bundle,
+            image: None,
+            ..image_node()
+        }
+    }
+
+    fn arg_after<'a>(argv: &'a [String], flag: &str) -> &'a str {
+        let i = argv.iter().position(|a| a == flag).expect(flag);
+        &argv[i + 1]
+    }
+
+    /// An aarch64 bundle boots QEMU's `virt` machine with the PL011 console. Without KVM for its
+    /// instruction set it runs under the emulator, so `-enable-kvm` is absent.
+    #[test]
+    fn an_aarch64_guest_boots_virt_with_its_console_under_tcg() {
+        let np = microvm_node(None);
+        let rt = Path::new("/run/vx");
+        let argv = microvm_argv(&np, rt, "k", "i", GuestArch::Aarch64, Acceleration::Tcg);
+        assert_eq!(argv[0], "qemu-system-aarch64");
+        assert_eq!(arg_after(&argv, "-M"), "virt");
+        assert_eq!(arg_after(&argv, "-cpu"), "cortex-a57");
+        assert_eq!(arg_after(&argv, "-m"), "256m");
+        assert!(arg_after(&argv, "-append").starts_with("console=ttyAMA0 "));
+        assert!(arg_after(&argv, "-append").contains(&format!("vx.node={}", np.node_id)));
+        assert_eq!(
+            arg_after(&argv, "-device"),
+            format!("virtio-net-device,netdev=n0,mac={}", np.guest_mac())
+        );
+        assert!(!argv.iter().any(|a| a == "-enable-kvm"));
+
+        let x86 = microvm_argv(&np, rt, "k", "i", GuestArch::X86_64, Acceleration::Kvm);
+        assert_eq!(x86[0], "qemu-system-x86_64");
+        assert_eq!(arg_after(&x86, "-M"), "microvm,acpi=off");
+        assert_eq!(arg_after(&x86, "-cpu"), "host");
+        assert!(arg_after(&x86, "-append").starts_with("console=ttyS0 "));
+        assert_eq!(x86.last().map(String::as_str), Some("-enable-kvm"));
+    }
+
+    /// KVM runs a guest only on a host of the same instruction set.
+    #[test]
+    fn kvm_only_for_the_hosts_own_instruction_set() {
+        let host = GuestArch::host().expect("a supported test host");
+        let other = match host {
+            GuestArch::X86_64 => GuestArch::Aarch64,
+            GuestArch::Aarch64 => GuestArch::X86_64,
+        };
+        assert_eq!(Acceleration::for_guest(host, true), Acceleration::Kvm);
+        assert_eq!(Acceleration::for_guest(host, false), Acceleration::Tcg);
+        assert_eq!(Acceleration::for_guest(other, true), Acceleration::Tcg);
+    }
+
+    /// Status reads the running emulator, not the bundle: what started is what is reported.
+    #[test]
+    fn a_running_guests_platform_comes_from_its_command_line() {
+        let tcg = b"/usr/bin/qemu-system-aarch64\0-M\0virt\0-append\0console=ttyAMA0 vx.node=a\0";
+        assert_eq!(
+            platform_of(tcg),
+            Some(GuestPlatform {
+                arch: GuestArch::Aarch64,
+                acceleration: Acceleration::Tcg
+            })
+        );
+        let kvm = b"qemu-system-x86_64\0-M\0microvm,acpi=off\0-daemonize\0-enable-kvm\0";
+        assert_eq!(
+            platform_of(kvm),
+            Some(GuestPlatform {
+                arch: GuestArch::X86_64,
+                acceleration: Acceleration::Kvm
+            })
+        );
+        assert_eq!(platform_of(b"taskset\0-c\0"), None);
+    }
+
+    /// A bundle names its instruction set in `meta.json`; one that names none is x86_64.
+    #[test]
+    fn a_bundles_arch_comes_from_its_meta_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let np = microvm_node(Some(dir.path().to_path_buf()));
+        assert_eq!(bundle_arch(&np).unwrap(), GuestArch::X86_64, "no meta.json");
+        for (meta, want) in [
+            (r#"{"bundle":"linux-probe"}"#, GuestArch::X86_64),
+            (r#"{"arch":"x86_64"}"#, GuestArch::X86_64),
+            (r#"{"arch":"aarch64"}"#, GuestArch::Aarch64),
+            (r#"{"arch":"arm64"}"#, GuestArch::Aarch64),
+            (r#"{"org.vxedge.arch":"aarch64"}"#, GuestArch::Aarch64),
+            (r#"{"org.vxedge.arch":"x86_64"}"#, GuestArch::X86_64),
+        ] {
+            std::fs::write(dir.path().join("meta.json"), meta).unwrap();
+            assert_eq!(bundle_arch(&np).unwrap(), want, "{meta}");
+        }
+        std::fs::write(dir.path().join("meta.json"), r#"{"arch":"riscv64"}"#).unwrap();
+        let e = bundle_arch(&np).unwrap_err().to_string();
+        assert!(e.contains("riscv64"), "{e}");
     }
 
     /// The guest sees the host CPU, as on qemu-microvm (`-cpu host` under KVM). Without a `<cpu>`
