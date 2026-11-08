@@ -188,10 +188,13 @@ pub(crate) async fn preflight(
     // A run whose gateway is still being built is not on the host yet, but it already holds the
     // host: refused by what is recorded, another workspace's `up` would be told it differently
     // depending on how far that gateway had got.
+    // `vehicle` verbs name a run by its vehicle's id, `experiment` verbs by the model's: either is
+    // this workspace, and its own duplicate is the job engine's to answer.
+    let vehicle = model.entities.first().map(|e| e.id.as_str());
     let starting = running
         .as_deref()
         .and_then(workspace_of_lifecycle)
-        .filter(|id| *id != model.id)
+        .filter(|id| *id != model.id && Some(*id) != vehicle)
         .map(str::to_string);
     let target = match (&active, starting) {
         (None, Some(other)) => Some(crate::errors::precondition(
