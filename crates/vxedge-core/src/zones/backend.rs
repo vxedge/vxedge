@@ -562,7 +562,7 @@ fn microvm_status(np: &NodePlan, runtime_dir: &Path) -> NodeState {
 const VIRSH: [&str; 2] = ["-c", "qemu:///system"];
 
 /// `virsh` as vxedged's own user, never through `sudo` and never inside the gateway's netns
-/// (Track V0, `docs-internal/PROVISIONING.md` §10). `virsh` is only a client: `libvirtd` does
+/// (docs repo `ARCHITECTURE.md` §9). `virsh` is only a client: `libvirtd` does
 /// the work, in the host namespace, and authorizes the caller by access to its socket, which
 /// membership in the `libvirt` group grants. So escalating it changed nothing it could create
 /// and only widened what vxedged runs as root; entering a netns changed nothing either. This is

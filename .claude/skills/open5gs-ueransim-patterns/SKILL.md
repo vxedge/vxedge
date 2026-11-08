@@ -79,7 +79,7 @@ UE's pod/netns. Full write-up with the diagnosis trail: ask for
   enough." UE registration + PDU Session Establishment is an asynchronous live handshake
   with no fixed cost; poll `uesimtun0` up to a bounded timeout (~15s) instead of sleeping
   a guessed duration.
-- **Generalizes beyond vxprobe:** any future process deployed inside a UE pod — a
+- **Generalizes beyond vxprobe:** any other process deployed inside a UE pod — a
   different probe, an agent, a service — hits this identically if it binds `0.0.0.0` for
   "convenience." Bind to the discovered tunnel address, always.
 

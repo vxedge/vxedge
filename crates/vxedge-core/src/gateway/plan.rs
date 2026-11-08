@@ -169,7 +169,7 @@ pub struct GatewayPlan {
     /// teardown/observe below are still vlan-slice-only and untouched, so
     /// this is additive: existing vlan-only plans are unaffected byte for
     /// byte. Bridging an s-nssai slice's fiveg pod into `bridge` as an
-    /// access port is `fiveg`'s job, tracked in `vxedge/TASKS.md` §4.
+    /// access port is `fiveg`'s job, not this plan's.
     pub snssai_slice_ids: Vec<String>,
     /// Which mechanism renders this plan (`gateway::provision::data_plane`'s selector). Carried
     /// on the plan, not passed alongside it, because the choice is part of the provisioning

@@ -650,7 +650,7 @@ impl GatewaySvc {
                         plan.summary()
                     )),
                     Verb::Up { .. } => {
-                        // Converging reconciler (`docs/ROADMAP.md` #16 / vxedge/TASKS.md §2):
+                        // Converging reconciler (`docs/ROADMAP.md` #16):
                         // `apply_links`/`apply_slices`/`apply_endpoints` are each individually
                         // idempotent (the netns integration test proves double-apply is a
                         // no-op), but until now a single observed gap after one pass — a

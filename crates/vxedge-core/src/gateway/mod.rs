@@ -2,8 +2,8 @@
 //! provisioning plan (pure data), then renders it onto the Linux networking
 //! stack — bridge + VLAN filtering, veth endpoints, tc HTB queue tree.
 //!
-//! H1 minimum (TASKS §2): bridge/VLAN/HTB. WireGuard/VXLAN/FRR/nftables trail
-//! within phase 1. Default backend is the kernel bridge — every frozen H1/H3/H4 number was
+//! H1 minimum: bridge/VLAN/HTB. WireGuard and VXLAN tunnels and nftables
+//! ingress filters sit on top of it. Default backend is the kernel bridge — every frozen H1/H3/H4 number was
 //! measured on it; the OVS variant (`network.data_plane: ovs`) is a second implementation
 //! behind the same [`plan::GatewayPlan`], not a replacement — see AGENTS.md.
 

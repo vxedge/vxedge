@@ -1,8 +1,8 @@
 //! vxedged — the vxedge control-plane daemon.
 //!
 //! Serves vxAPI (gRPC) on a Unix domain socket. Live: job engine, event bus,
-//! audit log, Gateway/Job/Event services (gateway Up/Down validate manifests
-//! and fail honestly at provisioning until the backend lands — TASKS.md §2).
+//! audit log, Gateway/Job/Event services (gateway Up/Down validate manifests,
+//! then provision through `vxedge-core`'s gateway backend).
 
 mod audit;
 mod errors;

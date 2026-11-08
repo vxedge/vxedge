@@ -1,5 +1,5 @@
 //! Proves `zones::node_up`'s new registry-fetch wiring against a real, published, digest-pinned
-//! part — `ghcr.io/vxedge/parts/zone/linux/stack/probe-bundle:0.1.0` (`vxparts/TASKS.md`'s own
+//! part — `ghcr.io/vxedge/parts/zone/linux/stack/probe-bundle:0.1.0` (vxparts' own
 //! first end-to-end proof-of-concept: "built → pushed → pulled fresh from the registry →
 //! booted the pulled artifact under `qemu-microvm`", 2026-07-26). This is that proof driven
 //! through `vxedge-core`'s real `node_up` code path instead of a manual `oras pull` + manual

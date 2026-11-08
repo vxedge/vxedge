@@ -41,8 +41,7 @@ comments before "fixing" a lint warning it silences:
 
 - vxAPI stays in `vxedge.v1`. Wire changes are additive: new RPCs, fields and values, with old
   ones kept and marked deprecated, which is what makes buf's `FILE`-level check meaningful.
-  Don't introduce a new package. A version roadmap is defined once vxedge can simulate real
-  software use cases for SDV OEM engineers (`ARCHITECTURE.md` §5.2).
+  Don't introduce a new package (`ARCHITECTURE.md` §5.2).
 - Behaviour may change between releases when the changelog says so. buf can't see that kind of
   change, so review it by hand.
 

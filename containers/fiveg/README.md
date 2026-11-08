@@ -14,8 +14,7 @@ networking. All containers of the stack share one pod's network namespace, so
 | `vx5g-core` | Open5GS 2.8.x (PPA — the version the renderer is validated against), every NF | `podman build -t vx5g-core -f Containerfile.open5gs .` |
 | `vx5g-ran` | UERANSIM (pinned tag, source build): `nr-gnb`, `nr-ue`, `nr-cli`, plus `vxprobe` (staged from the sibling `vxagents` repo — an H2 campaign's reflector runs *inside* a UE's own pod) | `./build-vx5g-ran.sh` (stages the `vxprobe` binary into this build context first — `vxagents` is a separate repo podman can't reach directly; do not `podman build` this Containerfile on its own) |
 
-Reproducibility: image digests are the version pin (§13). When the lifecycle
-stage lands, the digests used by a run get recorded into results metadata.
+Reproducibility: image digests are the version pin (§13).
 
 ## Host prerequisites (the honest, minimal list)
 
@@ -37,6 +36,5 @@ podman ps --pod --filter pod=vx5g
 ```
 
 `pod-up.sh` is the reference for the `vxedged` fiveg lifecycle stage, not the
-product path. Known gaps (TASKS.md §4): AUSF/UDM/UDR + subscriber insertion
-(`open5gs-dbctl`, keys matching the rendered `ue-*.yaml`) are lifecycle-stage
-work — until then UE registration cannot complete end to end.
+product path. Known gap: `open5gs-dbctl`'s slice helpers require an SD, so a
+slice declared without one gets the default subscribed slice in this script.
