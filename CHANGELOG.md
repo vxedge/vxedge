@@ -6,6 +6,23 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-08
+
+A zone can now be a guest that brings its own host stack. `backend: attach` runs the platform through a
+small adapter (`attach.yaml`: the interface it creates, and its start, status and stop commands), and the
+gateway adopts that interface as the slice port instead of creating one, so the guest's traffic is slice
+traffic like any other zone's. This is how an Android Automotive guest joins a vehicle on the platform it
+ships on, Cuttlefish today and a vendor hypervisor later (`ARCHITECTURE.md` §9, the AAOS image ladder):
+`vx-reference-sedan-03` boots AAOS 26Q2 as its cockpit zone and serves its Vehicle HAL from the vehicle's
+signals. A link endpoint can also carry several addresses. vxAPI stays `vxedge.v1`, additive only.
+
+**Upgrading from 0.8.x.** No manifest change is required. vxAPI clients that match `NodeBackend` or
+`PayloadKind` exhaustively handle `NODE_BACKEND_ATTACH` and `PAYLOAD_KIND_ATTACH_ADAPTER`. A package locked
+by 0.8.0 with a published `ota` artifact store is re-locked with `vxedge pkg lock`. Rust callers of
+`vxedge-core`: `EndpointDoc::ip()` returns `Option<String>` (`ips()` gives every address), and struct
+literals of `model::Endpoint`, `gateway::plan::EndpointPlan` and `zones::plan::NodePlan` add the new
+fields (`extra_cidrs`, `host_interface`, `extra_sources`); a `match` on `gateway::plan::EndpointKind` handles `Adopted`.
+
 ### Added
 
 - `backend: attach`, for a guest that brings its own host stack, as a production AAOS guest needs its
