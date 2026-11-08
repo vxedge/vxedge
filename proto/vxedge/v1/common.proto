@@ -140,6 +140,8 @@ enum NodeBackend {
   NODE_BACKEND_LIBVIRT = 3;
   NODE_BACKEND_CLOUD_HYPERVISOR = 4;
   NODE_BACKEND_WASM_CAPSULE = 5;
+  // A guest that brings its own host stack: the node's part is an adapter (ARCHITECTURE.md §9).
+  NODE_BACKEND_ATTACH = 6;
 }
 
 // What a node runs.
@@ -150,6 +152,8 @@ enum PayloadKind {
   PAYLOAD_KIND_CONTAINER = 2;
   PAYLOAD_KIND_GUEST_BUNDLE = 3;
   PAYLOAD_KIND_WASM = 4;
+  // An attach node's adapter directory: the platform's start, status and stop.
+  PAYLOAD_KIND_ATTACH_ADAPTER = 5;
 }
 
 message NodePayload {

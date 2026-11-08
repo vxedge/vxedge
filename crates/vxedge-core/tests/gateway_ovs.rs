@@ -51,6 +51,7 @@ fn test_plan() -> GatewayPlan {
                 },
             }),
             expected_source: None,
+            extra_sources: Vec::new(),
         }],
         tunnels: vec![],
         snssai_slice_ids: vec![],

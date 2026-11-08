@@ -456,6 +456,12 @@ fn probe_backends(podman: Result<(), String>) -> Vec<BackendProbe> {
             vxedge_core::zones::capsule_runner_available(),
             "no `vxcapsule` runner beside vxedged, on PATH or in VXEDGE_CAPSULE_BIN".to_string(),
         ),
+        // An adapter's commands run through `sh`; what they need is the platform's business.
+        entry(
+            Backend::Attach,
+            on_path("sh"),
+            "`sh` is not on PATH".to_string(),
+        ),
     ]
 }
 
@@ -564,7 +570,12 @@ impl HostService for PlanSvc {
         let (backends, gpu) = backends().await;
         Ok(Response::new(HostCapabilities {
             backends,
-            part_kinds: vec!["container".into(), "bundle".into(), "wasm".into()],
+            part_kinds: vec![
+                "container".into(),
+                "bundle".into(),
+                "wasm".into(),
+                "attach".into(),
+            ],
             max_runs: 1,
             gpu,
             package_schemas: vxedge_core::package::KNOWN_SCHEMAS

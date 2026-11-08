@@ -83,6 +83,8 @@ pub struct NodePlan {
     pub slice: Option<String>,
     /// Node address (CIDR) from the manifest, if declared.
     pub ip_cidr: Option<String>,
+    /// Further addresses on the same port, after `ip_cidr` (a container node carries them all).
+    pub extra_cidrs: Vec<String>,
     /// For vm/rtimage kinds: guest bundle dir (vmlinuz + initrd.img),
     /// resolved against the manifest's directory when relative.
     ///
@@ -192,6 +194,7 @@ pub fn plan_nodes_from_model(
                     Some(crate::model::Backend::QemuMicrovm) => Backend::QemuMicrovm,
                     Some(crate::model::Backend::CloudHypervisor) => Backend::CloudHypervisor,
                     Some(crate::model::Backend::WasmCapsule) => Backend::WasmCapsule,
+                    Some(crate::model::Backend::Attach) => Backend::Attach,
                     // GatewayPlan::from_model refuses this too, so reaching it means the two
                     // plans came from different models. Reported as what it is: an
                     // "endpoint mismatch" here would point at plan joining and send someone
@@ -247,6 +250,18 @@ pub fn plan_nodes_from_model(
                             None => (None, None),
                         }
                     }
+                    // An attach node's part is its adapter directory, local only: it carries the
+                    // platform's start, status and stop, not a payload to fetch.
+                    Backend::Attach => {
+                        let adapter = entity
+                            .functions_on(&device.id)
+                            .filter_map(|f| f.part.as_ref())
+                            .find(|part| part.kind == crate::model::PartKind::Attach && part.local);
+                        (
+                            adapter.map(|part| local_path(&part.reference, workspace_dir)),
+                            None,
+                        )
+                    }
                     Backend::Container | Backend::WasmCapsule => (None, None),
                 };
                 // A container node runs an OCI payload only when a published or `localhost/`
@@ -271,7 +286,8 @@ pub fn plan_nodes_from_model(
                     Backend::Libvirt
                     | Backend::QemuMicrovm
                     | Backend::CloudHypervisor
-                    | Backend::WasmCapsule => None,
+                    | Backend::WasmCapsule
+                    | Backend::Attach => None,
                 };
                 // A capsule's module is a local file, or a published part `zones::node_up`
                 // fetches, the same split a VM bundle has.
@@ -294,7 +310,10 @@ pub fn plan_nodes_from_model(
                     && remote_bundle.is_none()
                     && matches!(
                         backend,
-                        Backend::Libvirt | Backend::QemuMicrovm | Backend::CloudHypervisor
+                        Backend::Libvirt
+                            | Backend::QemuMicrovm
+                            | Backend::CloudHypervisor
+                            | Backend::Attach
                     )
                 {
                     return Err(ZonePlanError::MissingBundle(device.id.clone(), backend));
@@ -321,6 +340,7 @@ pub fn plan_nodes_from_model(
                     vlan: ep.vlan,
                     slice: ep.slice.clone(),
                     ip_cidr: endpoint.ip_cidr.clone(),
+                    extra_cidrs: endpoint.extra_cidrs.clone(),
                     bundle,
                     remote_bundle,
                     module,
@@ -403,7 +423,12 @@ pub fn missing_local_bundles(exp: &crate::model::Experiment, workspace_dir: &Pat
             for part in entity
                 .functions_on(&device.id)
                 .filter_map(|f| f.part.as_ref())
-                .filter(|p| p.kind == crate::model::PartKind::Bundle && p.local)
+                .filter(|p| {
+                    matches!(
+                        p.kind,
+                        crate::model::PartKind::Bundle | crate::model::PartKind::Attach
+                    ) && p.local
+                })
             {
                 let p = Path::new(&part.reference);
                 let dir = if p.is_absolute() {

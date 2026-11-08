@@ -528,7 +528,7 @@ pub fn lock(root: &Path, locked_with: &str) -> Result<Lock, PkgError> {
         };
         match p.kind {
             PartKind::Container => images.insert(r),
-            PartKind::Bundle | PartKind::Wasm => parts.insert(r),
+            PartKind::Bundle | PartKind::Wasm | PartKind::Attach => parts.insert(r),
         };
     }
     // A published artifact store is fetched into the part cache like a guest bundle, so it is a

@@ -325,6 +325,7 @@ fn part_kind(
         Some("container") => Some(PartKind::Container),
         Some("bundle") => Some(PartKind::Bundle),
         Some("wasm") => Some(PartKind::Wasm),
+        Some("attach") => Some(PartKind::Attach),
         Some(other) => {
             return Err(ModelError::UnknownPartKind {
                 component: component.to_string(),
@@ -340,6 +341,7 @@ fn part_kind(
         return Ok(match backend {
             Some(Backend::Container) | None => PartKind::Container,
             Some(Backend::WasmCapsule) => PartKind::Wasm,
+            Some(Backend::Attach) => PartKind::Attach,
             Some(_) => PartKind::Bundle,
         });
     };
@@ -348,6 +350,7 @@ fn part_kind(
         (_, None)
             | (PartKind::Container, Some(Backend::Container))
             | (PartKind::Wasm, Some(Backend::WasmCapsule))
+            | (PartKind::Attach, Some(Backend::Attach))
             | (
                 PartKind::Bundle,
                 Some(Backend::Libvirt | Backend::QemuMicrovm | Backend::CloudHypervisor)
@@ -361,6 +364,7 @@ fn part_kind(
                 PartKind::Container => "container",
                 PartKind::Bundle => "bundle",
                 PartKind::Wasm => "wasm",
+                PartKind::Attach => "attach",
             },
             backend: backend.map_or("none", Backend::as_str),
         });
@@ -389,7 +393,9 @@ fn link_endpoint(doc: &crate::workspace::EndpointDoc) -> Endpoint {
     Endpoint {
         node: doc.node().to_string(),
         port: doc.port().map(str::to_owned),
-        ip_cidr: doc.ip().map(str::to_owned),
+        ip_cidr: doc.ips().first().cloned(),
+        extra_cidrs: doc.ips().iter().skip(1).cloned().collect(),
+        host_interface: doc.host_interface().map(str::to_owned),
     }
 }
 
@@ -399,12 +405,12 @@ fn channel_endpoint(raw: &str) -> Endpoint {
         Some((n, p)) => Endpoint {
             node: n.to_string(),
             port: Some(p.to_string()),
-            ip_cidr: None,
+            ..Default::default()
         },
         None => Endpoint {
             node: raw.to_string(),
             port: None,
-            ip_cidr: None,
+            ..Default::default()
         },
     }
 }

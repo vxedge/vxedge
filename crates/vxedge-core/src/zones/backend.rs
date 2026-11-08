@@ -184,7 +184,7 @@ fn attach_port(sh: &Shell, np: &NodePlan, ns: &str) -> Result<(), ZoneBackendErr
         });
     }
     netlink::link_up(Some(ns), "lo").map_err(|e| nl(np, e))?;
-    if let Some(cidr) = &np.ip_cidr {
+    for cidr in np.ip_cidr.iter().chain(&np.extra_cidrs) {
         netlink::add_address(Some(ns), "eth0", cidr).map_err(|e| nl(np, e))?;
     }
     netlink::link_up(Some(ns), "eth0").map_err(|e| nl(np, e))?;
@@ -825,6 +825,7 @@ pub fn backend_for(kind: Backend) -> &'static dyn ZoneBackend {
         Backend::Libvirt => &LibvirtBackend,
         Backend::CloudHypervisor => &CloudHypervisorBackend,
         Backend::WasmCapsule => &WasmCapsuleBackend,
+        Backend::Attach => &super::attach::AttachBackend,
     }
 }
 
@@ -928,6 +929,7 @@ mod tests {
             vlan: 101,
             slice: Some("adas".into()),
             ip_cidr: Some("10.101.0.9/24".into()),
+            extra_cidrs: Vec::new(),
             bundle: None,
             remote_bundle: None,
             image: Some(PAUSE_IMAGE.into()),

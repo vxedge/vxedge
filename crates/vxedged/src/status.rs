@@ -91,6 +91,7 @@ fn node_payload(np: &NodePlan) -> NodePayload {
         Backend::QemuMicrovm | Backend::Libvirt | Backend::CloudHypervisor => {
             part(PayloadKind::GuestBundle, np.bundle.as_deref())
         }
+        Backend::Attach => part(PayloadKind::AttachAdapter, np.bundle.as_deref()),
     }
 }
 
@@ -102,6 +103,7 @@ pub fn node_backend(backend: Backend) -> NodeBackend {
         Backend::Libvirt => NodeBackend::Libvirt,
         Backend::CloudHypervisor => NodeBackend::CloudHypervisor,
         Backend::WasmCapsule => NodeBackend::WasmCapsule,
+        Backend::Attach => NodeBackend::Attach,
     }
 }
 

@@ -56,6 +56,7 @@ fn remote_plan() -> NodePlan {
         vlan: 101,
         slice: Some("adas".into()),
         ip_cidr: None,
+        extra_cidrs: Vec::new(),
         bundle: None,
         remote_bundle: Some((REFERENCE.to_string(), DIGEST.to_string())),
         image: None,

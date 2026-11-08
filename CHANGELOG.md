@@ -6,6 +6,19 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- `backend: attach`, for a guest that brings its own host stack, as a production AAOS guest needs its
+  hypervisor vendor's board support (`ARCHITECTURE.md` §9). The device's part is a local adapter directory
+  (`kind: attach`) whose `attach.yaml` declares the interface the platform creates and its `start`, `status`
+  and `stop` commands. The link endpoint names that interface as `host_interface`, and the gateway adopts it as
+  the slice port instead of creating one, recording its previous master in the interface's alias and giving it
+  back at `down`. Attach zones start after every other zone node and stop before them. vxAPI adds
+  `NODE_BACKEND_ATTACH` and `PAYLOAD_KIND_ATTACH_ADAPTER`, and host capabilities list the backend and the
+  `attach` part kind.
+- A link endpoint's `ip` may be a list. A container node carries every address on its port, and the gateway's
+  source filter accepts each; a VM guest is given the first.
+
 ### Changed
 
 - `pkg lock` lists a published `ota` artifact store (`config.artifacts: <ref>@sha256:<hex>`, vxedge

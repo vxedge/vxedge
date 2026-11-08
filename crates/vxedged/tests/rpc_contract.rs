@@ -1485,13 +1485,13 @@ async fn host_capabilities_cover_every_backend() {
         .into_inner();
     let mut backends: Vec<i32> = caps.backends.iter().map(|b| b.backend).collect();
     backends.sort();
-    assert_eq!(backends, [1, 2, 3, 4, 5]);
+    assert_eq!(backends, [1, 2, 3, 4, 5, 6]);
     assert!(
         caps.backends
             .iter()
             .all(|b| b.available || !b.detail.is_empty())
     );
-    assert_eq!(caps.part_kinds, ["container", "bundle", "wasm"]);
+    assert_eq!(caps.part_kinds, ["container", "bundle", "wasm", "attach"]);
     assert_eq!(caps.max_runs, 1);
     assert_eq!(caps.package_schemas, ["vxp/1"]);
     // The container backend is available only where `up`'s own Podman check would pass.
