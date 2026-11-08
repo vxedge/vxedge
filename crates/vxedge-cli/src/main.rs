@@ -406,6 +406,24 @@ enum PkgCmd {
         /// A packed `.vxp`. Without it, the package in the current directory.
         file: Option<String>,
     },
+    /// Push a packed package to an OCI registry, tagged with its version, through `oras`. The
+    /// layer is the packed file unchanged, so its digest is the package digest `pull` takes.
+    Push {
+        /// The repository, without a tag or digest, such as `ghcr.io/acme/experiments/demo`.
+        repository: String,
+        /// The packed file to push (default: pack the package here, which needs a matching lock).
+        #[arg(long, value_name = "FILE")]
+        file: Option<String>,
+    },
+    /// Pull a package by its package digest into the part cache, checking that the bytes hash to
+    /// it and are a canonical packed package.
+    Pull {
+        /// `<repository>@sha256:<hex>`, the digest `pkg pack` or `pkg push` printed.
+        reference: String,
+        /// Also restore a source folder here (must not exist or be empty).
+        #[arg(long, value_name = "DIR")]
+        into: Option<String>,
+    },
     /// Copy another folder's vxedge documents into the package here, such as a reference vehicle,
     /// and record where they came from in `vxp.lock`. Documents only: scripts and build outputs
     /// stay behind and are listed.
@@ -425,6 +443,15 @@ enum PkgCmd {
         #[arg(long)]
         check: bool,
     },
+}
+
+/// A staging folder removed when it goes out of scope.
+struct TempDir(std::path::PathBuf);
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// `git -C dir args`, trimmed, when it succeeds.
@@ -831,6 +858,67 @@ fn pkg(cmd: &PkgCmd, json: bool) -> Result<(), Box<dyn std::error::Error>> {
                     for r in &report.local_refs {
                         println!("  {r}");
                     }
+                }
+            }
+        }
+        PkgCmd::Push { repository, file } => {
+            use vxedge_core::distribution;
+            let (file, _stage) = match file {
+                Some(f) => (std::path::PathBuf::from(f), None),
+                None => {
+                    let root = vxedge_core::discover(&here()?)?.root;
+                    let problems = pkg::lock_problems(&root)?;
+                    if !problems.is_empty() {
+                        return Err(format!(
+                            "the lock does not match the package ({}); run `vxedge pkg lock` and \
+                             push again",
+                            problems.join("; ")
+                        )
+                        .into());
+                    }
+                    let stage = std::env::temp_dir()
+                        .join(format!("vxedge-push-src-{}", std::process::id()));
+                    std::fs::create_dir_all(&stage)?;
+                    let file = stage.join(pkg::packed_file_name(&root)?);
+                    std::fs::write(&file, pkg::pack(&root)?)?;
+                    (file, Some(TempDir(stage)))
+                }
+            };
+            let pushed = distribution::push(&file, repository)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "reference": pushed.reference, "digest": pushed.package_digest,
+                    })
+                );
+            } else {
+                println!(
+                    "pushed {}\ndigest {}\npull it with: vxedge pkg pull {repository}@{}",
+                    pushed.reference, pushed.package_digest, pushed.package_digest
+                );
+            }
+        }
+        PkgCmd::Pull { reference, into } => {
+            use vxedge_core::distribution;
+            let cache = vxedge_core::registry::default_cache_dir()
+                .ok_or("no cache directory: set XDG_CACHE_HOME or HOME")?;
+            let file = distribution::pull(reference, &cache)?;
+            let (_, digest) = distribution::split_pull_ref(reference)?;
+            if let Some(dir) = into {
+                pkg::unpack(&std::fs::read(&file)?, std::path::Path::new(dir))?;
+            }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "file": file.display().to_string(), "digest": digest, "into": into,
+                    })
+                );
+            } else {
+                println!("pulled {}\ndigest {digest}", file.display());
+                if let Some(dir) = into {
+                    println!("unpacked into {dir}");
                 }
             }
         }
