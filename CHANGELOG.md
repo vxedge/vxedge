@@ -6,6 +6,18 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-08
+
+Three additions. An experiment can state its intent as typed data, a hypothesis, parameters, metrics and pass
+criteria, which `Plan`, `validate` and `up` check before any trial. A packed experiment package can be pushed to
+an OCI registry and pulled back by its package digest. A `qemu-microvm` bundle sizes its guest (`cpus`,
+`memory_mb`), and an aarch64 one can ask for the CPU's virtualization extensions, so a zone's guest can itself be
+a hypervisor. vxAPI stays `vxedge.v1`, additive only.
+
+**Upgrading from 0.10.x.** No manifest change. Every new field is optional: an experiment without intent reads as
+before, and a bundle that names no size boots with the 0.10 defaults (1 vCPU; 128 MiB on x86_64, 256 MiB on
+aarch64). `pkg push` and `pkg pull` use `oras`, as part fetch already does.
+
 ### Added
 
 - A `qemu-microvm` bundle sizes its guest in `meta.json`: `cpus` (default 1, at most 16, and no more than a pinned
@@ -13,9 +25,6 @@ All notable changes to this repo are documented here. Format follows
   malformed value is refused by name.
 - `"virtualization": true` in an aarch64 bundle's `meta.json` gives a guest that is itself a hypervisor the CPU's
   virtualization extensions: QEMU's `virt` machine at EL2, with GICv3. aarch64 only; refused on x86.
-
-### Added
-
 - Typed intent on `kind: experiment` (`ARCHITECTURE.md` §6.0.3): `hypothesis`, `parameters`,
   `metrics`, `criteria` and `campaign`, all optional, so an experiment without them reads as before.
   `Plan`, `experiment validate` and `up` check them before any trial and name each field: a
