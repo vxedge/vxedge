@@ -6,6 +6,18 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- `vxedge pkg push <repository>` publishes a packed package as one OCI artifact through `oras`
+  (`ARCHITECTURE.md` §6.0.8): artifact type `application/vnd.vxedge.vxp.v1`, one layer that is the
+  packed file unchanged (`application/vnd.vxedge.vxp.v1.tar`, so the layer digest is the package
+  digest), and a config blob with the package's id, version and the parts and images its lock
+  lists. It is tagged with the version. Without `--file`, it packs the package here, which needs a
+  matching lock.
+- `vxedge pkg pull <repository>@sha256:<hex>` fetches a package by its package digest into the part
+  cache (`packages/<hex>.vxp`), keeping it only when the bytes hash to the digest and are a
+  canonical packed package; `--into <dir>` also restores the source folder. A tag alone is refused.
+
 ## [0.10.0] - 2026-11-08
 
 A zone can now run the instruction set production zone ECUs run. `qemu-microvm` boots aarch64 guest bundles on
