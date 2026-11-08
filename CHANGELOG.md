@@ -6,6 +6,18 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-08
+
+A zone can now run the instruction set production zone ECUs run. `qemu-microvm` boots aarch64 guest bundles on
+QEMU's `virt` machine, beside x86_64 ones in the same vehicle. On an x86_64 host QEMU emulates the guest's CPU
+(TCG); KVM is used only on a host of the guest's own instruction set. Each running guest reports which it got, so
+a result can say whether it ran under `kvm` or `tcg`, and a `tcg` result is functional only. The aarch64 Linux
+probe guest is the vxparts part `zone/linux/stack/probe-bundle-aarch64`. vxAPI stays `vxedge.v1`, additive only.
+
+**Upgrading from 0.9.x.** No manifest change. Existing bundles boot as before: one that names no `arch` is
+x86_64, and the virtio-mmio default stays modern. Rust callers that build `vxedge_api::v1::NodeStatus` with a
+struct literal add `..Default::default()` for the new `arch` and `acceleration` fields.
+
 ### Added
 
 - `qemu-microvm` boots aarch64 guests. A bundle names its instruction set in `meta.json` (`"arch": "aarch64"`, or
