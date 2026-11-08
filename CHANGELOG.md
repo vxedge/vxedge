@@ -6,6 +6,20 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- `vxedge pkg sign <file> --key <cosign.key>` signs a packed package for an air-gapped lab: a
+  key-pair signature in Sigstore bundle format, written beside it as `<file>.sigstore.json`, with
+  no transparency log (`ARCHITECTURE.md` §6.0.8).
+- `vxedge pkg verify <file> --key <cosign.pub>` checks that signature offline, and
+  `pkg verify <file> --repo <owner>/<repo> [--signer-workflow <workflow>]` checks a GitHub artifact
+  attestation. A successful check is recorded in the part cache beside the package, keyed by its
+  package digest, with the method and the signer (a GitHub repository and workflow, or a public
+  key's fingerprint), where the host trust policy finds it. A file that is not a canonical packed
+  package is refused before any tool runs.
+- Both shell out: `cosign` (3.x; checked with 3.1.4) and `gh attestation`, as packages already use
+  `oras`. Neither is needed by anything else.
+
 ## [0.11.0] - 2026-11-08
 
 Three additions. An experiment can state its intent as typed data, a hypothesis, parameters, metrics and pass
