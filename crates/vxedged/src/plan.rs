@@ -34,6 +34,20 @@ fn workspace_of_lifecycle(target: &str) -> Option<&str> {
     rest.split(' ').next().filter(|id| !id.is_empty())
 }
 
+/// The workspace a running lifecycle job holds, when it is not this one. `vehicle` verbs name a
+/// run by its vehicle's id and `experiment` verbs by the model's, so either is this workspace, and
+/// its own duplicate is the job engine's to answer.
+fn held_by_another(
+    running: Option<&str>,
+    model_id: &str,
+    vehicle_id: Option<&str>,
+) -> Option<String> {
+    running
+        .and_then(workspace_of_lifecycle)
+        .filter(|id| *id != model_id && Some(*id) != vehicle_id)
+        .map(str::to_string)
+}
+
 /// What `up` found before touching the host.
 #[derive(Default)]
 pub(crate) struct Preflight {
@@ -188,14 +202,11 @@ pub(crate) async fn preflight(
     // A run whose gateway is still being built is not on the host yet, but it already holds the
     // host: refused by what is recorded, another workspace's `up` would be told it differently
     // depending on how far that gateway had got.
-    // `vehicle` verbs name a run by its vehicle's id, `experiment` verbs by the model's: either is
-    // this workspace, and its own duplicate is the job engine's to answer.
-    let vehicle = model.entities.first().map(|e| e.id.as_str());
-    let starting = running
-        .as_deref()
-        .and_then(workspace_of_lifecycle)
-        .filter(|id| *id != model.id && Some(*id) != vehicle)
-        .map(str::to_string);
+    let starting = held_by_another(
+        running.as_deref(),
+        &model.id,
+        model.entities.first().map(|e| e.id.as_str()),
+    );
     let target = match (&active, starting) {
         (None, Some(other)) => Some(crate::errors::precondition(
             R::WrongWorkspace,
@@ -622,7 +633,31 @@ impl HostService for PlanSvc {
 
 #[cfg(test)]
 mod lifecycle_tests {
-    use super::workspace_of_lifecycle;
+    use super::{held_by_another, workspace_of_lifecycle};
+
+    #[test]
+    fn a_workspaces_own_running_job_is_not_another_workspace() {
+        let (model, vehicle) = ("vehicle-sedan", Some("sedan"));
+        assert_eq!(held_by_another(Some("vehicle sedan"), model, vehicle), None);
+        assert_eq!(
+            held_by_another(Some("experiment vehicle-sedan"), model, vehicle),
+            None
+        );
+        assert_eq!(held_by_another(None, model, vehicle), None);
+        assert_eq!(held_by_another(Some("zone ecu1"), model, vehicle), None);
+        assert_eq!(
+            held_by_another(
+                Some("vehicle other [EXPERIMENT_STAGE_GATEWAY]"),
+                model,
+                vehicle
+            ),
+            Some("other".to_string())
+        );
+        assert_eq!(
+            held_by_another(Some("experiment exp-002"), model, vehicle),
+            Some("exp-002".to_string())
+        );
+    }
 
     #[test]
     fn a_lifecycle_target_names_its_workspace_only_for_a_whole_run() {
