@@ -10,6 +10,7 @@ pub mod distribution;
 pub mod fiveg;
 pub mod gateway;
 pub mod identity;
+pub mod intent;
 pub mod model;
 pub mod package;
 pub mod pkg;

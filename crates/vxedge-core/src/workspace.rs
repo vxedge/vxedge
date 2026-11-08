@@ -335,6 +335,18 @@ pub struct ExperimentDoc {
     pub method: Option<serde_yaml_ng::Value>,
     #[serde(default)]
     pub traffic_profiles: Option<serde_yaml_ng::Value>,
+    /// Typed intent (`ARCHITECTURE.md` §6.0.3), carried opaque here and read by
+    /// [`crate::intent`], which types and checks it against the document itself.
+    #[serde(default)]
+    pub hypothesis: Option<serde_yaml_ng::Value>,
+    #[serde(default)]
+    pub parameters: Option<serde_yaml_ng::Value>,
+    #[serde(default)]
+    pub metrics: Option<serde_yaml_ng::Value>,
+    #[serde(default)]
+    pub criteria: Option<serde_yaml_ng::Value>,
+    #[serde(default)]
+    pub campaign: Option<serde_yaml_ng::Value>,
 }
 
 /// `tunnels`/`nos_check`/`data_plane`/`defaults` are opaque `Value`s for the same reason
@@ -1297,6 +1309,16 @@ impl Workspace {
 
         errors.extend(self.package_problems());
         errors
+    }
+
+    /// Every problem with the experiments' typed intent (`ARCHITECTURE.md` §6.0.3): parameters,
+    /// their `binds`, the campaign and the criteria, each typed as a parameter or a criterion
+    /// problem. Public so `Plan` and `up` run exactly the checks `experiment validate` does.
+    pub fn intent_problems(&self) -> Vec<crate::intent::Problem> {
+        self.experiments_raw
+            .iter()
+            .flat_map(crate::intent::check)
+            .collect()
     }
 
     /// The `.vxp` descriptor's agreement with the documents: its `id` is the experiment's id,

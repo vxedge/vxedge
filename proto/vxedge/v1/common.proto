@@ -125,6 +125,15 @@ enum ErrorReason {
   // reference disagrees, or there is no lock. The detail names each difference. Run
   // `vxedge pkg lock` to record the change, or set `unlocked` on the `Up` request while authoring.
   ERROR_REASON_LOCK_MISMATCH = 26;
+  // 27 is reserved for the package trust policy.
+  // An experiment's typed intent names a parameter wrongly: a type, unit, bound or `binds` path
+  // that does not hold, two parameters binding one field, or an arm, sweep or profile that sets
+  // an undeclared parameter or a value out of bounds. The detail names the document and field.
+  ERROR_REASON_PARAMETER_INVALID = 28;
+  // An experiment's criterion cannot be judged: an unknown metric, operands whose units
+  // disagree, a selection of an arm or parameter value that does not exist, or an aggregate its
+  // metric kind does not have. Refused before any trial runs.
+  ERROR_REASON_CRITERION_INVALID = 29;
 }
 
 // Names one run. See `RunService`.

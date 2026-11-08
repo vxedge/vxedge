@@ -1874,3 +1874,81 @@ async fn run_service_reports_the_package_and_kernel_a_run_recorded() {
         (None, None, false)
     );
 }
+
+/// Typed intent appended to `experiment_workspace`'s experiment document.
+const BAD_INTENT: &str = "\nparameters:\n  load_mbps: { type: integer, unit: Mbit/s, default: 5000, min: 0, max: 1000 }\n\
+metrics:\n  - { id: rtt_seconds, kind: histogram, unit: s, entity: measurements/rtt }\n\
+criteria:\n  - { id: bound, op: le, lhs: { metric: rtt, aggregate: p99 }, rhs: { value: 1, unit: s } }\n";
+
+/// A parameter or criterion that cannot hold is a typed problem in `Plan`, each under its own
+/// reason and naming its field, and `up` refuses on the first before anything runs.
+#[tokio::test]
+async fn plan_and_up_refuse_typed_intent_that_cannot_hold() {
+    let daemon = Daemon::start();
+    let channel = daemon.channel().await;
+    let (dir, _) = experiment_workspace();
+    let main = std::fs::read_to_string(dir.join("main.yaml")).unwrap();
+    std::fs::write(dir.join("main.yaml"), format!("{main}{BAD_INTENT}")).unwrap();
+
+    let plan = plan_of(&channel, &dir).await;
+    assert!(!plan.valid);
+    let typed = |r: vxedge_api::v1::ErrorReason| {
+        plan.problems
+            .iter()
+            .filter(|p| p.reason == r as i32)
+            .map(|p| p.detail.clone())
+            .collect::<Vec<_>>()
+    };
+    let params = typed(vxedge_api::v1::ErrorReason::ParameterInvalid);
+    assert_eq!(params.len(), 1, "{:?}", plan.problems);
+    assert!(
+        params[0].contains("parameters.load_mbps.default"),
+        "{}",
+        params[0]
+    );
+    let criteria = typed(vxedge_api::v1::ErrorReason::CriterionInvalid);
+    assert_eq!(criteria.len(), 1, "{:?}", plan.problems);
+    assert!(
+        criteria[0].contains("criteria[0].lhs.metric"),
+        "{}",
+        criteria[0]
+    );
+    assert!(
+        plan.host_checks
+            .iter()
+            .any(|c| c.name == "typed intent" && !c.passed),
+        "{:?}",
+        plan.host_checks
+    );
+
+    let refused = ExperimentServiceClient::new(channel)
+        .up(ExperimentUpRequest {
+            manifest: path_ref(&dir),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&refused), "ERROR_REASON_PARAMETER_INVALID");
+}
+
+/// Typed intent that holds adds no problem.
+#[tokio::test]
+async fn typed_intent_that_holds_plans_clean() {
+    let daemon = Daemon::start();
+    let channel = daemon.channel().await;
+    let (dir, _) = experiment_workspace();
+    let main = std::fs::read_to_string(dir.join("main.yaml")).unwrap();
+    let good = BAD_INTENT
+        .replace("default: 5000", "default: 0")
+        .replace("metric: rtt,", "metric: rtt_seconds,");
+    std::fs::write(dir.join("main.yaml"), format!("{main}{good}")).unwrap();
+    let plan = plan_of(&channel, &dir).await;
+    assert!(
+        !plan.problems.iter().any(|p| p.reason
+            == vxedge_api::v1::ErrorReason::ParameterInvalid as i32
+            || p.reason == vxedge_api::v1::ErrorReason::CriterionInvalid as i32
+            || p.reason == vxedge_api::v1::ErrorReason::WorkspaceInvalid as i32),
+        "{:?}",
+        plan.problems
+    );
+}

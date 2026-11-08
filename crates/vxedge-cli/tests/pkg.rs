@@ -315,6 +315,31 @@ fn a_package_vendors_a_vehicle_and_flags_drift_from_it() {
     std::fs::remove_dir_all(&loose).ok();
 }
 
+/// `experiment validate` runs the typed-intent checks `Plan` runs, and names each field.
+#[test]
+fn experiment_validate_reports_typed_intent_problems() {
+    let base = scratch("intent");
+    let (ok, _, _) = vxedge(&base, &["experiment", "new", "demo"]);
+    assert!(ok);
+    let root = base.join("demo");
+    let main = std::fs::read_to_string(root.join("main.yaml")).unwrap();
+    std::fs::write(
+        root.join("main.yaml"),
+        format!(
+            "{main}\nparameters:\n  rate: {{ type: integer, unit: 1/s, default: 0, binds: \"traffic_profiles[nope].pps\" }}\n"
+        ),
+    )
+    .unwrap();
+    let (ok, out, err) = vxedge(&root, &["experiment", "validate"]);
+    assert!(!ok, "{out}");
+    assert!(err.contains("parameters.rate.binds"), "{err}");
+    assert!(
+        err.contains("`traffic_profiles[nope]`: no entry `nope`"),
+        "{err}"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
 /// A stand-in `oras` that keeps pushed layers in a folder by digest and serves them back from
 /// `blob fetch`, recording each call's arguments.
 fn fake_oras(dir: &Path) {
