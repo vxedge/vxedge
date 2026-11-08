@@ -681,6 +681,7 @@ impl ExperimentService for ExperimentSvc {
             &self.handles.zones.runtime_dir,
             &self.handles.zones.cache_dir,
             &self.handles.gateway,
+            self.handles.engine.lifecycle_target().await,
         )
         .await;
         if let Some(refusal) = pf.refusal() {

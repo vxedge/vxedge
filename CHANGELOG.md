@@ -14,6 +14,10 @@ All notable changes to this repo are documented here. Format follows
   its gateway port, until the kernel gave up on the dead peer, and `down` failed with "gateway port … still
   exists 5 s after its namespace was removed". Stopped first, the node closes its connections while the
   guest can still answer.
+- Another workspace's `up` or `Plan` while a run is starting is refused with `ERROR_REASON_WRONG_WORKSPACE`,
+  as it is once that run is up. Until the run's gateway was recorded, the host only showed objects the
+  workspace did not declare, so the refusal was `ERROR_REASON_FOREIGN_WORKLOAD`, or a later check's reason,
+  depending on how far that gateway had got. The check now also reads the lifecycle job in flight.
 
 ## [0.9.0] - 2026-11-08
 
