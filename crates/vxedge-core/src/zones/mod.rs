@@ -5,6 +5,7 @@
 //! REST API), or `wasm-capsule` (a WebAssembly module). The packaging choice is the H3
 //! experimental variable; the payload and network attachment stay identical.
 
+mod attach;
 pub mod backend;
 mod cloud_hypervisor;
 pub mod foreign;

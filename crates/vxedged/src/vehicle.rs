@@ -109,10 +109,14 @@ fn plan_vehicle(
     Ok((gateway, nodes))
 }
 
-/// Node ids by the service that addresses them: `(zones, compute)`.
-fn by_stage(nodes: &[NodePlan]) -> (Vec<String>, Vec<String>) {
-    let (compute, zones): (Vec<&NodePlan>, Vec<&NodePlan>) =
+/// Node ids by the service that addresses them: `(zones, compute)`, in the order `up` (or, with
+/// `up` false, `down`) acts on them. An attach node's platform dials the vehicle's services as it
+/// boots, so it comes after every other zone node on the way up and before them on the way down
+/// (ARCHITECTURE.md §9).
+fn by_stage(nodes: &[NodePlan], up: bool) -> (Vec<String>, Vec<String>) {
+    let (compute, mut zones): (Vec<&NodePlan>, Vec<&NodePlan>) =
         nodes.iter().partition(|n| n.role == DeviceRole::Hpc);
+    zones.sort_by_key(|n| (n.backend == vxedge_core::model::Backend::Attach) == up);
     let ids = |plans: Vec<&NodePlan>| plans.iter().map(|n| n.node_id.clone()).collect();
     (ids(zones), ids(compute))
 }
@@ -206,7 +210,7 @@ impl VehicleService for VehicleSvc {
             ));
         }
         self.audit.record("VehicleService.Up", audit);
-        let (zones, compute) = by_stage(&nodes);
+        let (zones, compute) = by_stage(&nodes, true);
         let svc = self.handles.clone();
         let job = self
             .handles
@@ -287,7 +291,7 @@ impl VehicleService for VehicleSvc {
             .gateway
             .adopt(model.clone(), gateway, dir.clone(), sha256)
             .await;
-        let (zones, compute) = by_stage(&nodes);
+        let (zones, compute) = by_stage(&nodes, false);
         let svc = self.handles.clone();
         let job = self
             .handles
@@ -473,7 +477,7 @@ parts:
         let m = model(WS);
         let (_, nodes) = plan_vehicle(&m, None).unwrap();
         assert_eq!(
-            by_stage(&nodes),
+            by_stage(&nodes, true),
             (vec!["ecu1".to_string()], vec!["hpc1".to_string()])
         );
     }

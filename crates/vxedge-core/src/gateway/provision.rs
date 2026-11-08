@@ -199,7 +199,54 @@ fn ensure_endpoint_device(sh: &Shell, ep: &super::plan::EndpointPlan) -> Result<
         super::plan::EndpointKind::Tap => {
             super::tuntap::ensure_tap(sh.netns.as_deref(), &ep.name).map_err(tt)
         }
+        super::plan::EndpointKind::Adopted => adopt(sh, &ep.name),
     }
+}
+
+/// The alias prefix an adopted interface carries while vxedge holds it: what follows is the
+/// master it had before, so `down` can give it back with no state outside the kernel.
+const ADOPTED: &str = "vxedge:adopted-from=";
+
+/// Takes an interface another stack created, recording the master it had. It must exist: the
+/// gateway never creates it. Idempotent: an interface already adopted keeps its first record.
+fn adopt(sh: &Shell, dev: &str) -> Result<(), NetOpsError> {
+    let ns = sh.netns.as_deref();
+    if !netlink::link_exists(ns, dev) {
+        return Err(nl(netlink::NetlinkError::LinkNotFound {
+            name: dev.to_string(),
+        }));
+    }
+    let held = netlink::link_alias(ns, dev)
+        .map_err(nl)?
+        .is_some_and(|a| a.starts_with(ADOPTED));
+    if !held {
+        let before = netlink::link_master(ns, dev)
+            .map_err(nl)?
+            .unwrap_or_default();
+        netlink::set_alias(ns, dev, &format!("{ADOPTED}{before}")).map_err(nl)?;
+    }
+    Ok(())
+}
+
+/// Gives an adopted interface back to the master it had, or to none, and clears the record.
+/// An interface that is gone, or that vxedge does not hold, is left as it is.
+fn give_back(sh: &Shell, dev: &str) -> Result<(), NetOpsError> {
+    let ns = sh.netns.as_deref();
+    if !netlink::link_exists(ns, dev) {
+        return Ok(());
+    }
+    let Some(before) = netlink::link_alias(ns, dev)
+        .map_err(nl)?
+        .and_then(|a| a.strip_prefix(ADOPTED).map(str::to_owned))
+    else {
+        return Ok(());
+    };
+    if before.is_empty() {
+        netlink::set_nomaster(ns, dev).map_err(nl)?;
+    } else {
+        netlink::set_master(ns, dev, &before).map_err(nl)?;
+    }
+    netlink::set_alias(ns, dev, "").map_err(nl)
 }
 
 pub fn apply_endpoints(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
@@ -379,7 +426,11 @@ fn apply_ingress_filter(sh: &Shell, ep: &super::plan::EndpointPlan) -> Result<()
     let Some(cidr) = &ep.expected_source else {
         return Ok(());
     };
-    let host = cidr.split('/').next().unwrap_or(cidr);
+    let hosts: Vec<&str> = std::iter::once(cidr)
+        .chain(&ep.extra_sources)
+        .map(|c| c.split('/').next().unwrap_or(c))
+        .collect();
+    let set = format!("{{ {} }}", hosts.join(", "));
     let table = ingress_filter_table(&ep.name);
     sh.run("nft", &["add", "table", "netdev", &table])?;
     sh.run(
@@ -393,7 +444,7 @@ fn apply_ingress_filter(sh: &Shell, ep: &super::plan::EndpointPlan) -> Result<()
     sh.run(
         "nft",
         &[
-            "add", "rule", "netdev", &table, "ingress", "ip", "saddr", "!=", host, "counter",
+            "add", "rule", "netdev", &table, "ingress", "ip", "saddr", "!=", &set, "counter",
             "drop",
         ],
     )?;
@@ -1079,7 +1130,11 @@ fn ovs_teardown(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
             "ovs-vsctl",
             &["--if-exists", "del-port", &plan.bridge, &ep.name],
         )?;
-        netlink::delete_link(ns, &ep.name).map_err(nl)?;
+        if ep.kind == super::plan::EndpointKind::Adopted {
+            give_back(sh, &ep.name)?;
+        } else {
+            netlink::delete_link(ns, &ep.name).map_err(nl)?;
+        }
     }
     teardown_tunnels(sh, plan)?;
     sh.run(
@@ -1352,7 +1407,11 @@ pub fn teardown(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
             netlink::delete_link(ns, &imp.ifb).map_err(nl)?;
         }
         teardown_ingress_filter(sh, ep)?;
-        netlink::delete_link(ns, &ep.name).map_err(nl)?;
+        if ep.kind == super::plan::EndpointKind::Adopted {
+            give_back(sh, &ep.name)?;
+        } else {
+            netlink::delete_link(ns, &ep.name).map_err(nl)?;
+        }
     }
     teardown_tunnels(sh, plan)?;
     netlink::delete_link(ns, &plan.uplink).map_err(nl)?;

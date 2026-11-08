@@ -149,15 +149,19 @@ pub enum Backend {
     Libvirt,
     CloudHypervisor,
     WasmCapsule,
+    /// A guest that brings its own host stack: vxedge runs the part's adapter and adopts the
+    /// network interface the platform creates (ARCHITECTURE.md §9).
+    Attach,
 }
 
 impl Backend {
-    pub const ALL: [Backend; 5] = [
+    pub const ALL: [Backend; 6] = [
         Self::Container,
         Self::QemuMicrovm,
         Self::Libvirt,
         Self::CloudHypervisor,
         Self::WasmCapsule,
+        Self::Attach,
     ];
 
     /// The name a manifest uses: the one table every reader of a backend name goes through.
@@ -168,6 +172,7 @@ impl Backend {
             Self::Libvirt => "libvirt",
             Self::CloudHypervisor => "cloud-hypervisor",
             Self::WasmCapsule => "wasm-capsule",
+            Self::Attach => "attach",
         }
     }
 }
@@ -273,6 +278,8 @@ pub enum PartKind {
     Bundle,
     /// A WebAssembly component file the `wasm-capsule` backend runs.
     Wasm,
+    /// An adapter directory (`attach.yaml`) the `attach` backend runs.
+    Attach,
 }
 
 /// Structural connectivity: the harness.
@@ -358,6 +365,12 @@ pub struct Endpoint {
     /// whenever no fixed address is needed, which is most of the time — a pinned address is
     /// deployment policy, and a vehicle that pins none stays reusable across experiments.
     pub ip_cidr: Option<String>,
+    /// Further addresses on the same attachment, after `ip_cidr`: a container device carries
+    /// them all, as a multi-homed ECU does; a VM guest is given `ip_cidr` only.
+    pub extra_cidrs: Vec<String>,
+    /// For an `attach` device: the existing host interface the gateway adopts as this port,
+    /// instead of creating one (a platform's tap, or a physical NIC).
+    pub host_interface: Option<String>,
 }
 
 /// A logical information flow between functions.

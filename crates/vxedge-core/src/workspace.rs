@@ -611,7 +611,27 @@ pub struct AttachedEndpoint {
     /// backend. Validated for shape at load time — an address that only fails at `ip addr add`
     /// fails halfway through provisioning, with half a topology up.
     #[serde(default)]
-    pub ip: Option<String>,
+    pub ip: Option<Addresses>,
+    /// For an `attach` device: the host interface the gateway adopts as this port.
+    #[serde(default)]
+    pub host_interface: Option<String>,
+}
+
+/// One address or several on the same attachment (`ip: 10.0.0.2/24` or `ip: [a, b]`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum Addresses {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl Addresses {
+    pub fn all(&self) -> Vec<String> {
+        match self {
+            Addresses::One(a) => vec![a.clone()],
+            Addresses::Many(v) => v.clone(),
+        }
+    }
 }
 
 impl EndpointDoc {
@@ -631,10 +651,24 @@ impl EndpointDoc {
         }
     }
 
-    pub fn ip(&self) -> Option<&str> {
+    /// The first address, when declared.
+    pub fn ip(&self) -> Option<String> {
+        self.ips().into_iter().next()
+    }
+
+    /// Every address declared on this attachment, the first being the device's own.
+    pub fn ips(&self) -> Vec<String> {
+        match self {
+            EndpointDoc::Bare(_) => Vec::new(),
+            EndpointDoc::Attached(a) => a.ip.as_ref().map(Addresses::all).unwrap_or_default(),
+        }
+    }
+
+    /// The host interface an `attach` device's port adopts, when declared.
+    pub fn host_interface(&self) -> Option<&str> {
         match self {
             EndpointDoc::Bare(_) => None,
-            EndpointDoc::Attached(a) => a.ip.as_deref(),
+            EndpointDoc::Attached(a) => a.host_interface.as_deref(),
         }
     }
 
@@ -1082,9 +1116,7 @@ impl Workspace {
                             component: c.to_string(),
                         });
                     }
-                    if let Some(ip) = ep.ip()
-                        && !is_cidr(ip)
-                    {
+                    for ip in ep.ips().iter().filter(|ip| !is_cidr(ip)) {
                         errors.push(E::MalformedAddress {
                             vehicle: v.id.clone(),
                             link: l.id.clone(),
@@ -1900,7 +1932,7 @@ parts:
         assert_eq!(eps[0].ip(), None, "the bare form carries no address");
         assert_eq!(eps[1].node(), "zonefl");
         assert_eq!(eps[1].port(), Some("eth0"));
-        assert_eq!(eps[1].ip(), Some("10.101.0.11/24"));
+        assert_eq!(eps[1].ip().as_deref(), Some("10.101.0.11/24"));
         fs::remove_dir_all(&root).ok();
     }
 

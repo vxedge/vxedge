@@ -382,6 +382,7 @@ mod tests {
             vlan: 101,
             slice: Some("adas".into()),
             ip_cidr: Some("10.101.0.2/24".into()),
+            extra_cidrs: Vec::new(),
             bundle: None,
             remote_bundle: None,
             image: None,

@@ -9,10 +9,15 @@ const MAX_SLICES: usize = 200;
 #[derive(Debug, thiserror::Error)]
 pub enum PlanError {
     #[error(
+        "device `{0}` is an `attach` device, so its link endpoint must name the host interface \
+         its platform creates: add `host_interface: <name>` to the endpoint"
+    )]
+    AttachWithoutInterface(String),
+    #[error(
         "device `{0}` is attached to a slice but declares no `backend` — the planner has to know \
          whether to build a veth (container/wasm-capsule) or a tap (qemu-microvm/libvirt/cloud-hypervisor), and guessing is \
          what produced a manifest that validated and then could not boot. Add \
-         `backend: container|qemu-microvm|libvirt|cloud-hypervisor|wasm-capsule`."
+         `backend: container|qemu-microvm|libvirt|cloud-hypervisor|wasm-capsule|attach`."
     )]
     DeviceWithoutBackend(String),
     #[error("no `network.slices` at all — nothing to provision")]
@@ -73,6 +78,9 @@ pub struct SlicePlan {
 pub enum EndpointKind {
     Veth,
     Tap,
+    /// An interface another stack created (a platform's tap, a physical NIC): adopted as the
+    /// access port at `up`, given back at `down`, never created or deleted by the gateway.
+    Adopted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +105,8 @@ pub struct EndpointPlan {
     /// attachment has no pinned address; nothing is rendered for those (most attachments, per
     /// `model::Endpoint::ip_cidr`'s own doc comment — a pinned address is deployment policy).
     pub expected_source: Option<String>,
+    /// Further addresses the node may send from on this port (`Endpoint::extra_cidrs`).
+    pub extra_sources: Vec<String>,
 }
 
 /// A link's impairment, resolved onto the single access port that will render it.
@@ -343,9 +353,18 @@ impl GatewayPlan {
                         crate::model::Backend::Libvirt
                         | crate::model::Backend::QemuMicrovm
                         | crate::model::Backend::CloudHypervisor => EndpointKind::Tap,
+                        crate::model::Backend::Attach => EndpointKind::Adopted,
                     };
                     let port = attachment.port.as_deref();
-                    let name = super::ifnames::access_port(&device.id, port);
+                    // An attach device's port is an interface its platform made; the gateway
+                    // adopts it by that name rather than naming one itself.
+                    let name = match kind {
+                        EndpointKind::Adopted => attachment
+                            .host_interface
+                            .clone()
+                            .ok_or_else(|| PlanError::AttachWithoutInterface(device.id.clone()))?,
+                        _ => super::ifnames::access_port(&device.id, port),
+                    };
                     let origin = describe_attachment(&device.id, port);
                     if let Some(other) = claimed.insert(name.clone(), origin.clone()) {
                         return Err(PlanError::EndpointNameCollision {
@@ -357,7 +376,7 @@ impl GatewayPlan {
                     endpoints.push(EndpointPlan {
                         peer: match kind {
                             EndpointKind::Veth => super::ifnames::veth_peer(&device.id, port),
-                            EndpointKind::Tap => name.clone(),
+                            EndpointKind::Tap | EndpointKind::Adopted => name.clone(),
                         },
                         name,
                         kind,
@@ -366,6 +385,7 @@ impl GatewayPlan {
                         slice: Some(slice.clone()),
                         impairment: None,
                         expected_source: attachment.ip_cidr.clone(),
+                        extra_sources: attachment.extra_cidrs.clone(),
                     });
                     // Recorded for the impairment pass below, which needs to know which
                     // endpoints a given link produced — the loop above is keyed by device.
@@ -566,6 +586,68 @@ parts:
         format!(
             "kind: experiment\nid: exp-t\nvehicles: [veh]\nnetwork:\n  slices:\n{slices}\n---\nkind: vehicle\nid: veh\ndevices: {{}}\n"
         )
+    }
+
+    const ATTACH: &str = r#"
+kind: experiment
+id: exp-t
+vehicles: [veh]
+baseline: bl
+network:
+  slices:
+    - { id: ivi, mode: vlan, vlan: 104 }
+---
+kind: vehicle
+id: veh
+zones: { cockpit: {} }
+devices:
+  ivi-aaos: { role: ecu, zone: cockpit, backend: attach }
+  ivi-gw:   { role: ecu, zone: cockpit, backend: container }
+functions:
+  fn-ivi: { deployed_on: ivi-aaos }
+  fn-gw:  { deployed_on: ivi-gw }
+links:
+  - id: l-ivi
+    endpoints: [{ node: ivi-aaos, port: eth1, ip: 192.168.98.3/24, host_interface: cvd-etap-01 }]
+    slice: ivi
+  - id: l-gw
+    endpoints: [{ node: ivi-gw, port: eth0, ip: [10.120.0.60/24, 192.168.98.1/24] }]
+    slice: ivi
+---
+kind: baseline
+id: bl
+parts:
+  - { ref: ./aaos, kind: attach, target_ids: [fn-ivi] }
+  - { ref: localhost/vxedge/vxvhal:1, target_ids: [fn-gw] }
+"#;
+
+    /// An attach device's port is the interface its platform made, adopted by that name; a
+    /// container device's second address is accepted at its port alongside the first.
+    #[test]
+    fn an_attach_device_adopts_its_platforms_interface() {
+        let plan = GatewayPlan::from_model(&model(ATTACH)).unwrap();
+        let ivi = plan
+            .endpoints
+            .iter()
+            .find(|e| e.node == "ivi-aaos")
+            .unwrap();
+        assert_eq!(ivi.kind, EndpointKind::Adopted);
+        assert_eq!(ivi.name, "cvd-etap-01");
+        assert_eq!(ivi.peer, "cvd-etap-01");
+        assert_eq!(ivi.expected_source.as_deref(), Some("192.168.98.3/24"));
+        let gw = plan.endpoints.iter().find(|e| e.node == "ivi-gw").unwrap();
+        assert_eq!(gw.kind, EndpointKind::Veth);
+        assert_eq!(gw.expected_source.as_deref(), Some("10.120.0.60/24"));
+        assert_eq!(gw.extra_sources, ["192.168.98.1/24"]);
+    }
+
+    #[test]
+    fn an_attach_device_without_a_host_interface_is_refused() {
+        let ws = ATTACH.replace(", host_interface: cvd-etap-01", "");
+        assert!(matches!(
+            GatewayPlan::from_model(&model(&ws)),
+            Err(PlanError::AttachWithoutInterface(d)) if d == "ivi-aaos"
+        ));
     }
 
     #[test]

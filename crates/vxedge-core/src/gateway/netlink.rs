@@ -294,6 +294,62 @@ pub fn link_master(netns: Option<&str>, dev: &str) -> Result<Option<String>, Net
     })
 }
 
+/// `dev`'s interface alias (`IFLA_IFALIAS`), if it has one.
+pub fn link_alias(netns: Option<&str>, dev: &str) -> Result<Option<String>, NetlinkError> {
+    let dev = dev.to_string();
+    run_async(netns, "link_alias", move |handle| async move {
+        let mut links = handle.link().get().match_name(dev.clone()).execute();
+        let msg = match links.try_next().await {
+            Ok(Some(msg)) => msg,
+            Ok(None) => return Ok(None),
+            Err(e) if is_missing(&e) => return Ok(None),
+            Err(e) => return Err(op_err("link_alias", e)),
+        };
+        Ok(msg.attributes.iter().find_map(|a| match a {
+            LinkAttribute::IfAlias(alias) if !alias.is_empty() => Some(alias.clone()),
+            _ => None,
+        }))
+    })
+}
+
+/// Sets `dev`'s interface alias; an empty alias clears it.
+pub fn set_alias(netns: Option<&str>, dev: &str, alias: &str) -> Result<(), NetlinkError> {
+    let (dev, alias) = (dev.to_string(), alias.to_string());
+    run_async(netns, "set_alias", move |handle| async move {
+        let Some(idx) = link_index(&handle, &dev)
+            .await
+            .map_err(|e| op_err("set_alias", e))?
+        else {
+            return Err(NetlinkError::LinkNotFound { name: dev });
+        };
+        handle
+            .link()
+            .set(LinkUnspec::new_with_index(idx).alias(alias).build())
+            .execute()
+            .await
+            .map_err(|e| op_err("set_alias", e))
+    })
+}
+
+/// Releases `dev` from any bridge master.
+pub fn set_nomaster(netns: Option<&str>, dev: &str) -> Result<(), NetlinkError> {
+    let dev = dev.to_string();
+    run_async(netns, "set_nomaster", move |handle| async move {
+        let Some(idx) = link_index(&handle, &dev)
+            .await
+            .map_err(|e| op_err("set_nomaster", e))?
+        else {
+            return Err(NetlinkError::LinkNotFound { name: dev });
+        };
+        handle
+            .link()
+            .set(LinkUnspec::new_with_index(idx).nocontroller().build())
+            .execute()
+            .await
+            .map_err(|e| op_err("set_nomaster", e))
+    })
+}
+
 /// Idempotent: tolerates an already-existing bridge, the same contract
 /// `Shell::run_tolerate_exists` carried for `ip link add ... type bridge`.
 pub fn ensure_bridge(netns: Option<&str>, name: &str) -> Result<(), NetlinkError> {

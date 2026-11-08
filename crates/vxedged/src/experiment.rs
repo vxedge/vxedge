@@ -264,7 +264,21 @@ impl Handles {
             .list(Request::new(ZoneListRequest::default()))
             .await
         {
-            Ok(r) => r.into_inner().zones,
+            Ok(r) => {
+                let r = r.into_inner();
+                // An attach node's platform dials the vehicle's services as it boots, so it
+                // starts after every other zone node and stops before them (ARCHITECTURE.md §9).
+                let attach: std::collections::HashSet<String> = r
+                    .nodes
+                    .iter()
+                    .filter_map(|n| n.spec.as_ref())
+                    .filter(|s| s.backend == vxedge_api::v1::NodeBackend::Attach as i32)
+                    .map(|s| s.vxid.clone())
+                    .collect();
+                let mut zones = r.zones;
+                zones.sort_by_key(|z| attach.contains(&z.vxid) == up);
+                zones
+            }
             // A plan that cannot be made is a broken workspace, and reading it as "no zones"
             // reported success with nothing provisioned.
             Err(e) if e.code() == tonic::Code::Internal => {
