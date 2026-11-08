@@ -2057,3 +2057,53 @@ async fn a_host_that_requires_signatures_refuses_what_is_not_verified() {
     let problems = signature_problems(&plan_of(&channel, &legacy).await);
     assert!(problems[0].contains("legacy"), "{problems:?}");
 }
+
+/// `Plan` names every entity telemetry records will use, derived from ids, with the scrape
+/// targets bound to each; `collect` writes the same list beside what was ingested.
+#[tokio::test]
+async fn plan_and_collect_name_the_entities_records_use() {
+    let (ws, _) = experiment_workspace();
+    let bin = fake_vxtelemetry(0);
+    let daemon = Daemon::start_env(
+        |run| std::fs::create_dir_all(run.join("ingest")).unwrap(),
+        &[("VXEDGE_VXTELEMETRY_BIN", &bin)],
+    );
+    let channel = daemon.channel().await;
+    let plan = plan_of(&channel, &ws).await;
+    let paths: Vec<&str> = plan.entities.iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(paths[0], "host", "{paths:?}");
+    assert!(paths.contains(&"car/front/ecu1"), "{paths:?}");
+    assert!(paths.contains(&"car/links/l1"), "{paths:?}");
+    let ecu = plan
+        .entities
+        .iter()
+        .find(|e| e.path == "car/front/ecu1")
+        .unwrap();
+    assert_eq!(
+        (ecu.kind.as_str(), ecu.role.as_str(), ecu.backend.as_str()),
+        ("node", "zone-controller", "container")
+    );
+
+    let job =
+        vxedge_api::v1::telemetry_service_client::TelemetryServiceClient::new(channel.clone())
+            .collect(vxedge_api::v1::CollectRequest {
+                manifest: path_ref(&ws),
+                out_path: "results/run.zip".into(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+    assert_eq!(
+        wait_for_job(channel, job.id).await,
+        JobState::Succeeded as i32
+    );
+    let written = std::fs::read_to_string(daemon.root.join("run/ingest/entities.json")).unwrap();
+    let listed: serde_json::Value = serde_json::from_str(&written).unwrap();
+    let listed: Vec<&str> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(listed, paths, "Plan and the archive agree");
+}

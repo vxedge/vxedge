@@ -8,6 +8,13 @@ All notable changes to this repo are documented here. Format follows
 
 ### Added
 
+- Entity paths (`ARCHITECTURE.md` §12): `vxedge-core::entities` derives the path every telemetry
+  record names from the model's ids (`<vehicle>/<zone>/<node>`, `<vehicle>/links/<link>`,
+  `<vehicle>/slices/<slice>`, `<vehicle>/services/<service>`, `host`, …) and binds each scrape
+  target to the node whose link endpoint has its address, or to `host`. `WorkspacePlan.entities`
+  (`PlannedEntity`: path, kind, role, backend, payloads, scrape targets) lists them, and
+  `TelemetryService.Collect` writes the same list as `entities.json` into the ingest folder, so
+  the archive carries it.
 - `vxedge pkg vendor` also copies the local part folders the copied documents reference (`./…` in
   a part `ref` or an artifact store) when the source's git checkout tracks their files, such as a
   vehicle's committed attach adapter (`./aaos`), and records each copied file in `vendored`, so

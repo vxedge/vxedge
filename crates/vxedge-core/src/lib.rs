@@ -7,6 +7,7 @@
 
 pub mod containers;
 pub mod distribution;
+pub mod entities;
 pub mod fiveg;
 pub mod gateway;
 pub mod identity;
