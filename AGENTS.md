@@ -13,8 +13,6 @@ crates/
   vxedge-core/       # domain lib: manifest structs/validation, reconciler, backends
   vxedged/           # daemon: tonic gRPC server (+ tonic-web), job engine, event bus, audit
   vxedge-cli/        # thin client binary `vxedge`; may auto-spawn local vxedged
-templates/           # (pending) gateway provisioning templates (netlink/OVS/tc/nftables, libvirt XML)
-sdk/                 # (pending) generated TypeScript SDK (connect-es), never hand-edited
 ```
 
 ## Hard rules
@@ -27,13 +25,13 @@ sdk/                 # (pending) generated TypeScript SDK (connect-es), never ha
 - **proto/ is the contract**: wire changes are additive and stay in `vxedge.v1`
   (`ARCHITECTURE.md` §5.2). SDKs are generated in CI, never hand-written.
 - Every mutating RPC returns a `Job`; progress is server-streamed (`JobService.Watch`).
-- Transport: Unix socket only today, guarded by filesystem permissions. Peer credentials
-  locally and mTLS + OIDC remotely are planned (`ARCHITECTURE.md` §5.3).
+- Transport: Unix socket only, guarded by filesystem permissions. Peer-credential checks,
+  mTLS and OIDC are not supported today (`ARCHITECTURE.md` §5.3).
 
-## Key dependencies (when scaffolding)
+## Key dependencies
 
-tonic/prost (+ tonic-web), serde/serde_yaml_ng, rtnetlink, ovsdb client, `virsh` (libvirt),
-nftables via `nftables` crate or `nft -j`, clap (CLI), tokio, tracing.
+tonic/prost, serde/serde_yaml_ng, rtnetlink plus iproute2/`ovs-vsctl`/`nft` shell-outs,
+`virsh` (libvirt), bollard (Podman), clap (CLI), tokio, tracing.
 
 ## Build/test
 
@@ -44,9 +42,9 @@ serde_yaml_ng (serde_yaml is deprecated upstream — do not reintroduce it).
 
 - `cargo build --workspace` / `cargo test --workspace`
 - `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check`
-- `buf lint` for proto changes (CI runs it; `buf generate` produces the TS SDK, phase 2)
+- `buf lint` for proto changes (CI runs it)
 - CI: `.github/workflows/ci.yml` (build/test/clippy/fmt + buf lint)
-- Gateway integration tests (future) run in network namespaces (root or userns); keep them
+- Gateway integration tests run in network namespaces (root or userns); keep them
   behind a feature/ignored marker so plain `cargo test` works unprivileged.
 - Smoke test: `vxedged --listen unix:///tmp/vxedge.sock` then
   `vxedge --endpoint unix:///tmp/vxedge.sock status`.
@@ -54,7 +52,7 @@ serde_yaml_ng (serde_yaml is deprecated upstream — do not reintroduce it).
 ## Project skills
 
 AI/contributor skills in `.claude/skills/`: **rust-patterns** (house Rust rules, per the
-Microsoft Rust Patterns book), **testbed-quality** (the OEM-adoption bar), and
+Microsoft Rust Patterns book), **testbed-quality** (the testbed quality bar), and
 **gateway-verification** (netns/UDS/doctor verification loop + idempotency rule for
 gateway/zone backend changes). Apply all three to every change. Two more govern *structure*
 rather than code: **service-boundaries** (when a variation point earns a trait, who owns errors
@@ -66,3 +64,8 @@ design** (proto/ RPC/message design and versioning), **network-provisioning-patt
 (writing gateway/ netops/plan/provision code, as opposed to verifying it), and
 **zone-backend-contract** (the container/qemu-microvm/libvirt attachment + guest-bundle
 contract, shared with `vxparts` — zone-class guest images).
+
+## Work items
+
+Work items are tracked on the maintainers' internal board. The public record of changes is
+`CHANGELOG.md`.

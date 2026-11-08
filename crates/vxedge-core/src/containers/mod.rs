@@ -1,7 +1,7 @@
-//! Generic container provisioning over Podman's REST API (`docs-internal/PROVISIONING.md` §7.2,
-//! Track V1). Owned by neither `fiveg` nor `zones`: it is the one place this crate talks to a
-//! container engine, and both of those are its callers — `fiveg::lifecycle` (V2, replacing its
-//! `podman` CLI calls) and the zone `container` backend's OCI payload (V3).
+//! Generic container provisioning over Podman's REST API (the Podman policy is in the docs
+//! repo's `ARCHITECTURE.md` §15). Owned by neither `fiveg` nor `zones`: it is the one place this
+//! crate talks to a container engine, and both of those are its callers — `fiveg::lifecycle` and
+//! the zone `container` backend's OCI payload.
 //!
 //! Two layers, same split as every other provisioning module here:
 //!

@@ -1,5 +1,5 @@
-//! Native Rust netlink primitives for `provision.rs`'s kernel-bridge path — slice 1 of the
-//! rtnetlink port `netops.rs`'s own doc comment names as a follow-up.
+//! Native Rust netlink primitives for `provision.rs`'s kernel-bridge path, alongside
+//! `netops.rs`'s iproute2 shell-outs.
 //!
 //! Deliberately **not** a full replacement for [`super::netops::Shell`]: `rtnetlink`/
 //! `netlink-packet-route` (rust-netlink org, an 8-year, tens-of-millions-of-downloads track

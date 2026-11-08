@@ -658,9 +658,7 @@ async fn watch_job(
 }
 
 fn scaffold_notice(what: &str) {
-    eprintln!(
-        "vxedge: `{what}` is not wired to the daemon yet (scaffold) — see crates/vxedged TASKS"
-    );
+    eprintln!("vxedge: `{what}` is not wired to the daemon (scaffold)");
 }
 
 /// The directory an experiment verb is addressed against. Always the process working

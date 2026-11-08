@@ -1,9 +1,10 @@
 //! Thin wrapper over iproute2 (`ip`, `bridge`, `tc`) with JSON observation.
 //!
-//! Deliberate engineering call (recorded in TASKS): provisioning shells out to
-//! iproute2 for now — argument-vector execs of validated, generated tokens
-//! (no shell interpolation) — with `-json` for reads. A pure-rtnetlink port is
-//! a follow-up; the plan/reconcile logic above this layer won't change.
+//! Deliberate engineering call: provisioning shells out to iproute2 —
+//! argument-vector execs of validated, generated tokens (no shell
+//! interpolation) — with `-json` for reads. `netlink.rs` covers part of the
+//! kernel-bridge path natively; the plan/reconcile logic above this layer does
+//! not depend on which mechanism runs.
 
 use std::process::Command;
 

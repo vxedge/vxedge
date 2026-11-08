@@ -40,8 +40,8 @@ guest OS.
 
 Established by `linux-probe`
 (`vxparts/parts/zone/linux/stack/probe-bundle/build.sh`, migrated from `vxzones`'
-`scripts/build-guest-bundle.sh` — Track P, 2026-07-28), the pattern every future guest
-(QNX SDP 8, AAOS, real Zephyr/FreeRTOS) must follow, not just imitate loosely:
+`scripts/build-guest-bundle.sh` — Track P, 2026-07-28), the pattern every guest bundle
+must follow, not just imitate loosely:
 
 - `vmlinuz` + `initrd.img`, boots from the kernel cmdline `vx.ip=<address>` — guest init
   reads it and payload autostarts; no interactive provisioning step.

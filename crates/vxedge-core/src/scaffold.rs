@@ -106,7 +106,7 @@ pub struct WorkspacePlan {
 /// Ids become directory names *and* OCI repository path components on publish. OCI requires
 /// lowercase alphanumerics with separators between them, so reject anything else here rather
 /// than letting it fail when the workspace is published — which is exactly how a `_`-prefixed
-/// name bit us during the container publish work (see vxparts TASKS.md).
+/// name bit us during the container publish work.
 fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.starts_with(|c: char| c.is_ascii_lowercase())

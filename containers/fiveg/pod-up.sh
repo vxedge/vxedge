@@ -5,14 +5,13 @@
 # loopback addressing (127.0.0.x) works unchanged inside the pod — the same
 # rendered configs run on host or in the pod, byte-identical.
 #
-# This is the reference for the vxedged fiveg lifecycle stage (which will own
+# This is the reference for the vxedged fiveg lifecycle stage (which owns
 # process supervision, health, and teardown); it is NOT the product path.
 # Subscriber insertion uses open5gs-dbctl (baked into vx5g-core) with the
 # credentials parsed from the rendered ue-*.yaml files — the rendered configs
-# stay the single source of truth. Known gap, tracked in TASKS.md §4: dbctl's
-# add_ue_with_slice requires an SD, so slices declared without one register
-# via plain `add` (default APN) — the Rust lifecycle stage will write the
-# subscriber document explicitly instead.
+# stay the single source of truth. Known gap: dbctl's add_ue_with_slice
+# requires an SD, so slices declared without one register via plain `add`
+# (default APN) and get the default subscribed slice.
 #
 # Usage:
 #   ./pod-up.sh <rendered-config-dir>     # dir produced by `render_fiveg`
@@ -81,11 +80,10 @@ for f in "$CFG"/ueransim/ue-*.yaml; do
   else
     # dbctl's slice helpers require an SD; add_ue_with_apn keeps the right
     # APN/DNN but writes the default subscribed slice (sst 1) — a no-sd slice
-    # with a different SST won't match until the Rust lifecycle stage writes
-    # the subscriber document explicitly (TASKS.md §4).
+    # with a different SST does not match in this script (a known gap).
     podman run --rm --pod "$POD" vx5g-core \
       open5gs-dbctl add_ue_with_apn "$imsi" "$key" "$opc" "$apn" >/dev/null
-    echo "subscriber $imsi (apn=$apn sst=$sst — no sd: default subscribed slice, see TASKS §4)"
+    echo "subscriber $imsi (apn=$apn sst=$sst — no sd: default subscribed slice)"
   fi
 done
 

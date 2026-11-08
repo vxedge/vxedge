@@ -39,7 +39,7 @@
 //! wired to any vxAPI RPC or manifest lifecycle verb; that wiring
 //! (GatewayService recognizing `mode: s-nssai` slices, and deciding
 //! whether/how the bridge attachment joins `vxgateway`'s real, VLAN-aware
-//! `vxbr0`) is tracked separately (`vxedge/TASKS.md` §4) since it is a
+//! `vxbr0`) is not part of this module, since it is a
 //! proto/RPC design decision, not a mechanism one — [`bridge_up`]
 //! deliberately does not touch `vxbr0` or any VLAN membership itself.
 //!
@@ -750,8 +750,8 @@ pub const FIVEG_UPLINK_VLAN: u16 = 4000;
 /// one (`vxbr0` is `vlan_filtering 1`; a port needs an explicit `bridge
 /// vlan add ... pvid untagged` to pass any traffic on such a bridge, which
 /// this function does not do — that VLAN-membership decision belongs to
-/// the real GatewayService integration, tracked separately,
-/// `vxedge/TASKS.md` §4, not decided as a side effect here).
+/// the real GatewayService integration, not decided as a side effect
+/// here).
 pub async fn bridge_up(
     cfg: &FiveGLifecycleConfig,
     bridge: &str,

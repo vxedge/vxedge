@@ -12,10 +12,10 @@ first place. Code: `crates/vxedge-core/src/gateway/{netops,plan,provision}.rs`.
 ## Current backend is a deliberate deviation from the architecture doc — know which one you're in
 
 `ARCHITECTURE.md` describes the target as Rust `rtnetlink`/OVSDB, "no shell templating."
-The current implementation (`netops.rs`, doc comment: "deliberate engineering call,
-recorded in TASKS") shells out to iproute2 (`ip`/`bridge`/`tc`) instead, with a
-pure-rtnetlink port as an open, non-blocking phase-1 trailing item
-(`vxedge/TASKS.md` §2). Both are correct to build against **for now**:
+The current implementation shells out to iproute2 (`ip`/`bridge`/`tc`) through `netops.rs`,
+as a deliberate engineering call. Native rtnetlink primitives (`netlink.rs`) cover part of the
+kernel-bridge path (links, VLANs, netns); `tc`, `ovs-vsctl`, `nft` and `wg` still go through
+`Shell`. Build against both as they are:
 
 - Never construct a shell command by string interpolation. Every `Shell` invocation is
   an argument vector of already-validated, generated tokens — that's what makes shelling
@@ -65,8 +65,8 @@ silently mutate the real host's OVS config instead of a disposable copy of it.
 ## Idempotency is the actual deliverable, not a nice-to-have
 
 - `up|down` must be a no-op on double-apply — this is what makes the reconciler's
-  observe-vs-desired model work at all, and it's directly load-bearing for the OEM-trust
-  bar (`testbed-quality`: "up|down idempotent — double-apply is a no-op, verified by
+  observe-vs-desired model work at all, and it's directly load-bearing for the testbed
+  quality bar (`testbed-quality`: "up|down idempotent — double-apply is a no-op, verified by
   tests"). Three idempotency bugs were already found and fixed by the netns CI suite
   before H1 — treat a passing `cargo test` without the `--ignored` netns suite as
   incomplete, not green.
