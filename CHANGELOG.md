@@ -6,6 +6,29 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- `vxedge pkg sign <file> --key <cosign.key>` signs a packed package for an air-gapped lab: a
+  key-pair signature in Sigstore bundle format, written beside it as `<file>.sigstore.json`, with
+  no transparency log (`ARCHITECTURE.md` §6.0.8).
+- `vxedge pkg verify <file> --key <cosign.pub>` checks that signature offline, and
+  `pkg verify <file> --repo <owner>/<repo> [--signer-workflow <workflow>]` checks a GitHub artifact
+  attestation. A successful check is recorded in the part cache beside the package, keyed by its
+  package digest, with the method and the signer (a GitHub repository and workflow, or a public
+  key's fingerprint), where the host trust policy finds it. A file that is not a canonical packed
+  package is refused before any tool runs.
+- Both shell out: `cosign` (3.x; checked with 3.1.4) and `gh attestation`, as packages already use
+  `oras`. Neither is needed by anything else.
+- A host trust policy (`vxedged --trust-policy <file>`, or `/etc/vxedge/trust.yaml` when it exists):
+  `require_signed` and the allowed signers, a GitHub repository (optionally one workflow) or a
+  public key by fingerprint or file. With `require_signed`, `Plan`, `experiment up`, `vehicle up`
+  and `gateway up` refuse a package whose digest has no verification record from an allowed
+  signer in the daemon's part cache, and a legacy descriptor or inline manifest, under the new
+  `ERROR_REASON_SIGNATURE_INVALID`, before anything is provisioned. A package changed after it was
+  verified has another digest and no record. Without a policy, nothing changes. A policy that
+  requires signatures and allows no signer is refused at start. `pkg verify` and `pkg pull` take
+  `--cache-dir` (or `VXEDGE_CACHE_DIR`) to write where the daemon reads.
+
 ## [0.11.0] - 2026-11-08
 
 Three additions. An experiment can state its intent as typed data, a hypothesis, parameters, metrics and pass

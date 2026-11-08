@@ -423,6 +423,45 @@ enum PkgCmd {
         /// Also restore a source folder here (must not exist or be empty).
         #[arg(long, value_name = "DIR")]
         into: Option<String>,
+        /// The part cache to pull into: the daemon's `--cache-dir`, so its `up` finds the
+        /// package. Default: `$XDG_CACHE_HOME/vxedge/parts` or `$HOME/.cache/vxedge/parts`.
+        #[arg(long, value_name = "DIR", env = "VXEDGE_CACHE_DIR")]
+        cache_dir: Option<String>,
+    },
+    /// Sign a packed package with a cosign private key, for an air-gapped lab. Writes
+    /// `<file>.sigstore.json` beside it; no transparency log is used.
+    Sign {
+        /// The packed `.vxp` file.
+        file: String,
+        /// The cosign private key (`cosign generate-key-pair`). `COSIGN_PASSWORD` unlocks it.
+        #[arg(long, value_name = "KEY")]
+        key: String,
+    },
+    /// Verify a packed package's signature and record the verification on this host, keyed by
+    /// its package digest, where a trust policy finds it. Give `--key` for a key-pair signature
+    /// or `--repo` for a GitHub artifact attestation.
+    Verify {
+        /// The packed `.vxp` file.
+        file: String,
+        /// The signer's cosign public key; the signature is `<file>.sigstore.json`.
+        #[arg(
+            long,
+            value_name = "PUBLIC_KEY",
+            conflicts_with = "repo",
+            required_unless_present = "repo"
+        )]
+        key: Option<String>,
+        /// The repository whose workflow attested the package, `<owner>/<repo>`.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+        /// The workflow that must have made the attestation, such as
+        /// `<owner>/<repo>/.github/workflows/release.yml`.
+        #[arg(long, value_name = "WORKFLOW", requires = "repo")]
+        signer_workflow: Option<String>,
+        /// The part cache to record in: the daemon's `--cache-dir`, so its trust policy finds the
+        /// record. Default: `$XDG_CACHE_HOME/vxedge/parts` or `$HOME/.cache/vxedge/parts`.
+        #[arg(long, value_name = "DIR", env = "VXEDGE_CACHE_DIR")]
+        cache_dir: Option<String>,
     },
     /// Copy another folder's vxedge documents into the package here, such as a reference vehicle,
     /// and record where they came from in `vxp.lock`. Documents only: scripts and build outputs
@@ -861,6 +900,52 @@ fn pkg(cmd: &PkgCmd, json: bool) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        PkgCmd::Sign { file, key } => {
+            let bundle = vxedge_core::trust::sign_with_key(
+                std::path::Path::new(file),
+                std::path::Path::new(key),
+            )?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "bundle": bundle.display().to_string() })
+                );
+            } else {
+                println!("signed {file}\nbundle {}", bundle.display());
+            }
+        }
+        PkgCmd::Verify {
+            file,
+            key,
+            repo,
+            signer_workflow,
+            cache_dir,
+        } => {
+            use vxedge_core::trust;
+            let cache = cache_dir
+                .as_ref()
+                .map(std::path::PathBuf::from)
+                .or_else(vxedge_core::registry::default_cache_dir)
+                .ok_or("no cache directory: pass --cache-dir, or set XDG_CACHE_HOME or HOME")?;
+            let file = std::path::Path::new(file);
+            let record = match (key, repo) {
+                (Some(k), _) => trust::verify_with_key(file, std::path::Path::new(k), &cache)?,
+                (None, Some(r)) => {
+                    trust::verify_github(file, r, signer_workflow.as_deref(), &cache)?
+                }
+                (None, None) => unreachable!("clap requires --key or --repo"),
+            };
+            if json {
+                println!("{}", serde_json::to_string(&record)?);
+            } else {
+                println!(
+                    "verified {}\ndigest {}\nsigner {}",
+                    file.display(),
+                    record.package_digest,
+                    record.signer
+                );
+            }
+        }
         PkgCmd::Push { repository, file } => {
             use vxedge_core::distribution;
             let (file, _stage) = match file {
@@ -899,10 +984,17 @@ fn pkg(cmd: &PkgCmd, json: bool) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
-        PkgCmd::Pull { reference, into } => {
+        PkgCmd::Pull {
+            reference,
+            into,
+            cache_dir,
+        } => {
             use vxedge_core::distribution;
-            let cache = vxedge_core::registry::default_cache_dir()
-                .ok_or("no cache directory: set XDG_CACHE_HOME or HOME")?;
+            let cache = cache_dir
+                .as_ref()
+                .map(std::path::PathBuf::from)
+                .or_else(vxedge_core::registry::default_cache_dir)
+                .ok_or("no cache directory: pass --cache-dir, or set XDG_CACHE_HOME or HOME")?;
             let file = distribution::pull(reference, &cache)?;
             let (_, digest) = distribution::split_pull_ref(reference)?;
             if let Some(dir) = into {

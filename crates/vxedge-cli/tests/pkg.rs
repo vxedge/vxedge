@@ -467,3 +467,116 @@ fn a_package_is_pushed_and_pulled_back_by_its_digest() {
     );
     std::fs::remove_dir_all(&base).ok();
 }
+
+/// Stand-ins for `cosign` and `gh`: a bundle holds the digest of the bytes it signs, and `gh`
+/// vouches for a file only if its digest is in `attested`.
+fn fake_signers(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    let cosign = r#"#!/bin/sh
+cmd=$1; shift; key=""; bundle=""; file=""
+while [ $# -gt 0 ]; do case "$1" in
+  --key) key=$2; shift 2;; --bundle) bundle=$2; shift 2;; --*) shift;; *) file=$1; shift;; esac; done
+sum=$(sha256sum "$file" | cut -d' ' -f1)
+case "$cmd" in
+  sign-blob) echo "$sum $(cat "$key")" > "$bundle";;
+  verify-blob) [ "$(cat "$bundle" 2>/dev/null)" = "$sum $(cat "$key")" ] || { echo "invalid signature" >&2; exit 1; };;
+esac
+"#;
+    let gh = format!(
+        r#"#!/bin/sh
+sum=$(sha256sum "$3" | cut -d' ' -f1)
+grep -q "$sum" "{}/attested" 2>/dev/null || {{ echo "no attestation found" >&2; exit 1; }}
+"#,
+        dir.display()
+    );
+    for (name, body) in [("cosign", cosign.to_string()), ("gh", gh)] {
+        let bin = dir.join(name);
+        std::fs::write(&bin, body).unwrap();
+        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+    }
+}
+
+/// A signed package verifies, and the verification is recorded by its package digest; a package
+/// changed after signing, or one nobody attested, does not verify and records nothing.
+#[test]
+fn a_package_is_signed_verified_and_recorded_by_its_digest() {
+    let base = scratch("sign");
+    let (fake, cache) = (base.join("fake"), base.join("cache"));
+    fake_signers(&fake);
+    let (ok, _, _) = vxedge(&base, &["pkg", "new", "demo", "--namespace", "acme"]);
+    assert!(ok);
+    let (ok, out, _) = vxedge(&base.join("demo"), &["pkg", "pack"]);
+    assert!(ok);
+    let digest = digest_line(&out);
+    let file = base.join("demo-0.1.0.vxp");
+    let file_s = file.to_str().unwrap();
+    std::fs::write(base.join("lab.key"), "private-1").unwrap();
+    std::fs::write(base.join("lab.pub"), "private-1").unwrap();
+
+    let (ok, out, err) = vxedge_with(
+        &base,
+        &fake,
+        &cache,
+        &["pkg", "sign", file_s, "--key", "lab.key"],
+    );
+    assert!(ok, "{out}{err}");
+    assert!(base.join("demo-0.1.0.vxp.sigstore.json").is_file());
+    let (ok, out, err) = vxedge_with(
+        &base,
+        &fake,
+        &cache,
+        &["pkg", "verify", file_s, "--key", "lab.pub"],
+    );
+    assert!(ok, "{out}{err}");
+    let fingerprint = vxedge_core::pkg::sha256(b"private-1");
+    assert!(out.contains(&format!("signer key:{fingerprint}")), "{out}");
+    let record = cache.join("vxedge/parts/packages").join(format!(
+        "{}.verified.json",
+        digest.trim_start_matches("sha256:")
+    ));
+    let text = std::fs::read_to_string(&record).unwrap();
+    assert!(
+        text.contains(&digest) && text.contains("sigstore-key"),
+        "{text}"
+    );
+
+    // Another key does not verify it.
+    std::fs::write(base.join("other.pub"), "private-2").unwrap();
+    let (ok, _, err) = vxedge_with(
+        &base,
+        &fake,
+        &cache,
+        &["pkg", "verify", file_s, "--key", "other.pub"],
+    );
+    assert!(!ok && err.contains("cosign"), "{err}");
+
+    // GitHub: only an attested digest verifies.
+    let (ok, _, err) = vxedge_with(
+        &base,
+        &fake,
+        &cache,
+        &["pkg", "verify", file_s, "--repo", "acme/experiments"],
+    );
+    assert!(!ok && err.contains("no attestation"), "{err}");
+    std::fs::write(fake.join("attested"), digest.trim_start_matches("sha256:")).unwrap();
+    let (ok, out, err) = vxedge_with(
+        &base,
+        &fake,
+        &cache,
+        &["pkg", "verify", file_s, "--repo", "acme/experiments"],
+    );
+    assert!(ok, "{out}{err}");
+    assert!(out.contains("signer github:acme/experiments"), "{out}");
+
+    // A file that is not a canonical packed package is refused before any tool runs.
+    std::fs::write(base.join("junk.vxp"), b"not a package").unwrap();
+    let (ok, _, err) = vxedge_with(
+        &base,
+        &fake,
+        &cache,
+        &["pkg", "sign", "junk.vxp", "--key", "lab.key"],
+    );
+    assert!(!ok && err.contains("packed"), "{err}");
+    std::fs::remove_dir_all(&base).ok();
+}

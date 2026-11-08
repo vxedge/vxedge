@@ -20,6 +20,7 @@ pub mod services;
 pub mod sonic;
 pub mod status;
 pub mod traffic;
+pub mod trust;
 pub mod workspace;
 pub mod zones;
 
