@@ -50,7 +50,8 @@ impl GuestArch {
 
     fn from_name(name: &str) -> Option<Self> {
         match name {
-            "x86_64" => Some(GuestArch::X86_64),
+            // A 32-bit x86 guest (the Zephyr probe is `i386`) runs on the same x86_64 machine.
+            "x86_64" | "i386" | "i686" | "x86" => Some(GuestArch::X86_64),
             "aarch64" | "arm64" => Some(GuestArch::Aarch64),
             _ => None,
         }
@@ -136,7 +137,7 @@ fn bundle_arch(np: &NodePlan) -> Result<GuestArch, ZoneBackendError> {
         Some(name) => GuestArch::from_name(name).ok_or_else(|| ZoneBackendError::Runtime {
             node: np.node_id.clone(),
             detail: format!(
-                "the bundle's meta.json names arch `{name}`; qemu-microvm boots x86_64 and aarch64"
+                "the bundle's meta.json names arch `{name}`; qemu-microvm boots x86 (x86_64, i386) and aarch64"
             ),
         }),
     }
@@ -1248,6 +1249,7 @@ mod tests {
             (r#"{"arch":"arm64"}"#, GuestArch::Aarch64),
             (r#"{"org.vxedge.arch":"aarch64"}"#, GuestArch::Aarch64),
             (r#"{"org.vxedge.arch":"x86_64"}"#, GuestArch::X86_64),
+            (r#"{"org.vxedge.arch":"i386"}"#, GuestArch::X86_64),
         ] {
             std::fs::write(dir.path().join("meta.json"), meta).unwrap();
             assert_eq!(bundle_arch(&np).unwrap(), want, "{meta}");
