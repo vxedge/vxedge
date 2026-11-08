@@ -266,8 +266,10 @@ impl Handles {
         {
             Ok(r) => {
                 let r = r.into_inner();
-                // An attach node's platform dials the vehicle's services as it boots, so it
-                // starts after every other zone node and stops before them (ARCHITECTURE.md §9).
+                // An attach node comes after every other zone node both ways
+                // (ARCHITECTURE.md §9): its platform dials the vehicle's services as it boots,
+                // and stopping it first would leave the other nodes holding connections to a
+                // guest that can no longer close them.
                 let attach: std::collections::HashSet<String> = r
                     .nodes
                     .iter()
@@ -276,7 +278,7 @@ impl Handles {
                     .map(|s| s.vxid.clone())
                     .collect();
                 let mut zones = r.zones;
-                zones.sort_by_key(|z| attach.contains(&z.vxid) == up);
+                zones.sort_by_key(|z| attach.contains(&z.vxid));
                 zones
             }
             // A plan that cannot be made is a broken workspace, and reading it as "no zones"

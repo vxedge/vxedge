@@ -109,14 +109,15 @@ fn plan_vehicle(
     Ok((gateway, nodes))
 }
 
-/// Node ids by the service that addresses them: `(zones, compute)`, in the order `up` (or, with
-/// `up` false, `down`) acts on them. An attach node's platform dials the vehicle's services as it
-/// boots, so it comes after every other zone node on the way up and before them on the way down
-/// (ARCHITECTURE.md §9).
-fn by_stage(nodes: &[NodePlan], up: bool) -> (Vec<String>, Vec<String>) {
+/// Node ids by the service that addresses them: `(zones, compute)`, in the order `up` and `down`
+/// act on them. An attach node comes after every other zone node both ways (ARCHITECTURE.md §9):
+/// its platform dials the vehicle's services as it boots, and stopping it kills its guest without
+/// closing the guest's connections, so a vehicle node still holding one keeps its namespace, and
+/// its gateway port, until the kernel gives up on the dead peer.
+fn by_stage(nodes: &[NodePlan]) -> (Vec<String>, Vec<String>) {
     let (compute, mut zones): (Vec<&NodePlan>, Vec<&NodePlan>) =
         nodes.iter().partition(|n| n.role == DeviceRole::Hpc);
-    zones.sort_by_key(|n| (n.backend == vxedge_core::model::Backend::Attach) == up);
+    zones.sort_by_key(|n| n.backend == vxedge_core::model::Backend::Attach);
     let ids = |plans: Vec<&NodePlan>| plans.iter().map(|n| n.node_id.clone()).collect();
     (ids(zones), ids(compute))
 }
@@ -210,7 +211,7 @@ impl VehicleService for VehicleSvc {
             ));
         }
         self.audit.record("VehicleService.Up", audit);
-        let (zones, compute) = by_stage(&nodes, true);
+        let (zones, compute) = by_stage(&nodes);
         let svc = self.handles.clone();
         let job = self
             .handles
@@ -291,7 +292,7 @@ impl VehicleService for VehicleSvc {
             .gateway
             .adopt(model.clone(), gateway, dir.clone(), sha256)
             .await;
-        let (zones, compute) = by_stage(&nodes, false);
+        let (zones, compute) = by_stage(&nodes);
         let svc = self.handles.clone();
         let job = self
             .handles
@@ -477,9 +478,21 @@ parts:
         let m = model(WS);
         let (_, nodes) = plan_vehicle(&m, None).unwrap();
         assert_eq!(
-            by_stage(&nodes, true),
+            by_stage(&nodes),
             (vec!["ecu1".to_string()], vec!["hpc1".to_string()])
         );
+    }
+
+    #[test]
+    fn an_attach_node_comes_last_both_ways() {
+        let m = model(WS);
+        let (_, mut nodes) = plan_vehicle(&m, None).unwrap();
+        let mut ivi = nodes.iter().find(|n| n.node_id == "ecu1").unwrap().clone();
+        ivi.node_id = "ivi".into();
+        ivi.backend = vxedge_core::model::Backend::Attach;
+        nodes.insert(0, ivi);
+        let (zones, _) = by_stage(&nodes);
+        assert_eq!(zones, vec!["ecu1".to_string(), "ivi".to_string()]);
     }
 
     #[test]

@@ -6,6 +6,15 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- `vehicle down` and `experiment down` stop an attach zone after the other zone nodes, as `up` starts it,
+  instead of first. Stopping the platform kills its guest without closing the guest's connections, so a
+  node that served one (the AAOS guest's Vehicle HAL connection to its gateway ECU) kept its namespace, and
+  its gateway port, until the kernel gave up on the dead peer, and `down` failed with "gateway port … still
+  exists 5 s after its namespace was removed". Stopped first, the node closes its connections while the
+  guest can still answer.
+
 ## [0.9.0] - 2026-11-08
 
 A zone can now be a guest that brings its own host stack. `backend: attach` runs the platform through a
