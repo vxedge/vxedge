@@ -174,8 +174,12 @@ pub fn plan_nodes_from_model(
                 if !is_vlan_attached {
                     continue;
                 }
-                let iface =
-                    crate::gateway::ifnames::access_port(&device.id, endpoint.port.as_deref());
+                // An attach device's port is the host interface the gateway adopted, under the
+                // platform's own name; every other port is named from the device id.
+                let iface = match (device.backend, &endpoint.host_interface) {
+                    (Some(crate::model::Backend::Attach), Some(adopted)) => adopted.clone(),
+                    _ => crate::gateway::ifnames::access_port(&device.id, endpoint.port.as_deref()),
+                };
                 let Some(ep) = gateway.endpoints.iter().find(|e| e.name == iface) else {
                     return Err(ZonePlanError::NoSuchEndpoint {
                         device: device.id.clone(),
@@ -436,7 +440,11 @@ pub fn missing_local_bundles(exp: &crate::model::Experiment, workspace_dir: &Pat
                 } else {
                     workspace_dir.join(p)
                 };
-                let complete = dir.join("vmlinuz").exists() && dir.join("initrd.img").exists();
+                // A guest bundle is a kernel and an initramfs; an attach part is its adapter.
+                let complete = match part.kind {
+                    crate::model::PartKind::Attach => dir.join("attach.yaml").exists(),
+                    _ => dir.join("vmlinuz").exists() && dir.join("initrd.img").exists(),
+                };
                 if !complete && !missing.contains(&dir) {
                     missing.push(dir);
                 }
