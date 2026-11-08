@@ -118,6 +118,14 @@ pub(crate) fn package_run(
     })
 }
 
+/// The vxAPI reason for a typed-intent problem.
+fn intent_reason(kind: vxedge_core::intent::ProblemKind) -> R {
+    match kind {
+        vxedge_core::intent::ProblemKind::Parameter => R::ParameterInvalid,
+        vxedge_core::intent::ProblemKind::Criterion => R::CriterionInvalid,
+    }
+}
+
 /// Every check `up` makes before it touches the host, in the order it makes them.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn preflight(
@@ -163,6 +171,28 @@ pub(crate) async fn preflight(
         "package descriptor",
         package.map(|(reason, detail)| (reason, model.id.clone(), detail)),
     );
+
+    // Typed intent, checked before any host question: a bad criterion fails here, in a second,
+    // not after an hour of trials. Every problem is listed, each under its own reason.
+    if let Some(ws) = dir.and_then(|d| vxedge_core::Workspace::load(d).ok()) {
+        let problems = ws.intent_problems();
+        for p in &problems {
+            pf.problems.push(PlanProblem {
+                reason: intent_reason(p.kind) as i32,
+                subject: model.id.clone(),
+                detail: p.to_string(),
+            });
+        }
+        pf.checks.push(HostCheck {
+            name: "typed intent".to_string(),
+            passed: problems.is_empty(),
+            detail: problems
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; "),
+        });
+    }
 
     let version = crate::services::preflight_vxedge_version(dir).err();
     pf.check(

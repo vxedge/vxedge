@@ -1773,7 +1773,12 @@ fn finish_workspace(
     ws: vxedge_core::Workspace,
     model: impl FnOnce() -> Result<vxedge_core::model::Experiment, vxedge_core::model::LoadError>,
 ) -> Result<Summary, String> {
-    let errors = ws.validate();
+    let errors: Vec<String> = ws
+        .validate()
+        .iter()
+        .map(ToString::to_string)
+        .chain(ws.intent_problems().iter().map(ToString::to_string))
+        .collect();
     if !errors.is_empty() {
         return Err(errors
             .iter()

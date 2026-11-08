@@ -6,6 +6,22 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- Typed intent on `kind: experiment` (`ARCHITECTURE.md` §6.0.3): `hypothesis`, `parameters`,
+  `metrics`, `criteria` and `campaign`, all optional, so an experiment without them reads as before.
+  `Plan`, `experiment validate` and `up` check them before any trial and name each field: a
+  parameter whose type, unit, bounds or `binds` path does not hold, two parameters binding one
+  field, or an arm, sweep or profile setting an undeclared parameter or a value out of bounds is
+  `ERROR_REASON_PARAMETER_INVALID`; a criterion with an unknown metric, operands whose units
+  disagree, a selection of an arm or parameter value that does not exist, or an aggregate its metric
+  kind does not have is `ERROR_REASON_CRITERION_INVALID`. `binds` names a field by id path
+  (`traffic_profiles[bg].bandwidth_mbps`), never by text templating. An experiment declares
+  `campaign` or `method`, not both.
+- `vxedge-core::intent`: the typed blocks, their checks, and `evaluate`, which judges a criterion
+  over samples as `pass`, `fail` or `inconclusive` (too few samples, incomplete telemetry) and never
+  reports `inconclusive` as a pass.
+
 ## [0.10.0] - 2026-11-08
 
 A zone can now run the instruction set production zone ECUs run. `qemu-microvm` boots aarch64 guest bundles on
