@@ -6,6 +6,11 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-11-08
+
+Two fixes found by the first gate on a vehicle with an AAOS zone: `down` now stops an attach zone last, and
+a run that is still starting refuses another workspace with one stable reason. No manifest or vxAPI change.
+
 ### Fixed
 
 - `vehicle down` and `experiment down` stop an attach zone after the other zone nodes, as `up` starts it,

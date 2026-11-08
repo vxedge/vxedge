@@ -2493,7 +2493,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vxcapsule"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "thiserror",
  "wasmtime",
@@ -2502,7 +2502,7 @@ dependencies = [
 
 [[package]]
 name = "vxedge-api"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "pbjson",
  "pbjson-build",
@@ -2516,7 +2516,7 @@ dependencies = [
 
 [[package]]
 name = "vxedge-cli"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "clap",
  "hyper-util",
@@ -2533,7 +2533,7 @@ dependencies = [
 
 [[package]]
 name = "vxedge-core"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "bollard",
  "cloud-hypervisor-client",
@@ -2554,7 +2554,7 @@ dependencies = [
 
 [[package]]
 name = "vxedged"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "clap",
  "hyper-util",
