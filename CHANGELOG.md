@@ -8,6 +8,14 @@ All notable changes to this repo are documented here. Format follows
 
 ### Added
 
+- A `qemu-microvm` bundle sizes its guest in `meta.json`: `cpus` (default 1, at most 16, and no more than a pinned
+  node has pinned CPUs) and `memory_mb` (default 128 MiB on x86_64, 256 MiB on aarch64). An out-of-range or
+  malformed value is refused by name.
+- `"virtualization": true` in an aarch64 bundle's `meta.json` gives a guest that is itself a hypervisor the CPU's
+  virtualization extensions: QEMU's `virt` machine at EL2, with GICv3. aarch64 only; refused on x86.
+
+### Added
+
 - Typed intent on `kind: experiment` (`ARCHITECTURE.md` §6.0.3): `hypothesis`, `parameters`,
   `metrics`, `criteria` and `campaign`, all optional, so an experiment without them reads as before.
   `Plan`, `experiment validate` and `up` check them before any trial and name each field: a

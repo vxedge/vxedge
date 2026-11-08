@@ -56,6 +56,8 @@ must follow, not just imitate loosely:
   carries its whole system). `qemu-microvm` then leaves `-initrd` off; QEMU's arm loader refuses an empty file.
 - `meta.json` `virtio_mmio`: `modern` (default, version 2; Zephyr requires it) or `legacy` (version 1, for a
   driver that speaks only that). The bundle states what its driver speaks.
+- `meta.json` `cpus` and `memory_mb` size the guest; `virtualization: true` (aarch64 only) boots `virt` at EL2
+  with GICv3, for a guest that is itself a hypervisor.
 - Document, in the recipe's own README, exactly which `backend:` values the image
   supports — QNX's recipe in particular must state the QNX-Hypervisor-inversion fidelity
   caveat (`vxparts/AGENTS.md`) inline, not leave it implicit.

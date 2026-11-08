@@ -125,12 +125,26 @@ struct BundleBoot {
     /// transport. Default `modern`, the version 2 transport, which
     /// Zephyr's driver requires.
     legacy_mmio: bool,
+    /// `cpus`: vCPUs. Default 1. With pinned CPUs, at most as many as are pinned.
+    cpus: u32,
+    /// `memory_mb`: guest memory. Default 128 MiB on x86_64, 256 MiB on aarch64.
+    memory_mb: Option<u32>,
+    /// `"virtualization": true`: the guest is itself a hypervisor and needs the CPU's
+    /// virtualization extensions. aarch64 only: EL2 on `virt`, with GICv3.
+    virtualization: bool,
 }
+
+/// The ranges `cpus` and `memory_mb` may take: a zone ECU guest, not a server.
+const MAX_CPUS: u32 = 16;
+const MEMORY_MB: std::ops::RangeInclusive<u32> = 64..=65536;
 
 fn bundle_boot(np: &NodePlan) -> Result<BundleBoot, ZoneBackendError> {
     let default = BundleBoot {
         arch: GuestArch::X86_64,
         legacy_mmio: false,
+        cpus: 1,
+        memory_mb: None,
+        virtualization: false,
     };
     let Some(dir) = np.bundle.as_deref() else {
         return Ok(default);
@@ -164,7 +178,61 @@ fn bundle_boot(np: &NodePlan) -> Result<BundleBoot, ZoneBackendError> {
             )));
         }
     };
-    Ok(BundleBoot { arch, legacy_mmio })
+    let number = |key: &str| -> Result<Option<u32>, ZoneBackendError> {
+        match meta.get(key) {
+            None => Ok(None),
+            Some(v) => v
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .map(Some)
+                .ok_or_else(|| {
+                    refuse(format!(
+                        "the bundle's meta.json `{key}` is not a whole number: {v}"
+                    ))
+                }),
+        }
+    };
+    let cpus = number("cpus")?.unwrap_or(1);
+    if !(1..=MAX_CPUS).contains(&cpus) {
+        return Err(refuse(format!(
+            "the bundle's meta.json asks for {cpus} cpus; 1 to {MAX_CPUS}"
+        )));
+    }
+    if !np.pinned_cpus.is_empty() && cpus as usize > np.pinned_cpus.len() {
+        return Err(refuse(format!(
+            "the bundle asks for {cpus} cpus, but the node is pinned to {}",
+            np.pinned_cpus.len()
+        )));
+    }
+    let memory_mb = number("memory_mb")?;
+    if let Some(mb) = memory_mb.filter(|mb| !MEMORY_MB.contains(mb)) {
+        return Err(refuse(format!(
+            "the bundle's meta.json asks for {mb} MiB; {} to {} MiB",
+            MEMORY_MB.start(),
+            MEMORY_MB.end()
+        )));
+    }
+    let virtualization = match meta.get("virtualization") {
+        None => false,
+        Some(v) => v.as_bool().ok_or_else(|| {
+            refuse(format!(
+                "the bundle's meta.json `virtualization` is not true or false: {v}"
+            ))
+        })?,
+    };
+    if virtualization && arch != GuestArch::Aarch64 {
+        return Err(refuse(
+            "the bundle asks for `virtualization`, which qemu-microvm offers on aarch64 only"
+                .into(),
+        ));
+    }
+    Ok(BundleBoot {
+        arch,
+        legacy_mmio,
+        cpus,
+        memory_mb,
+        virtualization,
+    })
 }
 
 use super::cloud_hypervisor;
@@ -614,11 +682,20 @@ fn microvm_argv(
     let nic = format!("virtio-net-device,netdev=n0,mac={}", np.guest_mac());
     let append = kernel_cmdline_for(np, arch);
     let kvm = accel == Acceleration::Kvm;
-    let (machine, cpu, memory) = match arch {
-        GuestArch::X86_64 => ("microvm,acpi=off", if kvm { "host" } else { "max" }, "128m"),
+    let (machine, cpu, default_mb) = match arch {
+        GuestArch::X86_64 => ("microvm,acpi=off", if kvm { "host" } else { "max" }, 128),
+        // A guest that is itself a hypervisor runs at EL2, and its own guests need the GICv3
+        // virtualization interface.
+        GuestArch::Aarch64 if boot.virtualization => (
+            "virt,virtualization=on,gic-version=3",
+            if kvm { "host" } else { "cortex-a57" },
+            256,
+        ),
         // A distribution arm64 kernel unpacks to about 70 MB, so the guest gets more room.
-        GuestArch::Aarch64 => ("virt", if kvm { "host" } else { "cortex-a57" }, "256m"),
+        GuestArch::Aarch64 => ("virt", if kvm { "host" } else { "cortex-a57" }, 256),
     };
+    let memory = format!("{}m", boot.memory_mb.unwrap_or(default_mb));
+    let smp = boot.cpus.to_string();
 
     let mut args: Vec<String> = Vec::new();
     if !np.pinned_cpus.is_empty() {
@@ -641,9 +718,9 @@ fn microvm_argv(
             "-cpu",
             cpu,
             "-m",
-            memory,
+            &memory,
             "-smp",
-            "1",
+            &smp,
             "-nodefaults",
             // QEMU's virtio-mmio is the legacy (version 1) transport unless told otherwise.
             // Linux speaks both; Zephyr's driver refuses version 1, and some drivers speak only
@@ -1170,6 +1247,9 @@ mod tests {
         BundleBoot {
             arch,
             legacy_mmio: false,
+            cpus: 1,
+            memory_mb: None,
+            virtualization: false,
         }
     }
 
@@ -1272,6 +1352,70 @@ mod tests {
         }
         std::fs::write(dir.path().join("meta.json"), r#"{"virtio_mmio":"v3"}"#).unwrap();
         assert!(bundle_boot(&np).unwrap_err().to_string().contains("v3"));
+    }
+
+    /// A bundle sizes its guest and, on aarch64, asks for the virtualization extensions.
+    #[test]
+    fn a_bundle_sizes_its_guest_and_may_ask_for_el2() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut np = microvm_node(Some(dir.path().to_path_buf()));
+        let rt = Path::new("/run/vx");
+        std::fs::write(
+            dir.path().join("meta.json"),
+            r#"{"arch":"aarch64","cpus":2,"memory_mb":2048,"virtualization":true}"#,
+        )
+        .unwrap();
+        let b = bundle_boot(&np).unwrap();
+        let argv = microvm_argv(&np, rt, "k", "i", b, Acceleration::Tcg);
+        assert_eq!(
+            arg_after(&argv, "-M"),
+            "virt,virtualization=on,gic-version=3"
+        );
+        assert_eq!(arg_after(&argv, "-smp"), "2");
+        assert_eq!(arg_after(&argv, "-m"), "2048m");
+
+        // Defaults: one vCPU, the architecture's memory, no EL2.
+        std::fs::write(dir.path().join("meta.json"), r#"{"arch":"aarch64"}"#).unwrap();
+        let argv = microvm_argv(
+            &np,
+            rt,
+            "k",
+            "i",
+            bundle_boot(&np).unwrap(),
+            Acceleration::Tcg,
+        );
+        assert_eq!(arg_after(&argv, "-M"), "virt");
+        assert_eq!(arg_after(&argv, "-smp"), "1");
+        assert_eq!(arg_after(&argv, "-m"), "256m");
+
+        for (meta, why) in [
+            (r#"{"virtualization":true}"#, "aarch64 only"),
+            (r#"{"arch":"aarch64","cpus":0}"#, "0 cpus"),
+            (r#"{"arch":"aarch64","cpus":"two"}"#, "not a whole number"),
+            (r#"{"arch":"aarch64","memory_mb":16}"#, "16 MiB"),
+            (
+                r#"{"arch":"aarch64","virtualization":"yes"}"#,
+                "not true or false",
+            ),
+        ] {
+            std::fs::write(dir.path().join("meta.json"), meta).unwrap();
+            let e = bundle_boot(&np).unwrap_err().to_string();
+            assert!(e.contains(why), "{meta}: {e}");
+        }
+
+        // A pinned node gets no more vCPUs than it has pinned CPUs.
+        np.pinned_cpus = vec![3];
+        std::fs::write(
+            dir.path().join("meta.json"),
+            r#"{"arch":"aarch64","cpus":2}"#,
+        )
+        .unwrap();
+        assert!(
+            bundle_boot(&np)
+                .unwrap_err()
+                .to_string()
+                .contains("pinned to 1")
+        );
     }
 
     /// KVM runs a guest only on a host of the same instruction set.
