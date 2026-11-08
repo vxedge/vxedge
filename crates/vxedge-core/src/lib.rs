@@ -12,6 +12,7 @@ pub mod gateway;
 pub mod identity;
 pub mod intent;
 pub mod model;
+pub mod offline;
 pub mod package;
 pub mod pkg;
 pub mod registry;
