@@ -265,6 +265,13 @@ impl JobEngine {
         &self.inner.events
     }
 
+    /// The target of the lifecycle job running now (`vehicle <id>`, `experiment <id> [stages]`,
+    /// `zone <vxid>`, …), if one is.
+    pub async fn lifecycle_target(&self) -> Option<String> {
+        let st = self.inner.state.lock().await;
+        st.lifecycle.as_ref().map(|(_, target, _)| target.clone())
+    }
+
     #[cfg(test)]
     pub fn new(events: EventBus) -> Self {
         Self::build(events, None)

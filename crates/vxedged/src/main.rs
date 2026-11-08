@@ -244,11 +244,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             gateway: plan_gateway.clone(),
             runtime_dir: args.runtime_dir.clone(),
             cache_dir: cache_dir.clone(),
+            engine: engine.clone(),
         }))
         .add_service(HostServiceServer::new(plan::PlanSvc {
             gateway: plan_gateway,
             runtime_dir: args.runtime_dir.clone(),
             cache_dir: cache_dir.clone(),
+            engine: engine.clone(),
         }))
         .add_service(ZoneServiceServer::from_arc(zones))
         .add_service(ComputeServiceServer::from_arc(compute))

@@ -25,6 +25,29 @@ use vxedge_core::zones::NodePlan;
 use crate::errors::{self, R};
 use crate::services::GatewaySvc;
 
+/// The workspace a lifecycle target acts on: `<id>` of `vehicle <id>` or `experiment <id> [stages]`.
+/// A zone, compute or service target acts on the active run and names none.
+fn workspace_of_lifecycle(target: &str) -> Option<&str> {
+    let rest = target
+        .strip_prefix("vehicle ")
+        .or_else(|| target.strip_prefix("experiment "))?;
+    rest.split(' ').next().filter(|id| !id.is_empty())
+}
+
+/// The workspace a running lifecycle job holds, when it is not this one. `vehicle` verbs name a
+/// run by its vehicle's id and `experiment` verbs by the model's, so either is this workspace, and
+/// its own duplicate is the job engine's to answer.
+fn held_by_another(
+    running: Option<&str>,
+    model_id: &str,
+    vehicle_id: Option<&str>,
+) -> Option<String> {
+    running
+        .and_then(workspace_of_lifecycle)
+        .filter(|id| *id != model_id && Some(*id) != vehicle_id)
+        .map(str::to_string)
+}
+
 /// What `up` found before touching the host.
 #[derive(Default)]
 pub(crate) struct Preflight {
@@ -107,6 +130,7 @@ pub(crate) async fn preflight(
     runtime_dir: &Path,
     cache_dir: &Path,
     gateway: &GatewaySvc,
+    running: Option<String>,
 ) -> Preflight {
     let mut pf = Preflight::default();
     let workspace = dir.unwrap_or_else(|| Path::new("."));
@@ -175,15 +199,33 @@ pub(crate) async fn preflight(
     pf.check("package lock", package);
 
     let active = gateway.active_on_host().await;
-    let target = crate::experiment::check_active_target(
-        verb,
-        active
-            .as_ref()
-            .map(|(id, dir)| (id.as_str(), dir.as_path())),
+    // A run whose gateway is still being built is not on the host yet, but it already holds the
+    // host: refused by what is recorded, another workspace's `up` would be told it differently
+    // depending on how far that gateway had got.
+    let starting = held_by_another(
+        running.as_deref(),
         &model.id,
-        dir,
-    )
-    .err();
+        model.entities.first().map(|e| e.id.as_str()),
+    );
+    let target = match (&active, starting) {
+        (None, Some(other)) => Some(crate::errors::precondition(
+            R::WrongWorkspace,
+            format!(
+                "`{other}` is being brought up or down on this host, not `{}`: `{verb}` only acts \
+                 on what is active — wait for it, then run it from that workspace or bring it down",
+                model.id
+            ),
+        )),
+        _ => crate::experiment::check_active_target(
+            verb,
+            active
+                .as_ref()
+                .map(|(id, dir)| (id.as_str(), dir.as_path())),
+            &model.id,
+            dir,
+        )
+        .err(),
+    };
     pf.check(
         "active workspace",
         target.map(|s| (R::WrongWorkspace, model.id.clone(), s.message().to_string())),
@@ -377,6 +419,8 @@ pub struct PlanSvc {
     pub runtime_dir: PathBuf,
     /// The part cache, where a published artifact store would be fetched to.
     pub cache_dir: PathBuf,
+    /// Read for the lifecycle job running now, so `Plan` refuses what `up` would.
+    pub engine: crate::jobs::JobEngine,
 }
 
 fn on_path(binary: &str) -> bool {
@@ -515,6 +559,7 @@ impl WorkspaceService for PlanSvc {
             &self.runtime_dir,
             &self.cache_dir,
             &self.gateway,
+            self.engine.lifecycle_target().await,
         )
         .await;
         let probes = match pf.backends {
@@ -583,5 +628,49 @@ impl HostService for PlanSvc {
                 .map(|s| s.to_string())
                 .collect(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::{held_by_another, workspace_of_lifecycle};
+
+    #[test]
+    fn a_workspaces_own_running_job_is_not_another_workspace() {
+        let (model, vehicle) = ("vehicle-sedan", Some("sedan"));
+        assert_eq!(held_by_another(Some("vehicle sedan"), model, vehicle), None);
+        assert_eq!(
+            held_by_another(Some("experiment vehicle-sedan"), model, vehicle),
+            None
+        );
+        assert_eq!(held_by_another(None, model, vehicle), None);
+        assert_eq!(held_by_another(Some("zone ecu1"), model, vehicle), None);
+        assert_eq!(
+            held_by_another(
+                Some("vehicle other [EXPERIMENT_STAGE_GATEWAY]"),
+                model,
+                vehicle
+            ),
+            Some("other".to_string())
+        );
+        assert_eq!(
+            held_by_another(Some("experiment exp-002"), model, vehicle),
+            Some("exp-002".to_string())
+        );
+    }
+
+    #[test]
+    fn a_lifecycle_target_names_its_workspace_only_for_a_whole_run() {
+        assert_eq!(
+            workspace_of_lifecycle("vehicle vehicle-x"),
+            Some("vehicle-x")
+        );
+        assert_eq!(
+            workspace_of_lifecycle("experiment exp-002 [EXPERIMENT_STAGE_GATEWAY]"),
+            Some("exp-002")
+        );
+        assert_eq!(workspace_of_lifecycle("zone ecu1"), None);
+        assert_eq!(workspace_of_lifecycle("vxgateway"), None);
+        assert_eq!(workspace_of_lifecycle("vehicle "), None);
     }
 }
