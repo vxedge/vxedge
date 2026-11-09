@@ -151,6 +151,8 @@ enum ErrorReason {
   ERROR_REASON_PACKAGE_UNKNOWN = 31;
   // A campaign id this daemon has no record of.
   ERROR_REASON_CAMPAIGN_UNKNOWN = 32;
+  // An archive digest this host's results do not hold.
+  ERROR_REASON_RESULT_UNKNOWN = 33;
 }
 
 // Names one run. See `RunService`.

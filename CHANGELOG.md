@@ -8,6 +8,19 @@ All notable changes to this repo are documented here. Format follows
 
 ### Added
 
+- `ResultService` (new service, additive): `List`, `Get` and `Fetch`.
+  - **Where results come from:** a campaign's trial archives, and every archive under a
+    workspace's `results/`.
+  - **What describes them:** each archive's own `metadata.json` and nothing else. That covers
+    the digest of its bytes, the archive format, experiment, package and lock state, and the
+    trial (campaign, arm, repetition, parameter values), plus the collection time, the
+    vxtelemetry version and the kernel.
+  - **Fetching:** `Fetch` streams an archive's bytes by digest, so a client on another
+    filesystem can rerun from it.
+  - **Errors:** an unknown digest is the new `ERROR_REASON_RESULT_UNKNOWN` (33).
+
+### Added
+
 - `CampaignService.Start`, `Get`, `List` and `Watch`: run a campaign's trials serially as one
   `campaign.run` job.
   - **Each trial, in order:**
