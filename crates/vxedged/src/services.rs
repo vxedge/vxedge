@@ -2359,33 +2359,24 @@ impl TrafficSvc {
     }
 }
 
-/// Refuse, before any job starts, a profile whose node-side endpoint is not on the host: a node
-/// whose zone is up holds its gateway-side veth in its own namespace, where a host-side load
-/// generator cannot bind. Found in the 0.5.0 gate, where it surfaced only as a failed job.
-fn endpoints_on_host(
+/// The profiles whose node-side endpoint is not on the host: a node whose zone is up holds its
+/// gateway-side veth in its own namespace, so its generator runs inside the node
+/// (`traffic::in_node`) instead of on the host.
+fn inside_nodes(
     profiles: &[vxedge_core::traffic::ResolvedProfile],
     sys_class_net: &Path,
-) -> Result<(), Status> {
+) -> Vec<String> {
     use vxedge_core::traffic::ProfileEndpoint;
-    for p in profiles {
-        for ep in [&p.source, &p.target] {
-            if let ProfileEndpoint::VlanNodePeer { peer_iface, .. } = ep
-                && !sys_class_net.join(peer_iface).exists()
-            {
-                return Err(crate::errors::precondition(
-                    crate::errors::R::EndpointNotOnHost,
-                    format!(
-                        "traffic profile `{}`: its endpoint `{peer_iface}` is not on the host. Its \
-                         node's zone is up, which moves the gateway-side veth into the node; for \
-                         host-side traffic bring the run up with the gateway stage only \
-                         (`experiment up --stage gateway`)",
-                        p.id
-                    ),
-                ));
-            }
-        }
-    }
-    Ok(())
+    profiles
+        .iter()
+        .filter(|p| {
+            [&p.source, &p.target].iter().any(|ep| {
+                matches!(ep, ProfileEndpoint::VlanNodePeer { peer_iface, .. }
+                    if !sys_class_net.join(peer_iface).exists())
+            })
+        })
+        .map(|p| p.id.clone())
+        .collect()
 }
 
 fn select_profiles(
@@ -2459,9 +2450,33 @@ impl TrafficService for TrafficSvc {
             serde_json::json!({ "manifest_sha256": sha256, "profiles": req.profiles }),
         );
         let selected = select_profiles(traffic_plan, &req.profiles)?;
-        if active_run(&self.runtime_dir).is_some() {
-            endpoints_on_host(&selected, Path::new("/sys/class/net"))?;
-        }
+        let inside = if active_run(&self.runtime_dir).is_some() {
+            inside_nodes(&selected, Path::new("/sys/class/net"))
+        } else {
+            Vec::new()
+        };
+        // A profile whose node is up runs inside it. One that cannot (its source is no node) is
+        // refused before any job starts.
+        let in_node = if inside.is_empty() {
+            Vec::new()
+        } else {
+            let (yaml, _, dir) = resolve_manifest(req.manifest.as_ref()).await?;
+            let refuse =
+                |e: String| crate::errors::precondition(crate::errors::R::EndpointNotOnHost, e);
+            let model = parse_to_model(&yaml).map_err(refuse)?;
+            let gateway = GatewayPlan::from_model(&model).map_err(|e| refuse(e.to_string()))?;
+            let workspace = dir.unwrap_or_else(|| PathBuf::from("."));
+            let nodes = vxedge_core::zones::plan_nodes_from_model(&model, &gateway, &workspace)
+                .map_err(|e| refuse(e.to_string()))?;
+            inside
+                .iter()
+                .map(|id| traffic::in_node::plan(&model, &gateway, &nodes, id).map_err(refuse))
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let selected: Vec<_> = selected
+            .into_iter()
+            .filter(|p| !inside.contains(&p.id))
+            .collect();
 
         let shell = self.shell.clone();
         let runtime_dir = self.runtime_dir.clone();
@@ -2472,7 +2487,7 @@ impl TrafficService for TrafficSvc {
         let job = self
             .engine
             .submit_with(opts, "traffic.up", move |p| async move {
-                let total = selected.len().max(1);
+                let total = (selected.len() + in_node.len()).max(1);
                 let mut messages = Vec::with_capacity(selected.len());
                 for (i, profile) in selected.into_iter().enumerate() {
                     p.update(
@@ -2495,6 +2510,24 @@ impl TrafficService for TrafficSvc {
                     )
                     .await
                     .map_err(|e| e.to_string())?;
+                    events.emit(crate::events::EventKind::TrafficStarted, &profile.id, &msg);
+                    messages.push(msg);
+                }
+                for profile in &in_node {
+                    p.update(
+                        90,
+                        &format!("starting traffic profile `{}` inside its node", profile.id),
+                    );
+                    let msg = traffic::in_node::up(
+                        &shell,
+                        &containers,
+                        &runtime_dir,
+                        &vxprobe_bin,
+                        &vxtraffic_bin,
+                        profile,
+                        duration_s,
+                    )
+                    .await?;
                     events.emit(crate::events::EventKind::TrafficStarted, &profile.id, &msg);
                     messages.push(msg);
                 }
@@ -2531,6 +2564,7 @@ impl TrafficService for TrafficSvc {
                     let runtime_dir = runtime_dir.clone();
                     let profile_id = profile.id.clone();
                     let msg = blocking(move || {
+                        traffic::in_node::forget(&runtime_dir, &profile.id);
                         Ok::<_, String>(traffic::profile_down(&runtime_dir, &profile.id))
                     })
                     .await?;
@@ -2963,8 +2997,7 @@ impl NosCheckService for NosCheckSvc {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn traffic_refuses_an_endpoint_that_is_not_on_the_host() {
-        use tonic_types::StatusExt;
+    fn a_profile_whose_node_is_up_runs_inside_it() {
         use vxedge_core::traffic::{ProfileEndpoint, ResolvedProfile};
         let net = std::env::temp_dir().join(format!("vx-endpoints-{}", std::process::id()));
         std::fs::create_dir_all(net.join("vzp-present")).unwrap();
@@ -2984,13 +3017,9 @@ mod tests {
             bandwidth_mbps: Some(10),
             payload_bytes: 1200,
         };
-        assert!(endpoints_on_host(&[profile("vzp-present")], &net).is_ok());
-        let refused = endpoints_on_host(&[profile("vzp-gone")], &net).unwrap_err();
+        assert!(inside_nodes(&[profile("vzp-present")], &net).is_empty());
+        assert_eq!(inside_nodes(&[profile("vzp-gone")], &net), ["load"]);
         let _ = std::fs::remove_dir_all(&net);
-        assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
-        let info = refused.get_error_details().error_info().cloned().unwrap();
-        assert_eq!(info.reason, "ERROR_REASON_ENDPOINT_NOT_ON_HOST");
-        assert!(refused.message().contains("--stage gateway"));
     }
 
     use super::*;

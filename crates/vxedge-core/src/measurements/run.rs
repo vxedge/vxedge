@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::{INTERNET, Measurement};
+use super::INTERNET;
 use crate::containers::LazyClient;
 use crate::gateway::netlink;
 use crate::gateway::{GatewayPlan, Shell};
@@ -97,11 +97,12 @@ pub fn plan(
         .enumerate()
         .map(|(i, m)| {
             let i = u16::try_from(i).map_err(|_| "too many measurements".to_string())?;
-            let sender = end(model, nodes, &m.from, &m.slice, &m.id)?;
+            let what = format!("measurement `{}`", m.id);
+            let sender = end_on(model, nodes, &m.from, &m.slice, &what)?;
             let reflector = if m.to == INTERNET {
-                far_side(model, gateway, m, &sender)?
+                far_side_of(model, gateway, &m.from, &m.slice, &what)?
             } else {
-                Reflector::Node(end(model, nodes, &m.to, &m.slice, &m.id)?)
+                Reflector::Node(end_on(model, nodes, &m.to, &m.slice, &what)?)
             };
             Ok(Placement {
                 id: m.id.clone(),
@@ -117,26 +118,28 @@ pub fn plan(
         .collect()
 }
 
-fn end(
+/// `node` as an end on `slice`: its namespace and its pinned address there. `what` names the
+/// measurement or profile in errors.
+pub(crate) fn end_on(
     model: &Experiment,
     nodes: &[NodePlan],
     node: &str,
     slice: &str,
-    id: &str,
+    what: &str,
 ) -> Result<End, String> {
     let endpoint = model
         .entities
         .iter()
         .find_map(|v| super::endpoint_on(v, node, slice))
-        .ok_or_else(|| format!("measurement `{id}`: `{node}` has no link on slice `{slice}`"))?;
+        .ok_or_else(|| format!("{what}: `{node}` has no link on slice `{slice}`"))?;
     let cidr = endpoint
         .ip_cidr
         .as_deref()
-        .ok_or_else(|| format!("measurement `{id}`: `{node}` pins no `ip` on slice `{slice}`"))?;
+        .ok_or_else(|| format!("{what}: `{node}` pins no `ip` on slice `{slice}`"))?;
     let np = nodes
         .iter()
         .find(|n| n.node_id == node)
-        .ok_or_else(|| format!("measurement `{id}`: `{node}` has no node plan"))?;
+        .ok_or_else(|| format!("{what}: `{node}` has no node plan"))?;
     Ok(End {
         node: node.to_string(),
         runtime_name: np.runtime_name(),
@@ -145,31 +148,28 @@ fn end(
     })
 }
 
-/// The far side for `m`: the first host address of the sender's subnet, on the slice's VLAN.
-fn far_side(
+/// The far side for a sender at `from` on `slice`: the first host address of its subnet, on the
+/// slice's VLAN.
+pub(crate) fn far_side_of(
     model: &Experiment,
     gateway: &GatewayPlan,
-    m: &Measurement,
-    sender: &End,
+    from: &str,
+    slice_id: &str,
+    what: &str,
 ) -> Result<Reflector, String> {
     let slice = gateway
         .slices
         .iter()
-        .find(|s| s.id == m.slice)
-        .ok_or_else(|| {
-            format!(
-                "measurement `{}`: slice `{}` is not a VLAN slice of the gateway",
-                m.id, m.slice
-            )
-        })?;
+        .find(|s| s.id == slice_id)
+        .ok_or_else(|| format!("{what}: slice `{slice_id}` is not a VLAN slice of the gateway"))?;
     let cidr = model
         .entities
         .iter()
-        .find_map(|v| super::endpoint_on(v, &m.from, &m.slice))
+        .find_map(|v| super::endpoint_on(v, from, slice_id))
         .and_then(|e| e.ip_cidr.clone())
         .unwrap_or_default();
-    let addr = first_host(&cidr)
-        .ok_or_else(|| format!("measurement `{}`: `{cidr}` is not an IPv4 subnet", m.id))?;
+    let addr =
+        first_host(&cidr).ok_or_else(|| format!("{what}: `{cidr}` is not an IPv4 subnet"))?;
     let taken = model
         .entities
         .iter()
@@ -179,9 +179,8 @@ fn far_side(
         .find(|c| c.split('/').next() == Some(addr.as_str()));
     if let Some(taken) = taken {
         return Err(format!(
-            "measurement `{}`: the far side takes {addr}, the first address of `{}`'s subnet, \
-             and a link already pins `{taken}`",
-            m.id, sender.node
+            "{what}: the far side takes {addr}, the first address of `{from}`'s subnet, and a \
+             link already pins `{taken}`"
         ));
     }
     let prefix = cidr.split_once('/').map(|(_, p)| p).unwrap_or("24");
@@ -223,8 +222,18 @@ pub struct Started {
     pub far_side: Option<String>,
 }
 
+/// The file prefix of a measurement's processes, records and logs.
+const MEASURE: &str = "measure";
+/// The file prefix `traffic::lifecycle` uses, so a profile run inside a node is read and stopped
+/// by the same status and `down` as one run on the host.
+pub(crate) const TRAFFIC: &str = "traffic";
+
+fn file_of(prefix: &str, runtime_dir: &Path, id: &str, suffix: &str) -> PathBuf {
+    runtime_dir.join(format!("{prefix}-{id}{suffix}"))
+}
+
 fn file(runtime_dir: &Path, id: &str, suffix: &str) -> PathBuf {
-    runtime_dir.join(format!("measure-{id}{suffix}"))
+    file_of(MEASURE, runtime_dir, id, suffix)
 }
 
 fn pidfile(runtime_dir: &Path, id: &str, role: &str) -> PathBuf {
@@ -241,14 +250,18 @@ pub fn summary_file(runtime_dir: &Path, id: &str) -> PathBuf {
 }
 
 fn read_pid(runtime_dir: &Path, id: &str, role: &str) -> Option<i32> {
-    std::fs::read_to_string(pidfile(runtime_dir, id, role))
+    read_pid_of(MEASURE, runtime_dir, id, role)
+}
+
+pub(crate) fn read_pid_of(prefix: &str, runtime_dir: &Path, id: &str, role: &str) -> Option<i32> {
+    std::fs::read_to_string(file_of(prefix, runtime_dir, id, &format!("-{role}.pid")))
         .ok()?
         .trim()
         .parse()
         .ok()
 }
 
-fn alive(pid: i32) -> bool {
+pub(crate) fn alive(pid: i32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
 
@@ -310,7 +323,22 @@ fn spawn(
     args: Vec<String>,
     stdout: Option<PathBuf>,
 ) -> Result<u32, String> {
-    let log_path = file(runtime_dir, id, &format!("-{role}.log"));
+    spawn_as(MEASURE, runtime_dir, id, role, netns, bin, args, stdout)
+}
+
+/// [`spawn`] with the files named `<prefix>-<id>-<role>.*`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_as(
+    prefix: &'static str,
+    runtime_dir: &Path,
+    id: &str,
+    role: &'static str,
+    netns: Option<&str>,
+    bin: &str,
+    args: Vec<String>,
+    stdout: Option<PathBuf>,
+) -> Result<u32, String> {
+    let log_path = file_of(prefix, runtime_dir, id, &format!("-{role}.log"));
     let (rt, id_s, bin_s) = (runtime_dir.to_path_buf(), id.to_string(), bin.to_string());
     let start = move || -> Result<u32, String> {
         let log = std::fs::File::create(&log_path)
@@ -330,10 +358,13 @@ fn spawn(
             .spawn()
             .map_err(|e| format!("cannot run `{bin_s}`: {e}"))?;
         let pid = child.id();
-        let exit = exitfile(&rt, &id_s, role);
+        let exit = file_of(prefix, &rt, &id_s, &format!("-{role}.exit"));
         let _ = std::fs::remove_file(&exit);
-        std::fs::write(pidfile(&rt, &id_s, role), pid.to_string())
-            .map_err(|e| format!("cannot write the pidfile: {e}"))?;
+        std::fs::write(
+            file_of(prefix, &rt, &id_s, &format!("-{role}.pid")),
+            pid.to_string(),
+        )
+        .map_err(|e| format!("cannot write the pidfile: {e}"))?;
         std::thread::spawn(move || {
             let code = match child.wait() {
                 Ok(status) => status
@@ -356,7 +387,7 @@ fn spawn(
 
 /// The namespace an end runs in: its infra container's when it runs an image, else its named
 /// namespace. Either must exist: the node's zone is up.
-async fn netns_of(end: &End, containers: &LazyClient) -> Result<String, String> {
+pub(crate) async fn netns_of(end: &End, containers: &LazyClient) -> Result<String, String> {
     if end.image {
         let client = containers.get().await.map_err(|e| e.to_string())?;
         let pid = client
@@ -372,6 +403,54 @@ async fn netns_of(end: &End, containers: &LazyClient) -> Result<String, String> 
             end.node
         ))
     }
+}
+
+/// The far side's VLAN subinterface of the uplink's peer, up and addressed. Idempotent.
+pub(crate) fn ensure_far_side(
+    sh: &Shell,
+    parent: &str,
+    vlan: u16,
+    iface: &str,
+    cidr: &str,
+) -> Result<(), String> {
+    if !sh.link_exists(iface) {
+        let vlan = vlan.to_string();
+        sh.run(
+            "ip",
+            &[
+                "link", "add", "link", parent, "name", iface, "type", "vlan", "id", &vlan,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    sh.run("ip", &["addr", "replace", cidr, "dev", iface])
+        .map_err(|e| e.to_string())?;
+    sh.run("ip", &["link", "set", iface, "up"])
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Whether a running traffic profile sends to the far side `iface` (`crate::traffic::in_node`).
+fn traffic_uses(runtime_dir: &Path, iface: &str) -> bool {
+    let Ok(dir) = std::fs::read_dir(runtime_dir) else {
+        return false;
+    };
+    dir.flatten().any(|e| {
+        let name = e.file_name().to_string_lossy().to_string();
+        let Some(id) = name
+            .strip_prefix("traffic-")
+            .and_then(|n| n.strip_suffix(".in-node.json"))
+        else {
+            return false;
+        };
+        let uses = std::fs::read(e.path())
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .is_some_and(|v| v["far_side"].as_str() == Some(iface));
+        uses && ["send", "load", "reflect"]
+            .iter()
+            .any(|role| read_pid_of(TRAFFIC, runtime_dir, id, role).is_some_and(alive))
+    })
 }
 
 /// Start one measurement for `duration_s`: its reflector, then its sender. A measurement whose
@@ -439,21 +518,7 @@ pub async fn start(
                 listen(addr),
             );
             tokio::task::spawn_blocking(move || -> Result<(), String> {
-                if !sh.link_exists(&iface_c) {
-                    let vlan = vlan.to_string();
-                    sh.run(
-                        "ip",
-                        &[
-                            "link", "add", "link", &parent, "name", &iface_c, "type", "vlan", "id",
-                            &vlan,
-                        ],
-                    )
-                    .map_err(|e| e.to_string())?;
-                }
-                sh.run("ip", &["addr", "replace", &cidr, "dev", &iface_c])
-                    .map_err(|e| e.to_string())?;
-                sh.run("ip", &["link", "set", &iface_c, "up"])
-                    .map_err(|e| e.to_string())?;
+                ensure_far_side(&sh, &parent, vlan, &iface_c, &cidr)?;
                 spawn(&rt, &id, "reflect", None, &bin, args, None).map(|_| ())
             })
             .await
@@ -540,7 +605,8 @@ pub fn stop(sh: &Shell, runtime_dir: &Path, id: &str) -> String {
     if let Some(iface) = far_side {
         let shared = started(runtime_dir)
             .iter()
-            .any(|s| s.far_side.as_deref() == Some(iface.as_str()));
+            .any(|s| s.far_side.as_deref() == Some(iface.as_str()))
+            || traffic_uses(runtime_dir, &iface);
         if !shared && sh.link_exists(&iface) {
             let _ = sh.run("ip", &["link", "del", &iface]);
         }
@@ -717,7 +783,7 @@ network:
         let nodes =
             crate::zones::plan_nodes_from_model(&model, &gateway, Path::new("/nonexistent"))
                 .unwrap();
-        let e = end(&model, &nodes, "ecu2", "info", "a").unwrap();
+        let e = end_on(&model, &nodes, "ecu2", "info", "measurement `a`").unwrap();
         assert!(e.image);
         assert_eq!(e.runtime_name, crate::zones::runtime_name_of("ecu2"));
     }
