@@ -83,6 +83,14 @@ All notable changes to this repo are documented here. Format follows
   requires signatures and allows no signer is refused at start. `pkg verify` and `pkg pull` take
   `--cache-dir` (or `VXEDGE_CACHE_DIR`) to write where the daemon reads.
 
+### Fixed
+
+- The daemon's exporter answered a scrape in about 3.6 s with three container nodes up, past
+  `vxtelemetry`'s 3 s scrape timeout, so a live run recorded no per-node or per-slice samples.
+  Every connection to Podman asked for its API version, and Podman takes about a second to answer
+  `/version`. The version is now asked for once per socket, and later connections only ping.
+  `experiment status` and other container operations are faster for the same reason.
+
 ## [0.11.0] - 2026-11-08
 
 Three additions. An experiment can state its intent as typed data, a hypothesis, parameters, metrics and pass

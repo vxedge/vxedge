@@ -43,6 +43,14 @@ pub struct GroupHandle {
     pub infra_pid: u32,
 }
 
+/// The API version each socket settled on, by socket path (see [`ContainerClient::connect`]).
+fn negotiated() -> &'static std::sync::Mutex<BTreeMap<PathBuf, bollard::ClientVersion>> {
+    static NEGOTIATED: std::sync::OnceLock<
+        std::sync::Mutex<BTreeMap<PathBuf, bollard::ClientVersion>>,
+    > = std::sync::OnceLock::new();
+    NEGOTIATED.get_or_init(Default::default)
+}
+
 #[derive(Debug, Clone)]
 pub struct ContainerClient {
     docker: Docker,
@@ -52,6 +60,11 @@ pub struct ContainerClient {
 impl ContainerClient {
     /// Connect to the API socket at `socket` and confirm a daemon answers on it — a client that
     /// constructs fine against a dead socket would defer the failure to the middle of an `up`.
+    ///
+    /// The API version is negotiated on a socket's first connect and reused after that, with a
+    /// `/_ping` as the liveness check. Podman answers `/version` by asking its runtime and conmon
+    /// for theirs, which takes about a second, and the daemon's exporter connects once per
+    /// container node on every scrape.
     pub async fn connect(socket: &Path) -> Result<Self, ContainerError> {
         let unreachable = |detail: String| ContainerError::SocketUnreachable {
             path: socket.display().to_string(),
@@ -60,15 +73,32 @@ impl ContainerClient {
         let path = socket
             .to_str()
             .ok_or_else(|| unreachable("path is not valid UTF-8".into()))?;
-        let docker =
-            Docker::connect_with_unix(path, API_TIMEOUT_SECS, bollard::API_DEFAULT_VERSION)
-                .map_err(|e| unreachable(e.to_string()))?;
-        // Doubles as the liveness check: settles on the lower of bollard's and the daemon's API
-        // versions, so a Podman whose compat API trails Docker's still gets requests it accepts.
-        let docker = docker
-            .negotiate_version()
-            .await
+        let known = negotiated()
+            .lock()
+            .ok()
+            .and_then(|m| m.get(socket).copied());
+        let version = known.unwrap_or(*bollard::API_DEFAULT_VERSION);
+        let docker = Docker::connect_with_unix(path, API_TIMEOUT_SECS, &version)
             .map_err(|e| unreachable(e.to_string()))?;
+        let docker = if known.is_some() {
+            docker
+                .ping()
+                .await
+                .map_err(|e| unreachable(e.to_string()))?;
+            docker
+        } else {
+            // Doubles as the liveness check: settles on the lower of bollard's and the daemon's
+            // API versions, so a Podman whose compat API trails Docker's still gets requests it
+            // accepts.
+            let docker = docker
+                .negotiate_version()
+                .await
+                .map_err(|e| unreachable(e.to_string()))?;
+            if let Ok(mut m) = negotiated().lock() {
+                m.insert(socket.to_path_buf(), docker.client_version());
+            }
+            docker
+        };
         Ok(Self {
             docker,
             socket: socket.to_path_buf(),
@@ -627,6 +657,59 @@ mod tests {
         // started must be picked up without a restart.
         assert!(lazy.get().await.is_err());
         assert!(lazy.cell.get().is_none());
+    }
+
+    /// The API version is asked for once per socket: Podman takes about a second to answer
+    /// `/version`, and a scrape connects once per container node. Later connects only ping.
+    #[tokio::test]
+    async fn the_api_version_is_negotiated_once_per_socket() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("podman.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let (versions, pings) = (
+            std::sync::Arc::new(AtomicUsize::new(0)),
+            std::sync::Arc::new(AtomicUsize::new(0)),
+        );
+        let (v, p) = (versions.clone(), pings.clone());
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let (v, p) = (v.clone(), p.clone());
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    while let Ok(n) = stream.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                        let body = if head.contains("/version ") {
+                            v.fetch_add(1, Ordering::SeqCst);
+                            r#"{"ApiVersion":"1.41","Version":"5.7.0"}"#
+                        } else if head.contains("/_ping ") {
+                            p.fetch_add(1, Ordering::SeqCst);
+                            "OK"
+                        } else {
+                            "{}"
+                        };
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                             content-length: {}\r\n\r\n{body}",
+                            body.len()
+                        );
+                        if stream.write_all(resp.as_bytes()).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        for _ in 0..3 {
+            ContainerClient::connect(&path).await.unwrap();
+        }
+        server.abort();
+        assert_eq!(versions.load(Ordering::SeqCst), 1);
+        assert_eq!(pings.load(Ordering::SeqCst), 2);
     }
 
     /// A socket that exists but has no Podman behind it must fail at connect, not mid-`up`.
