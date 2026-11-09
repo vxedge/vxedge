@@ -249,6 +249,105 @@ pub fn pull(reference: &str, cache_dir: &Path) -> Result<PathBuf, DistributionEr
     Ok(dest)
 }
 
+/// A package in `cache_dir`, as `PackageService.List` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedPackage {
+    pub digest: String,
+    pub id: String,
+    pub version: String,
+    pub size_bytes: u64,
+    pub has_lock: bool,
+}
+
+/// The id and version a packed package's descriptor names.
+fn id_and_version(bytes: &[u8]) -> Result<(String, String, bool), DistributionError> {
+    let (descriptor, lock) = pkg::packed_descriptor_and_lock(bytes)?;
+    let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&descriptor).unwrap_or_default();
+    let field = |k: &str| {
+        doc.get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    Ok((field("id"), field("version"), lock.is_some()))
+}
+
+/// Every package in `cache_dir`'s `packages/`, by digest. A file whose bytes no longer hash to
+/// its name, or that is not a packed package, is left out.
+pub fn cached(cache_dir: &Path) -> Vec<CachedPackage> {
+    let Ok(dir) = std::fs::read_dir(cache_dir.join("packages")) else {
+        return Vec::new();
+    };
+    let mut out: Vec<CachedPackage> = dir
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            let hex = name.strip_suffix(".vxp")?;
+            let digest = format!("sha256:{hex}");
+            let bytes = std::fs::read(e.path()).ok()?;
+            if pkg::sha256(&bytes) != digest {
+                return None;
+            }
+            let (id, version, has_lock) = id_and_version(&bytes).ok()?;
+            Some(CachedPackage {
+                digest,
+                id,
+                version,
+                size_bytes: bytes.len() as u64,
+                has_lock,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| (&a.id, &a.version, &a.digest).cmp(&(&b.id, &b.version, &b.digest)));
+    out
+}
+
+/// Put packed `bytes` in `cache_dir` as the package `digest`, as `pull` would: they must hash to
+/// it and be a canonical packed package, or nothing is kept.
+pub fn import(bytes: &[u8], digest: &str, cache_dir: &Path) -> Result<PathBuf, DistributionError> {
+    let dest = package_cache_path(cache_dir, digest)?;
+    let actual = pkg::sha256(bytes);
+    if actual != digest {
+        return Err(DistributionError::DigestMismatch {
+            expected: digest.to_string(),
+            actual,
+        });
+    }
+    pkg::read_packed(bytes)?;
+    let dir = dest.parent().expect("a cache path has a parent");
+    std::fs::create_dir_all(dir).map_err(io("creating", dir))?;
+    let partial = dest.with_extension("vxp.partial");
+    std::fs::write(&partial, bytes).map_err(io("writing", &partial))?;
+    std::fs::rename(&partial, &dest).map_err(io("moving into the cache", &dest))?;
+    Ok(dest)
+}
+
+/// The unpacked folder of the cached package `digest`, `packages/<hex>.d`, unpacked once from its
+/// packed file after checking the bytes still hash to the digest. `None` when the cache does not
+/// hold it.
+pub fn cached_package_dir(
+    cache_dir: &Path,
+    digest: &str,
+) -> Result<Option<PathBuf>, DistributionError> {
+    let packed = package_cache_path(cache_dir, digest)?;
+    let Ok(bytes) = std::fs::read(&packed) else {
+        return Ok(None);
+    };
+    if pkg::sha256(&bytes) != digest {
+        return Ok(None);
+    }
+    let dir = packed.with_extension("d");
+    if dir.join(crate::package::DESCRIPTOR_FILE).is_file() {
+        return Ok(Some(dir));
+    }
+    let staging = packed.with_extension("d.partial");
+    let _ = std::fs::remove_dir_all(&staging);
+    pkg::unpack(&bytes, &staging)?;
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::rename(&staging, &dir).map_err(io("moving into the cache", &dir))?;
+    Ok(Some(dir))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,5 +429,41 @@ mod tests {
                 DIGEST.trim_start_matches("sha256:")
             ))
         );
+    }
+
+    #[test]
+    fn an_imported_package_is_listed_and_unpacked_once() {
+        let cache = tempfile::tempdir().unwrap();
+        let bytes = packed(None);
+        let digest = pkg::sha256(&bytes);
+        let file = import(&bytes, &digest, cache.path()).unwrap();
+        assert!(file.ends_with(format!(
+            "packages/{}.vxp",
+            digest.trim_start_matches("sha256:")
+        )));
+        let listed = cached(cache.path());
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(
+            (listed[0].digest.as_str(), listed[0].has_lock),
+            (digest.as_str(), false)
+        );
+        let dir = cached_package_dir(cache.path(), &digest).unwrap().unwrap();
+        assert!(dir.join(crate::package::DESCRIPTOR_FILE).is_file());
+        assert_eq!(
+            cached_package_dir(cache.path(), &digest).unwrap().unwrap(),
+            dir
+        );
+    }
+
+    #[test]
+    fn import_refuses_bytes_that_do_not_hash_to_the_digest_and_unknown_digests_are_none() {
+        let cache = tempfile::tempdir().unwrap();
+        let err = import(&packed(None), DIGEST, cache.path()).unwrap_err();
+        assert!(
+            matches!(err, DistributionError::DigestMismatch { .. }),
+            "{err}"
+        );
+        assert!(cached(cache.path()).is_empty());
+        assert_eq!(cached_package_dir(cache.path(), DIGEST).unwrap(), None);
     }
 }

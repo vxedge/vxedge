@@ -693,8 +693,26 @@ async fn no_rpc_of_the_agent_surface_is_a_stub() {
                 .map(|_| ()),
         ),
         code(
-            measurement_service_client::MeasurementServiceClient::new(ch)
+            measurement_service_client::MeasurementServiceClient::new(ch.clone())
                 .stop(MeasurementStopRequest::default())
+                .await
+                .map(|_| ()),
+        ),
+        code(
+            package_service_client::PackageServiceClient::new(ch.clone())
+                .list(PackageListRequest::default())
+                .await
+                .map(|_| ()),
+        ),
+        code(
+            package_service_client::PackageServiceClient::new(ch.clone())
+                .inspect(PackageInspectRequest::default())
+                .await
+                .map(|_| ()),
+        ),
+        code(
+            package_service_client::PackageServiceClient::new(ch)
+                .pull(PackagePullRequest::default())
                 .await
                 .map(|_| ()),
         ),
@@ -2071,6 +2089,197 @@ async fn measurements_report_their_state_and_need_their_nodes_up() {
         .unwrap()
         .into_inner();
     assert!(failed.error.contains("`ecu1`"), "{}", failed.error);
+}
+
+/// A scaffolded `vxp/1` package, locked: a folder `PackageService` can inspect, pack and import.
+fn scaffolded_package() -> PathBuf {
+    let parent = scratch();
+    let plan =
+        vxedge_core::WorkspacePlan::plan_with_id("pkgx", "pkgx", vxedge_core::Template::Minimal)
+            .unwrap();
+    let root = plan.write(&parent).unwrap();
+    let lock = vxedge_core::pkg::lock(&root, "test").unwrap();
+    vxedge_core::pkg::write_lock(&root, &lock).unwrap();
+    root
+}
+
+/// `Inspect` reads a folder's descriptor, lock state, typed intent and entities, touching
+/// nothing; an unknown digest is `PACKAGE_UNKNOWN`.
+#[tokio::test]
+async fn inspect_reads_a_package_and_refuses_an_unknown_digest() {
+    use vxedge_api::v1::PackageInspectRequest;
+    use vxedge_api::v1::package_service_client::PackageServiceClient;
+    let daemon = Daemon::start();
+    let channel = daemon.channel().await;
+    let root = scaffolded_package();
+    let info = PackageServiceClient::new(channel.clone())
+        .inspect(PackageInspectRequest {
+            package: path_ref(&root),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        (info.id.as_str(), info.version.as_str()),
+        ("local/pkgx", "0.1.0")
+    );
+    assert_eq!(info.schema, "vxp/1");
+    assert!(info.locked, "{:?}", info.lock_problems);
+    assert_eq!(
+        info.digest,
+        vxedge_core::pkg::package_digest(&root).unwrap()
+    );
+    assert!(
+        info.entities.iter().any(|e| e.path == "host"),
+        "{:?}",
+        info.entities
+    );
+    assert!(info.problems.is_empty(), "{:?}", info.problems);
+
+    let unknown = PackageServiceClient::new(channel)
+        .inspect(PackageInspectRequest {
+            package: Some(ManifestRef {
+                source: Some(Source::Package(format!("sha256:{}", "0".repeat(64)))),
+                ..Default::default()
+            }),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&unknown), "ERROR_REASON_PACKAGE_UNKNOWN");
+}
+
+/// `Inspect` types an experiment's intent: parameters with bounds, structured criteria with a
+/// rendering for people, the campaign and the measurements.
+#[tokio::test]
+async fn inspect_types_parameters_criteria_campaign_and_measurements() {
+    use vxedge_api::v1::package_service_client::PackageServiceClient;
+    use vxedge_api::v1::{
+        PackageInspectRequest, criterion_operand, package_criterion, param_value,
+    };
+    let daemon = Daemon::start();
+    let channel = daemon.channel().await;
+    let (dir, _) = experiment_workspace();
+    let main = std::fs::read_to_string(dir.join("main.yaml")).unwrap();
+    std::fs::write(
+        dir.join("main.yaml"),
+        format!(
+            "{main}\nparameters:\n  load_mbps: {{ type: integer, unit: Mbit/s, default: 0, min: 0, max: 1000 }}\n\
+             metrics:\n  - {{ id: rtt_seconds, kind: histogram, unit: s, entity: measurements/rtt }}\n\
+             criteria:\n  - {{ id: bound, op: le, lhs: {{ metric: rtt_seconds, aggregate: p99, select: {{ arm: busy }} }}, rhs: {{ value: 1, unit: s }} }}\n\
+             campaign:\n  arms: {{ idle: {{ load_mbps: 0 }}, busy: {{ load_mbps: 600 }} }}\n  repetitions: 5\n\
+             measurements:\n  rtt: {{ kind: rtt-probe, from: ecu1, to: internet, slice: adas }}\n"
+        ),
+    )
+    .unwrap();
+    let info = PackageServiceClient::new(channel)
+        .inspect(PackageInspectRequest {
+            package: path_ref(&dir),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let p = &info.parameters[0];
+    assert_eq!(
+        (p.name.as_str(), p.r#type.as_str(), p.max),
+        ("load_mbps", "integer", Some(1000.0))
+    );
+    assert_eq!(
+        p.default.as_ref().and_then(|d| d.value.clone()),
+        Some(param_value::Value::Integer(0))
+    );
+    let c = &info.criteria[0];
+    assert_eq!(c.text, "p99(rtt_seconds)[arm=busy] <= 1 s");
+    let Some(package_criterion::Criterion::Comparison(cmp)) = &c.criterion else {
+        panic!("{c:?}")
+    };
+    assert!(matches!(
+        cmp.rhs.as_ref().and_then(|o| o.operand.as_ref()),
+        Some(criterion_operand::Operand::Constant(_))
+    ));
+    let campaign = info.campaign.unwrap();
+    assert_eq!((campaign.arms.len(), campaign.repetitions), (2, Some(5)));
+    assert_eq!(info.measurements[0].entity, "measurements/rtt");
+    assert!(info.entities.iter().any(|e| e.path == "measurements/rtt"));
+    assert!(info.problems.is_empty(), "{:?}", info.problems);
+}
+
+/// A package imported by its bytes is listed, and every verb then reaches it by digest.
+#[tokio::test]
+async fn an_imported_package_is_listed_and_addressed_by_digest() {
+    use vxedge_api::v1::package_service_client::PackageServiceClient;
+    use vxedge_api::v1::{PackageImportChunk, PackageInspectRequest, PackageListRequest};
+    let daemon = Daemon::start();
+    let channel = daemon.channel().await;
+    let root = scaffolded_package();
+    let bytes = vxedge_core::pkg::pack(&root).unwrap();
+    let digest = vxedge_core::pkg::sha256(&bytes);
+    let chunks: Vec<PackageImportChunk> = bytes
+        .chunks(4096)
+        .enumerate()
+        .map(|(i, c)| PackageImportChunk {
+            digest: if i == 0 {
+                digest.clone()
+            } else {
+                String::new()
+            },
+            data: c.to_vec(),
+        })
+        .collect();
+    let mut packages = PackageServiceClient::new(channel.clone());
+    let job = packages
+        .import(tokio_stream::iter(chunks))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        wait_for_job(channel.clone(), job.id).await,
+        JobState::Succeeded as i32
+    );
+    let listed = packages
+        .list(PackageListRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed.packages.len(), 1, "{:?}", listed.packages);
+    assert_eq!(listed.packages[0].digest, digest);
+    assert_eq!(listed.packages[0].id, "local/pkgx");
+
+    let by_digest = Some(ManifestRef {
+        source: Some(Source::Package(digest.clone())),
+        ..Default::default()
+    });
+    let info = packages
+        .inspect(PackageInspectRequest {
+            package: by_digest.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(info.digest, digest);
+    let plan = vxedge_api::v1::workspace_service_client::WorkspaceServiceClient::new(channel)
+        .plan(vxedge_api::v1::WorkspacePlanRequest {
+            manifest: by_digest,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!plan.entities.is_empty(), "{plan:?}");
+
+    // Bytes that do not hash to the named digest are refused, and nothing is kept.
+    let bad = PackageImportChunk {
+        digest: format!("sha256:{}", "1".repeat(64)),
+        data: bytes,
+    };
+    let job = packages
+        .import(tokio_stream::iter(vec![bad]))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        wait_for_job(daemon.channel().await, job.id).await,
+        JobState::Failed as i32
+    );
 }
 
 /// Typed intent that holds adds no problem.

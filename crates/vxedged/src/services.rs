@@ -152,6 +152,10 @@ pub(crate) async fn resolve_manifest(
             })?;
             (yaml, PathBuf::from(path).parent().map(PathBuf::from))
         }
+        Some(Source::Package(digest)) => {
+            let dir = crate::package::cached_dir(digest)?;
+            (read_workspace(&dir.to_string_lossy()).await?, Some(dir))
+        }
         Some(Source::InlineYaml(yaml)) => {
             // See ManifestRef.resolved_dir's own doc comment (common.proto): set only by
             // ExperimentService's own stage orchestration, carrying the workspace directory

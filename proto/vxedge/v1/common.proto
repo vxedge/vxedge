@@ -11,6 +11,9 @@ message ManifestRef {
     string path = 1;
     // Full manifest document inlined as YAML.
     string inline_yaml = 2;
+    // A package in this host's cache, by package digest (`sha256:<hex>`, the sha256 of its packed
+    // bytes; `PackageService`).
+    string package = 5;
   }
   // Optional expected workspace identity; the daemon answers FAILED_PRECONDITION if it does not
   // match (reproducibility guard). For `path`, or `inline_yaml` with `resolved_dir`, this is the
@@ -144,6 +147,8 @@ enum ErrorReason {
   // declared or that an end has no link on, or a rate, payload or window out of bounds. Refused
   // before anything runs.
   ERROR_REASON_MEASUREMENT_INVALID = 30;
+  // A package digest this host's cache does not hold: pull or import it first.
+  ERROR_REASON_PACKAGE_UNKNOWN = 31;
 }
 
 // Names one run. See `RunService`.

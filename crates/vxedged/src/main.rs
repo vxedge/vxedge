@@ -11,6 +11,7 @@ mod experiment;
 mod exporter;
 mod jobs;
 mod measure;
+mod package;
 mod plan;
 mod records;
 mod runs;
@@ -34,6 +35,7 @@ use vxedge_api::v1::job_service_server::JobServiceServer;
 use vxedge_api::v1::log_service_server::LogServiceServer;
 use vxedge_api::v1::measurement_service_server::MeasurementServiceServer;
 use vxedge_api::v1::nos_check_service_server::NosCheckServiceServer;
+use vxedge_api::v1::package_service_server::PackageServiceServer;
 use vxedge_api::v1::run_service_server::RunServiceServer;
 use vxedge_api::v1::svc_service_server::SvcServiceServer;
 use vxedge_api::v1::telemetry_service_server::TelemetryServiceServer;
@@ -147,6 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .or_else(vxedge_core::registry::default_cache_dir)
         .unwrap_or_else(|| args.runtime_dir.join("cache/parts"));
     let _ = std::fs::create_dir_all(&cache_dir);
+    package::set_cache_dir(&cache_dir);
     let policy_path = args.trust_policy.clone().or_else(|| {
         let default = std::path::PathBuf::from("/etc/vxedge/trust.yaml");
         default.is_file().then_some(default)
@@ -293,6 +296,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .add_service(NosCheckServiceServer::from_arc(nos_check))
         .add_service(ExperimentServiceServer::from_arc(experiments))
         .add_service(VehicleServiceServer::from_arc(vehicles))
+        .add_service(PackageServiceServer::new(package::PackageSvc {
+            engine: engine.clone(),
+            audit: audit.clone(),
+            cache_dir: cache_dir.clone(),
+            runtime_dir: args.runtime_dir.clone(),
+        }))
         .add_service(MeasurementServiceServer::new(measure::MeasurementSvc {
             engine: engine.clone(),
             audit: audit.clone(),
