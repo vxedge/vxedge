@@ -6,6 +6,33 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-09
+
+Three additions.
+- **Measured from inside the vehicle.** An experiment declares what it measures, and the daemon
+  runs it. A `measurements` block names a probe by node ids, and `MeasurementService` (with
+  `vxedge measure`) runs it inside the node's network namespace. `traffic up` now runs a
+  profile's load inside its node too, once the node is up.
+- **Every run is observable by entity.** Records are named by vehicle, zone, node, slice and
+  service. The daemon exports per-node CPU and memory and per-slice queue counters. The live
+  record, metric and log streams are what the archive holds.
+- **Packages for air-gapped labs.** Packages can be signed and verified, a host trust policy can
+  require that, and `pack --offline` carries a package's parts and images to a host with no
+  network.
+
+vxAPI stays `vxedge.v1`, and the changes are additive.
+
+**Upgrading from 0.11.x.**
+- No manifest change: `measurements` is optional.
+- The exporter listens on `127.0.0.1:9469` by default; `--metrics-listen` moves it, and port 0
+  picks a free one.
+- A traffic profile whose node is up used to be refused with `ERROR_REASON_ENDPOINT_NOT_ON_HOST`.
+  It now runs inside the node. A profile whose source is not a node still needs
+  `--stage gateway`.
+- Measurements and in-node traffic need `vxedged` with `cap_net_admin` and `cap_sys_admin`, as
+  container nodes already did.
+- With `vxtelemetry` 0.5.0, a run archives each entity's log files and can collect archive v2.
+
 ### Added
 
 - `TrafficService.Up` runs a profile inside its node once the node's zone is up, instead of
