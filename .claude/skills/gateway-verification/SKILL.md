@@ -37,4 +37,4 @@ first-run check (`manifest.rs` `Backend` enum: `libvirt` default for vm/rtimage,
 The platform is production-*representative*, not safety-certified (§14). Don't phrase test
 coverage or backend choices as ASIL/safety-certification claims — state what's measured
 (freedom-from-interference via the hypervisor fidelity ladder, exp-004) and what's a stated
-gap (shared-host gateway, non-PREEMPT_RT kernel, QNX-as-guest inversion).
+gap (shared-host gateway, non-PREEMPT_RT kernel, RTOS-as-guest inversion).

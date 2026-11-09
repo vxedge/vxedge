@@ -1,6 +1,6 @@
 ---
 name: zone-backend-contract
-description: The shared contract all five zone backends (container/qemu-microvm/libvirt/cloud-hypervisor/wasm-capsule) and every guest image must satisfy — use when touching crates/vxedge-core/src/zones/ in vxedge, or building/publishing a zone-class guest image (Zephyr/FreeRTOS/QNX/AAOS) in vxparts. One contract, three isolation mechanisms — that's the H3 variable itself.
+description: The shared contract all five zone backends (container/qemu-microvm/libvirt/cloud-hypervisor/wasm-capsule) and every guest image must satisfy — use when touching crates/vxedge-core/src/zones/ in vxedge, or building/publishing a zone-class guest image (Zephyr/FreeRTOS/AAOS) in vxparts. One contract, three isolation mechanisms — that's the H3 variable itself.
 ---
 
 # Zone backend contract
@@ -59,8 +59,8 @@ must follow, not just imitate loosely:
 - `meta.json` `cpus` and `memory_mb` size the guest; `virtualization: true` (aarch64 only) boots `virt` at EL2
   with GICv3, for a guest that is itself a hypervisor.
 - Document, in the recipe's own README, exactly which `backend:` values the image
-  supports — QNX's recipe in particular must state the QNX-Hypervisor-inversion fidelity
-  caveat (`vxparts/AGENTS.md`) inline, not leave it implicit.
+  supports — a recipe for a guest that production runs under a Type-1 hypervisor must state
+  the RTOS-as-guest inversion fidelity caveat (ARCHITECTURE §9) inline, not leave it implicit.
 - Agents (`vxagents`) are injected per experiment, never baked into the image
   (`vxparts/AGENTS.md`) — a guest image that assumes vxprobe/vxtraffic is already
   present breaks the inject-per-experiment model.
