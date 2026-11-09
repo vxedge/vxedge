@@ -24,6 +24,11 @@ All notable changes to this repo are documented here. Format follows
     repetitions and windows.
   - The package is never written: values are bound in memory.
 
+### Fixed
+
+- Two `vxedge-core` tests shared a temporary folder, `vxpkg-<pid>-legacy`, and could fail when
+  run in parallel. `package.rs`'s tests now use their own prefix.
+
 ### Added
 
 - `PackageService` (new service, additive): `Inspect`, `List`, `Pull` and `Import`.

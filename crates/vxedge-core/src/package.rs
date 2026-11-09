@@ -799,7 +799,7 @@ mod tests {
     use super::*;
 
     fn tmp(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("vxpkg-{}-{name}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("vxpackage-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
