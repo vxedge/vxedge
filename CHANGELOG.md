@@ -8,6 +8,15 @@ All notable changes to this repo are documented here. Format follows
 
 ### Added
 
+- `TelemetryService.StreamRecords` (new, additive): every `sample`, `gap` and `phase` record a
+  workspace's telemetry service appends to `records.jsonl`, in the order written, so a live stream
+  carries what the archive will (`ARCHITECTURE.md` §11). Each `Record` carries its line number as
+  `seq`; `after` resumes from a cursor, `entity_prefix` narrows to an entity subtree, and `follow`
+  keeps the stream open as the ingest writes more. The workspace is the request's, else the live
+  run's.
+- `TelemetryService.StreamMetrics` is built: the same stream's samples, from the first and
+  following, as `Metric` values, which gain `entity` and `ts_ns`, filtered by `selector` (a label,
+  or `entity`). It no longer answers `UNIMPLEMENTED`.
 - Entity paths (`ARCHITECTURE.md` §12): `vxedge-core::entities` derives the path every telemetry
   record names from the model's ids (`<vehicle>/<zone>/<node>`, `<vehicle>/links/<link>`,
   `<vehicle>/slices/<slice>`, `<vehicle>/services/<service>`, `host`, …) and binds each scrape

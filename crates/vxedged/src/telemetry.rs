@@ -2,7 +2,7 @@
 //!
 //! `Collect` archives what the workspace's telemetry service ingested, with the workspace itself
 //! and the digests of every image it runs, and returns the archive through `Job.artifact` with its
-//! sha256. `StreamMetrics` is not built.
+//! sha256. `StreamRecords` and `StreamMetrics` tail what the service is ingesting (`records`).
 
 use sha2::Digest;
 use std::path::{Path, PathBuf};
@@ -12,11 +12,15 @@ use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
 use vxedge_api::v1::telemetry_service_server::TelemetryService;
-use vxedge_api::v1::{CollectRequest, Job, Metric, StreamMetricsRequest};
+use vxedge_api::v1::{
+    CollectRequest, Job, ManifestRef, Metric, Record, StreamMetricsRequest, StreamRecordsRequest,
+    record,
+};
 
 use crate::audit::Audit;
 use crate::errors::{self, R};
 use crate::jobs::{JobEngine, JobFailure};
+use crate::records;
 
 pub struct TelemetrySvc {
     pub engine: JobEngine,
@@ -30,17 +34,89 @@ fn sha256_of(path: &Path) -> std::io::Result<String> {
     Ok(crate::services::hex::encode(sha2::Sha256::digest(&bytes)))
 }
 
+impl TelemetrySvc {
+    /// The ingest folder of the workspace `experiment` names, else of the live run's workspace,
+    /// else this daemon's default one.
+    async fn ingest_of(&self, experiment: Option<&ManifestRef>) -> Result<PathBuf, Status> {
+        let live = || {
+            crate::services::active_run(&self.runtime_dir).map(|r| ManifestRef {
+                source: Some(vxedge_api::v1::manifest_ref::Source::Path(
+                    r.dir.to_string_lossy().into_owned(),
+                )),
+                ..Default::default()
+            })
+        };
+        let Some(mref) = experiment
+            .filter(|m| m.source.is_some())
+            .cloned()
+            .or_else(live)
+        else {
+            return Ok(self.runtime_dir.join("ingest"));
+        };
+        let (yaml, _, _) = crate::services::resolve_manifest(Some(&mref)).await?;
+        let model = vxedge_core::model::load_workspace_yaml(&yaml)
+            .map_err(|e| errors::invalid(R::WorkspaceInvalid, e.to_string()))?;
+        match vxedge_core::services::ServiceDef::find(&model, "telemetry") {
+            Some(def) => vxedge_core::services::telemetry_ingest_dir(def, &self.runtime_dir)
+                .map_err(|e| errors::invalid(R::WorkspaceInvalid, e.to_string())),
+            None => Ok(self.runtime_dir.join("ingest")),
+        }
+    }
+}
+
 #[tonic::async_trait]
 impl TelemetryService for TelemetrySvc {
     type StreamMetricsStream = Pin<Box<dyn Stream<Item = Result<Metric, Status>> + Send>>;
 
+    type StreamRecordsStream = Pin<Box<dyn Stream<Item = Result<Record, Status>> + Send>>;
+
+    async fn stream_records(
+        &self,
+        req: Request<StreamRecordsRequest>,
+    ) -> Result<Response<Self::StreamRecordsStream>, Status> {
+        let req = req.into_inner();
+        let ingest = self.ingest_of(req.experiment.as_ref()).await?;
+        let prefix = req.entity_prefix;
+        let stream = records::stream(
+            records::Tail {
+                path: ingest.join(records::FILE),
+                after: req.after.max(0),
+                follow: req.follow,
+            },
+            move |r| records::entity(r).is_none_or(|e| records::under(e, &prefix)),
+            |r| r,
+        );
+        Ok(Response::new(Box::pin(stream)))
+    }
+
     async fn stream_metrics(
         &self,
-        _: Request<StreamMetricsRequest>,
+        req: Request<StreamMetricsRequest>,
     ) -> Result<Response<Self::StreamMetricsStream>, Status> {
-        Err(Status::unimplemented(
-            "TelemetryService.StreamMetrics is not built (ARCHITECTURE.md section 5.2)",
-        ))
+        let req = req.into_inner();
+        let ingest = self.ingest_of(req.experiment.as_ref()).await?;
+        let selector: std::collections::BTreeMap<String, String> =
+            req.selector.into_iter().collect();
+        let stream = records::stream(
+            records::Tail {
+                path: ingest.join(records::FILE),
+                after: 0,
+                follow: true,
+            },
+            move |r| matches!(&r.record, Some(record::Record::Sample(s)) if records::selected(s, &selector)),
+            |r| match r.record {
+                Some(record::Record::Sample(s)) => Metric {
+                    name: s.metric,
+                    labels: s.labels,
+                    value: s.value,
+                    ts_unix_ms: r.ts_ns / 1_000_000,
+                    entity: s.entity,
+                    ts_ns: r.ts_ns,
+                },
+                _ => unreachable!("only samples are kept"),
+            },
+        );
+        Ok(Response::new(Box::pin(stream)))
     }
 
     async fn collect(&self, req: Request<CollectRequest>) -> Result<Response<Job>, Status> {
