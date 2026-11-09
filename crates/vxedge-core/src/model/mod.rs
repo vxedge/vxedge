@@ -606,6 +606,8 @@ pub struct Experiment {
     /// field) keeps planning and provisioning byte-for-byte as before.
     pub data_plane: DataPlaneKind,
     pub traffic: Vec<TrafficProfile>,
+    /// What the experiment measures, by node id (`crate::measurements`).
+    pub measurements: Vec<crate::measurements::Measurement>,
     pub method: Method,
     /// Services the experiment runs alongside the vehicle (OTA, telemetry). Typed and validated
     /// at build time rather than re-parsed per use: `ServiceDef::find` used to deserialize the

@@ -1290,6 +1290,12 @@ pub fn build(ws: &Workspace) -> Result<Experiment, ModelError> {
         nos_check: nos_check_of(&raw)?,
         entities,
         traffic,
+        measurements: crate::measurements::parse(raw.get("measurements")).map_err(|detail| {
+            ModelError::MalformedBlock {
+                block: "measurements",
+                detail,
+            }
+        })?,
         method,
         services,
         signal_plane,

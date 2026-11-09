@@ -1952,6 +1952,56 @@ async fn plan_and_up_refuse_typed_intent_that_cannot_hold() {
     assert_eq!(reason(&refused), "ERROR_REASON_PARAMETER_INVALID");
 }
 
+/// A measurement that cannot run is a typed problem in `Plan` naming its field, and `up` refuses
+/// before anything runs. One that can is listed as an entity of its own.
+#[tokio::test]
+async fn plan_types_measurement_problems_and_lists_measurements() {
+    let daemon = Daemon::start();
+    let channel = daemon.channel().await;
+    let (dir, _) = experiment_workspace();
+    let main = std::fs::read_to_string(dir.join("main.yaml")).unwrap();
+    std::fs::write(
+        dir.join("main.yaml"),
+        format!(
+            "{main}\nmeasurements:\n  ok: {{ kind: rtt-probe, from: ecu1, to: internet, slice: adas }}\n  \
+             bad: {{ kind: rtt-probe, from: ecu1, to: nope, slice: adas }}\n"
+        ),
+    )
+    .unwrap();
+
+    let plan = plan_of(&channel, &dir).await;
+    assert!(!plan.valid);
+    let measured: Vec<_> = plan
+        .problems
+        .iter()
+        .filter(|p| p.reason == vxedge_api::v1::ErrorReason::MeasurementInvalid as i32)
+        .collect();
+    assert_eq!(measured.len(), 1, "{:?}", plan.problems);
+    assert!(
+        measured[0].detail.contains("measurements.bad.to"),
+        "{}",
+        measured[0].detail
+    );
+    let entity = plan
+        .entities
+        .iter()
+        .find(|e| e.path == "measurements/ok")
+        .unwrap_or_else(|| panic!("{:?}", plan.entities));
+    assert_eq!(
+        (entity.kind.as_str(), entity.role.as_str()),
+        ("measurement", "rtt-probe")
+    );
+
+    let refused = ExperimentServiceClient::new(channel)
+        .up(ExperimentUpRequest {
+            manifest: path_ref(&dir),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&refused), "ERROR_REASON_MEASUREMENT_INVALID");
+}
+
 /// Typed intent that holds adds no problem.
 #[tokio::test]
 async fn typed_intent_that_holds_plans_clean() {

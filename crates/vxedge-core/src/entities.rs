@@ -10,6 +10,7 @@
 //! <vehicle>/services/<service> a service placed on one of the vehicle's devices
 //! host/services/<service>      a service run as a host process
 //! host                         the testbed host, including the observer's own cost
+//! measurements/<measurement>   a declared measurement
 //! ```
 //!
 //! Paths come from ids, never from addresses. A scrape target is bound to the node whose link
@@ -30,6 +31,7 @@ pub enum Kind {
     Slice,
     Service,
     Host,
+    Measurement,
 }
 
 impl Kind {
@@ -41,6 +43,7 @@ impl Kind {
             Self::Slice => "slice",
             Self::Service => "service",
             Self::Host => "host",
+            Self::Measurement => "measurement",
         }
     }
 }
@@ -177,12 +180,18 @@ pub fn entities_with(model: &Experiment, host_targets: &[String]) -> Vec<EntityR
     };
 
     let mut host = record(HOST.to_string(), Kind::Host);
+    let measurements = model.measurements.iter().map(|m| {
+        let mut r = record(m.entity(), Kind::Measurement);
+        r.role = Some(m.kind.as_str().to_string());
+        r
+    });
     for t in host_targets {
         if !host.scrape_targets.contains(t) {
             host.scrape_targets.push(t.clone());
         }
     }
     out.push(host);
+    out.extend(measurements);
     for (id, def) in &model.services {
         if def.on.is_none() {
             let mut r = record(format!("{HOST}/services/{id}"), Kind::Service);

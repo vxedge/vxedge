@@ -2054,6 +2054,14 @@ fn finish_workspace(
             .join("\n"));
     }
     let model = model().map_err(|e| e.to_string())?;
+    let measured = vxedge_core::measurements::problems(&model);
+    if !measured.is_empty() {
+        return Err(measured
+            .iter()
+            .map(|e| format!("  - {e}"))
+            .collect::<Vec<_>>()
+            .join("\n"));
+    }
     let devices: usize = model.entities.iter().map(|e| e.devices.len()).sum();
     let (vehicles, slices) = (model.entities.len(), model.slices.len());
     Ok((
