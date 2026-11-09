@@ -189,6 +189,9 @@ impl Daemon {
             .arg(&runtime)
             .arg("--cache-dir")
             .arg(root.join("cache"))
+            // Daemons run side by side here: each exporter takes a free port.
+            .arg("--metrics-listen")
+            .arg("127.0.0.1:0")
             .envs(env.iter().map(|(k, v)| (*k, v.as_os_str())))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -2188,4 +2191,44 @@ async fn live_streams_carry_the_ingest_records() {
         ),
         ("vxedge_process_memory_bytes", "host", 7.0, 5, 5_000_000)
     );
+}
+
+/// The daemon's exporter is a `host` scrape target in both the plan and `entities.json`, and
+/// serves Prometheus text whose series name their entities (§12).
+#[tokio::test]
+async fn the_daemon_exporter_is_a_host_target_serving_entity_series() {
+    let (ws, _) = experiment_workspace();
+    let daemon = Daemon::start();
+    let channel = daemon.channel().await;
+    let plan = plan_of(&channel, &ws).await;
+    let host = &plan.entities[0];
+    assert_eq!(host.path, "host");
+    let target = host
+        .scrape_targets
+        .iter()
+        .find(|t| t.starts_with("127.0.0.1:"))
+        .expect("the exporter is bound to host")
+        .clone();
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let get = |path: &'static str| {
+        let target = target.clone();
+        async move {
+            let mut s = tokio::net::TcpStream::connect(&target).await.unwrap();
+            s.write_all(format!("GET {path} HTTP/1.1\r\nhost: x\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let mut out = String::new();
+            s.read_to_string(&mut out).await.unwrap();
+            out
+        }
+    };
+    let page = get("/metrics").await;
+    assert!(page.starts_with("HTTP/1.1 200 OK\r\n"), "{page}");
+    assert!(
+        page.contains("# TYPE vxedge_process_cpu_seconds_total counter\n")
+            && page.contains("vxedge_process_memory_bytes{entity=\"host\",process=\"vxedged\"}"),
+        "{page}"
+    );
+    assert!(get("/").await.starts_with("HTTP/1.1 404"));
 }

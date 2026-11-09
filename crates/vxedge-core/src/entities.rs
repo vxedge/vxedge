@@ -131,6 +131,12 @@ pub fn target_entity(model: &Experiment, target: &str) -> String {
 /// Every entity of the model, in a stable order: host first, then each vehicle's nodes, links,
 /// channels, slices and services, by id.
 pub fn entities_of(model: &Experiment) -> Vec<EntityRecord> {
+    entities_with(model, &[])
+}
+
+/// [`entities_of`], with `host_targets` bound to `host` as well: the daemon's own exporter,
+/// whose samples each name their entity with an `entity` label.
+pub fn entities_with(model: &Experiment, host_targets: &[String]) -> Vec<EntityRecord> {
     let mut out = Vec::new();
     let targets: Vec<(String, String)> = model
         .telemetry
@@ -155,7 +161,13 @@ pub fn entities_of(model: &Experiment) -> Vec<EntityRecord> {
         payloads: Vec::new(),
     };
 
-    out.push(record(HOST.to_string(), Kind::Host));
+    let mut host = record(HOST.to_string(), Kind::Host);
+    for t in host_targets {
+        if !host.scrape_targets.contains(t) {
+            host.scrape_targets.push(t.clone());
+        }
+    }
+    out.push(host);
     for (id, def) in &model.services {
         if def.on.is_none() {
             let mut r = record(format!("{HOST}/services/{id}"), Kind::Service);
@@ -298,6 +310,8 @@ telemetry:
         );
         let host = &all[0];
         assert_eq!(host.scrape_targets, ["127.0.0.1:9900"]);
+        let with = entities_with(&m, &["127.0.0.1:9469".to_string()]);
+        assert_eq!(with[0].scrape_targets, ["127.0.0.1:9900", "127.0.0.1:9469"]);
         let json = serde_json::to_value(ecu).unwrap();
         assert_eq!(json["kind"], "node");
         assert_eq!(json["payloads"][0]["ref"], "ghcr.io/vxedge/parts/vxprobe");

@@ -8,6 +8,7 @@ mod audit;
 mod errors;
 mod events;
 mod experiment;
+mod exporter;
 mod jobs;
 mod plan;
 mod records;
@@ -95,6 +96,12 @@ struct Args {
     /// whom. Default: `/etc/vxedge/trust.yaml` when it exists; without one, any package runs.
     #[arg(long, env = "VXEDGE_TRUST_POLICY")]
     trust_policy: Option<std::path::PathBuf>,
+
+    /// Where the daemon's own exporter serves `/metrics` (`ARCHITECTURE.md` §12): per-node CPU
+    /// and memory and per-slice queue counters, by entity. Loopback by default; port 0 picks a
+    /// free one; `off` serves nothing. An address in use is logged and the daemon starts anyway.
+    #[arg(long, default_value = "127.0.0.1:9469", env = "VXEDGE_METRICS_LISTEN")]
+    metrics_listen: String,
 }
 
 #[tokio::main]
@@ -170,6 +177,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state: services::SharedState =
         Arc::new(tokio::sync::Mutex::new(services::EdgeState::default()));
+    if let Some(metrics) = exporter::bind(&args.metrics_listen).await {
+        info!(metrics = %exporter::targets().join(","), "metrics exporter listening");
+        tokio::spawn(exporter::serve(
+            metrics,
+            state.clone(),
+            shell.clone(),
+            args.runtime_dir.clone(),
+        ));
+    }
 
     // One instance of each service, shared between its own gRPC endpoint and `ExperimentSvc`,
     // which composes them. Two independent instances would each hold a handle to the same

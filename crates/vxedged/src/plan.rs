@@ -668,7 +668,7 @@ impl WorkspaceService for PlanSvc {
             services,
             images: all_images(&model, &nodes).into_iter().collect(),
             host_checks,
-            entities: vxedge_core::entities::entities_of(&model)
+            entities: vxedge_core::entities::entities_with(&model, &crate::exporter::targets())
                 .into_iter()
                 .map(planned_entity)
                 .collect(),

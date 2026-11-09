@@ -155,6 +155,23 @@ impl ContainerClient {
         })
     }
 
+    /// The pid of `group`'s running member `member`, or `None` when it is not running.
+    pub async fn member_pid(&self, group: &str, member: &str) -> Option<u32> {
+        let inspected = self
+            .docker
+            .inspect_container(&member_name(group, member), None)
+            .await
+            .ok()?;
+        let state = inspected.state?;
+        if state.running != Some(true) {
+            return None;
+        }
+        state
+            .pid
+            .and_then(|p| u32::try_from(p).ok())
+            .filter(|p| *p != 0)
+    }
+
     /// Converge one long-running member into the group's namespace. Idempotent: a running
     /// member from the same spec and infra container is left alone.
     pub async fn ensure_member(

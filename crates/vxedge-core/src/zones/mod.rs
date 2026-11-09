@@ -10,11 +10,12 @@ pub mod backend;
 mod cloud_hypervisor;
 pub mod foreign;
 pub mod plan;
+pub mod usage;
 mod wasm_capsule;
 
 pub use backend::{
     Acceleration, GuestArch, GuestPlatform, QEMU_MICROVM_BIN, guest_platform, member_down,
-    member_status, member_up, node_down, node_status, node_up,
+    member_status, member_up, node_down, node_status, node_up, node_usage_source,
 };
 pub use cloud_hypervisor::{socket_too_long as ch_socket_too_long, vmm_available as ch_available};
 pub use foreign::foreign_objects;
