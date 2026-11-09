@@ -118,6 +118,8 @@ message CollectRequest {
   ManifestRef manifest = 1;
   // Archive output path, e.g. "results/exp-001.zip".
   string out_path = 2;
+  // The archive format: 2 (`vxarchive/2`) or 1. 0 leaves it to vxtelemetry's default.
+  uint32 archive_version = 3;
 }
 
 service TelemetryService {

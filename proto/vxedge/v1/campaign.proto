@@ -3,6 +3,7 @@ syntax = "proto3";
 package vxedge.v1;
 
 import "vxedge/v1/common.proto";
+import "vxedge/v1/jobs.proto";
 import "vxedge/v1/package.proto";
 import "vxedge/v1/workspace.proto";
 
@@ -49,7 +50,94 @@ message CampaignPlan {
   string profile = 6;
 }
 
+message CampaignStartRequest {
+  ManifestRef manifest = 1;
+  string profile = 2;
+  // An id of the caller's choosing. A retry with the same id resumes that campaign: trials whose
+  // archives exist are skipped.
+  string request_id = 3;
+  // Who started it, as the caller names itself. Recorded with the campaign.
+  string caller = 4;
+  // Skip each trial's `vxp.lock` check, as `experiment up --unlocked` does. Recorded.
+  bool unlocked = 5;
+  // Where the trial archives and `campaign.json` go. Empty: `results/<campaign id>/` in the
+  // workspace, or under the daemon's runtime folder for a cached package.
+  string results_dir = 6;
+}
+
+enum CampaignState {
+  CAMPAIGN_STATE_UNSPECIFIED = 0;
+  CAMPAIGN_STATE_RUNNING = 1;
+  CAMPAIGN_STATE_SUCCEEDED = 2;
+  // At least one trial failed; the others ran.
+  CAMPAIGN_STATE_FAILED = 3;
+  CAMPAIGN_STATE_CANCELLED = 4;
+}
+
+enum TrialState {
+  TRIAL_STATE_UNSPECIFIED = 0;
+  TRIAL_STATE_PENDING = 1;
+  TRIAL_STATE_RUNNING = 2;
+  TRIAL_STATE_SUCCEEDED = 3;
+  TRIAL_STATE_FAILED = 4;
+  // Its archive already existed when the campaign resumed.
+  TRIAL_STATE_SKIPPED = 5;
+}
+
+message CampaignTrialStatus {
+  string id = 1;
+  string arm = 2;
+  uint32 repetition = 3;
+  TrialState state = 4;
+  // The phase it is in or last reached: provision, warmup, measure, cooldown, teardown.
+  string phase = 5;
+  // The trial's archive and its sha256, once collected.
+  string archive = 6;
+  string sha256 = 7;
+  string error = 8;
+}
+
+message CampaignStatus {
+  string campaign_id = 1;
+  CampaignState state = 2;
+  // The campaign's job; each trial's stages are its child jobs.
+  string job_id = 3;
+  string experiment_id = 4;
+  string package_digest = 5;
+  string profile = 6;
+  string caller = 7;
+  bool unlocked = 8;
+  string results_dir = 9;
+  repeated CampaignTrialStatus trials = 10;
+  int64 started_unix_ms = 11;
+  int64 finished_unix_ms = 12;
+}
+
+message CampaignGetRequest {
+  string campaign_id = 1;
+}
+
+message CampaignListRequest {}
+
+message CampaignList {
+  repeated CampaignStatus campaigns = 1;
+}
+
+message CampaignWatchRequest {
+  string campaign_id = 1;
+}
+
 service CampaignService {
   // The trials a campaign would run, with each point's document checked. Touches nothing.
   rpc Plan(CampaignPlanRequest) returns (CampaignPlan);
+  // Run the campaign's trials serially (`campaign.run`): each trial is provisioned, warmed up,
+  // measured, cooled down, archived and torn down on its own, with phase markers in its records.
+  // A failed trial does not stop the others; `down` always runs. Cancel it with
+  // `JobService.Cancel`, which stops between trials. One campaign runs at a time: another is
+  // refused as busy, naming the active one.
+  rpc Start(CampaignStartRequest) returns (Job);
+  rpc Get(CampaignGetRequest) returns (CampaignStatus);
+  rpc List(CampaignListRequest) returns (CampaignList);
+  // The campaign's status each time it changes, until it ends.
+  rpc Watch(CampaignWatchRequest) returns (stream CampaignStatus);
 }

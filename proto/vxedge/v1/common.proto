@@ -149,6 +149,8 @@ enum ErrorReason {
   ERROR_REASON_MEASUREMENT_INVALID = 30;
   // A package digest this host's cache does not hold: pull or import it first.
   ERROR_REASON_PACKAGE_UNKNOWN = 31;
+  // A campaign id this daemon has no record of.
+  ERROR_REASON_CAMPAIGN_UNKNOWN = 32;
 }
 
 // Names one run. See `RunService`.

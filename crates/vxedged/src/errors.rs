@@ -20,6 +20,22 @@ pub fn refuse(code: Code, reason: R, message: impl Into<String>) -> Status {
     Status::with_error_details(code, message, details)
 }
 
+/// A refusal with its reason and typed `ErrorInfo.metadata` (`active_campaign`,
+/// `retry_after_ms`, ...), so a client reads the detail without parsing the message.
+pub fn refuse_with(
+    code: Code,
+    reason: R,
+    message: impl Into<String>,
+    metadata: &[(&str, String)],
+) -> Status {
+    let metadata: HashMap<String, String> = metadata
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.clone()))
+        .collect();
+    let details = ErrorDetails::with_error_info(reason.as_str_name(), DOMAIN, metadata);
+    Status::with_error_details(code, message, details)
+}
+
 pub fn precondition(reason: R, message: impl Into<String>) -> Status {
     refuse(Code::FailedPrecondition, reason, message)
 }

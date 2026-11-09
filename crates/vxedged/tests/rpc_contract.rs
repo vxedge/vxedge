@@ -717,8 +717,32 @@ async fn no_rpc_of_the_agent_surface_is_a_stub() {
                 .map(|_| ()),
         ),
         code(
-            campaign_service_client::CampaignServiceClient::new(ch)
+            campaign_service_client::CampaignServiceClient::new(ch.clone())
                 .plan(CampaignPlanRequest::default())
+                .await
+                .map(|_| ()),
+        ),
+        code(
+            campaign_service_client::CampaignServiceClient::new(ch.clone())
+                .start(CampaignStartRequest::default())
+                .await
+                .map(|_| ()),
+        ),
+        code(
+            campaign_service_client::CampaignServiceClient::new(ch.clone())
+                .get(CampaignGetRequest::default())
+                .await
+                .map(|_| ()),
+        ),
+        code(
+            campaign_service_client::CampaignServiceClient::new(ch.clone())
+                .list(CampaignListRequest::default())
+                .await
+                .map(|_| ()),
+        ),
+        code(
+            campaign_service_client::CampaignServiceClient::new(ch)
+                .watch(CampaignWatchRequest::default())
                 .await
                 .map(|_| ()),
         ),
@@ -1670,6 +1694,7 @@ async fn collect_returns_the_archive_and_its_digest() {
             .collect(vxedge_api::v1::CollectRequest {
                 manifest: path_ref(&ws),
                 out_path: "results/run.zip".into(),
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -1727,6 +1752,7 @@ async fn collect_passes_on_whether_the_run_was_locked() {
             .collect(vxedge_api::v1::CollectRequest {
                 manifest: path_ref(&ws),
                 out_path: "results/run.zip".into(),
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -1754,6 +1780,7 @@ async fn a_failed_collect_fails_its_job_and_nothing_ingested_is_refused() {
         .collect(vxedge_api::v1::CollectRequest {
             manifest: path_ref(&ws),
             out_path: String::new(),
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -1766,6 +1793,7 @@ async fn a_failed_collect_fails_its_job_and_nothing_ingested_is_refused() {
     .collect(vxedge_api::v1::CollectRequest {
         manifest: path_ref(&ws),
         out_path: String::new(),
+        ..Default::default()
     })
     .await
     .unwrap_err();
@@ -2288,6 +2316,128 @@ async fn an_imported_package_is_listed_and_addressed_by_digest() {
     );
 }
 
+/// An experiment-level host telemetry service, which a campaign archives every trial through.
+const TELEMETRY_SERVICE: &str = "services:\n  telemetry:\n    id: telemetry\n    type: telemetry\n    image: { url: local/vxtelemetry:host-process, kind: container }\n";
+
+/// A campaign runs every trial as stages of its job and keeps going past a failed one: here no
+/// trial can provision (the test host has no privileges), so each fails at `up`, `down` still
+/// runs, and `campaign.json`, the trial's identity and its first phase marker are written. A
+/// campaign without a telemetry service is refused, and an unknown id is `CAMPAIGN_UNKNOWN`.
+#[tokio::test]
+async fn a_campaign_records_each_trial_and_keeps_going_past_a_failure() {
+    use vxedge_api::v1::campaign_service_client::CampaignServiceClient;
+    use vxedge_api::v1::{
+        CampaignGetRequest, CampaignListRequest, CampaignStartRequest, CampaignState,
+        CampaignWatchRequest, TrialState,
+    };
+    let daemon = Daemon::start();
+    let channel = daemon.channel().await;
+    let (dir, _) = experiment_workspace();
+    let main = std::fs::read_to_string(dir.join("main.yaml")).unwrap();
+    let mut client = CampaignServiceClient::new(channel.clone());
+
+    let refused = client
+        .start(CampaignStartRequest {
+            manifest: path_ref(&dir),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&refused), "ERROR_REASON_WORKSPACE_INVALID");
+    assert!(
+        refused.message().contains("telemetry"),
+        "{}",
+        refused.message()
+    );
+
+    std::fs::write(
+        dir.join("main.yaml"),
+        format!(
+            "{main}\n{TELEMETRY_SERVICE}parameters:\n  n: {{ type: integer, unit: \"1\", default: 1 }}\n\
+             campaign:\n  sweep: {{ n: [1, 2] }}\n  duration_s: 1\n"
+        ),
+    )
+    .unwrap();
+    let job = client
+        .start(CampaignStartRequest {
+            manifest: path_ref(&dir),
+            request_id: "contract-1".into(),
+            caller: "rpc_contract".into(),
+            unlocked: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(job.kind, "campaign.run");
+    assert_eq!(
+        wait_for_job(channel.clone(), job.id.clone()).await,
+        JobState::Failed as i32
+    );
+
+    let list = client
+        .list(CampaignListRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(list.campaigns.len(), 1);
+    let id = list.campaigns[0].campaign_id.clone();
+    let status = client
+        .get(CampaignGetRequest {
+            campaign_id: id.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(status.state, CampaignState::Failed as i32);
+    assert_eq!(
+        (
+            status.job_id.as_str(),
+            status.caller.as_str(),
+            status.unlocked
+        ),
+        (job.id.as_str(), "rpc_contract", true)
+    );
+    let ids: Vec<&str> = status.trials.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ids, ["r1-defaults", "r1-n=2"]);
+    for t in &status.trials {
+        assert_eq!(t.state, TrialState::Failed as i32, "{t:?}");
+        assert_eq!(t.phase, "provision");
+        assert!(!t.error.is_empty());
+    }
+    let results = std::path::PathBuf::from(&status.results_dir);
+    assert!(results.starts_with(&dir) && results.join("campaign.json").is_file());
+    let ingest = daemon.root.join("run/ingest");
+    let trial: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(ingest.join("trial.json")).unwrap()).unwrap();
+    assert_eq!(
+        (trial["campaign_id"].as_str(), trial["trial_id"].as_str()),
+        (Some(id.as_str()), Some("r1-n=2"))
+    );
+    let phases = std::fs::read_to_string(ingest.join("phases.jsonl")).unwrap();
+    assert!(phases.contains("\"phase\":\"provision\""), "{phases}");
+
+    let mut watch = client
+        .watch(CampaignWatchRequest { campaign_id: id })
+        .await
+        .unwrap()
+        .into_inner();
+    let first = tokio_stream::StreamExt::next(&mut watch)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.state, CampaignState::Failed as i32);
+    assert!(tokio_stream::StreamExt::next(&mut watch).await.is_none());
+
+    let unknown = client
+        .get(CampaignGetRequest {
+            campaign_id: "c-nope".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&unknown), "ERROR_REASON_CAMPAIGN_UNKNOWN");
+}
+
 /// `CampaignService.Plan` expands arms and sweep into trials, labelling a sweep point that equals
 /// an arm, applies a profile, and checks each point's bound document.
 #[tokio::test]
@@ -2302,7 +2452,7 @@ async fn campaign_plan_expands_trials_and_checks_each_point() {
         std::fs::write(
             dir.join("main.yaml"),
             format!(
-                "{main}\nmeasurements:\n  rtt: {{ kind: rtt-probe, from: ecu1, to: internet, slice: adas, rate_pps: 100 }}\n\
+                "{main}\n{TELEMETRY_SERVICE}measurements:\n  rtt: {{ kind: rtt-probe, from: ecu1, to: internet, slice: adas, rate_pps: 100 }}\n\
                  parameters:\n  pps: {{ type: integer, unit: 1/s, default: 100, min: 0, max: 1000, binds: \"measurements[rtt].rate_pps\" }}\n\
                  campaign:\n{campaign}"
             ),
@@ -2537,6 +2687,7 @@ async fn plan_and_collect_name_the_entities_records_use() {
             .collect(vxedge_api::v1::CollectRequest {
                 manifest: path_ref(&ws),
                 out_path: "results/run.zip".into(),
+                ..Default::default()
             })
             .await
             .unwrap()

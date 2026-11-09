@@ -6,6 +6,7 @@
 
 mod audit;
 mod campaign;
+mod campaign_run;
 mod errors;
 mod events;
 mod experiment;
@@ -277,6 +278,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         vehicles: vehicles.clone(),
         runtime_dir: args.runtime_dir.clone(),
     };
+    // Shared with `CampaignService`, whose trials call them as stages.
+    let measure = Arc::new(measure::MeasurementSvc {
+        engine: engine.clone(),
+        audit: audit.clone(),
+        shell: shell.clone(),
+        runtime_dir: args.runtime_dir.clone(),
+        vxprobe_bin: args.vxprobe_bin.clone(),
+        containers: containers.clone(),
+    });
+    let traffic = Arc::new(services::TrafficSvc {
+        engine: engine.clone(),
+        audit: audit.clone(),
+        shell,
+        runtime_dir: args.runtime_dir.clone(),
+        vxprobe_bin: args.vxprobe_bin.clone(),
+        vxtraffic_bin: args.vxtraffic_bin.clone(),
+        containers,
+    });
+    let telemetry = Arc::new(telemetry::TelemetrySvc {
+        engine: telemetry_engine,
+        audit: telemetry_audit,
+        runtime_dir: args.runtime_dir.clone(),
+        vxtelemetry_bin: args.vxtelemetry_bin.clone(),
+    });
     Server::builder()
         .add_service(GatewayServiceServer::from_arc(gateway))
         .add_service(RunServiceServer::new(runs))
@@ -294,42 +319,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }))
         .add_service(ZoneServiceServer::from_arc(zones))
         .add_service(ComputeServiceServer::from_arc(compute))
-        .add_service(SvcServiceServer::from_arc(svcs))
+        .add_service(SvcServiceServer::from_arc(svcs.clone()))
         .add_service(NosCheckServiceServer::from_arc(nos_check))
-        .add_service(ExperimentServiceServer::from_arc(experiments))
+        .add_service(ExperimentServiceServer::from_arc(experiments.clone()))
         .add_service(VehicleServiceServer::from_arc(vehicles))
-        .add_service(CampaignServiceServer::new(campaign::CampaignSvc))
+        .add_service(CampaignServiceServer::new(campaign::CampaignSvc {
+            steps: campaign_run::Steps {
+                engine: engine.clone(),
+                experiments: experiments.clone(),
+                traffic: traffic.clone(),
+                measure: measure.clone(),
+                telemetry: telemetry.clone(),
+                svcs: svcs.clone(),
+            },
+            audit: audit.clone(),
+            runtime_dir: args.runtime_dir.clone(),
+        }))
         .add_service(PackageServiceServer::new(package::PackageSvc {
             engine: engine.clone(),
             audit: audit.clone(),
             cache_dir: cache_dir.clone(),
             runtime_dir: args.runtime_dir.clone(),
         }))
-        .add_service(MeasurementServiceServer::new(measure::MeasurementSvc {
-            engine: engine.clone(),
-            audit: audit.clone(),
-            shell: shell.clone(),
-            runtime_dir: args.runtime_dir.clone(),
-            vxprobe_bin: args.vxprobe_bin.clone(),
-            containers: containers.clone(),
-        }))
-        .add_service(TrafficServiceServer::new(services::TrafficSvc {
-            engine: engine.clone(),
-            audit,
-            shell,
-            runtime_dir: args.runtime_dir.clone(),
-            vxprobe_bin: args.vxprobe_bin.clone(),
-            vxtraffic_bin: args.vxtraffic_bin.clone(),
-            containers,
-        }))
+        .add_service(MeasurementServiceServer::from_arc(measure))
+        .add_service(TrafficServiceServer::from_arc(traffic))
         .add_service(JobServiceServer::new(services::JobSvc { engine }))
         .add_service(EventServiceServer::new(services::EventSvc { bus }))
-        .add_service(TelemetryServiceServer::new(telemetry::TelemetrySvc {
-            engine: telemetry_engine,
-            audit: telemetry_audit,
-            runtime_dir: args.runtime_dir.clone(),
-            vxtelemetry_bin: args.vxtelemetry_bin.clone(),
-        }))
+        .add_service(TelemetryServiceServer::from_arc(telemetry))
         .add_service(LogServiceServer::new(telemetry::LogSvc {
             runtime_dir: args.runtime_dir.clone(),
         }))

@@ -130,6 +130,12 @@ enum Command {
         #[command(subcommand)]
         cmd: TrafficCmd,
     },
+    /// The experiment's campaign: its trials, and running them. Addressed by the working
+    /// directory, as the experiment verbs are.
+    Campaign {
+        #[command(subcommand)]
+        cmd: CampaignCmd,
+    },
     /// The experiment's `measurements`, run inside each end's network namespace. Addressed by
     /// the working directory, as the experiment verbs are; the experiment must be up.
     Measure {
@@ -639,6 +645,28 @@ enum ManifestLifecycleCmd {
         #[arg(long)]
         manifest: String,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum CampaignCmd {
+    /// The trials the campaign would run, checked. Touches nothing.
+    Plan {
+        #[arg(long, default_value = "")]
+        profile: String,
+    },
+    /// Run the campaign's trials, one after another, and follow the job.
+    Start {
+        #[arg(long, default_value = "")]
+        profile: String,
+        /// A retry with the same id resumes the campaign, skipping archived trials.
+        #[arg(long, default_value = "")]
+        request_id: String,
+        /// Skip each trial's `vxp.lock` check while authoring. Recorded with the campaign.
+        #[arg(long)]
+        unlocked: bool,
+    },
+    /// One campaign by id, or every campaign on the daemon.
+    Status { campaign_id: Option<String> },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1662,6 +1690,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         .collect(vxedge_api::v1::CollectRequest {
                             manifest: manifest_ref(&Some(manifest.clone())),
                             out_path: out.clone(),
+                            ..Default::default()
                         })
                         .await?
                         .into_inner();
@@ -1875,6 +1904,137 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 watch_job(channel, job, cli.json).await?;
             }
         },
+        Command::Campaign { cmd } => {
+            use vxedge_api::v1::campaign_service_client::CampaignServiceClient;
+            use vxedge_api::v1::{
+                CampaignGetRequest, CampaignListRequest, CampaignPlanRequest, CampaignStartRequest,
+            };
+            let channel = connect(&cli.endpoint).await?;
+            let mut campaigns = CampaignServiceClient::new(channel.clone());
+            let here_ref = || -> Result<_, Box<dyn std::error::Error>> {
+                let found = vxedge_core::discover(&here()?)?;
+                Ok(manifest_ref(&Some(
+                    found.root.to_string_lossy().to_string(),
+                )))
+            };
+            match cmd {
+                CampaignCmd::Plan { profile } => {
+                    let plan = campaigns
+                        .plan(CampaignPlanRequest {
+                            manifest: here_ref()?,
+                            profile: profile.clone(),
+                        })
+                        .await?
+                        .into_inner();
+                    for t in &plan.trials {
+                        println!(
+                            "{:<24} {:>6.0}s warmup {:>6.0}s",
+                            t.id, t.duration_s, t.warmup_s
+                        );
+                    }
+                    println!(
+                        "{} trials ({} points x {} repetitions), about {:.0} s",
+                        plan.trials.len(),
+                        plan.points,
+                        plan.repetitions,
+                        plan.estimated_s
+                    );
+                    for p in &plan.problems {
+                        println!("problem: {}", p.detail);
+                    }
+                    if !plan.problems.is_empty() {
+                        std::process::exit(1);
+                    }
+                }
+                CampaignCmd::Start {
+                    profile,
+                    request_id,
+                    unlocked,
+                } => {
+                    let job = campaigns
+                        .start(CampaignStartRequest {
+                            manifest: here_ref()?,
+                            profile: profile.clone(),
+                            request_id: request_id.clone(),
+                            caller: "vxedge-cli".into(),
+                            unlocked: *unlocked,
+                            ..Default::default()
+                        })
+                        .await?
+                        .into_inner();
+                    watch_job(channel, job, cli.json).await?;
+                }
+                CampaignCmd::Status { campaign_id } => {
+                    let list = match campaign_id {
+                        Some(id) => vec![
+                            campaigns
+                                .get(CampaignGetRequest {
+                                    campaign_id: id.clone(),
+                                })
+                                .await?
+                                .into_inner(),
+                        ],
+                        None => {
+                            campaigns
+                                .list(CampaignListRequest {})
+                                .await?
+                                .into_inner()
+                                .campaigns
+                        }
+                    };
+                    if cli.json {
+                        let out: Vec<serde_json::Value> = list
+                            .iter()
+                            .map(|c| {
+                                serde_json::json!({
+                                    "campaign_id": c.campaign_id, "experiment_id": c.experiment_id,
+                                    "state": c.state, "results_dir": c.results_dir, "job_id": c.job_id,
+                                    "trials": c.trials.iter().map(|t| serde_json::json!({
+                                        "id": t.id, "arm": t.arm, "state": t.state, "phase": t.phase,
+                                        "archive": t.archive, "sha256": t.sha256, "error": t.error,
+                                    })).collect::<Vec<_>>(),
+                                })
+                            })
+                            .collect();
+                        println!("{}", serde_json::to_string_pretty(&out)?);
+                    } else {
+                        for c in &list {
+                            let state = vxedge_api::v1::CampaignState::try_from(c.state)
+                                .map(|s| {
+                                    s.as_str_name()
+                                        .trim_start_matches("CAMPAIGN_STATE_")
+                                        .to_lowercase()
+                                })
+                                .unwrap_or_default();
+                            println!(
+                                "{} {} {} ({})",
+                                c.campaign_id, c.experiment_id, state, c.results_dir
+                            );
+                            for t in &c.trials {
+                                let ts = vxedge_api::v1::TrialState::try_from(t.state)
+                                    .map(|s| {
+                                        s.as_str_name()
+                                            .trim_start_matches("TRIAL_STATE_")
+                                            .to_lowercase()
+                                    })
+                                    .unwrap_or_default();
+                                println!(
+                                    "  {:<24} {:<10} {:<10} {}",
+                                    t.id,
+                                    ts,
+                                    t.phase,
+                                    if t.error.is_empty() {
+                                        &t.archive
+                                    } else {
+                                        &t.error
+                                    }
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
         Command::Measure { cmd } => {
             use vxedge_api::v1::{
                 MeasurementStartRequest, MeasurementState, MeasurementStatusRequest,

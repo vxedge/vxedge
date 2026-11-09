@@ -370,6 +370,8 @@ message TrafficUpRequest {
   // Traffic is a time-bounded process, so `Up` does not converge. A retry with the same id returns
   // the original job instead of starting a second load run.
   string request_id = 4;
+  // How long each generator runs, in seconds. 0 uses the experiment's `method.duration_s`.
+  uint32 duration_s = 5;
 }
 
 message TrafficDownRequest {
