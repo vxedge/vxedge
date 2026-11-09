@@ -46,6 +46,8 @@ enum ResourceKind {
   RESOURCE_KIND_TRAFFIC = 7;
   RESOURCE_KIND_NOS_CHECK = 8;
   RESOURCE_KIND_SIGNAL_PLANE = 9;
+  // A declared measurement (`MeasurementService`).
+  RESOURCE_KIND_MEASUREMENT = 10;
 }
 
 enum ResourceState {

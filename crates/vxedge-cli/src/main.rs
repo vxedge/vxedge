@@ -27,6 +27,7 @@ use vxedge_api::v1::experiment_service_client::ExperimentServiceClient;
 use vxedge_api::v1::gateway_service_client::GatewayServiceClient;
 use vxedge_api::v1::job_service_client::JobServiceClient;
 use vxedge_api::v1::manifest_ref::Source;
+use vxedge_api::v1::measurement_service_client::MeasurementServiceClient;
 use vxedge_api::v1::nos_check_service_client::NosCheckServiceClient;
 use vxedge_api::v1::svc_service_client::SvcServiceClient;
 use vxedge_api::v1::traffic_service_client::TrafficServiceClient;
@@ -128,6 +129,12 @@ enum Command {
     Traffic {
         #[command(subcommand)]
         cmd: TrafficCmd,
+    },
+    /// The experiment's `measurements`, run inside each end's network namespace. Addressed by
+    /// the working directory, as the experiment verbs are; the experiment must be up.
+    Measure {
+        #[command(subcommand)]
+        cmd: MeasureCmd,
     },
     /// `network.nos_check` — check an experiment's declared VLAN intent against a real
     /// production NOS (ARCHITECTURE.md §7/§6.0.3). Never part of `experiment up`: a missing or
@@ -632,6 +639,26 @@ enum ManifestLifecycleCmd {
         #[arg(long)]
         manifest: String,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum MeasureCmd {
+    /// Start measurements: each one's reflector, then its sender.
+    Start {
+        /// Only this measurement (repeatable; default: every one).
+        #[arg(long = "id")]
+        ids: Vec<String>,
+        /// How long each sender runs. Default: the experiment's `method.duration_s`, else 10.
+        #[arg(long, default_value_t = 0)]
+        duration_s: u32,
+    },
+    /// Stop measurements. Idempotent.
+    Stop {
+        #[arg(long = "id")]
+        ids: Vec<String>,
+    },
+    /// Where each measurement stands.
+    Status,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1848,6 +1875,69 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 watch_job(channel, job, cli.json).await?;
             }
         },
+        Command::Measure { cmd } => {
+            use vxedge_api::v1::{
+                MeasurementStartRequest, MeasurementState, MeasurementStatusRequest,
+                MeasurementStopRequest,
+            };
+            let found = vxedge_core::discover(&here()?)?;
+            let manifest = manifest_ref(&Some(found.root.to_string_lossy().to_string()));
+            let channel = connect(&cli.endpoint).await?;
+            let mut measure = MeasurementServiceClient::new(channel.clone());
+            match cmd {
+                MeasureCmd::Start { ids, duration_s } => {
+                    let job = measure
+                        .start(MeasurementStartRequest {
+                            manifest,
+                            ids: ids.clone(),
+                            duration_s: *duration_s,
+                            ..Default::default()
+                        })
+                        .await?
+                        .into_inner();
+                    watch_job(channel, job, cli.json).await?;
+                }
+                MeasureCmd::Stop { ids } => {
+                    let job = measure
+                        .stop(MeasurementStopRequest {
+                            manifest,
+                            ids: ids.clone(),
+                            ..Default::default()
+                        })
+                        .await?
+                        .into_inner();
+                    watch_job(channel, job, cli.json).await?;
+                }
+                MeasureCmd::Status => {
+                    let st = measure
+                        .status(MeasurementStatusRequest {
+                            manifest,
+                            ..Default::default()
+                        })
+                        .await?
+                        .into_inner();
+                    for m in &st.measurements {
+                        let state = match MeasurementState::try_from(m.state) {
+                            Ok(MeasurementState::Running) => "running",
+                            Ok(MeasurementState::Finished) => "finished",
+                            Ok(MeasurementState::Failed) => "failed",
+                            _ => "not running",
+                        };
+                        if cli.json {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "id": m.id, "entity": m.entity, "kind": m.kind,
+                                    "state": state, "detail": m.detail,
+                                })
+                            );
+                        } else {
+                            println!("{:<16} {:<10} {:<12} {}", m.id, m.kind, state, m.detail);
+                        }
+                    }
+                }
+            }
+        }
         Command::Pkg { cmd } => pkg(cmd, cli.json)?,
         Command::Manifest { cmd } => match cmd {
             ManifestCmd::Validate { manifest } => {

@@ -10,6 +10,7 @@ mod events;
 mod experiment;
 mod exporter;
 mod jobs;
+mod measure;
 mod plan;
 mod records;
 mod runs;
@@ -31,6 +32,7 @@ use vxedge_api::v1::gateway_service_server::GatewayServiceServer;
 use vxedge_api::v1::host_service_server::HostServiceServer;
 use vxedge_api::v1::job_service_server::JobServiceServer;
 use vxedge_api::v1::log_service_server::LogServiceServer;
+use vxedge_api::v1::measurement_service_server::MeasurementServiceServer;
 use vxedge_api::v1::nos_check_service_server::NosCheckServiceServer;
 use vxedge_api::v1::run_service_server::RunServiceServer;
 use vxedge_api::v1::svc_service_server::SvcServiceServer;
@@ -291,6 +293,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .add_service(NosCheckServiceServer::from_arc(nos_check))
         .add_service(ExperimentServiceServer::from_arc(experiments))
         .add_service(VehicleServiceServer::from_arc(vehicles))
+        .add_service(MeasurementServiceServer::new(measure::MeasurementSvc {
+            engine: engine.clone(),
+            audit: audit.clone(),
+            shell: shell.clone(),
+            runtime_dir: args.runtime_dir.clone(),
+            vxprobe_bin: args.vxprobe_bin.clone(),
+            containers: containers.clone(),
+        }))
         .add_service(TrafficServiceServer::new(services::TrafficSvc {
             engine: engine.clone(),
             audit,

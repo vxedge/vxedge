@@ -675,8 +675,26 @@ async fn no_rpc_of_the_agent_surface_is_a_stub() {
                 .map(|_| ()),
         ),
         code(
-            log_service_client::LogServiceClient::new(ch)
+            log_service_client::LogServiceClient::new(ch.clone())
                 .follow(LogFollowRequest::default())
+                .await
+                .map(|_| ()),
+        ),
+        code(
+            measurement_service_client::MeasurementServiceClient::new(ch.clone())
+                .status(MeasurementStatusRequest::default())
+                .await
+                .map(|_| ()),
+        ),
+        code(
+            measurement_service_client::MeasurementServiceClient::new(ch.clone())
+                .start(MeasurementStartRequest::default())
+                .await
+                .map(|_| ()),
+        ),
+        code(
+            measurement_service_client::MeasurementServiceClient::new(ch)
+                .stop(MeasurementStopRequest::default())
                 .await
                 .map(|_| ()),
         ),
@@ -2000,6 +2018,59 @@ async fn plan_types_measurement_problems_and_lists_measurements() {
         .await
         .unwrap_err();
     assert_eq!(reason(&refused), "ERROR_REASON_MEASUREMENT_INVALID");
+}
+
+/// `MeasurementService` names each declared measurement with its entity, and a start whose
+/// sender's node is not up fails its job naming the node, before any process runs.
+#[tokio::test]
+async fn measurements_report_their_state_and_need_their_nodes_up() {
+    use vxedge_api::v1::measurement_service_client::MeasurementServiceClient;
+    use vxedge_api::v1::{MeasurementStartRequest, MeasurementState, MeasurementStatusRequest};
+    let daemon = Daemon::start();
+    let channel = daemon.channel().await;
+    let (dir, _) = experiment_workspace();
+    let main = std::fs::read_to_string(dir.join("main.yaml")).unwrap();
+    std::fs::write(
+        dir.join("main.yaml"),
+        format!("{main}\nmeasurements:\n  rtt: {{ kind: rtt-probe, from: ecu1, to: hpc1, slice: adas }}\n"),
+    )
+    .unwrap();
+    let mut client = MeasurementServiceClient::new(channel.clone());
+    let status = client
+        .status(MeasurementStatusRequest {
+            manifest: path_ref(&dir),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(status.measurements.len(), 1);
+    let m = &status.measurements[0];
+    assert_eq!(
+        (m.id.as_str(), m.entity.as_str(), m.kind.as_str()),
+        ("rtt", "measurements/rtt", "rtt-probe")
+    );
+    assert_eq!(m.state, MeasurementState::Unspecified as i32);
+
+    let job = client
+        .start(MeasurementStartRequest {
+            manifest: path_ref(&dir),
+            duration_s: 1,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        wait_for_job(channel.clone(), job.id.clone()).await,
+        JobState::Failed as i32
+    );
+    let failed = vxedge_api::v1::job_service_client::JobServiceClient::new(channel)
+        .get(GetJobRequest { id: job.id })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(failed.error.contains("`ecu1`"), "{}", failed.error);
 }
 
 /// Typed intent that holds adds no problem.

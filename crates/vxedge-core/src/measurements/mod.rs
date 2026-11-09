@@ -26,6 +26,8 @@ use serde_yaml_ng::Value;
 use crate::intent::{Problem, ProblemKind};
 use crate::model::{Backend, Experiment};
 
+pub mod run;
+
 /// The far side of the shared uplink, as a measurement's `to`.
 pub const INTERNET: &str = "internet";
 /// The smallest probe: `vxprobe`'s own header.
@@ -188,13 +190,30 @@ fn end_problems(
             ),
         );
     }
-    let on_slice = vehicle
+    match endpoint_on(vehicle, node, slice) {
+        None => push("slice", format!("`{node}` has no link on slice `{slice}`")),
+        Some(e) if e.ip_cidr.is_none() => push(
+            field,
+            format!(
+                "`{node}`'s link on slice `{slice}` pins no `ip`, and a probe needs the address \
+                 it sends from or answers on"
+            ),
+        ),
+        Some(_) => {}
+    }
+}
+
+/// `node`'s link endpoint on `slice`, in `vehicle`.
+pub(crate) fn endpoint_on<'a>(
+    vehicle: &'a crate::model::Entity,
+    node: &str,
+    slice: &str,
+) -> Option<&'a crate::model::Endpoint> {
+    vehicle
         .links
         .iter()
-        .any(|l| l.slice.as_deref() == Some(slice) && l.endpoints.iter().any(|e| e.node == node));
-    if !on_slice {
-        push("slice", format!("`{node}` has no link on slice `{slice}`"));
-    }
+        .filter(|l| l.slice.as_deref() == Some(slice))
+        .find_map(|l| l.endpoints.iter().find(|e| e.node == node))
 }
 
 #[cfg(test)]

@@ -265,7 +265,8 @@ fn render(
     let mut families = vec![cpu, mem];
     families.extend(slice.into_iter().map(|(f, _)| f));
     families.extend([own_cpu, own_mem]);
-    text(&families)
+    // Each running measurement's sender, read inside its own namespace (`measurements/<id>`).
+    text(&families) + &vxedge_core::measurements::run::collect_metrics(runtime_dir)
 }
 
 /// Prometheus text exposition (0.0.4). A family with no samples is left out.

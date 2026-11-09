@@ -17,6 +17,15 @@ All notable changes to this repo are documented here. Format follows
   that is not declared or that an end has no link on, or a value out of bounds. A parameter can
   bind a measurement's field (`measurements[ctl-rtt].rate_pps`), and `Plan` lists each
   measurement as the entity `measurements/<id>`.
+- `MeasurementService` (new service, additive): `Start`, `Stop` and `Status` for an experiment's
+  measurements, and `vxedge measure start|stop|status` in the workspace's folder. The daemon runs
+  the host's `vxprobe` inside each end's network namespace: the sender in the `from` node, the
+  reflector in the `to` node or, for `to: internet`, on a VLAN subinterface of the uplink's peer
+  addressed at the first host of the sender's subnet. Each sender serves its metrics on
+  `127.0.0.1` inside its own namespace, and the daemon's exporter reads them there and serves
+  them as `entity="measurements/<id>"`, so a scrape never crosses the slice it measures.
+  `experiment down` stops running measurements before the nodes. New `RESOURCE_KIND_MEASUREMENT`
+  and the `measurement.started` event.
 - `LogService.Follow` (new service, additive): the log lines a workspace's telemetry service reads
   from each entity's log files, as `LogRecord` (`seq`, `ts_ns`, `entity`, `stream`, `line`), in the
   order read from its `logs.jsonl` (`ARCHITECTURE.md` §11, decision X-18). `after` resumes from a
