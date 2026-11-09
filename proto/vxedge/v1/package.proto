@@ -1,0 +1,223 @@
+syntax = "proto3";
+
+package vxedge.v1;
+
+import "vxedge/v1/common.proto";
+import "vxedge/v1/jobs.proto";
+import "vxedge/v1/workspace.proto";
+
+// ---------------------------------------------------------------------------
+// Packages (`vxp/1`, ARCHITECTURE.md section 6.0.7): what a package is, from its documents, and
+// the packages this host's cache holds. `ManifestRef.package` addresses any verb by package
+// digest once the package is in the cache.
+// ---------------------------------------------------------------------------
+
+message PackageInspectRequest {
+  // The package: a workspace folder, a packed `.vxp` file the daemon can read, or a package
+  // digest in this host's cache (`ManifestRef.package`).
+  ManifestRef package = 1;
+}
+
+// A typed parameter value: the one of these its parameter's `type` names.
+message ParamValue {
+  oneof value {
+    int64 integer = 1;
+    double number = 2;
+    bool boolean = 3;
+    string text = 4;
+  }
+}
+
+message PackageHypothesis {
+  string id = 1;
+  string statement = 2;
+}
+
+// One knob a caller may turn between trials.
+message PackageParameter {
+  string name = 1;
+  // `integer`, `number`, `boolean` or `string`.
+  string type = 2;
+  string unit = 3;
+  ParamValue default = 4;
+  // Bounds, for numbers. Unset when the parameter declares none.
+  optional double min = 5;
+  optional double max = 6;
+  // The allowed values, when the parameter lists them.
+  repeated ParamValue values = 7;
+  // The manifest field the parameter sets, as an id path.
+  string binds = 8;
+}
+
+message PackageMetric {
+  string id = 1;
+  // `counter`, `gauge` or `histogram`.
+  string kind = 2;
+  string unit = 3;
+  string entity = 4;
+}
+
+// One side of a comparison: an aggregate of a metric's samples, or a constant.
+message CriterionOperand {
+  message MetricOperand {
+    string metric = 1;
+    string aggregate = 2;
+    // `arm` or parameter names to the value selected.
+    map<string, ParamValue> select = 3;
+    optional double factor = 4;
+  }
+  message Constant {
+    double value = 1;
+    string unit = 2;
+  }
+  oneof operand {
+    MetricOperand metric = 1;
+    Constant constant = 2;
+  }
+}
+
+message CriterionComparison {
+  // `lt`, `le`, `gt`, `ge` or `within`.
+  string op = 1;
+  CriterionOperand lhs = 2;
+  CriterionOperand rhs = 3;
+  optional double tolerance = 4;
+  optional uint64 min_samples = 5;
+}
+
+message CriterionGroup {
+  // `all` or `any`.
+  string rule = 1;
+  repeated PackageCriterion members = 2;
+}
+
+// A criterion: a comparison, or an `all`/`any` group of criteria.
+message PackageCriterion {
+  string id = 1;
+  oneof criterion {
+    CriterionComparison comparison = 2;
+    CriterionGroup group = 3;
+  }
+  // A one-line rendering for people. Nothing parses it.
+  string text = 4;
+}
+
+message CampaignArm {
+  string name = 1;
+  map<string, ParamValue> parameters = 2;
+}
+
+message CampaignSweep {
+  string parameter = 1;
+  repeated ParamValue values = 2;
+}
+
+message CampaignProfile {
+  string name = 1;
+  optional uint32 repetitions = 2;
+  optional double warmup_s = 3;
+  optional double duration_s = 4;
+}
+
+message PackageCampaign {
+  repeated CampaignArm arms = 1;
+  repeated CampaignSweep sweep = 2;
+  optional uint32 repetitions = 3;
+  optional double warmup_s = 4;
+  optional double duration_s = 5;
+  repeated CampaignProfile profiles = 6;
+}
+
+message PackageMeasurement {
+  string id = 1;
+  // `rtt-probe`.
+  string kind = 2;
+  string from = 3;
+  string to = 4;
+  string slice = 5;
+  uint32 rate_pps = 6;
+  uint32 payload_bytes = 7;
+  // `measurements/<id>`.
+  string entity = 8;
+}
+
+// What the package needs from its host, as its descriptor's `requires` says.
+message PackageRequirements {
+  // `none`, or the GPU tier the package needs (`tier2`).
+  string gpu = 1;
+  // Whether it needs KVM.
+  bool kvm = 2;
+  // `required`, `preferred`, `any`, or empty when it names no kernel requirement.
+  string preempt_rt = 3;
+  // Backends that must be available on the host, as the manifest spells them.
+  repeated string backends = 4;
+}
+
+message PackageInfo {
+  // `namespace/name`, the version and the package digest (sha256 of its packed bytes).
+  string id = 1;
+  string version = 2;
+  string digest = 3;
+  // `vxp/1`, or `legacy` for a `<name>.vxp` descriptor.
+  string schema = 4;
+  // The experiment document the package runs.
+  string entry = 5;
+  string experiment_id = 6;
+  // Whether `vxp.lock` matches the package, and what differs when it does not.
+  bool locked = 7;
+  repeated string lock_problems = 8;
+  PackageRequirements requires = 9;
+  PackageHypothesis hypothesis = 10;
+  repeated PackageParameter parameters = 11;
+  repeated PackageMetric metrics = 12;
+  repeated PackageCriterion criteria = 13;
+  PackageCampaign campaign = 14;
+  repeated PackageMeasurement measurements = 15;
+  // The entities its telemetry names, as `WorkspaceService.Plan` lists them.
+  repeated PlannedEntity entities = 16;
+  // Every problem with its documents and typed intent. Empty for a package `up` would accept.
+  repeated PlanProblem problems = 17;
+}
+
+message PackageListRequest {}
+
+message CachedPackage {
+  string digest = 1;
+  string id = 2;
+  string version = 3;
+  uint64 size_bytes = 4;
+  // Whether the packed file carries a `vxp.lock`.
+  bool has_lock = 5;
+}
+
+message PackageList {
+  repeated CachedPackage packages = 1;
+}
+
+message PackagePullRequest {
+  // `<repository>@sha256:<hex>`: an OCI repository and the package digest.
+  string reference = 1;
+  // A retry with the same id returns the original job.
+  string request_id = 2;
+}
+
+// One part of a packed package, client-streamed. The first message names the digest the bytes
+// must hash to; every message carries the next bytes.
+message PackageImportChunk {
+  // In the first message only: `sha256:<hex>`.
+  string digest = 1;
+  bytes data = 2;
+}
+
+service PackageService {
+  // A package's descriptor, lock state, requirements, typed intent, measurements and entities,
+  // from its documents. Touches nothing.
+  rpc Inspect(PackageInspectRequest) returns (PackageInfo);
+  // The packages in this host's cache.
+  rpc List(PackageListRequest) returns (PackageList);
+  // Pull a package by digest into the cache (`package.pull`). The artifact is the cached file.
+  rpc Pull(PackagePullRequest) returns (Job);
+  // Upload a packed package into the cache when the client shares no filesystem with the daemon
+  // (`package.import`). The bytes must hash to the digest and be a canonical packed package.
+  rpc Import(stream PackageImportChunk) returns (Job);
+}

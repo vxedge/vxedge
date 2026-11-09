@@ -6,6 +6,23 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- `PackageService` (new service, additive): `Inspect`, `List`, `Pull` and `Import`.
+  - `Inspect` reads a workspace folder, a packed `.vxp` file or a cached package. It returns the
+    descriptor, the package digest, the lock state, the host requirements, the typed intent
+    (hypothesis, parameters with bounds, metrics, structured criteria with a one-line
+    rendering, campaign), the measurements, the entities and every problem `Plan` would report.
+    It touches nothing.
+  - `List` reports the packages in this host's cache.
+  - `Pull` (`package.pull`) and `Import` (`package.import`, client-streamed bytes) put a
+    package in the cache. Its bytes must hash to its digest and be a canonical packed package.
+    Under a trust policy that requires signatures, `Pull` refuses an unverified digest before it
+    fetches anything, as `up` does.
+- `ManifestRef.package`: any verb can address a cached package by its digest (`sha256:<hex>`),
+  which the daemon unpacks once into its cache. An unknown digest is the new
+  `ERROR_REASON_PACKAGE_UNKNOWN` (31).
+
 ## [0.12.0] - 2026-11-09
 
 Three additions.
