@@ -61,6 +61,10 @@ pub enum EventKind {
     TrafficStarted,
     /// A traffic profile stopped.
     TrafficStopped,
+    /// A measurement's reflector and sender started.
+    MeasurementStarted,
+    /// A measurement's processes were stopped.
+    MeasurementStopped,
     /// A `network.nos_check` instance was booted (via `NosCheckService.Up`).
     NosCheckUp,
     /// A `network.nos_check` instance was torn down.
@@ -95,6 +99,8 @@ impl EventKind {
             EventKind::RunDown => "run.down",
             EventKind::TrafficStarted => "traffic.started",
             EventKind::TrafficStopped => "traffic.stopped",
+            EventKind::MeasurementStarted => "measurement.started",
+            EventKind::MeasurementStopped => "measurement.stopped",
             EventKind::NosCheckUp => "nos-check.up",
             EventKind::NosCheckDown => "nos-check.down",
             EventKind::NosCheckVerified => "nos-check.verified",
@@ -117,6 +123,9 @@ impl EventKind {
             // A run is a vehicle's unless said otherwise: `emit_run` names the kind it really is.
             EventKind::RunUp | EventKind::RunDown => ResourceKind::Vehicle,
             EventKind::TrafficStarted | EventKind::TrafficStopped => ResourceKind::Traffic,
+            EventKind::MeasurementStarted | EventKind::MeasurementStopped => {
+                ResourceKind::Measurement
+            }
             EventKind::NosCheckUp | EventKind::NosCheckDown | EventKind::NosCheckVerified => {
                 ResourceKind::NosCheck
             }
@@ -279,6 +288,8 @@ mod tests {
             EventKind::SignalPlaneDown,
             EventKind::TrafficStarted,
             EventKind::TrafficStopped,
+            EventKind::MeasurementStarted,
+            EventKind::MeasurementStopped,
         ] {
             assert_ne!(
                 kind.resource_kind(),

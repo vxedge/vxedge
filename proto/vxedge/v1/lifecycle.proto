@@ -407,6 +407,65 @@ service TrafficService {
 }
 
 // ---------------------------------------------------------------------------
+// Measurements: what an experiment's `measurements` block declares, run by the daemon inside
+// each end's network namespace (ARCHITECTURE.md section 6.0.3). Their samples reach the ingest
+// through the daemon's exporter as the entity `measurements/<id>`.
+// ---------------------------------------------------------------------------
+
+message MeasurementStartRequest {
+  // The workspace whose measurements to start; its experiment must be up.
+  ManifestRef manifest = 1;
+  // Restrict to these measurement ids (empty = every measurement).
+  repeated string ids = 2;
+  RunRef run = 3;
+  // How long each sender runs. 0 uses the experiment's `method.duration_s`, else 10.
+  uint32 duration_s = 4;
+  // A retry with the same id returns the original job instead of starting the senders again.
+  string request_id = 5;
+}
+
+message MeasurementStopRequest {
+  ManifestRef manifest = 1;
+  repeated string ids = 2;
+  RunRef run = 3;
+}
+
+message MeasurementStatusRequest {
+  ManifestRef manifest = 1;
+  RunRef run = 2;
+}
+
+enum MeasurementState {
+  MEASUREMENT_STATE_UNSPECIFIED = 0;
+  MEASUREMENT_STATE_RUNNING = 1;
+  MEASUREMENT_STATE_FINISHED = 2;
+  MEASUREMENT_STATE_FAILED = 3;
+}
+
+message MeasurementStatus {
+  string id = 1;
+  // The entity its samples name, `measurements/<id>`.
+  string entity = 2;
+  // `rtt-probe`.
+  string kind = 3;
+  MeasurementState state = 4;
+  string detail = 5;
+}
+
+message MeasurementStatusResponse {
+  repeated MeasurementStatus measurements = 1;
+}
+
+service MeasurementService {
+  // Start each selected measurement: its reflector, then its sender, for `duration_s`. A
+  // measurement whose sender still runs is left as it is.
+  rpc Start(MeasurementStartRequest) returns (Job);
+  // Stop each selected measurement's processes. Idempotent.
+  rpc Stop(MeasurementStopRequest) returns (Job);
+  rpc Status(MeasurementStatusRequest) returns (MeasurementStatusResponse);
+}
+
+// ---------------------------------------------------------------------------
 // NOS check (SONiC-VS production-NOS config-parity check — ARCHITECTURE.md §7,
 // network.nos_check). Never part of ExperimentService.Up's provisioning sequence: this
 // checks network.slices' VLAN intent against a real production NOS, alongside — never

@@ -788,6 +788,16 @@ impl ExperimentService for ExperimentSvc {
                     // strands whatever came after it. Collect failures, tear the rest down anyway,
                     // and report everything that went wrong.
                     let mut failures: Vec<JobFailure> = Vec::new();
+                    // Measurements run inside the nodes, so they stop before the nodes do.
+                    if wants(&stages, ExperimentStage::Zones) {
+                        let (sh, rt) = (svc.gateway.shell.clone(), svc.gateway.runtime_dir.clone());
+                        let _ = tokio::task::spawn_blocking(move || {
+                            for s in vxedge_core::measurements::run::started(&rt) {
+                                vxedge_core::measurements::run::stop(&sh, &rt, &s.id);
+                            }
+                        })
+                        .await;
+                    }
                     if wants(&stages, ExperimentStage::Services)
                         && let Err(e) = svc
                             .stage_services(&model, &yaml, dir.as_deref(), false, &p)

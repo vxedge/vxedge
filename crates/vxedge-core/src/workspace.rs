@@ -335,6 +335,9 @@ pub struct ExperimentDoc {
     pub method: Option<serde_yaml_ng::Value>,
     #[serde(default)]
     pub traffic_profiles: Option<serde_yaml_ng::Value>,
+    /// Read by [`crate::measurements`] when the model is built.
+    #[serde(default)]
+    pub measurements: Option<serde_yaml_ng::Value>,
     /// Typed intent (`ARCHITECTURE.md` §6.0.3), carried opaque here and read by
     /// [`crate::intent`], which types and checks it against the document itself.
     #[serde(default)]

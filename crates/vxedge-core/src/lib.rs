@@ -12,6 +12,7 @@ pub mod fiveg;
 pub mod gateway;
 pub mod identity;
 pub mod intent;
+pub mod measurements;
 pub mod model;
 pub mod offline;
 pub mod package;

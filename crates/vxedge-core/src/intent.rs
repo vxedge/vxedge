@@ -13,13 +13,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Deserialize;
 use serde_yaml_ng::Value;
 
-/// Which kind of problem: a parameter (including the campaign that sets parameters) or a
-/// criterion. vxAPI reports them as `ERROR_REASON_PARAMETER_INVALID` and
-/// `ERROR_REASON_CRITERION_INVALID`.
+/// Which kind of problem: a parameter (including the campaign that sets parameters), a
+/// criterion, or a measurement ([`crate::measurements`]). vxAPI reports them as
+/// `ERROR_REASON_PARAMETER_INVALID`, `ERROR_REASON_CRITERION_INVALID` and
+/// `ERROR_REASON_MEASUREMENT_INVALID`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProblemKind {
     Parameter,
     Criterion,
+    Measurement,
 }
 
 /// One problem with an experiment's typed intent: the field it is in, as a path from the

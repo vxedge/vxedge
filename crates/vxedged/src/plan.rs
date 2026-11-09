@@ -167,6 +167,7 @@ fn intent_reason(kind: vxedge_core::intent::ProblemKind) -> R {
     match kind {
         vxedge_core::intent::ProblemKind::Parameter => R::ParameterInvalid,
         vxedge_core::intent::ProblemKind::Criterion => R::CriterionInvalid,
+        vxedge_core::intent::ProblemKind::Measurement => R::MeasurementInvalid,
     }
 }
 
@@ -216,10 +217,14 @@ pub(crate) async fn preflight(
         package.map(|(reason, detail)| (reason, model.id.clone(), detail)),
     );
 
-    // Typed intent, checked before any host question: a bad criterion fails here, in a second,
-    // not after an hour of trials. Every problem is listed, each under its own reason.
-    if let Some(ws) = dir.and_then(|d| vxedge_core::Workspace::load(d).ok()) {
-        let problems = ws.intent_problems();
+    // Typed intent and measurements, checked before any host question: a bad criterion fails
+    // here, in a second, not after an hour of trials. Every problem is listed, each under its own
+    // reason. Measurements are checked against the model, which knows each end's backend.
+    let measured = vxedge_core::measurements::problems(model);
+    let intent = dir.and_then(|d| vxedge_core::Workspace::load(d).ok());
+    if intent.is_some() || !measured.is_empty() {
+        let mut problems = intent.map(|ws| ws.intent_problems()).unwrap_or_default();
+        problems.extend(measured);
         for p in &problems {
             pf.problems.push(PlanProblem {
                 reason: intent_reason(p.kind) as i32,
