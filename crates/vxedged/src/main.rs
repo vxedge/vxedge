@@ -11,6 +11,7 @@ mod experiment;
 mod exporter;
 mod jobs;
 mod plan;
+mod records;
 mod runs;
 mod services;
 mod status;

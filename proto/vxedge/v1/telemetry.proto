@@ -10,6 +10,63 @@ message Metric {
   map<string, string> labels = 2;
   double value = 3;
   int64 ts_unix_ms = 4;
+  // The entity path the sample is about (ARCHITECTURE.md section 12), e.g. "car/front/ecu1".
+  string entity = 5;
+  // The same instant as `ts_unix_ms`, in nanoseconds since the Unix epoch.
+  int64 ts_ns = 6;
+}
+
+// A telemetry record (ARCHITECTURE.md section 11), as the ingest writes it and the archive keeps
+// it: live and archived streams carry the same records.
+message Record {
+  // The record's line number in the ingest's `records.jsonl`, from 1: the cursor for `after`.
+  int64 seq = 1;
+  // Nanoseconds since the Unix epoch: a sample's or phase's time, a gap's start.
+  int64 ts_ns = 2;
+  oneof record {
+    SampleRecord sample = 3;
+    GapRecord gap = 4;
+    PhaseRecord phase = 5;
+  }
+}
+
+// One value of one series at one time.
+message SampleRecord {
+  string entity = 1;
+  string metric = 2;
+  map<string, string> labels = 3;
+  double value = 4;
+}
+
+// A span with no data from an entity: a renderer draws a break, never a line across it.
+message GapRecord {
+  string entity = 1;
+  // The series, when the gap is one series; empty for a whole failed scrape.
+  string metric = 2;
+  int64 from_ns = 3;
+  int64 to_ns = 4;
+  string reason = 5;
+}
+
+// A trial entering a phase (provision, warmup, measure, cooldown, teardown).
+message PhaseRecord {
+  string trial = 1;
+  string phase = 2;
+}
+
+message StreamRecordsRequest {
+  // The workspace whose telemetry service's ingest to read; empty reads this daemon's default
+  // ingest folder.
+  ManifestRef experiment = 1;
+  // Only records whose `seq` is greater: 0 starts from the first record, and a client that
+  // reconnects passes the last `seq` it saw.
+  int64 after = 2;
+  // Keep the stream open and send records as the ingest writes them. False ends the stream at
+  // the last record written so far.
+  bool follow = 3;
+  // Only records about entities at or under this path ("car", "car/front"); empty is all.
+  // Phase records, which name no entity, always pass.
+  string entity_prefix = 4;
 }
 
 message StreamMetricsRequest {
@@ -26,8 +83,12 @@ message CollectRequest {
 }
 
 service TelemetryService {
-  // Live metrics for dashboards / HMI. Not built: answers `UNIMPLEMENTED`.
+  // Live samples for dashboards and HMIs: the `sample` records of `StreamRecords`, from the first
+  // and following, filtered by `selector` (a label, or `entity`).
   rpc StreamMetrics(StreamMetricsRequest) returns (stream Metric);
+  // Every sample, gap and phase record of a workspace's ingest, in the order written, from a
+  // cursor, optionally following as the ingest writes more.
+  rpc StreamRecords(StreamRecordsRequest) returns (stream Record);
   // Bundle Prometheus data, PCAPs, logs + metadata into the results archive.
   rpc Collect(CollectRequest) returns (Job);
 }

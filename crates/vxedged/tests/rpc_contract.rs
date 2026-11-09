@@ -611,7 +611,7 @@ async fn experiment_up_does_not_skip_a_declared_signal_plane() {
 }
 
 /// The 0.5.0 release gate: every RPC the agent surface added is built. Each answers something other
-/// than `UNIMPLEMENTED`, even to an empty request. `StreamMetrics` is the one documented exception.
+/// than `UNIMPLEMENTED`, even to an empty request.
 #[tokio::test]
 async fn no_rpc_of_the_agent_surface_is_a_stub() {
     use tonic::Code::Unimplemented;
@@ -657,8 +657,20 @@ async fn no_rpc_of_the_agent_surface_is_a_stub() {
                 .map(|_| ()),
         ),
         code(
-            telemetry_service_client::TelemetryServiceClient::new(ch)
+            telemetry_service_client::TelemetryServiceClient::new(ch.clone())
                 .collect(CollectRequest::default())
+                .await
+                .map(|_| ()),
+        ),
+        code(
+            telemetry_service_client::TelemetryServiceClient::new(ch.clone())
+                .stream_metrics(StreamMetricsRequest::default())
+                .await
+                .map(|_| ()),
+        ),
+        code(
+            telemetry_service_client::TelemetryServiceClient::new(ch)
+                .stream_records(StreamRecordsRequest::default())
                 .await
                 .map(|_| ()),
         ),
@@ -2109,6 +2121,76 @@ async fn plan_and_collect_name_the_entities_records_use() {
         .map(|e| e["path"].as_str().unwrap())
         .collect();
     assert_eq!(listed, paths, "Plan and the archive agree");
+}
+
+/// `StreamRecords` carries the ingest's records in order, with a cursor and an entity filter;
+/// `StreamMetrics` carries its samples by selector (`ARCHITECTURE.md` §11).
+#[tokio::test]
+async fn live_streams_carry_the_ingest_records() {
+    use tokio_stream::StreamExt;
+    use vxedge_api::v1::{StreamMetricsRequest, StreamRecordsRequest, record};
+    let daemon = Daemon::start_with(|run| {
+        std::fs::create_dir_all(run.join("ingest")).unwrap();
+        std::fs::write(
+            run.join("ingest/records.jsonl"),
+            concat!(
+                r#"{"record":"phase","ts_ns":1,"trial":"t1","phase":"measure"}"#, "\n",
+                r#"{"record":"sample","ts_ns":2000000,"entity":"car/front/ecu1","metric":"rtt_seconds","labels":{"quantile":"0.99"},"value":0.5}"#, "\n",
+                r#"{"record":"gap","entity":"host","from_ns":3,"to_ns":4,"reason":"scrape failed"}"#, "\n",
+                r#"{"record":"sample","ts_ns":5000000,"entity":"host","metric":"vxedge_process_memory_bytes","value":7}"#, "\n",
+            ),
+        )
+        .unwrap();
+    });
+    let mut client = vxedge_api::v1::telemetry_service_client::TelemetryServiceClient::new(
+        daemon.channel().await,
+    );
+    let all: Vec<_> = client
+        .stream_records(StreamRecordsRequest::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(all.iter().map(|r| r.seq).collect::<Vec<_>>(), [1, 2, 3, 4]);
+    assert!(matches!(all[2].record, Some(record::Record::Gap(_))));
+
+    let car: Vec<i64> = client
+        .stream_records(StreamRecordsRequest {
+            after: 1,
+            entity_prefix: "car".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .map(|r| r.unwrap().seq)
+        .collect()
+        .await;
+    assert_eq!(car, [2], "after the cursor, under `car` only");
+
+    let mut live = client
+        .stream_metrics(StreamMetricsRequest {
+            selector: [("entity".to_string(), "host".to_string())].into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let m = live.next().await.unwrap().unwrap();
+    assert_eq!(
+        (
+            m.name.as_str(),
+            m.entity.as_str(),
+            m.value,
+            m.ts_unix_ms,
+            m.ts_ns
+        ),
+        ("vxedge_process_memory_bytes", "host", 7.0, 5, 5_000_000)
+    );
 }
 
 /// The daemon's exporter is a `host` scrape target in both the plan and `entities.json`, and
