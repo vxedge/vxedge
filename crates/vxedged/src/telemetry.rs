@@ -69,6 +69,20 @@ impl TelemetryService for TelemetrySvc {
                 ),
             ));
         }
+        // The entity paths every record names, mapped once here from the model (§12), so the
+        // archive carries them beside the samples that use them.
+        let entities = vxedge_core::entities::entities_of(&model);
+        let entities_file = ingest.join("entities.json");
+        std::fs::write(
+            &entities_file,
+            serde_json::to_vec_pretty(&entities).expect("entities always serialize"),
+        )
+        .map_err(|e| {
+            errors::invalid(
+                R::Unspecified,
+                format!("cannot write `{}`: {e}", entities_file.display()),
+            )
+        })?;
         let out = if req.out_path.is_empty() {
             workspace
                 .join("results")

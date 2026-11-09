@@ -133,6 +133,27 @@ pub(crate) fn package_run(
     Ok(package)
 }
 
+/// An entity as `Plan` reports it.
+pub(crate) fn planned_entity(
+    e: vxedge_core::entities::EntityRecord,
+) -> vxedge_api::v1::PlannedEntity {
+    vxedge_api::v1::PlannedEntity {
+        path: e.path,
+        kind: e.kind.as_str().to_string(),
+        role: e.role.unwrap_or_default(),
+        backend: e.backend.unwrap_or_default(),
+        payloads: e
+            .payloads
+            .into_iter()
+            .map(|p| vxedge_api::v1::EntityPayload {
+                r#ref: p.reference,
+                digest: p.digest.unwrap_or_default(),
+            })
+            .collect(),
+        scrape_targets: e.scrape_targets,
+    }
+}
+
 /// The vxAPI reason for a typed-intent problem.
 fn intent_reason(kind: vxedge_core::intent::ProblemKind) -> R {
     match kind {
@@ -647,6 +668,10 @@ impl WorkspaceService for PlanSvc {
             services,
             images: all_images(&model, &nodes).into_iter().collect(),
             host_checks,
+            entities: vxedge_core::entities::entities_of(&model)
+                .into_iter()
+                .map(planned_entity)
+                .collect(),
         }))
     }
 }

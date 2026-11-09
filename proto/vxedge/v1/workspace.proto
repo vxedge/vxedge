@@ -41,6 +41,31 @@ message WorkspacePlan {
   // Every image the workspace would run.
   repeated string images = 5;
   repeated HostCheck host_checks = 6;
+  // Every entity of the model (`ARCHITECTURE.md` §12): the paths telemetry records name, with
+  // the scrape targets bound to each. Derived from ids, never from addresses.
+  repeated PlannedEntity entities = 7;
+}
+
+// One entity: `<vehicle>/<zone>/<node>` (`_` for no zone), `<vehicle>/links/<link>`,
+// `<vehicle>/channels/<channel>`, `<vehicle>/slices/<slice>`, `<vehicle>/services/<service>`,
+// `host/services/<service>` or `host`.
+message PlannedEntity {
+  string path = 1;
+  // `node`, `link`, `channel`, `slice`, `service` or `host`.
+  string kind = 2;
+  // A node's role (`zone-controller`, `hpc`, ...) or a service's type (`ota`, ...).
+  string role = 3;
+  // A node's backend, as the manifest spells it.
+  string backend = 4;
+  // What runs on a node: each function's part, as the documents pin it.
+  repeated EntityPayload payloads = 5;
+  // The telemetry scrape targets bound to this entity.
+  repeated string scrape_targets = 6;
+}
+
+message EntityPayload {
+  string ref = 1;
+  string digest = 2;
 }
 
 service WorkspaceService {
