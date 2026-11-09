@@ -25,7 +25,7 @@ automotive vocabulary**. Every feature is judged against those four properties.
 - Call the platform an **executable virtual prototype / all-software SDV testbed** — the
   word "twin" is reserved for hardware-in-the-loop parity or explicit vendor-twin
   claims (Snapdragon vSoC, Mcity). Overclaiming once costs more than underclaiming always.
-- Known gaps are stated where users will see them: QNX-as-guest inversion, shared-host
+- Known gaps are stated where users will see them: RTOS-as-guest inversion, shared-host
   gateway, userspace timestamps, non-PREEMPT_RT kernels. New features add their caveats to
   the same places (ARCHITECTURE §2/§9/§12, results metadata).
 - Status output never lies: DOWN when nothing is provisioned, DEGRADED with specifics when
@@ -56,7 +56,7 @@ automotive vocabulary**. Every feature is judged against those four properties.
 - Containers digest-pinned and non-root; OTA artifacts signed and verified (vxota).
 - No secrets in repos or manifests; anything credential-shaped goes through the environment.
 - License hygiene: MIT/Apache-2.0 for our code; never commit licensed vendor artifacts
-  (QNX, AAOS) — recipes only.
+  (such as AAOS) — recipes only.
 
 ## 6. Documentation currency
 
