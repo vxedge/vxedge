@@ -478,8 +478,12 @@ impl PackageService for PackageSvc {
     async fn pull(&self, req: Request<PackagePullRequest>) -> Result<Response<Job>, Status> {
         let opts = crate::jobs::JobOpts::request(&req, &req.get_ref().request_id);
         let reference = req.into_inner().reference;
-        vxedge_core::distribution::split_pull_ref(&reference)
+        let (_, digest) = vxedge_core::distribution::split_pull_ref(&reference)
             .map_err(|e| errors::invalid(R::InvalidRequest, e.to_string()))?;
+        // As `up` does, and before anything is fetched: under a policy that requires signatures,
+        // a package with no verification record from an allowed signer is refused.
+        crate::plan::trust_check(Some(digest))
+            .map_err(|detail| errors::precondition(R::SignatureInvalid, detail))?;
         self.audit.record(
             "PackageService.Pull",
             serde_json::json!({ "reference": reference }),

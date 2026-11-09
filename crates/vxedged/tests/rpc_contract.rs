@@ -2371,6 +2371,16 @@ async fn a_host_that_requires_signatures_refuses_what_is_not_verified() {
             .await
             .unwrap_err();
     assert_eq!(reason(&refused), "ERROR_REASON_SIGNATURE_INVALID");
+    // `PackageService.Pull` applies the same policy, before anything is fetched.
+    let refused =
+        vxedge_api::v1::package_service_client::PackageServiceClient::new(channel.clone())
+            .pull(vxedge_api::v1::PackagePullRequest {
+                reference: format!("ghcr.io/vxedge/experiments/x@{digest}"),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+    assert_eq!(reason(&refused), "ERROR_REASON_SIGNATURE_INVALID");
 
     write_verification(&cache, &digest, "sha256:someone-else");
     let problems = signature_problems(&plan_of(&channel, &dir).await);

@@ -133,6 +133,15 @@ pub(crate) fn package_run(
     Ok(package)
 }
 
+/// The host trust policy's verdict on a package digest (`None` for no package), as `up` applies
+/// it. Without a policy that requires signatures, every package passes.
+pub(crate) fn trust_check(digest: Option<&str>) -> Result<(), String> {
+    match HOST_TRUST.get() {
+        Some((policy, cache_dir)) => policy.check(cache_dir, digest),
+        None => Ok(()),
+    }
+}
+
 /// An entity as `Plan` reports it.
 pub(crate) fn planned_entity(
     e: vxedge_core::entities::EntityRecord,
