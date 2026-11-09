@@ -28,6 +28,27 @@
 pub mod client;
 pub mod spec;
 
+/// Whether this user's Podman can create a container with `--cpuset-cpus`. A rootless container
+/// lives under the user's systemd service, and its cgroup gets the `cpuset` controller only when
+/// that service delegates it; root's containers sit under the root cgroup. Without it the OCI
+/// runtime refuses the container at start.
+pub fn cpuset_available() -> bool {
+    let uid = nix::unistd::geteuid();
+    let path = if uid.is_root() {
+        "/sys/fs/cgroup/cgroup.controllers".to_string()
+    } else {
+        format!(
+            "/sys/fs/cgroup/user.slice/user-{0}.slice/user@{0}.service/cgroup.controllers",
+            uid.as_raw()
+        )
+    };
+    std::fs::read_to_string(path).is_ok_and(|c| has_cpuset(&c))
+}
+
+fn has_cpuset(controllers: &str) -> bool {
+    controllers.split_whitespace().any(|c| c == "cpuset")
+}
+
 use std::ffi::OsStr;
 use std::path::PathBuf;
 
@@ -107,6 +128,13 @@ pub fn user_socket_path(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cpuset_is_read_from_the_controller_list() {
+        assert!(!super::has_cpuset("cpu memory pids"));
+        assert!(super::has_cpuset("cpuset cpu io memory pids"));
+        assert!(!super::has_cpuset(""));
+    }
+
     use super::*;
 
     #[test]

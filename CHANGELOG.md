@@ -58,6 +58,17 @@ All notable changes to this repo are documented here. Format follows
 
 ### Fixed
 
+- A `libvirt` guest gets ACPI (`<features><acpi/><apic/></features>`). Without it QEMU ran the q35
+  machine with `acpi=off`, the virtio-net behind its PCIe root port stayed in D3cold, and the guest
+  booted with no `eth0`, so it never answered (found on a vehicle running every backend).
+- A pinned `libvirt` node keeps its emulator, I/O and vhost threads on its pinned CPUs
+  (`<emulatorpin>`), not only its vCPU (`<vcpupin>`), as `qemu-microvm` and `cloud-hypervisor` keep
+  the whole VMM process there. Measured before: the vCPU on its CPU, every other QEMU thread on all.
+- A `container` device's `realtime.pinned_cpus` is applied: its payload and infra containers get it
+  as their cpuset. The pins used to be dropped without a word. `Plan` and `up` refuse, under
+  `ERROR_REASON_HOST_REQUIREMENT_UNMET`, a pinned container device that runs a host process (which
+  vxedge does not pin) or whose Podman has no `cpuset` cgroup controller (rootless Podman gets it
+  only when the user's systemd service delegates it). A container without pins keeps its spec hash.
 - Two `vxedge-core` tests shared a temporary folder, `vxpkg-<pid>-legacy`, and could fail when
   run in parallel. `package.rs`'s tests now use their own prefix.
 
