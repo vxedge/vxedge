@@ -14,6 +14,8 @@ All notable changes to this repo are documented here. Format follows
   or to the far side of the uplink at the first host of the source's subnet, on port 19700.
   `Status` and `Down` treat it as any other profile. A profile whose source is not a node still
   needs `experiment up --stage gateway` and is refused with `ERROR_REASON_ENDPOINT_NOT_ON_HOST`.
+- A measurement to `internet` whose far side would take the same address on another slice as a
+  traffic profile's far side is a problem in `Plan`, as two such measurements already were.
 - A `measurements` block in `kind: experiment` documents: what the experiment measures, by node
   id. The first kind is `rtt-probe` (`from` a device, `to` a device or `internet`, the `slice` its
   packets use, `rate_pps`, `payload_bytes`). `Plan`, `up` and `experiment validate`
