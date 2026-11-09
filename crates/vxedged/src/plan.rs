@@ -448,7 +448,53 @@ pub(crate) async fn preflight(
         "socket paths",
         socket.map(|(node, e)| (R::RuntimeDirTooLong, node, e)),
     );
+
+    let pinned_containers: Vec<&NodePlan> = nodes
+        .iter()
+        .filter(|n| n.backend == Backend::Container && !n.pinned_cpus.is_empty())
+        .collect();
+    pf.check(
+        "container pinning",
+        container_pinning_problem(
+            &pinned_containers,
+            vxedge_core::containers::cpuset_available,
+        ),
+    );
     pf
+}
+
+/// A container device's `realtime.pinned_cpus` is applied as the containers' cpuset, so it is
+/// refused before anything starts when it cannot be: on a node with no image (a host process in
+/// a namespace, which vxedge does not pin), or when Podman cannot use the `cpuset` controller.
+fn container_pinning_problem(
+    pinned: &[&NodePlan],
+    cpuset_available: impl Fn() -> bool,
+) -> Option<(R, String, String)> {
+    if let Some(n) = pinned.iter().find(|n| n.image.is_none()) {
+        return Some((
+            R::HostRequirementUnmet,
+            n.node_id.clone(),
+            format!(
+                "`{}` declares `realtime.pinned_cpus`, but it runs a host process in a network \
+                 namespace, which vxedge does not pin. Give it a container image, or drop the pins.",
+                n.node_id
+            ),
+        ));
+    }
+    let n = pinned.first()?;
+    (!cpuset_available()).then(|| {
+        (
+            R::HostRequirementUnmet,
+            n.node_id.clone(),
+            format!(
+                "`{}` declares `realtime.pinned_cpus`, applied as its containers' cpuset, but this \
+                 user's Podman has no `cpuset` cgroup controller. Delegate it to the user service \
+                 (systemd `Delegate=cpu cpuset io memory pids` in a `user@.service` drop-in, then \
+                 log in again), run vxedged as root, or drop the pins.",
+                n.node_id
+            ),
+        )
+    })
 }
 
 /// Every `localhost/` image the workspace runs: payloads and everything placed on a device.
@@ -764,5 +810,53 @@ mod lifecycle_tests {
         assert_eq!(workspace_of_lifecycle("zone ecu1"), None);
         assert_eq!(workspace_of_lifecycle("vxgateway"), None);
         assert_eq!(workspace_of_lifecycle("vehicle "), None);
+    }
+}
+
+#[cfg(test)]
+mod pinning_tests {
+    use super::*;
+
+    fn node(image: Option<&str>, pinned: Vec<u32>) -> NodePlan {
+        NodePlan {
+            zone_id: "z".into(),
+            node_id: "n1".into(),
+            role: vxedge_core::model::DeviceRole::Ecu,
+            backend: Backend::Container,
+            endpoint: "vz-n1".into(),
+            peer: "vzp-n1".into(),
+            kind: vxedge_core::gateway::plan::EndpointKind::Veth,
+            vlan: 100,
+            slice: Some("adas".into()),
+            ip_cidr: Some("10.100.0.9/24".into()),
+            extra_cidrs: Vec::new(),
+            bundle: None,
+            remote_bundle: None,
+            image: image.map(String::from),
+            module: None,
+            pinned_cpus: pinned,
+        }
+    }
+
+    #[test]
+    fn unpinned_containers_need_nothing() {
+        assert!(container_pinning_problem(&[], || false).is_none());
+    }
+
+    #[test]
+    fn a_pinned_image_container_needs_the_cpuset_controller() {
+        let n = node(Some("img"), vec![8]);
+        assert!(container_pinning_problem(&[&n], || true).is_none());
+        let (reason, subject, detail) = container_pinning_problem(&[&n], || false).unwrap();
+        assert_eq!(reason, R::HostRequirementUnmet);
+        assert_eq!(subject, "n1");
+        assert!(detail.contains("cpuset"), "{detail}");
+    }
+
+    #[test]
+    fn a_pinned_host_process_node_is_refused_whatever_the_host() {
+        let n = node(None, vec![8]);
+        let (_, _, detail) = container_pinning_problem(&[&n], || true).unwrap();
+        assert!(detail.contains("host process"), "{detail}");
     }
 }

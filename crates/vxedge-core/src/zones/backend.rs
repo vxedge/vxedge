@@ -379,7 +379,8 @@ fn container_up(sh: &Shell, np: &NodePlan) -> Result<(), ZoneBackendError> {
     let client = block_on(ContainerClient::connect_user()).map_err(|e| ct(np, e))?;
     let (handle, _) = block_on(client.ensure_group(&group)).map_err(|e| ct(np, e))?;
     attach_port(sh, np, &infra_netns(&handle))?;
-    block_on(client.ensure_member(&group, &handle, &payload_spec(image))).map_err(|e| ct(np, e))?;
+    block_on(client.ensure_member(&group, &handle, &payload_spec(image, &np.pinned_cpus)))
+        .map_err(|e| ct(np, e))?;
     Ok(())
 }
 
@@ -570,6 +571,7 @@ fn payload_group(np: &NodePlan) -> Result<GroupSpec, ZoneBackendError> {
         np.runtime_name(),
         ContainerSpec {
             image: PAUSE_IMAGE.to_string(),
+            cpuset_cpus: np.pinned_cpus.clone(),
             ..Default::default()
         },
     )
@@ -577,12 +579,13 @@ fn payload_group(np: &NodePlan) -> Result<GroupSpec, ZoneBackendError> {
     .map_err(|e| ct(np, e.into()))
 }
 
-/// The payload: the planned image with its own default command. Nothing else is set, so what
-/// runs is exactly what was published under that digest.
-fn payload_spec(image: &str) -> ContainerSpec {
+/// The payload: the planned image with its own default command, on the device's pinned CPUs if
+/// it has any. Nothing else is set, so what runs is exactly what was published under that digest.
+fn payload_spec(image: &str, pinned_cpus: &[u32]) -> ContainerSpec {
     ContainerSpec {
         name: "payload".to_string(),
         image: image.to_string(),
+        cpuset_cpus: pinned_cpus.to_vec(),
         ..Default::default()
     }
 }
@@ -913,13 +916,17 @@ fn libvirt_domain_xml(np: &NodePlan, kernel: &str, initrd: &str) -> String {
     let cputune = if np.pinned_cpus.is_empty() {
         String::new()
     } else {
+        // vcpupin alone leaves QEMU's emulator, I/O and vhost threads on every host CPU.
+        // emulatorpin keeps them on the cell too, as `taskset` does for qemu-microvm and Cloud
+        // Hypervisor.
+        let cpus = np
+            .pinned_cpus
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
         format!(
-            "<cputune><vcpupin vcpu='0' cpuset='{}'/></cputune>",
-            np.pinned_cpus
-                .iter()
-                .map(u32::to_string)
-                .collect::<Vec<_>>()
-                .join(",")
+            "<cputune><vcpupin vcpu='0' cpuset='{cpus}'/><emulatorpin cpuset='{cpus}'/></cputune>"
         )
     };
     format!(
@@ -929,6 +936,7 @@ fn libvirt_domain_xml(np: &NodePlan, kernel: &str, initrd: &str) -> String {
   <vcpu>1</vcpu>
   {cputune}
   <cpu mode='host-passthrough'/>
+  <features><acpi/><apic/></features>
   <os>
     <type arch='x86_64' machine='q35'>hvm</type>
     <kernel>{kernel}</kernel>
@@ -1557,6 +1565,52 @@ mod tests {
         };
         let xml = libvirt_domain_xml(&np, "/b/vmlinuz", "/b/initrd.img");
         assert!(xml.contains("<cpu mode='host-passthrough'/>"), "{xml}");
+    }
+
+    /// A q35 guest needs ACPI: without `<features><acpi/>` QEMU runs it with `acpi=off`, and the
+    /// virtio-net behind its PCIe root port stays in D3cold, so the guest boots with no `eth0`
+    /// (found live on vx-vehicle-04, 2026-11-10).
+    #[test]
+    fn a_libvirt_guest_gets_acpi_so_its_pcie_nic_powers_up() {
+        let np = NodePlan {
+            backend: Backend::Libvirt,
+            image: None,
+            ..image_node()
+        };
+        let xml = libvirt_domain_xml(&np, "/b/vmlinuz", "/b/initrd.img");
+        assert!(xml.contains("<features><acpi/><apic/></features>"), "{xml}");
+    }
+
+    /// A pinned libvirt node keeps every QEMU thread on its cell: the vCPU (`vcpupin`) and the
+    /// emulator, I/O and vhost threads (`emulatorpin`). With `vcpupin` alone those ran on every
+    /// host CPU (measured on vx-vehicle-04). An unpinned node gets no `<cputune>`.
+    #[test]
+    fn a_pinned_libvirt_node_pins_its_emulator_threads_too() {
+        let mut np = NodePlan {
+            backend: Backend::Libvirt,
+            image: None,
+            ..image_node()
+        };
+        assert!(!libvirt_domain_xml(&np, "/b/vmlinuz", "/b/initrd.img").contains("<cputune>"));
+        np.pinned_cpus = vec![6, 7];
+        let xml = libvirt_domain_xml(&np, "/b/vmlinuz", "/b/initrd.img");
+        assert!(
+            xml.contains(
+                "<cputune><vcpupin vcpu='0' cpuset='6,7'/><emulatorpin cpuset='6,7'/></cputune>"
+            ),
+            "{xml}"
+        );
+    }
+
+    /// A pinned container node runs its payload and its infra container on the pinned CPUs; an
+    /// unpinned one sets no cpuset (measured: the container backend used to drop the pins).
+    #[test]
+    fn a_pinned_container_node_carries_its_pins_into_both_containers() {
+        let mut np = image_node();
+        assert!(payload_spec("img", &np.pinned_cpus).cpuset_cpus.is_empty());
+        np.pinned_cpus = vec![8];
+        assert_eq!(payload_spec("img", &np.pinned_cpus).cpuset_cpus, vec![8]);
+        assert_eq!(payload_group(&np).unwrap().infra().cpuset_cpus, vec![8]);
     }
 
     /// `status` reports and never fails: with no socket (CI) or no such group (a dev host), an

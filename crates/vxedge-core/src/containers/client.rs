@@ -483,6 +483,13 @@ pub(crate) fn create_body(
                     })
                     .collect()
             }),
+            cpuset_cpus: (!spec.cpuset_cpus.is_empty()).then(|| {
+                spec.cpuset_cpus
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }),
             ..Default::default()
         }),
         ..Default::default()
@@ -576,6 +583,23 @@ mod tests {
     }
 
     #[test]
+    fn create_body_carries_pinned_cpus_as_a_cpuset() {
+        let body = create_body(
+            &ContainerSpec {
+                image: "probe".into(),
+                cpuset_cpus: vec![4, 5],
+                ..Default::default()
+            },
+            BTreeMap::new(),
+            None,
+        );
+        assert_eq!(
+            body.host_config.unwrap().cpuset_cpus.as_deref(),
+            Some("4,5")
+        );
+    }
+
+    #[test]
     fn create_body_for_infra_leaves_networking_to_the_daemon_default() {
         let body = create_body(
             &ContainerSpec {
@@ -596,6 +620,7 @@ mod tests {
         assert_eq!(hc.network_mode, None);
         assert_eq!(hc.cap_add, None);
         assert_eq!(hc.devices, None);
+        assert_eq!(hc.cpuset_cpus, None, "no pins, no cpuset");
     }
 
     #[test]

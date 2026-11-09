@@ -146,6 +146,11 @@ pub struct ContainerSpec {
     pub cap_add: Vec<String>,
     /// Host device paths passed through at the same path (`/dev/net/tun`).
     pub devices: Vec<String>,
+    /// CPUs the container may run on (Podman's `--cpuset-cpus`), from a device's
+    /// `realtime.pinned_cpus`. Empty means no restriction, and is left out of the spec hash, so a
+    /// container without pins keeps the hash it had before this field existed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cpuset_cpus: Vec<u32>,
 }
 
 /// A validated group: a name every member is prefixed with, and the infra container that owns
