@@ -8,6 +8,18 @@ All notable changes to this repo are documented here. Format follows
 
 ### Added
 
+- `LogService.Follow` (new service, additive): the log lines a workspace's telemetry service reads
+  from each entity's log files, as `LogRecord` (`seq`, `ts_ns`, `entity`, `stream`, `line`), in the
+  order read from its `logs.jsonl` (`ARCHITECTURE.md` §11, decision X-18). `after` resumes from a
+  cursor, `entity_prefix` and `streams` narrow it, and `follow` keeps it open.
+- `WorkspacePlan.entities[].logs` (`EntityLog`: `stream`, `path`) and `entities.json` name the log
+  files the daemon writes for each entity: `serial` for a qemu-microvm, cloud-hypervisor or
+  libvirt node, `vmm` for cloud-hypervisor's own log, `stdout` for a wasm capsule's runner and a
+  host service, `attach` for an attached platform's scripts, and `traffic-<profile>-<role>` for a
+  traffic generator, bound to the node it runs from (a reflector to the node it answers on, or
+  `host`). A container's output stays with Podman and is not listed.
+  `vxedge_core::entities::add_logs` fills them; `vxedge_core::zones::runtime_name_of` gives a
+  node's runtime name from its id.
 - `TelemetryService.StreamRecords` (new, additive): every `sample`, `gap` and `phase` record a
   workspace's telemetry service appends to `records.jsonl`, in the order written, so a live stream
   carries what the archive will (`ARCHITECTURE.md` §11). Each `Record` carries its line number as

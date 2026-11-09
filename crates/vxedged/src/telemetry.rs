@@ -2,7 +2,8 @@
 //!
 //! `Collect` archives what the workspace's telemetry service ingested, with the workspace itself
 //! and the digests of every image it runs, and returns the archive through `Job.artifact` with its
-//! sha256. `StreamRecords` and `StreamMetrics` tail what the service is ingesting (`records`).
+//! sha256. `StreamRecords` and `StreamMetrics` tail what the service is ingesting (`records`), and
+//! `LogService.Follow` the log lines it reads.
 
 use sha2::Digest;
 use std::path::{Path, PathBuf};
@@ -11,10 +12,11 @@ use std::sync::Arc;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
+use vxedge_api::v1::log_service_server::LogService;
 use vxedge_api::v1::telemetry_service_server::TelemetryService;
 use vxedge_api::v1::{
-    CollectRequest, Job, ManifestRef, Metric, Record, StreamMetricsRequest, StreamRecordsRequest,
-    record,
+    CollectRequest, Job, LogFollowRequest, LogRecord, ManifestRef, Metric, Record,
+    StreamMetricsRequest, StreamRecordsRequest, record,
 };
 
 use crate::audit::Audit;
@@ -29,10 +31,53 @@ pub struct TelemetrySvc {
     pub vxtelemetry_bin: String,
 }
 
-/// The `entities.json` of `model`: every entity, with this daemon's exporter bound to `host`.
-pub(crate) fn entities_json(model: &vxedge_core::model::Experiment) -> Vec<u8> {
-    let entities = vxedge_core::entities::entities_with(model, &crate::exporter::targets());
-    serde_json::to_vec_pretty(&entities).expect("entities always serialize")
+/// Every entity of `model`, with this daemon's exporter bound to `host` and the log files it
+/// writes under `runtime_dir` bound to theirs.
+pub(crate) fn entities(
+    model: &vxedge_core::model::Experiment,
+    runtime_dir: &Path,
+) -> Vec<vxedge_core::entities::EntityRecord> {
+    let mut entities = vxedge_core::entities::entities_with(model, &crate::exporter::targets());
+    vxedge_core::entities::add_logs(&mut entities, model, runtime_dir);
+    entities
+}
+
+/// The `entities.json` of `model`: [`entities`], as the telemetry service reads it.
+pub(crate) fn entities_json(model: &vxedge_core::model::Experiment, runtime_dir: &Path) -> Vec<u8> {
+    serde_json::to_vec_pretty(&entities(model, runtime_dir)).expect("entities always serialize")
+}
+
+/// `LogService`: the log lines the workspace's telemetry service reads, live.
+pub struct LogSvc {
+    pub runtime_dir: PathBuf,
+}
+
+#[tonic::async_trait]
+impl LogService for LogSvc {
+    type FollowStream = Pin<Box<dyn Stream<Item = Result<LogRecord, Status>> + Send>>;
+
+    async fn follow(
+        &self,
+        req: Request<LogFollowRequest>,
+    ) -> Result<Response<Self::FollowStream>, Status> {
+        let req = req.into_inner();
+        let ingest = ingest_of(&self.runtime_dir, req.experiment.as_ref()).await?;
+        let (prefix, streams) = (req.entity_prefix, req.streams);
+        let stream = records::stream(
+            records::Tail {
+                path: ingest.join(records::LOGS),
+                after: req.after.max(0),
+                follow: req.follow,
+            },
+            records::parse_log,
+            move |l| {
+                records::under(&l.entity, &prefix)
+                    && (streams.is_empty() || streams.contains(&l.stream))
+            },
+            |l| l,
+        );
+        Ok(Response::new(Box::pin(stream)))
+    }
 }
 
 fn sha256_of(path: &Path) -> std::io::Result<String> {
@@ -41,32 +86,39 @@ fn sha256_of(path: &Path) -> std::io::Result<String> {
 }
 
 impl TelemetrySvc {
-    /// The ingest folder of the workspace `experiment` names, else of the live run's workspace,
-    /// else this daemon's default one.
     async fn ingest_of(&self, experiment: Option<&ManifestRef>) -> Result<PathBuf, Status> {
-        let live = || {
-            crate::services::active_run(&self.runtime_dir).map(|r| ManifestRef {
-                source: Some(vxedge_api::v1::manifest_ref::Source::Path(
-                    r.dir.to_string_lossy().into_owned(),
-                )),
-                ..Default::default()
-            })
-        };
-        let Some(mref) = experiment
-            .filter(|m| m.source.is_some())
-            .cloned()
-            .or_else(live)
-        else {
-            return Ok(self.runtime_dir.join("ingest"));
-        };
-        let (yaml, _, _) = crate::services::resolve_manifest(Some(&mref)).await?;
-        let model = vxedge_core::model::load_workspace_yaml(&yaml)
-            .map_err(|e| errors::invalid(R::WorkspaceInvalid, e.to_string()))?;
-        match vxedge_core::services::ServiceDef::find(&model, "telemetry") {
-            Some(def) => vxedge_core::services::telemetry_ingest_dir(def, &self.runtime_dir)
-                .map_err(|e| errors::invalid(R::WorkspaceInvalid, e.to_string())),
-            None => Ok(self.runtime_dir.join("ingest")),
-        }
+        ingest_of(&self.runtime_dir, experiment).await
+    }
+}
+
+/// The ingest folder of the workspace `experiment` names, else of the live run's workspace, else
+/// this daemon's default one.
+async fn ingest_of(
+    runtime_dir: &Path,
+    experiment: Option<&ManifestRef>,
+) -> Result<PathBuf, Status> {
+    let live = || {
+        crate::services::active_run(runtime_dir).map(|r| ManifestRef {
+            source: Some(vxedge_api::v1::manifest_ref::Source::Path(
+                r.dir.to_string_lossy().into_owned(),
+            )),
+            ..Default::default()
+        })
+    };
+    let Some(mref) = experiment
+        .filter(|m| m.source.is_some())
+        .cloned()
+        .or_else(live)
+    else {
+        return Ok(runtime_dir.join("ingest"));
+    };
+    let (yaml, _, _) = crate::services::resolve_manifest(Some(&mref)).await?;
+    let model = vxedge_core::model::load_workspace_yaml(&yaml)
+        .map_err(|e| errors::invalid(R::WorkspaceInvalid, e.to_string()))?;
+    match vxedge_core::services::ServiceDef::find(&model, "telemetry") {
+        Some(def) => vxedge_core::services::telemetry_ingest_dir(def, runtime_dir)
+            .map_err(|e| errors::invalid(R::WorkspaceInvalid, e.to_string())),
+        None => Ok(runtime_dir.join("ingest")),
     }
 }
 
@@ -89,6 +141,7 @@ impl TelemetryService for TelemetrySvc {
                 after: req.after.max(0),
                 follow: req.follow,
             },
+            records::parse,
             move |r| records::entity(r).is_none_or(|e| records::under(e, &prefix)),
             |r| r,
         );
@@ -109,6 +162,7 @@ impl TelemetryService for TelemetrySvc {
                 after: 0,
                 follow: true,
             },
+            records::parse,
             move |r| matches!(&r.record, Some(record::Record::Sample(s)) if records::selected(s, &selector)),
             |r| match r.record {
                 Some(record::Record::Sample(s)) => Metric {
@@ -154,7 +208,7 @@ impl TelemetryService for TelemetrySvc {
         // The entity paths every record names, mapped once here from the model (§12), so the
         // archive carries them beside the samples that use them.
         let entities_file = ingest.join("entities.json");
-        std::fs::write(&entities_file, entities_json(&model)).map_err(|e| {
+        std::fs::write(&entities_file, entities_json(&model, &self.runtime_dir)).map_err(|e| {
             errors::invalid(
                 R::Unspecified,
                 format!("cannot write `{}`: {e}", entities_file.display()),

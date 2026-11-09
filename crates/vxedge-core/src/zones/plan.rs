@@ -108,16 +108,21 @@ pub struct NodePlan {
     pub pinned_cpus: Vec<u32>,
 }
 
+/// The runtime name of node `node_id`: `vx-` and the id, each character that is not ASCII
+/// alphanumeric replaced by `-`, cut to 48.
+pub fn runtime_name_of(node_id: &str) -> String {
+    let mut s: String = node_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    s.truncate(48);
+    format!("vx-{s}")
+}
+
 impl NodePlan {
     /// Stable, IFNAMSIZ-safe-ish runtime name (netns / domain / pidfile).
     pub fn runtime_name(&self) -> String {
-        let mut s: String = self
-            .node_id
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-            .collect();
-        s.truncate(48);
-        format!("vx-{s}")
+        runtime_name_of(&self.node_id)
     }
 
     /// A stable, locally administered unicast MAC for this node's guest NIC. Left unset, QEMU

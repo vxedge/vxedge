@@ -2014,7 +2014,12 @@ impl SvcSvc {
             (None, vxedge_core::services::ServiceType::Telemetry) => {
                 vxedge_core::services::telemetry_ingest_dir(&def, &self.runtime_dir)
                     .ok()
-                    .map(|dir| (dir, crate::telemetry::entities_json(&model)))
+                    .map(|dir| {
+                        (
+                            dir,
+                            crate::telemetry::entities_json(&model, &self.runtime_dir),
+                        )
+                    })
             }
             _ => None,
         };

@@ -151,6 +151,14 @@ pub(crate) fn planned_entity(
             })
             .collect(),
         scrape_targets: e.scrape_targets,
+        logs: e
+            .logs
+            .into_iter()
+            .map(|l| vxedge_api::v1::EntityLog {
+                stream: l.stream,
+                path: l.path.to_string_lossy().into_owned(),
+            })
+            .collect(),
     }
 }
 
@@ -668,7 +676,7 @@ impl WorkspaceService for PlanSvc {
             services,
             images: all_images(&model, &nodes).into_iter().collect(),
             host_checks,
-            entities: vxedge_core::entities::entities_with(&model, &crate::exporter::targets())
+            entities: crate::telemetry::entities(&model, &self.runtime_dir)
                 .into_iter()
                 .map(planned_entity)
                 .collect(),

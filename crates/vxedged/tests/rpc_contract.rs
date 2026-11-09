@@ -669,8 +669,14 @@ async fn no_rpc_of_the_agent_surface_is_a_stub() {
                 .map(|_| ()),
         ),
         code(
-            telemetry_service_client::TelemetryServiceClient::new(ch)
+            telemetry_service_client::TelemetryServiceClient::new(ch.clone())
                 .stream_records(StreamRecordsRequest::default())
+                .await
+                .map(|_| ()),
+        ),
+        code(
+            log_service_client::LogServiceClient::new(ch)
+                .follow(LogFollowRequest::default())
                 .await
                 .map(|_| ()),
         ),
@@ -2121,6 +2127,101 @@ async fn plan_and_collect_name_the_entities_records_use() {
         .map(|e| e["path"].as_str().unwrap())
         .collect();
     assert_eq!(listed, paths, "Plan and the archive agree");
+    let logs_of = |path: &str| -> Vec<(String, String)> {
+        plan.entities
+            .iter()
+            .find(|e| e.path == path)
+            .unwrap()
+            .logs
+            .iter()
+            .map(|l| (l.stream.clone(), l.path.clone()))
+            .collect()
+    };
+    let written: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(daemon.root.join("run/ingest/entities.json")).unwrap(),
+    )
+    .unwrap();
+    for e in written.as_array().unwrap() {
+        let in_file: Vec<(String, String)> = e["logs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|l| {
+                (
+                    l["stream"].as_str().unwrap().into(),
+                    l["path"].as_str().unwrap().into(),
+                )
+            })
+            .collect();
+        assert_eq!(in_file, logs_of(e["path"].as_str().unwrap()), "{e}");
+    }
+}
+
+/// `LogService.Follow` carries the log lines the ingest read, with a cursor and filters by entity
+/// and stream, and follows as more are read (§11).
+#[tokio::test]
+async fn follow_carries_the_ingest_log_lines() {
+    use tokio_stream::StreamExt;
+    use vxedge_api::v1::LogFollowRequest;
+    let line = |entity: &str, stream: &str, text: &str| {
+        format!(
+            r#"{{"record":"log","ts_ns":7,"entity":"{entity}","stream":"{stream}","line":"{text}"}}"#
+        ) + "\n"
+    };
+    let first = line("car/_/hpc1", "serial", "login:")
+        + &line("host/services/telemetry", "stdout", "ingest starting")
+        + &line("car/_/hpc1", "vmm", "vcpu 0 up");
+    let daemon = Daemon::start_with(|run| {
+        std::fs::create_dir_all(run.join("ingest")).unwrap();
+        std::fs::write(run.join("ingest/logs.jsonl"), &first).unwrap();
+    });
+    let mut client =
+        vxedge_api::v1::log_service_client::LogServiceClient::new(daemon.channel().await);
+    let all: Vec<(i64, String)> = client
+        .follow(LogFollowRequest::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .map(|r| {
+            let r = r.unwrap();
+            (r.seq, r.line)
+        })
+        .collect()
+        .await;
+    assert_eq!(
+        all,
+        [
+            (1, "login:".into()),
+            (2, "ingest starting".into()),
+            (3, "vcpu 0 up".into())
+        ]
+    );
+
+    let mut serial = client
+        .follow(LogFollowRequest {
+            entity_prefix: "car".into(),
+            streams: vec!["serial".into()],
+            follow: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let r = serial.next().await.unwrap().unwrap();
+    assert_eq!((r.seq, r.entity.as_str(), r.ts_ns), (1, "car/_/hpc1", 7));
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(daemon.root.join("run/ingest/logs.jsonl"))
+        .unwrap()
+        .write_all(line("car/_/hpc1", "serial", "root@hpc1:~#").as_bytes())
+        .unwrap();
+    let r = serial.next().await.unwrap().unwrap();
+    assert_eq!(
+        (r.seq, r.line.as_str()),
+        (4, "root@hpc1:~#"),
+        "followed past the vmm line"
+    );
 }
 
 /// `StreamRecords` carries the ingest's records in order, with a cursor and an entity filter;

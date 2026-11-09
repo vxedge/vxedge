@@ -15,10 +15,12 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Status;
 
-use vxedge_api::v1::{GapRecord, PhaseRecord, Record, SampleRecord, record};
+use vxedge_api::v1::{GapRecord, LogRecord, PhaseRecord, Record, SampleRecord, record};
 
 /// The file the ingest appends records to.
 pub const FILE: &str = "records.jsonl";
+/// The file the ingest appends log records to (decision X-18).
+pub const LOGS: &str = "logs.jsonl";
 
 /// How often a following stream looks for more.
 const POLL: Duration = Duration::from_millis(200);
@@ -32,12 +34,13 @@ pub struct Tail {
     pub follow: bool,
 }
 
-/// Stream `tail`'s records that `keep` accepts, mapped by `map`. The task stops when the client
-/// goes away.
-pub fn stream<T: Send + 'static>(
+/// Stream `tail`'s lines as `parse` reads them, those `keep` accepts, mapped by `map`. The task
+/// stops when the client goes away.
+pub fn stream<R: Send + 'static, T: Send + 'static>(
     tail: Tail,
-    keep: impl Fn(&Record) -> bool + Send + 'static,
-    map: impl Fn(Record) -> T + Send + 'static,
+    parse: fn(i64, &str) -> Option<R>,
+    keep: impl Fn(&R) -> bool + Send + 'static,
+    map: impl Fn(R) -> T + Send + 'static,
 ) -> ReceiverStream<Result<T, Status>> {
     let (tx, rx) = mpsc::channel(256);
     tokio::spawn(async move {
@@ -142,6 +145,22 @@ pub fn parse(seq: i64, line: &str) -> Option<Record> {
     })
 }
 
+/// One `logs.jsonl` line as a `LogRecord`, or `None` when it is not one.
+pub fn parse_log(seq: i64, line: &str) -> Option<LogRecord> {
+    let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    if v["record"].as_str()? != "log" {
+        return None;
+    }
+    let s = |k: &str| v[k].as_str().unwrap_or_default().to_string();
+    Some(LogRecord {
+        seq,
+        ts_ns: v["ts_ns"].as_i64().unwrap_or_default(),
+        entity: s("entity"),
+        stream: s("stream"),
+        line: v["line"].as_str()?.to_string(),
+    })
+}
+
 /// The entity a record is about; a phase is about none.
 pub fn entity(r: &Record) -> Option<&str> {
     match r.record.as_ref()? {
@@ -195,6 +214,16 @@ mod tests {
         assert_eq!(entity(&p), None);
         assert!(parse(6, r#"{"record":"story","ts_ns":1}"#).is_none());
         assert!(parse(7, "{torn").is_none());
+        let l = parse_log(
+            8,
+            r#"{"record":"log","ts_ns":3,"entity":"car/_/hpc1","stream":"serial","line":"login:"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (l.seq, l.stream.as_str(), l.line.as_str()),
+            (8, "serial", "login:")
+        );
+        assert!(parse_log(9, r#"{"record":"sample","ts_ns":1}"#).is_none());
     }
 
     #[test]
@@ -224,6 +253,7 @@ mod tests {
                 after: 1,
                 follow: true,
             },
+            parse,
             |_| true,
             |r| r.seq,
         );
@@ -248,6 +278,7 @@ mod tests {
                 after: 0,
                 follow: false,
             },
+            parse,
             |_| true,
             |r| r.seq,
         )
@@ -260,6 +291,7 @@ mod tests {
                 after: 0,
                 follow: false,
             },
+            parse,
             |_| true,
             |r| r.seq,
         )
