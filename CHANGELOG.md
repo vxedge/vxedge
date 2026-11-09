@@ -31,6 +31,9 @@ All notable changes to this repo are documented here. Format follows
     `ERROR_REASON_CAMPAIGN_UNKNOWN` (32).
   - **Requirements:** a campaign needs the experiment's own telemetry service, and `Plan` and
     `Start` refuse one without it.
+- `vxedge campaign plan|start|status`, in the workspace's folder: `plan` lists the trials and any
+  problem, `start` runs them and follows the job (`--profile`, `--request-id`, `--unlocked`), and
+  `status` shows one campaign or all of them, with each trial's state, phase and archive.
 - `TrafficUpRequest.duration_s` sets how long the generators run, and
   `CollectRequest.archive_version` picks the archive format. Both are additive, and 0 keeps
   today's behaviour.
