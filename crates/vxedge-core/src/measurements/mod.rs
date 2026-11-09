@@ -10,7 +10,6 @@
 //!     slice: adas            # the slice the probe's packets travel on
 //!     rate_pps: 500          # default 100
 //!     payload_bytes: 64      # default 64
-//!     window_s: 1            # default 1: the histogram window
 //! ```
 //!
 //! [`parse`] reads the block's shape when the model is built. [`problems`] checks it against the
@@ -67,8 +66,6 @@ pub struct Measurement {
     pub rate_pps: u32,
     #[serde(default = "default_payload_bytes")]
     pub payload_bytes: u32,
-    #[serde(default = "default_window_s")]
-    pub window_s: u32,
 }
 
 fn default_rate_pps() -> u32 {
@@ -77,10 +74,6 @@ fn default_rate_pps() -> u32 {
 
 fn default_payload_bytes() -> u32 {
     64
-}
-
-fn default_window_s() -> u32 {
-    1
 }
 
 impl Measurement {
@@ -149,11 +142,47 @@ pub fn problems(model: &Experiment) -> Vec<Problem> {
                 ),
             );
         }
-        if m.window_s == 0 {
-            push("window_s", "needs at least 1".into());
+    }
+    shared_far_sides(model, &mut out);
+    out
+}
+
+/// Two `to: internet` measurements on different slices whose senders share a subnet would put one
+/// far-side address on two VLAN interfaces of the host, and the host answers both through one of
+/// them: one probe's replies would be lost without anything saying why.
+fn shared_far_sides(model: &Experiment, out: &mut Vec<Problem>) {
+    let far: Vec<(&Measurement, String)> = model
+        .measurements
+        .iter()
+        .filter(|m| m.to == INTERNET)
+        .filter_map(|m| {
+            let cidr = model
+                .entities
+                .iter()
+                .find_map(|v| endpoint_on(v, &m.from, &m.slice))?
+                .ip_cidr
+                .clone()?;
+            Some((m, run::first_host(&cidr)?))
+        })
+        .collect();
+    for (i, (a, addr)) in far.iter().enumerate() {
+        if let Some((b, _)) = far[..i]
+            .iter()
+            .find(|(b, other)| other == addr && b.slice != a.slice)
+        {
+            out.push(Problem {
+                kind: ProblemKind::Measurement,
+                experiment: model.id.clone(),
+                field: format!("measurements.{}.to", a.id),
+                detail: format!(
+                    "its far side is {addr} on slice `{}`, and measurement `{}` puts {addr} on \
+                     slice `{}`: one host address cannot answer on two VLANs. Measure one of \
+                     them at a time",
+                    a.slice, b.id, b.slice
+                ),
+            });
         }
     }
-    out
 }
 
 /// A node end: a device of one of the vehicles, with a namespace on the host a probe can enter,
@@ -268,10 +297,7 @@ network:
         );
         assert_eq!(fields(&m), Vec::<String>::new());
         let peer = m.measurements.iter().find(|x| x.id == "peer").unwrap();
-        assert_eq!(
-            (peer.rate_pps, peer.payload_bytes, peer.window_s),
-            (100, 64, 1)
-        );
+        assert_eq!((peer.rate_pps, peer.payload_bytes), (100, 64));
         assert_eq!(peer.entity(), "measurements/peer");
     }
 
@@ -281,7 +307,7 @@ network:
             "  a: { kind: rtt-probe, from: vm1, to: internet, slice: adas }\n  \
              b: { kind: rtt-probe, from: nope, to: ecu1, slice: adas }\n  \
              c: { kind: rtt-probe, from: ecu2, to: internet, slice: adas }\n  \
-             d: { kind: rtt-probe, from: ecu1, to: ecu1, slice: nope, rate_pps: 0, payload_bytes: 4, window_s: 0 }\n  \
+             d: { kind: rtt-probe, from: ecu1, to: ecu1, slice: nope, rate_pps: 0, payload_bytes: 4 }\n  \
              e: { kind: rtt-probe, from: internet, to: ecu1, slice: adas }\n",
         );
         let p = problems(&m);
@@ -297,11 +323,38 @@ network:
                 "measurements.d.to",
                 "measurements.d.rate_pps",
                 "measurements.d.payload_bytes",
-                "measurements.d.window_s",
                 "measurements.e.from",
             ]
         );
         assert!(p[0].detail.contains("qemu-microvm"), "{}", p[0].detail);
+    }
+
+    #[test]
+    fn two_far_sides_on_one_subnet_and_different_slices_are_refused() {
+        let shared = crate::model::load_yaml(
+            &format!(
+                "{VEHICLE}measurements:\n  a: {{ kind: rtt-probe, from: ecu1, to: internet, slice: adas }}\n  \
+                 b: {{ kind: rtt-probe, from: ecu2, to: internet, slice: info }}\n"
+            )
+            .replace("ip: 10.2.0.2/24", "ip: 10.1.0.9/24"),
+        )
+        .unwrap();
+        let p = problems(&shared);
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert_eq!(p[0].field, "measurements.b.to");
+        assert!(p[0].detail.contains("10.1.0.1"), "{}", p[0].detail);
+    }
+
+    #[test]
+    fn an_end_with_no_pinned_address_is_refused() {
+        let m = crate::model::load_yaml(
+            &format!(
+                "{VEHICLE}measurements:\n  a: {{ kind: rtt-probe, from: ecu1, to: internet, slice: adas }}\n"
+            )
+            .replace("{ node: ecu1, port: eth0, ip: 10.1.0.2/24 }", "ecu1:eth0"),
+        )
+        .unwrap();
+        assert_eq!(fields(&m), ["measurements.a.from"]);
     }
 
     #[test]

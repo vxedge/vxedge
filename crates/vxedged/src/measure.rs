@@ -146,16 +146,22 @@ impl MeasurementService for MeasurementSvc {
             .map(|p| p.id)
             .collect();
         let (shell, runtime_dir) = (self.shell.clone(), self.runtime_dir.clone());
+        let events = self.engine.events().clone();
         let job = self
             .engine
             .submit("measurement.stop", move |p| async move {
-                let messages = tokio::task::spawn_blocking(move || {
+                let stopped = tokio::task::spawn_blocking(move || {
                     ids.iter()
-                        .map(|id| run::stop(&shell, &runtime_dir, id))
+                        .map(|id| (id.clone(), run::stop(&shell, &runtime_dir, id)))
                         .collect::<Vec<_>>()
                 })
                 .await
                 .map_err(|e| format!("stop task panicked: {e}"))?;
+                let mut messages = Vec::with_capacity(stopped.len());
+                for (id, msg) in stopped {
+                    events.emit(crate::events::EventKind::MeasurementStopped, &id, &msg);
+                    messages.push(msg);
+                }
                 p.update(100, "measurements stopped");
                 Ok::<_, crate::jobs::JobFailure>(messages.join("; "))
             })

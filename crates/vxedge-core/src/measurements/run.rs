@@ -195,7 +195,7 @@ fn far_side(
 }
 
 /// The first host address of an IPv4 subnet given as `a.b.c.d/p`.
-fn first_host(cidr: &str) -> Option<String> {
+pub(crate) fn first_host(cidr: &str) -> Option<String> {
     let (ip, prefix) = cidr.split_once('/')?;
     let ip: Ipv4Addr = ip.parse().ok()?;
     let prefix: u32 = prefix.parse().ok()?;
@@ -396,7 +396,12 @@ pub async fn start(
             format!("{addr}:{}", p.reflect_port),
         ]
     };
+    // A reflector outlives its sender: a measurement started again after its sender finished
+    // keeps the one already listening, which still holds the port.
+    let reflecting = read_pid(runtime_dir, &p.id, "reflect").is_some_and(alive);
     let far_side = match &p.reflector {
+        Reflector::Node(_) if reflecting => None,
+        Reflector::FarSide { iface, .. } if reflecting => Some(iface.clone()),
         Reflector::Node(to) => {
             let ns = netns_of(to, containers).await.map_err(err)?;
             let (rt, id, bin, args) = (
@@ -544,7 +549,8 @@ pub fn stop(sh: &Shell, runtime_dir: &Path, id: &str) -> String {
 }
 
 /// Every running measurement's metrics, read inside its sender's namespace and labelled with its
-/// entity, as Prometheus text. One that does not answer within a second is left out.
+/// entity, as Prometheus text. One that does not answer within half a second is left out, so a
+/// hung sender cannot hold a scrape past the ingest's timeout.
 pub fn collect_metrics(runtime_dir: &Path) -> String {
     let mut out = String::new();
     for s in started(runtime_dir) {
@@ -563,8 +569,11 @@ pub fn collect_metrics(runtime_dir: &Path) -> String {
 /// `GET /metrics` from `127.0.0.1:port`, in the calling thread's namespace.
 fn fetch(port: u16) -> Option<String> {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    let mut stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(1)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(300)).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .ok()?;
     stream
         .write_all(b"GET /metrics HTTP/1.1\r\nhost: 127.0.0.1\r\nconnection: close\r\n\r\n")
         .ok()?;

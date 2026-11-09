@@ -10,11 +10,12 @@ All notable changes to this repo are documented here. Format follows
 
 - A `measurements` block in `kind: experiment` documents: what the experiment measures, by node
   id. The first kind is `rtt-probe` (`from` a device, `to` a device or `internet`, the `slice` its
-  packets use, `rate_pps`, `payload_bytes`, `window_s`). `Plan`, `up` and `experiment validate`
+  packets use, `rate_pps`, `payload_bytes`). `Plan`, `up` and `experiment validate`
   check each one against the model and report a problem under the new
   `ERROR_REASON_MEASUREMENT_INVALID` (30), naming its field: an end that is no device, an end that
   is a VM or an attached platform (a probe runs inside its node's network namespace), a slice
-  that is not declared or that an end has no link on, or a value out of bounds. A parameter can
+  that is not declared or that an end has no link or pinned `ip` on, two `to: internet`
+  measurements whose far sides would share one address on two slices, or a value out of bounds. A parameter can
   bind a measurement's field (`measurements[ctl-rtt].rate_pps`), and `Plan` lists each
   measurement as the entity `measurements/<id>`.
 - `MeasurementService` (new service, additive): `Start`, `Stop` and `Status` for an experiment's
