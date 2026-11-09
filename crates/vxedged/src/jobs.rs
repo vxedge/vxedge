@@ -153,6 +153,16 @@ impl JobOpts {
         }
     }
 
+    /// A long verb that holds the lifecycle claim on `target` for its whole run and also takes a
+    /// request id: a campaign, whose trials are its stages.
+    pub fn claimed_request(target: impl Into<String>, request_id: &str) -> Self {
+        Self {
+            parent: String::new(),
+            claim: Some(target.into()),
+            request_key: (!request_id.is_empty()).then(|| request_id.to_string()),
+        }
+    }
+
     /// A verb that does not converge, so a retry with the same id returns the original job.
     pub fn request<T>(req: &Request<T>, request_id: &str) -> Self {
         Self {

@@ -8,6 +8,35 @@ All notable changes to this repo are documented here. Format follows
 
 ### Added
 
+- `CampaignService.Start`, `Get`, `List` and `Watch`: run a campaign's trials serially as one
+  `campaign.run` job.
+  - **Each trial, in order:**
+    1. *provision:* `experiment up` with the trial's values bound, in memory;
+    2. *warmup:* traffic up for the trial's windows, then wait;
+    3. *measure:* the measurements, for the trial's duration;
+    4. *cooldown:* measurements and traffic stop;
+    5. *teardown:* the telemetry service stops, the trial is archived as `vxarchive/2` with its
+       identity in `metadata.json`, and `experiment down` runs.
+  - **Stages and records:** every step is a stage of the campaign job, so it shows as a child
+    job, and every phase starts with a marker in the trial's records.
+  - **Failures:** a failed trial is recorded and the next one runs. `down` runs after every
+    trial that started provisioning.
+  - **State:** the campaign's state is kept in `campaign.json` beside its archives and under the
+    runtime folder, so `Get`, `List` and `Watch` read it after a restart.
+  - **Resuming:** a retried `request_id` resumes the same campaign and skips trials whose
+    archives exist.
+  - **Cancelling:** `JobService.Cancel` stops between trials.
+  - **One at a time:** another campaign is refused as `ERROR_REASON_BUSY`, with
+    `active_campaign` and `retry_after_ms` in `ErrorInfo.metadata`. An unknown id is the new
+    `ERROR_REASON_CAMPAIGN_UNKNOWN` (32).
+  - **Requirements:** a campaign needs the experiment's own telemetry service, and `Plan` and
+    `Start` refuse one without it.
+- `TrafficUpRequest.duration_s` sets how long the generators run, and
+  `CollectRequest.archive_version` picks the archive format. Both are additive, and 0 keeps
+  today's behaviour.
+
+### Added
+
 - `CampaignService.Plan` (new service, additive): the trials an experiment's campaign asks for,
   checked before any runs (decisions X-22, X-23).
   - Every sweep point is a trial, and a sweep over several parameters is their product. Every

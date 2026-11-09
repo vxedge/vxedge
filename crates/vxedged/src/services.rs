@@ -2447,8 +2447,12 @@ impl TrafficService for TrafficSvc {
         require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
         let opts = crate::jobs::JobOpts::request(&req, &req.get_ref().request_id);
         let req = req.into_inner();
-        let (traffic_plan, five_g_plan, sha256, duration_s) =
+        let (traffic_plan, five_g_plan, sha256, method_duration_s) =
             self.resolve_plans(req.manifest.as_ref()).await?;
+        let duration_s = match req.duration_s {
+            0 => method_duration_s,
+            d => u64::from(d),
+        };
         self.audit.record(
             "TrafficService.Up",
             serde_json::json!({ "manifest_sha256": sha256, "profiles": req.profiles }),

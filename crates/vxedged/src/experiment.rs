@@ -92,7 +92,7 @@ pub(crate) enum NodeStage {
 /// Returns the job's own message on success and its error on failure, so the experiment job's
 /// failure text names what actually broke instead of "stage 2 failed". The relay is what makes
 /// `JobService.Watch` on a composite job show each step rather than one line per stage.
-async fn await_job(
+pub(crate) async fn await_job(
     engine: &JobEngine,
     job: Job,
     parent: &Progress,

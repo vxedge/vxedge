@@ -1662,6 +1662,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         .collect(vxedge_api::v1::CollectRequest {
                             manifest: manifest_ref(&Some(manifest.clone())),
                             out_path: out.clone(),
+                            ..Default::default()
                         })
                         .await?
                         .into_inner();
