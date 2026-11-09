@@ -25,6 +25,12 @@ pub struct TelemetrySvc {
     pub vxtelemetry_bin: String,
 }
 
+/// The `entities.json` of `model`: every entity, with this daemon's exporter bound to `host`.
+pub(crate) fn entities_json(model: &vxedge_core::model::Experiment) -> Vec<u8> {
+    let entities = vxedge_core::entities::entities_with(model, &crate::exporter::targets());
+    serde_json::to_vec_pretty(&entities).expect("entities always serialize")
+}
+
 fn sha256_of(path: &Path) -> std::io::Result<String> {
     let bytes = std::fs::read(path)?;
     Ok(crate::services::hex::encode(sha2::Sha256::digest(&bytes)))
@@ -71,13 +77,8 @@ impl TelemetryService for TelemetrySvc {
         }
         // The entity paths every record names, mapped once here from the model (§12), so the
         // archive carries them beside the samples that use them.
-        let entities = vxedge_core::entities::entities_of(&model);
         let entities_file = ingest.join("entities.json");
-        std::fs::write(
-            &entities_file,
-            serde_json::to_vec_pretty(&entities).expect("entities always serialize"),
-        )
-        .map_err(|e| {
+        std::fs::write(&entities_file, entities_json(&model)).map_err(|e| {
             errors::invalid(
                 R::Unspecified,
                 format!("cannot write `{}`: {e}", entities_file.display()),

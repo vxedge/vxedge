@@ -357,6 +357,14 @@ pub(super) fn down(np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneBackendE
     }
 }
 
+/// The VMM's pid, as the VMM itself reports it.
+pub(super) fn vmm_pid(np: &NodePlan, runtime_dir: &Path) -> Option<i32> {
+    match probe(&live_socket(np, runtime_dir)) {
+        Vmm::Alive { pid, .. } => pid.and_then(|p| i32::try_from(p).ok()),
+        _ => None,
+    }
+}
+
 pub(super) fn status(np: &NodePlan, runtime_dir: &Path) -> NodeState {
     match probe(&live_socket(np, runtime_dir)) {
         Vmm::Alive { running: true, .. } => NodeState::Up,

@@ -2008,11 +2008,22 @@ impl SvcSvc {
                 })?)
             }
         };
+        // A host telemetry service reads `entities.json` from its ingest folder when it starts,
+        // for the entity each target belongs to and the daemon's own exporter target (§12).
+        let entities = match (&node, def.service_type) {
+            (None, vxedge_core::services::ServiceType::Telemetry) => {
+                vxedge_core::services::telemetry_ingest_dir(&def, &self.runtime_dir)
+                    .ok()
+                    .map(|dir| (dir, crate::telemetry::entities_json(&model)))
+            }
+            _ => None,
+        };
         Ok(DeclaredService {
             def,
             sha256,
             workspace_dir,
             node,
+            entities,
         })
     }
 
@@ -2064,6 +2075,9 @@ struct DeclaredService {
     sha256: String,
     workspace_dir: PathBuf,
     node: Option<NodePlan>,
+    /// The ingest folder and the `entities.json` to write there before a host telemetry
+    /// service starts.
+    entities: Option<(PathBuf, Vec<u8>)>,
 }
 
 #[tonic::async_trait]
@@ -2094,8 +2108,15 @@ impl SvcService for SvcSvc {
                     def,
                     node,
                     workspace_dir,
+                    entities,
                     ..
                 } = declared;
+                if let Some((dir, json)) = entities {
+                    let file = dir.join("entities.json");
+                    std::fs::create_dir_all(&dir)
+                        .and_then(|()| std::fs::write(&file, json))
+                        .map_err(|e| format!("cannot write `{}`: {e}", file.display()))?;
+                }
                 let probe = match &node {
                     Some(np) => {
                         let (fetch_def, fetch_cache) = (def.clone(), cache_dir.clone());
