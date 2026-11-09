@@ -30,6 +30,7 @@ use vxedge_api::v1::experiment_service_server::ExperimentServiceServer;
 use vxedge_api::v1::gateway_service_server::GatewayServiceServer;
 use vxedge_api::v1::host_service_server::HostServiceServer;
 use vxedge_api::v1::job_service_server::JobServiceServer;
+use vxedge_api::v1::log_service_server::LogServiceServer;
 use vxedge_api::v1::nos_check_service_server::NosCheckServiceServer;
 use vxedge_api::v1::run_service_server::RunServiceServer;
 use vxedge_api::v1::svc_service_server::SvcServiceServer;
@@ -306,6 +307,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             audit: telemetry_audit,
             runtime_dir: args.runtime_dir.clone(),
             vxtelemetry_bin: args.vxtelemetry_bin.clone(),
+        }))
+        .add_service(LogServiceServer::new(telemetry::LogSvc {
+            runtime_dir: args.runtime_dir.clone(),
         }))
         .serve_with_incoming_shutdown(UnixListenerStream::new(listener), async {
             let _ = tokio::signal::ctrl_c().await;

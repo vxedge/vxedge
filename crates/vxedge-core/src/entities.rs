@@ -71,6 +71,20 @@ pub struct EntityRecord {
     /// The telemetry scrape targets bound to this entity.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub scrape_targets: Vec<String>,
+    /// The log files this daemon writes for the entity, which the ingest reads into `log`
+    /// records (decision X-18). Filled by [`add_logs`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub logs: Vec<LogSource>,
+}
+
+/// One log file of an entity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LogSource {
+    /// What the file is to its entity: `serial` (a guest's console), `vmm` (the hypervisor's own
+    /// log), `stdout` (a capsule runner's or a host service's output), `attach` (an attached
+    /// platform's scripts), or `traffic-<profile>-<role>`.
+    pub stream: String,
+    pub path: std::path::PathBuf,
 }
 
 /// The path of the host entity.
@@ -159,6 +173,7 @@ pub fn entities_with(model: &Experiment, host_targets: &[String]) -> Vec<EntityR
         role: None,
         backend: None,
         payloads: Vec::new(),
+        logs: Vec::new(),
     };
 
     let mut host = record(HOST.to_string(), Kind::Host);
@@ -233,6 +248,74 @@ pub fn entities_with(model: &Experiment, host_targets: &[String]) -> Vec<EntityR
         }
     }
     out
+}
+
+/// Bind the log files the daemon writes under `runtime_dir` to the entities in `records`: each
+/// node's by its backend, each host service's output, and each traffic generator's output to
+/// the node it runs from (a reflector to the node it answers on), or to `host` when that is no
+/// device. A container's output is Podman's and has no file here.
+pub fn add_logs(records: &mut [EntityRecord], model: &Experiment, runtime_dir: &std::path::Path) {
+    use crate::model::Backend;
+    let file = |name: String| runtime_dir.join(name);
+    let mut add = |path: &str, stream: String, at: std::path::PathBuf| {
+        if let Some(r) = records.iter_mut().find(|r| r.path == path) {
+            r.logs.push(LogSource { stream, path: at });
+        }
+    };
+    for vehicle in &model.entities {
+        for device in vehicle.devices.values() {
+            let Some(path) = node_path(model, &device.id) else {
+                continue;
+            };
+            let name = crate::zones::runtime_name_of(&device.id);
+            let streams: Vec<(&str, std::path::PathBuf)> = match device.backend {
+                Some(Backend::QemuMicrovm) => vec![("serial", file(format!("{name}.serial.log")))],
+                Some(Backend::CloudHypervisor) => vec![
+                    ("serial", file(format!("{name}.serial.log"))),
+                    ("vmm", file(format!("{name}.ch.log"))),
+                ],
+                // The domain XML points the console at this file; libvirt writes it.
+                Some(Backend::Libvirt) => vec![(
+                    "serial",
+                    std::path::PathBuf::from(format!("/tmp/{name}.serial.log")),
+                )],
+                Some(Backend::WasmCapsule) => vec![("stdout", file(format!("{name}.capsule.log")))],
+                Some(Backend::Attach) => vec![("attach", file(format!("{name}.attach.log")))],
+                Some(Backend::Container) | None => Vec::new(),
+            };
+            for (stream, at) in streams {
+                add(&path, stream.to_string(), at);
+            }
+        }
+    }
+    for (id, def) in &model.services {
+        if def.on.is_none() {
+            let t = def.service_type.as_str();
+            add(
+                &format!("{HOST}/services/{id}"),
+                "stdout".into(),
+                file(format!("svc-{t}.log")),
+            );
+        }
+    }
+    let node_of = |e: &crate::model::TrafficEndpoint| match e {
+        crate::model::TrafficEndpoint::Device(d) => node_path(model, d),
+        _ => None,
+    };
+    for p in &model.traffic {
+        for (role, end) in [
+            ("send", &p.source),
+            ("load", &p.source),
+            ("reflect", &p.target),
+        ] {
+            let path = node_of(end).unwrap_or_else(|| HOST.to_string());
+            add(
+                &path,
+                format!("traffic-{}-{role}", p.id),
+                file(format!("traffic-{}-{role}.log", p.id)),
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -315,5 +398,52 @@ telemetry:
         let json = serde_json::to_value(ecu).unwrap();
         assert_eq!(json["kind"], "node");
         assert_eq!(json["payloads"][0]["ref"], "ghcr.io/vxedge/parts/vxprobe");
+    }
+
+    #[test]
+    fn log_files_bind_to_the_entity_they_are_about() {
+        let mut m = model();
+        m.traffic.push(crate::model::TrafficProfile {
+            id: "bulk".into(),
+            source: crate::model::TrafficEndpoint::Device("ecu1".into()),
+            target: crate::model::TrafficEndpoint::Internet,
+            pps: None,
+            bandwidth_mbps: None,
+            payload_bytes: None,
+        });
+        let rt = std::path::Path::new("/run/vx");
+        let mut all = entities_of(&m);
+        add_logs(&mut all, &m, rt);
+        let logs = |path: &str| -> Vec<(String, std::path::PathBuf)> {
+            all.iter()
+                .find(|e| e.path == path)
+                .unwrap()
+                .logs
+                .iter()
+                .map(|l| (l.stream.clone(), l.path.clone()))
+                .collect()
+        };
+        assert_eq!(
+            logs("car/_/hpc1"),
+            [("serial".into(), rt.join("vx-hpc1.serial.log"))]
+        );
+        // A container's output is Podman's; only its traffic generator's is a file.
+        assert_eq!(
+            logs("car/front/ecu1"),
+            [
+                ("traffic-bulk-send".into(), rt.join("traffic-bulk-send.log")),
+                ("traffic-bulk-load".into(), rt.join("traffic-bulk-load.log")),
+            ]
+        );
+        assert_eq!(
+            logs("host"),
+            [(
+                "traffic-bulk-reflect".into(),
+                rt.join("traffic-bulk-reflect.log")
+            )]
+        );
+        let json = serde_json::to_value(&all[0]).unwrap();
+        assert_eq!(json["logs"][0]["stream"], "traffic-bulk-reflect");
+        assert!(serde_json::to_value(&all[3]).unwrap().get("logs").is_none());
     }
 }

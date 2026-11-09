@@ -21,5 +21,6 @@ pub use cloud_hypervisor::{socket_too_long as ch_socket_too_long, vmm_available 
 pub use foreign::foreign_objects;
 pub use plan::{
     NodePlan, ZonePlanError, missing_local_bundles, missing_local_modules, plan_nodes_from_model,
+    runtime_name_of,
 };
 pub use wasm_capsule::runner_available as capsule_runner_available;

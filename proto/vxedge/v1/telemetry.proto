@@ -54,6 +54,44 @@ message PhaseRecord {
   string phase = 2;
 }
 
+// Log lines of the experiment's entities: a node's serial console, a hypervisor's log, a host
+// service's or a traffic generator's output, as the workspace's telemetry service reads them
+// into its ingest (ARCHITECTURE.md §11).
+service LogService {
+  // Every log record of a workspace's ingest, in the order read, from a cursor, optionally
+  // following as the ingest reads more.
+  rpc Follow(LogFollowRequest) returns (stream LogRecord);
+}
+
+message LogFollowRequest {
+  // The workspace whose telemetry service's ingest to read; empty reads the live run's, else this
+  // daemon's default ingest folder.
+  ManifestRef experiment = 1;
+  // Only records whose `seq` is greater: 0 starts from the first, and a client that reconnects
+  // passes the last `seq` it saw.
+  int64 after = 2;
+  // Keep the stream open and send lines as the ingest reads them.
+  bool follow = 3;
+  // Only lines of entities at or under this path ("car", "car/front/ecu1"); empty is all.
+  string entity_prefix = 4;
+  // Only these streams ("serial", "vmm", "stdout", "attach", "traffic-<profile>-<role>"); empty
+  // is all.
+  repeated string streams = 5;
+}
+
+// One line of one log file of one entity.
+message LogRecord {
+  // The record's line number in the ingest's `logs.jsonl`, from 1: the resume cursor.
+  int64 seq = 1;
+  // When the ingest read the line, in nanoseconds since the Unix epoch. The files carry no
+  // common clock, so this is the bound the ingest can vouch for, not the moment it was written.
+  int64 ts_ns = 2;
+  string entity = 3;
+  string stream = 4;
+  // The line, without its line ending. Bytes that are not UTF-8 read as U+FFFD.
+  string line = 5;
+}
+
 message StreamRecordsRequest {
   // The workspace whose telemetry service's ingest to read; empty reads this daemon's default
   // ingest folder.

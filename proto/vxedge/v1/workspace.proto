@@ -61,6 +61,17 @@ message PlannedEntity {
   repeated EntityPayload payloads = 5;
   // The telemetry scrape targets bound to this entity.
   repeated string scrape_targets = 6;
+  // The log files the daemon writes for this entity, which its telemetry service reads into log
+  // records (`LogService.Follow`).
+  repeated EntityLog logs = 7;
+}
+
+message EntityLog {
+  // What the file is to its entity: `serial`, `vmm`, `stdout`, `attach` or
+  // `traffic-<profile>-<role>`.
+  string stream = 1;
+  // Its path on the host.
+  string path = 2;
 }
 
 message EntityPayload {
