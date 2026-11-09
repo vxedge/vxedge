@@ -147,38 +147,68 @@ pub fn problems(model: &Experiment) -> Vec<Problem> {
     out
 }
 
-/// Two `to: internet` measurements on different slices whose senders share a subnet would put one
-/// far-side address on two VLAN interfaces of the host, and the host answers both through one of
-/// them: one probe's replies would be lost without anything saying why.
+/// Two far sides on different slices with one address would put that address on two VLAN
+/// interfaces of the host, and the host answers both through one of them: one probe's replies
+/// would be lost without anything saying why. A measurement to `internet` is checked against
+/// every other one and against every traffic profile that sends from a node to a far side, since
+/// such a profile runs inside its node too once the node is up.
 fn shared_far_sides(model: &Experiment, out: &mut Vec<Problem>) {
-    let far: Vec<(&Measurement, String)> = model
+    let far_of = |from: &str, slice: &str| {
+        let cidr = model
+            .entities
+            .iter()
+            .find_map(|v| endpoint_on(v, from, slice))?
+            .ip_cidr
+            .clone()?;
+        run::first_host(&cidr)
+    };
+    let measured: Vec<(&Measurement, String)> = model
         .measurements
         .iter()
         .filter(|m| m.to == INTERNET)
-        .filter_map(|m| {
-            let cidr = model
+        .filter_map(|m| Some((m, far_of(&m.from, &m.slice)?)))
+        .collect();
+    let loads: Vec<(String, String, String)> = model
+        .traffic
+        .iter()
+        .filter_map(|p| {
+            let crate::model::TrafficEndpoint::Device(from) = &p.source else {
+                return None;
+            };
+            if matches!(p.target, crate::model::TrafficEndpoint::Device(_)) {
+                return None;
+            }
+            let slice = model
                 .entities
                 .iter()
-                .find_map(|v| endpoint_on(v, &m.from, &m.slice))?
-                .ip_cidr
-                .clone()?;
-            Some((m, run::first_host(&cidr)?))
+                .flat_map(|v| &v.links)
+                .filter(|l| l.endpoints.iter().any(|e| &e.node == from))
+                .find_map(|l| l.slice.clone())?;
+            let addr = far_of(from, &slice)?;
+            Some((format!("traffic profile `{}`", p.id), slice, addr))
         })
         .collect();
-    for (i, (a, addr)) in far.iter().enumerate() {
-        if let Some((b, _)) = far[..i]
-            .iter()
-            .find(|(b, other)| other == addr && b.slice != a.slice)
-        {
+    for (i, (a, addr)) in measured.iter().enumerate() {
+        let earlier = measured[..i].iter().map(|(b, other)| {
+            (
+                format!("measurement `{}`", b.id),
+                b.slice.clone(),
+                other.clone(),
+            )
+        });
+        let clash = earlier
+            .chain(loads.iter().cloned())
+            .find(|(_, slice, other)| other == addr && *slice != a.slice);
+        if let Some((who, slice, _)) = clash {
             out.push(Problem {
                 kind: ProblemKind::Measurement,
                 experiment: model.id.clone(),
                 field: format!("measurements.{}.to", a.id),
                 detail: format!(
-                    "its far side is {addr} on slice `{}`, and measurement `{}` puts {addr} on \
-                     slice `{}`: one host address cannot answer on two VLANs. Measure one of \
-                     them at a time",
-                    a.slice, b.id, b.slice
+                    "its far side is {addr} on slice `{}`, and {who} puts {addr} on slice \
+                     `{slice}`: one host address cannot answer on two VLANs. Run one of them at \
+                     a time",
+                    a.slice
                 ),
             });
         }
@@ -343,6 +373,25 @@ network:
         assert_eq!(p.len(), 1, "{p:?}");
         assert_eq!(p[0].field, "measurements.b.to");
         assert!(p[0].detail.contains("10.1.0.1"), "{}", p[0].detail);
+    }
+
+    #[test]
+    fn a_far_side_a_traffic_profile_takes_on_another_slice_is_refused() {
+        let m = crate::model::load_yaml(
+            &format!(
+                "{VEHICLE}measurements:\n  a: {{ kind: rtt-probe, from: ecu1, to: internet, slice: adas }}\n\
+                 traffic_profiles:\n  bg: {{ source: ecu2, target: internet, bandwidth_mbps: 10 }}\n"
+            )
+            .replace("ip: 10.2.0.2/24", "ip: 10.1.0.9/24"),
+        )
+        .unwrap();
+        let p = problems(&m);
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(
+            p[0].detail.contains("traffic profile `bg`"),
+            "{}",
+            p[0].detail
+        );
     }
 
     #[test]
