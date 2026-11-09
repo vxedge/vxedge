@@ -5,6 +5,7 @@
 //! then provision through `vxedge-core`'s gateway backend).
 
 mod audit;
+mod campaign;
 mod errors;
 mod events;
 mod experiment;
@@ -26,6 +27,7 @@ use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::Server;
 use tracing::info;
 
+use vxedge_api::v1::campaign_service_server::CampaignServiceServer;
 use vxedge_api::v1::compute_service_server::ComputeServiceServer;
 use vxedge_api::v1::event_service_server::EventServiceServer;
 use vxedge_api::v1::experiment_service_server::ExperimentServiceServer;
@@ -296,6 +298,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .add_service(NosCheckServiceServer::from_arc(nos_check))
         .add_service(ExperimentServiceServer::from_arc(experiments))
         .add_service(VehicleServiceServer::from_arc(vehicles))
+        .add_service(CampaignServiceServer::new(campaign::CampaignSvc))
         .add_service(PackageServiceServer::new(package::PackageSvc {
             engine: engine.clone(),
             audit: audit.clone(),

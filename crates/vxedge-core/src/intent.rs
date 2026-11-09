@@ -397,6 +397,33 @@ pub fn resolve<'a>(doc: &'a Value, path: &str) -> Result<&'a Value, String> {
     Ok(here)
 }
 
+/// Set the field an id path names in `doc` to `value`, or say why it names none. The field must
+/// already exist: a parameter binds a field the document declares, so the bound document keeps
+/// the shape it validated with.
+pub fn set(doc: &mut Value, path: &str, value: Value) -> Result<(), String> {
+    let steps = parse_path(path).ok_or_else(|| format!("`{path}` is not an id path"))?;
+    let mut here = doc;
+    for (name, key) in steps {
+        here = here
+            .get_mut(name)
+            .ok_or_else(|| format!("`{path}`: `{name}` does not exist"))?;
+        if let Some(key) = key {
+            here = match here {
+                Value::Sequence(items) => items
+                    .iter_mut()
+                    .find(|i| i.get("id").and_then(Value::as_str) == Some(key))
+                    .ok_or_else(|| format!("`{path}`: no element has `id: {key}`"))?,
+                Value::Mapping(_) => here
+                    .get_mut(key)
+                    .ok_or_else(|| format!("`{path}`: no entry `{key}`"))?,
+                _ => return Err(format!("`{path}`: `{name}` is not a list or a map")),
+            };
+        }
+    }
+    *here = value;
+    Ok(())
+}
+
 fn check_parameters(c: &mut Checker<'_>, intent: &Intent) {
     let mut bound: BTreeMap<&str, &str> = BTreeMap::new();
     for (name, p) in &intent.parameters {

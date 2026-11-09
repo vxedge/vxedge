@@ -8,6 +8,24 @@ All notable changes to this repo are documented here. Format follows
 
 ### Added
 
+- `CampaignService.Plan` (new service, additive): the trials an experiment's campaign asks for,
+  checked before any runs (decisions X-22, X-23).
+  - Every sweep point is a trial, and a sweep over several parameters is their product. Every
+    arm is a trial too.
+  - A sweep point whose values equal an arm's carries the arm's name instead of running twice,
+    so exp-001's campaign is five points, with `0` labelled `idle` and `600` `saturated`.
+  - Points run in order within each repetition. A profile overrides the repetitions, warmup
+    and duration.
+  - Each trial has an id (`r<repetition>-<point>`), its arm, every parameter's value and its
+    windows. The plan also gives the estimated wall time.
+  - Every distinct point's document is built with its values bound, so a value the parameter
+    allows but the document cannot run (a probe rate of 0) is a typed problem naming the point.
+  - An experiment without a campaign is one point at its defaults, with its `method`'s
+    repetitions and windows.
+  - The package is never written: values are bound in memory.
+
+### Added
+
 - `PackageService` (new service, additive): `Inspect`, `List`, `Pull` and `Import`.
   - `Inspect` reads a workspace folder, a packed `.vxp` file or a cached package. It returns the
     descriptor, the package digest, the lock state, the host requirements, the typed intent
