@@ -96,7 +96,7 @@ fn locate(mref: Option<&ManifestRef>) -> Result<Located, Status> {
     }
 }
 
-fn param_value(v: &Value, ty: Option<intent::ParamType>) -> ParamValue {
+pub(crate) fn param_value(v: &Value, ty: Option<intent::ParamType>) -> ParamValue {
     use param_value::Value as V;
     let value = match (v, ty) {
         (Value::Bool(b), _) => V::Boolean(*b),

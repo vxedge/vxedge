@@ -711,8 +711,14 @@ async fn no_rpc_of_the_agent_surface_is_a_stub() {
                 .map(|_| ()),
         ),
         code(
-            package_service_client::PackageServiceClient::new(ch)
+            package_service_client::PackageServiceClient::new(ch.clone())
                 .pull(PackagePullRequest::default())
+                .await
+                .map(|_| ()),
+        ),
+        code(
+            campaign_service_client::CampaignServiceClient::new(ch)
+                .plan(CampaignPlanRequest::default())
                 .await
                 .map(|_| ()),
         ),
@@ -2279,6 +2285,87 @@ async fn an_imported_package_is_listed_and_addressed_by_digest() {
     assert_eq!(
         wait_for_job(daemon.channel().await, job.id).await,
         JobState::Failed as i32
+    );
+}
+
+/// `CampaignService.Plan` expands arms and sweep into trials, labelling a sweep point that equals
+/// an arm, applies a profile, and checks each point's bound document.
+#[tokio::test]
+async fn campaign_plan_expands_trials_and_checks_each_point() {
+    use vxedge_api::v1::CampaignPlanRequest;
+    use vxedge_api::v1::campaign_service_client::CampaignServiceClient;
+    let daemon = Daemon::start();
+    let channel = daemon.channel().await;
+    let (dir, _) = experiment_workspace();
+    let main = std::fs::read_to_string(dir.join("main.yaml")).unwrap();
+    let write = |campaign: &str| {
+        std::fs::write(
+            dir.join("main.yaml"),
+            format!(
+                "{main}\nmeasurements:\n  rtt: {{ kind: rtt-probe, from: ecu1, to: internet, slice: adas, rate_pps: 100 }}\n\
+                 parameters:\n  pps: {{ type: integer, unit: 1/s, default: 100, min: 0, max: 1000, binds: \"measurements[rtt].rate_pps\" }}\n\
+                 campaign:\n{campaign}"
+            ),
+        )
+        .unwrap()
+    };
+    write(
+        "  arms: { low: { pps: 100 }, high: { pps: 500 } }\n  sweep: { pps: [100, 300] }\n  repetitions: 2\n  duration_s: 20\n  profiles: { quick: { repetitions: 1, duration_s: 5 } }\n",
+    );
+    let mut client = CampaignServiceClient::new(channel);
+    let plan = client
+        .plan(CampaignPlanRequest {
+            manifest: path_ref(&dir),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let ids: Vec<&str> = plan.trials.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        [
+            "r1-low",
+            "r1-pps=300",
+            "r1-high",
+            "r2-low",
+            "r2-pps=300",
+            "r2-high"
+        ]
+    );
+    assert_eq!((plan.points, plan.repetitions), (3, 2));
+    assert_eq!(plan.estimated_s, 6.0 * (20.0 + 30.0));
+    assert!(plan.problems.is_empty(), "{:?}", plan.problems);
+
+    let quick = client
+        .plan(CampaignPlanRequest {
+            manifest: path_ref(&dir),
+            profile: "quick".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((quick.trials.len(), quick.trials[0].duration_s), (3, 5.0));
+
+    // A value the parameter allows can still break the document it binds: rate 0 is no probe.
+    write("  sweep: { pps: [100, 0] }\n");
+    let broken = client
+        .plan(CampaignPlanRequest {
+            manifest: path_ref(&dir),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(broken.problems.len(), 1, "{:?}", broken.problems);
+    assert_eq!(
+        broken.problems[0].reason,
+        vxedge_api::v1::ErrorReason::MeasurementInvalid as i32
+    );
+    assert!(
+        broken.problems[0].detail.contains("point `pps=0`"),
+        "{}",
+        broken.problems[0].detail
     );
 }
 

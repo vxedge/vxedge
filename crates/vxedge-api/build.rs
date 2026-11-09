@@ -8,6 +8,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "../../proto/vxedge/v1/runs.proto",
         "../../proto/vxedge/v1/workspace.proto",
         "../../proto/vxedge/v1/package.proto",
+        "../../proto/vxedge/v1/campaign.proto",
     ];
     let out = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
     let descriptors = out.join("vxedge_descriptor.bin");

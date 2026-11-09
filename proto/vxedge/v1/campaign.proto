@@ -1,0 +1,55 @@
+syntax = "proto3";
+
+package vxedge.v1;
+
+import "vxedge/v1/common.proto";
+import "vxedge/v1/package.proto";
+import "vxedge/v1/workspace.proto";
+
+// ---------------------------------------------------------------------------
+// Campaigns (ARCHITECTURE.md section 6.0.3): the trials an experiment's `campaign` block asks
+// for. Every sweep point is a trial (a sweep over several parameters is their product), and every
+// arm is one; a trial whose values equal an arm's carries the arm's name instead of running twice
+// (decision X-22). Each trial is provisioned and torn down on its own (decision X-23).
+// ---------------------------------------------------------------------------
+
+message CampaignPlanRequest {
+  // The workspace or package whose campaign to expand.
+  ManifestRef manifest = 1;
+  // A profile the campaign declares (`quick`, `repro`, ...). Empty uses the campaign as written.
+  string profile = 2;
+}
+
+message CampaignTrial {
+  // `r<repetition>-<point>`, unique in the campaign: the point is the arm's name, or the
+  // parameters that differ from their defaults (`load_mbps=100`), or `defaults`.
+  string id = 1;
+  // The arm whose values this trial's equal, if any.
+  string arm = 2;
+  // Every declared parameter's value for this trial.
+  map<string, ParamValue> parameters = 3;
+  // From 1.
+  uint32 repetition = 4;
+  double warmup_s = 5;
+  double duration_s = 6;
+}
+
+message CampaignPlan {
+  // In the order they run: every point of one repetition before the next.
+  repeated CampaignTrial trials = 1;
+  // Distinct parameter assignments.
+  uint32 points = 2;
+  uint32 repetitions = 3;
+  // Each trial's warmup and duration, plus an assumed 30 s of provisioning and teardown.
+  double estimated_s = 4;
+  // Every problem with the campaign and with each point's bound document. Empty for a campaign
+  // `Start` would accept.
+  repeated PlanProblem problems = 5;
+  // The profile applied, if any.
+  string profile = 6;
+}
+
+service CampaignService {
+  // The trials a campaign would run, with each point's document checked. Touches nothing.
+  rpc Plan(CampaignPlanRequest) returns (CampaignPlan);
+}
