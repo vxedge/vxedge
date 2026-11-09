@@ -251,6 +251,11 @@ pub(super) fn down(sh: &Shell, np: &NodePlan) -> Result<(), ZoneBackendError> {
     container_down(sh, np)
 }
 
+/// The runner's pid, for its usage.
+pub(super) fn runner_pid(np: &NodePlan) -> Option<i32> {
+    running_pid(np)
+}
+
 pub(super) fn status(np: &NodePlan) -> NodeState {
     match running_pid(np) {
         Some(_) => NodeState::Up,

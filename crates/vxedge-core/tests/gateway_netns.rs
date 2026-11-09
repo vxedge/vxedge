@@ -112,6 +112,17 @@ fn gateway_and_container_zone_cycle_in_netns() {
     apply(&sh, &plan).unwrap(); // double-apply is a no-op
     assert!(observe(&sh, &plan).unwrap().fully_up());
 
+    // --- slice counters: each slice's HTB class on the uplink, as the exporter reads it -----
+    let classes = vxedge_core::gateway::stats::class_stats(&sh, &plan.uplink).unwrap();
+    for slice in &plan.slices {
+        let handle = format!("1:{:x}", slice.class_minor);
+        assert!(
+            classes.iter().any(|c| c.handle == handle),
+            "no class {handle} for slice {} in {classes:?}",
+            slice.id
+        );
+    }
+
     // --- container zone backend ---------------------------------------------
     let runtime = std::env::temp_dir().join(format!("vxzones-test-{}", std::process::id()));
     std::fs::create_dir_all(&runtime).unwrap();
@@ -125,6 +136,11 @@ fn gateway_and_container_zone_cycle_in_netns() {
     assert_eq!(node_status(&sh, container, &runtime), NodeState::Up);
     node_up(&sh, container, &runtime, &runtime).unwrap(); // idempotent
     assert_eq!(node_status(&sh, container, &runtime), NodeState::Up);
+    // A bare namespace runs nothing of its own: no usage source.
+    assert_eq!(
+        vxedge_core::zones::node_usage_source(&sh, container, &runtime),
+        None
+    );
 
     // The node's eth0 carries the manifest IP inside its namespace.
     let addr = sh

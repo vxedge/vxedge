@@ -1019,6 +1019,17 @@ pub trait ZoneBackend {
     fn down(&self, sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneBackendError>;
 
     fn status(&self, sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> NodeState;
+
+    /// Where this node's CPU and memory are read (`zones::usage`), or `None` when nothing on
+    /// this host runs it: a bare namespace, an attached platform, a node that is down.
+    fn usage_source(
+        &self,
+        _sh: &Shell,
+        _np: &NodePlan,
+        _runtime_dir: &Path,
+    ) -> Option<super::usage::Source> {
+        None
+    }
 }
 
 struct ContainerBackend;
@@ -1040,6 +1051,19 @@ impl ZoneBackend for ContainerBackend {
     fn status(&self, sh: &Shell, np: &NodePlan, _runtime_dir: &Path) -> NodeState {
         container_status(sh, np)
     }
+    fn usage_source(
+        &self,
+        _sh: &Shell,
+        np: &NodePlan,
+        _runtime_dir: &Path,
+    ) -> Option<super::usage::Source> {
+        np.image.as_ref()?;
+        let pid = block_on(async {
+            let client = ContainerClient::connect_user().await.ok()?;
+            client.member_pid(&np.runtime_name(), "payload").await
+        })?;
+        super::usage::cgroup_of(i32::try_from(pid).ok()?).map(super::usage::Source::Cgroup)
+    }
 }
 
 impl ZoneBackend for QemuMicrovmBackend {
@@ -1054,6 +1078,14 @@ impl ZoneBackend for QemuMicrovmBackend {
     }
     fn status(&self, _sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> NodeState {
         microvm_status(np, runtime_dir)
+    }
+    fn usage_source(
+        &self,
+        _sh: &Shell,
+        np: &NodePlan,
+        runtime_dir: &Path,
+    ) -> Option<super::usage::Source> {
+        guest_pid(np, runtime_dir).map(super::usage::Source::Process)
     }
 }
 
@@ -1076,6 +1108,15 @@ impl ZoneBackend for LibvirtBackend {
     fn status(&self, _sh: &Shell, np: &NodePlan, _runtime_dir: &Path) -> NodeState {
         libvirt_status(np)
     }
+    // libvirt's QEMU carries the same `vx.node=` marker on its kernel command line.
+    fn usage_source(
+        &self,
+        _sh: &Shell,
+        np: &NodePlan,
+        runtime_dir: &Path,
+    ) -> Option<super::usage::Source> {
+        guest_pid(np, runtime_dir).map(super::usage::Source::Process)
+    }
 }
 
 impl ZoneBackend for CloudHypervisorBackend {
@@ -1091,6 +1132,14 @@ impl ZoneBackend for CloudHypervisorBackend {
     fn status(&self, _sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> NodeState {
         cloud_hypervisor::status(np, runtime_dir)
     }
+    fn usage_source(
+        &self,
+        _sh: &Shell,
+        np: &NodePlan,
+        runtime_dir: &Path,
+    ) -> Option<super::usage::Source> {
+        cloud_hypervisor::vmm_pid(np, runtime_dir).map(super::usage::Source::Process)
+    }
 }
 
 impl ZoneBackend for WasmCapsuleBackend {
@@ -1105,6 +1154,14 @@ impl ZoneBackend for WasmCapsuleBackend {
     }
     fn status(&self, _sh: &Shell, np: &NodePlan, _runtime_dir: &Path) -> NodeState {
         wasm_capsule::status(np)
+    }
+    fn usage_source(
+        &self,
+        _sh: &Shell,
+        np: &NodePlan,
+        _runtime_dir: &Path,
+    ) -> Option<super::usage::Source> {
+        wasm_capsule::runner_pid(np).map(super::usage::Source::Process)
     }
 }
 
@@ -1173,6 +1230,15 @@ pub fn node_down(sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), Zo
 
 pub fn node_status(sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> NodeState {
     backend_for(np.backend).status(sh, np, runtime_dir)
+}
+
+/// Where `np`'s CPU and memory are read, if anything on this host runs it.
+pub fn node_usage_source(
+    sh: &Shell,
+    np: &NodePlan,
+    runtime_dir: &Path,
+) -> Option<super::usage::Source> {
+    backend_for(np.backend).usage_source(sh, np, runtime_dir)
 }
 
 #[cfg(test)]

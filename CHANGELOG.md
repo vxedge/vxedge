@@ -8,6 +8,17 @@ All notable changes to this repo are documented here. Format follows
 
 ### Added
 
+- `vxedged` serves its own exporter (`--metrics-listen`, default `127.0.0.1:9469`; port 0 picks a
+  free one, `off` serves nothing; an address in use is logged and the daemon starts anyway):
+  Prometheus text at `/metrics`, every series labelled with its entity path (`ARCHITECTURE.md`
+  §12). `vxedge_node_cpu_seconds_total` and `vxedge_node_memory_bytes` read a container node's
+  cgroup, or a VM's or capsule's own VMM or runner process (`source="cgroup|process"`).
+  `vxedge_slice_*` reads each slice's HTB class on the gateway uplink: bytes and packets sent,
+  drops, overlimits, and the backlog in bytes and packets.
+  `vxedge_process_*{process="vxedged"}` on `host` is the observer's own cost. The exporter is a
+  `host` scrape target in `WorkspacePlan.entities` and in `entities.json`. `SvcService.Up` now
+  writes `entities.json` into the ingest folder before a host telemetry service starts, so its
+  ingest scrapes the exporter from the first round.
 - Entity paths (`ARCHITECTURE.md` §12): `vxedge-core::entities` derives the path every telemetry
   record names from the model's ids (`<vehicle>/<zone>/<node>`, `<vehicle>/links/<link>`,
   `<vehicle>/slices/<slice>`, `<vehicle>/services/<service>`, `host`, …) and binds each scrape

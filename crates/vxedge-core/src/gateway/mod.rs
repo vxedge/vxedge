@@ -12,6 +12,7 @@ pub mod netlink;
 pub mod netops;
 pub mod plan;
 pub mod provision;
+pub mod stats;
 pub mod tuntap;
 
 pub use netops::{NetOpsError, Shell};
