@@ -353,7 +353,12 @@ fn part_kind(
             | (PartKind::Attach, Some(Backend::Attach))
             | (
                 PartKind::Bundle,
-                Some(Backend::Libvirt | Backend::QemuMicrovm | Backend::CloudHypervisor)
+                Some(
+                    Backend::Libvirt
+                        | Backend::QemuMicrovm
+                        | Backend::CloudHypervisor
+                        | Backend::QemuMcu
+                )
             )
     );
     if !runnable {

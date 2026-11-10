@@ -278,7 +278,9 @@ pub fn add_logs(records: &mut [EntityRecord], model: &Experiment, runtime_dir: &
             };
             let name = crate::zones::runtime_name_of(&device.id);
             let streams: Vec<(&str, std::path::PathBuf)> = match device.backend {
-                Some(Backend::QemuMicrovm) => vec![("serial", file(format!("{name}.serial.log")))],
+                Some(Backend::QemuMicrovm | Backend::QemuMcu) => {
+                    vec![("serial", file(format!("{name}.serial.log")))]
+                }
                 Some(Backend::CloudHypervisor) => vec![
                     ("serial", file(format!("{name}.serial.log"))),
                     ("vmm", file(format!("{name}.ch.log"))),

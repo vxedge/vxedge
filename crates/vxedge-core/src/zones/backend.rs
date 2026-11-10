@@ -37,6 +37,8 @@ pub const QEMU_MICROVM_BIN: &str = "qemu-system-x86_64";
 pub enum GuestArch {
     X86_64,
     Aarch64,
+    /// A Cortex-M microcontroller, which only `qemu-mcu` runs, and only under TCG.
+    Armv7m,
 }
 
 impl GuestArch {
@@ -45,9 +47,11 @@ impl GuestArch {
         match self {
             GuestArch::X86_64 => "x86_64",
             GuestArch::Aarch64 => "aarch64",
+            GuestArch::Armv7m => "armv7m",
         }
     }
 
+    /// The names `qemu-microvm` boots: an MCU's `armv7m` is not one of them.
     fn from_name(name: &str) -> Option<Self> {
         match name {
             // A 32-bit x86 guest (the Zephyr probe is `i386`) runs on the same x86_64 machine.
@@ -62,6 +66,7 @@ impl GuestArch {
         match self {
             GuestArch::X86_64 => QEMU_MICROVM_BIN,
             GuestArch::Aarch64 => "qemu-system-aarch64",
+            GuestArch::Armv7m => super::qemu_mcu::QEMU_MCU_BIN,
         }
     }
 
@@ -165,7 +170,8 @@ fn bundle_boot(np: &NodePlan) -> Result<BundleBoot, ZoneBackendError> {
         None => GuestArch::X86_64,
         Some(name) => GuestArch::from_name(name).ok_or_else(|| {
             refuse(format!(
-                "the bundle's meta.json names arch `{name}`; qemu-microvm boots x86 (x86_64, i386) and aarch64"
+                "the bundle's meta.json names arch `{name}`; qemu-microvm boots x86 (x86_64, i386) and \
+                 aarch64 (microcontroller firmware runs on `backend: qemu-mcu`)"
             ))
         })?,
     };
@@ -314,7 +320,7 @@ fn kernel_cmdline_for(np: &NodePlan, arch: GuestArch) -> String {
     let ip = np.ip_cidr.as_deref().unwrap_or("");
     let console = match arch {
         GuestArch::X86_64 => "ttyS0",
-        GuestArch::Aarch64 => "ttyAMA0",
+        GuestArch::Aarch64 | GuestArch::Armv7m => "ttyAMA0",
     };
     format!(
         "console={console} reboot=t panic=-1 quiet vx.ip={ip} vx.node={}",
@@ -702,6 +708,7 @@ fn microvm_argv(
         ),
         // A distribution arm64 kernel unpacks to about 70 MB, so the guest gets more room.
         GuestArch::Aarch64 => ("virt", if kvm { "host" } else { "cortex-a57" }, 256),
+        GuestArch::Armv7m => unreachable!("bundle_boot refuses an armv7m bundle for qemu-microvm"),
     };
     let memory = format!("{}m", boot.memory_mb.unwrap_or(default_mb));
     let smp = boot.cpus.to_string();
@@ -771,7 +778,7 @@ fn microvm_argv(
 /// What this node's running QEMU runs on: the emulator names the instruction set, and
 /// `-enable-kvm` the acceleration. `None` when the node has no running guest.
 pub fn guest_platform(np: &NodePlan, runtime_dir: &Path) -> Option<GuestPlatform> {
-    if np.backend != Backend::QemuMicrovm {
+    if !matches!(np.backend, Backend::QemuMicrovm | Backend::QemuMcu) {
         return None;
     }
     let pid = guest_pid(np, runtime_dir)?;
@@ -787,6 +794,8 @@ fn platform_of(cmdline: &[u8]) -> Option<GuestPlatform> {
         GuestArch::Aarch64
     } else if bin.ends_with("qemu-system-x86_64") {
         GuestArch::X86_64
+    } else if bin.ends_with(super::qemu_mcu::QEMU_MCU_BIN) {
+        GuestArch::Armv7m
     } else {
         return None;
     };
@@ -824,13 +833,14 @@ fn guest_pid(np: &NodePlan, runtime_dir: &Path) -> Option<i32> {
 }
 
 /// Whether a NUL-separated `/proc/<pid>/cmdline` is QEMU booting `node`, which
-/// [`kernel_cmdline`] marks with `vx.node=`.
+/// [`kernel_cmdline`] marks with `vx.node=`, and a `qemu-mcu` guest with `arg=vx.node=` in
+/// `-semihosting-config`.
 fn is_guest_of(cmdline: &[u8], node: &str) -> bool {
     let cmdline = String::from_utf8_lossy(cmdline);
     let mut args = cmdline.split('\0');
     let marker = format!("vx.node={node}");
     args.next().is_some_and(|bin| bin.contains("qemu"))
-        && args.any(|arg| arg.split(' ').any(|word| word == marker))
+        && args.any(|arg| super::foreign::guest_words(arg).any(|word| word == marker))
 }
 
 fn microvm_down(np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneBackendError> {
@@ -855,6 +865,41 @@ fn microvm_status(np: &NodePlan, runtime_dir: &Path) -> NodeState {
         Some(_) => NodeState::Up,
         None => NodeState::Down,
     }
+}
+
+// ---------------------------------------------------------------------------
+// qemu-mcu (microcontroller firmware, pidfile-managed like qemu-microvm)
+// ---------------------------------------------------------------------------
+
+fn mcu_up(sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneBackendError> {
+    if microvm_status(np, runtime_dir) == NodeState::Up {
+        return Ok(()); // idempotent
+    }
+    let dir = np
+        .bundle
+        .as_deref()
+        .expect("plan invariant: vm backends carry a bundle");
+    let firmware = super::qemu_mcu::firmware_path(np, dir)?;
+    let board = super::qemu_mcu::bundle_board(np, dir)?;
+    if !on_path(super::qemu_mcu::QEMU_MCU_BIN) {
+        return Err(ZoneBackendError::Runtime {
+            node: np.node_id.clone(),
+            detail: format!(
+                "a qemu-mcu node needs `{}` on PATH",
+                super::qemu_mcu::QEMU_MCU_BIN
+            ),
+        });
+    }
+    let args = super::qemu_mcu::argv(np, runtime_dir, &firmware, board);
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    // As `microvm_up`: QEMU needs no privilege beyond its own tap, so it is escalated only to enter
+    // a confined netns.
+    let qemu_sh = Shell {
+        netns: sh.netns.clone(),
+        escalate: sh.escalate && sh.netns.is_some(),
+    };
+    qemu_sh.run(argv[0], &argv[1..])?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1051,6 +1096,7 @@ struct QemuMicrovmBackend;
 struct LibvirtBackend;
 struct CloudHypervisorBackend;
 struct WasmCapsuleBackend;
+struct QemuMcuBackend;
 
 impl ZoneBackend for ContainerBackend {
     fn name(&self) -> &'static str {
@@ -1087,6 +1133,30 @@ impl ZoneBackend for QemuMicrovmBackend {
     fn up(&self, sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneBackendError> {
         microvm_up(sh, np, runtime_dir)
     }
+    fn down(&self, _sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneBackendError> {
+        microvm_down(np, runtime_dir)
+    }
+    fn status(&self, _sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> NodeState {
+        microvm_status(np, runtime_dir)
+    }
+    fn usage_source(
+        &self,
+        _sh: &Shell,
+        np: &NodePlan,
+        runtime_dir: &Path,
+    ) -> Option<super::usage::Source> {
+        guest_pid(np, runtime_dir).map(super::usage::Source::Process)
+    }
+}
+
+impl ZoneBackend for QemuMcuBackend {
+    fn name(&self) -> &'static str {
+        "qemu-mcu"
+    }
+    fn up(&self, sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneBackendError> {
+        mcu_up(sh, np, runtime_dir)
+    }
+    // The same pidfile and `vx.node=` marker as a microVM guest.
     fn down(&self, _sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneBackendError> {
         microvm_down(np, runtime_dir)
     }
@@ -1190,6 +1260,7 @@ pub fn backend_for(kind: Backend) -> &'static dyn ZoneBackend {
         Backend::CloudHypervisor => &CloudHypervisorBackend,
         Backend::WasmCapsule => &WasmCapsuleBackend,
         Backend::Attach => &super::attach::AttachBackend,
+        Backend::QemuMcu => &QemuMcuBackend,
     }
 }
 
@@ -1269,6 +1340,7 @@ mod tests {
             "cloud-hypervisor"
         );
         assert_eq!(backend_for(Backend::WasmCapsule).name(), "wasm-capsule");
+        assert_eq!(backend_for(Backend::QemuMcu).name(), "qemu-mcu");
     }
 
     /// libvirt's wording decides the hint: socket refusal (not in the `libvirt` group), a guest
@@ -1504,11 +1576,16 @@ mod tests {
         let host = GuestArch::host().expect("a supported test host");
         let other = match host {
             GuestArch::X86_64 => GuestArch::Aarch64,
-            GuestArch::Aarch64 => GuestArch::X86_64,
+            GuestArch::Aarch64 | GuestArch::Armv7m => GuestArch::X86_64,
         };
         assert_eq!(Acceleration::for_guest(host, true), Acceleration::Kvm);
         assert_eq!(Acceleration::for_guest(host, false), Acceleration::Tcg);
         assert_eq!(Acceleration::for_guest(other, true), Acceleration::Tcg);
+        assert_eq!(
+            Acceleration::for_guest(GuestArch::Armv7m, true),
+            Acceleration::Tcg,
+            "no host runs a microcontroller under KVM"
+        );
     }
 
     /// Status reads the running emulator, not the bundle: what started is what is reported.
@@ -1530,7 +1607,25 @@ mod tests {
                 acceleration: Acceleration::Kvm
             })
         );
+        let mcu = b"qemu-system-arm\0-M\0mps2-an385\0-semihosting-config\0enable=on,target=native,arg=vx.ip=10.0.0.5/24,arg=vx.node=m\0";
+        assert_eq!(
+            platform_of(mcu),
+            Some(GuestPlatform {
+                arch: GuestArch::Armv7m,
+                acceleration: Acceleration::Tcg
+            })
+        );
         assert_eq!(platform_of(b"taskset\0-c\0"), None);
+    }
+
+    /// A microcontroller bundle on `qemu-microvm` is refused with where it does run.
+    #[test]
+    fn qemu_microvm_points_an_mcu_bundle_at_qemu_mcu() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("meta.json"), r#"{"arch":"armv7m"}"#).unwrap();
+        let np = microvm_node(Some(dir.path().to_path_buf()));
+        let e = bundle_boot(&np).unwrap_err().to_string();
+        assert!(e.contains("backend: qemu-mcu"), "{e}");
     }
 
     /// A bundle names its instruction set in `meta.json`; one that names none is x86_64.
@@ -1675,6 +1770,12 @@ mod tests {
         let qemu = b"qemu-system-x86_64\0-append\0console=ttyS0 vx.node=zone-fl\0";
         assert!(is_guest_of(qemu, "zone-fl"));
         assert!(!is_guest_of(qemu, "zone-f"), "another node's id");
+        let mcu = b"qemu-system-arm\0-semihosting-config\0enable=on,target=native,arg=vx.ip=10.0.0.5/24,arg=vx.node=ecu-m3\0";
+        assert!(
+            is_guest_of(mcu, "ecu-m3"),
+            "a qemu-mcu guest's marker is a semihosting arg"
+        );
+        assert!(!is_guest_of(mcu, "ecu-m"));
         assert!(!is_guest_of(
             b"/usr/bin/bash\0-c\0vx.node=zone-fl\0",
             "zone-fl"

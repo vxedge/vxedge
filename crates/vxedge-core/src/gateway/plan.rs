@@ -15,9 +15,9 @@ pub enum PlanError {
     AttachWithoutInterface(String),
     #[error(
         "device `{0}` is attached to a slice but declares no `backend` — the planner has to know \
-         whether to build a veth (container/wasm-capsule) or a tap (qemu-microvm/libvirt/cloud-hypervisor), and guessing is \
+         whether to build a veth (container/wasm-capsule) or a tap (qemu-microvm/libvirt/cloud-hypervisor/qemu-mcu), and guessing is \
          what produced a manifest that validated and then could not boot. Add \
-         `backend: container|qemu-microvm|libvirt|cloud-hypervisor|wasm-capsule|attach`."
+         `backend: container|qemu-microvm|libvirt|cloud-hypervisor|wasm-capsule|attach|qemu-mcu`."
     )]
     DeviceWithoutBackend(String),
     #[error("no `network.slices` at all — nothing to provision")]
@@ -352,7 +352,8 @@ impl GatewayPlan {
                         }
                         crate::model::Backend::Libvirt
                         | crate::model::Backend::QemuMicrovm
-                        | crate::model::Backend::CloudHypervisor => EndpointKind::Tap,
+                        | crate::model::Backend::CloudHypervisor
+                        | crate::model::Backend::QemuMcu => EndpointKind::Tap,
                         crate::model::Backend::Attach => EndpointKind::Adopted,
                     };
                     let port = attachment.port.as_deref();

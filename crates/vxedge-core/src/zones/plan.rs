@@ -58,7 +58,7 @@ pub enum ZonePlanError {
     },
     #[error(
         "device `{0}` declares no `backend`, so there is no way to know whether it attaches by \
-         veth or by tap. Add `backend: container|qemu-microvm|libvirt|cloud-hypervisor|wasm-capsule`."
+         veth or by tap. Add `backend: container|qemu-microvm|libvirt|cloud-hypervisor|wasm-capsule|attach|qemu-mcu`."
     )]
     DeviceWithoutBackend(String),
 }
@@ -85,7 +85,7 @@ pub struct NodePlan {
     pub ip_cidr: Option<String>,
     /// Further addresses on the same port, after `ip_cidr` (a container node carries them all).
     pub extra_cidrs: Vec<String>,
-    /// For vm/rtimage kinds: guest bundle dir (vmlinuz + initrd.img),
+    /// For vm/rtimage kinds: guest bundle dir (vmlinuz + initrd.img; `firmware.elf` for qemu-mcu),
     /// resolved against the manifest's directory when relative.
     ///
     /// Mutually exclusive with `remote_bundle`: planning records *intent* only, never fetches —
@@ -204,6 +204,7 @@ pub fn plan_nodes_from_model(
                     Some(crate::model::Backend::CloudHypervisor) => Backend::CloudHypervisor,
                     Some(crate::model::Backend::WasmCapsule) => Backend::WasmCapsule,
                     Some(crate::model::Backend::Attach) => Backend::Attach,
+                    Some(crate::model::Backend::QemuMcu) => Backend::QemuMcu,
                     // GatewayPlan::from_model refuses this too, so reaching it means the two
                     // plans came from different models. Reported as what it is: an
                     // "endpoint mismatch" here would point at plan joining and send someone
@@ -222,7 +223,10 @@ pub fn plan_nodes_from_model(
                 // synchronous/testable, per the `ZoneBackend` trait's own "a backend takes a
                 // `NodePlan`; it does not compute one" contract).
                 let (bundle, remote_bundle) = match backend {
-                    Backend::Libvirt | Backend::QemuMicrovm | Backend::CloudHypervisor => {
+                    Backend::Libvirt
+                    | Backend::QemuMicrovm
+                    | Backend::CloudHypervisor
+                    | Backend::QemuMcu => {
                         let bundles: Vec<&crate::model::Part> = entity
                             .functions_on(&device.id)
                             .filter_map(|f| f.part.as_ref())
@@ -296,7 +300,8 @@ pub fn plan_nodes_from_model(
                     | Backend::QemuMicrovm
                     | Backend::CloudHypervisor
                     | Backend::WasmCapsule
-                    | Backend::Attach => None,
+                    | Backend::Attach
+                    | Backend::QemuMcu => None,
                 };
                 // A capsule's module is a local file, or a published part `zones::node_up`
                 // fetches, the same split a VM bundle has.
@@ -323,6 +328,7 @@ pub fn plan_nodes_from_model(
                             | Backend::QemuMicrovm
                             | Backend::CloudHypervisor
                             | Backend::Attach
+                            | Backend::QemuMcu
                     )
                 {
                     return Err(ZonePlanError::MissingBundle(device.id.clone(), backend));
@@ -445,9 +451,11 @@ pub fn missing_local_bundles(exp: &crate::model::Experiment, workspace_dir: &Pat
                 } else {
                     workspace_dir.join(p)
                 };
-                // A guest bundle is a kernel and an initramfs; an attach part is its adapter.
-                let complete = match part.kind {
-                    crate::model::PartKind::Attach => dir.join("attach.yaml").exists(),
+                // A guest bundle is a kernel and an initramfs, an MCU bundle its firmware, and an
+                // attach part its adapter.
+                let complete = match (part.kind, device.backend) {
+                    (crate::model::PartKind::Attach, _) => dir.join("attach.yaml").exists(),
+                    (_, Some(Backend::QemuMcu)) => dir.join(super::qemu_mcu::FIRMWARE).exists(),
                     _ => dir.join("vmlinuz").exists() && dir.join("initrd.img").exists(),
                 };
                 if !complete && !missing.contains(&dir) {

@@ -6,6 +6,23 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`backend: qemu-mcu`, microcontroller firmware as a zone node.** The node's bundle is
+  `firmware.elf` and a `meta.json` naming its board; QEMU's `mps2-an385` (Cortex-M3) is the board
+  this release boots, with its LAN9118 NIC on the node's gateway tap and the node's MAC.
+  - **Command line:** an MCU has no kernel command line, so the same `vx.ip=<cidr> vx.node=<id>`
+    words reach the firmware as its semihosting command line (`SYS_GET_CMDLINE`).
+  - **Console:** the board's first UART is the node's `serial` stream, as for `qemu-microvm`.
+  - **Always emulated:** a `qemu-mcu` guest runs under TCG. `NodeStatus` reports `arch: armv7m`,
+    `acceleration: tcg`: functional evidence, never timed.
+  - **Pinning:** `realtime.pinned_cpus` runs QEMU under `taskset`, as for `qemu-microvm`.
+  - **vxAPI:** `NODE_BACKEND_QEMU_MCU = 7`. `HostService.Capabilities` probes `qemu-system-arm`,
+    and `vxedge doctor` checks it as an optional tier-2 tool.
+  - **Refusals:** a bundle without `firmware.elf`, with no `meta.json`, or naming a board or arch
+    `qemu-mcu` does not boot is refused at `up`, naming what is supported. `qemu-microvm` points
+    an `armv7m` bundle at `qemu-mcu`.
+
 ## [0.15.1] - 2026-11-10
 
 A campaign retried with its `request_id` behaves as the spec says. Found by the done-means gate,

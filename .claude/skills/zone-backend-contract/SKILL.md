@@ -1,6 +1,6 @@
 ---
 name: zone-backend-contract
-description: The shared contract all five zone backends (container/qemu-microvm/libvirt/cloud-hypervisor/wasm-capsule) and every guest image must satisfy — use when touching crates/vxedge-core/src/zones/ in vxedge, or building/publishing a zone-class guest image (Zephyr/FreeRTOS/AAOS) in vxparts. One contract, three isolation mechanisms — that's the H3 variable itself.
+description: The shared contract all zone backends (container/qemu-microvm/libvirt/cloud-hypervisor/wasm-capsule/attach/qemu-mcu) and every guest image must satisfy — use when touching crates/vxedge-core/src/zones/ in vxedge, or building/publishing a zone-class guest image (Zephyr/FreeRTOS/AAOS) in vxparts. One contract, three isolation mechanisms — that's the H3 variable itself.
 ---
 
 # Zone backend contract
@@ -12,9 +12,9 @@ publish-vm-bundle.sh`/`publish-vm-disk.sh`). This contract is shared across both
 new guest image in `vxparts` and a new backend feature in `vxedge` must agree on it
 independently, since neither repo reads the other's source.
 
-## The five backends attach to the gateway identically — only isolation differs
+## The backends attach to the gateway identically — only isolation differs
 
-`Backend::{Container, QemuMicrovm, Libvirt, CloudHypervisor, WasmCapsule}` (`model/mod.rs`) all
+`Backend::{Container, QemuMicrovm, Libvirt, CloudHypervisor, WasmCapsule, Attach, QemuMcu}` (`model/mod.rs`) all
 attach to the same
 gateway port; per `zones/backend.rs`'s own doc comment, "the payload is exec'd... the
 isolation mechanism differs — that is exactly the H3 variable." Concretely:
@@ -33,10 +33,21 @@ isolation mechanism differs — that is exactly the H3 variable." Concretely:
   stable MAC.
 - `wasm-capsule`: a container node's network (named netns, gateway port as `eth0`) with a WASI 0.2
   module as the payload, run by a `vxcapsule` process inside it.
+- `qemu-mcu`: microcontroller firmware on an emulated board (`zones/qemu_mcu.rs`): `qemu-system-arm
+  -M mps2-an385`, the board's LAN9118 NIC on a tap with the node's MAC, always TCG. The command line
+  goes through semihosting (`-semihosting-config enable=on,target=native,arg=vx.ip=…,arg=vx.node=…`),
+  which the firmware reads with `SYS_GET_CMDLINE`; pidfile, status and `down` are `qemu-microvm`'s.
 
 Adding another backend (Renode, `crosvm`) or a new guest under an existing backend means
 satisfying this attachment contract exactly — don't special-case gateway wiring per
 guest OS.
+
+## MCU firmware bundle contract (`qemu-mcu`)
+
+- `firmware.elf`, loaded with `-kernel`, and `meta.json` with `machine` (or the published
+  `org.vxedge.machine`): `mps2-an385`. `arch`, if present, is `armv7m`.
+- The firmware reads `vx.ip=<cidr> vx.node=<id>` from the semihosting command line, takes its MAC from
+  the NIC (QEMU loads it into the LAN9118), prints to UART0 and echoes UDP on :9800.
 
 ## Guest bundle contract (what every new zone-class image in vxparts must produce)
 

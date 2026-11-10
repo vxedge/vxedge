@@ -105,9 +105,16 @@ fn guest_node(cmdline: &[u8]) -> Option<String> {
     if !bin.contains("qemu") {
         return None;
     }
-    args.flat_map(|arg| arg.split(' '))
+    args.flat_map(guest_words)
         .find_map(|word| word.strip_prefix(GUEST_MARKER))
         .map(str::to_owned)
+}
+
+/// The words of one QEMU argument that may carry the `vx.node=` marker: a kernel command line's
+/// space-separated words, and the `arg=` values of a `qemu-mcu` guest's `-semihosting-config`.
+pub(super) fn guest_words(arg: &str) -> impl Iterator<Item = &str> {
+    arg.split([' ', ','])
+        .map(|word| word.strip_prefix("arg=").unwrap_or(word))
 }
 
 /// The API socket a NUL-separated `/proc/<pid>/cmdline` names, if it is a Cloud Hypervisor VMM
@@ -183,6 +190,8 @@ parts:
         assert_eq!(guest_node(qemu).as_deref(), Some("zone-fl"));
         assert_eq!(guest_node(b"/bin/bash\0-c\0grep vx.node=zone-fl\0"), None);
         assert_eq!(guest_node(b"qemu-system-x86_64\0-m\x00128m\0"), None);
+        let mcu = b"qemu-system-arm\0-semihosting-config\0enable=on,target=native,arg=vx.ip=10.0.0.5/24,arg=vx.node=ecu-m3\0";
+        assert_eq!(guest_node(mcu).as_deref(), Some("ecu-m3"));
     }
 
     #[test]

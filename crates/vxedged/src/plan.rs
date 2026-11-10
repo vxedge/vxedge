@@ -692,6 +692,12 @@ fn probe_backends(podman: Result<(), String>) -> Vec<BackendProbe> {
             on_path("sh"),
             "`sh` is not on PATH".to_string(),
         ),
+        // Emulated, never accelerated: no KVM needed.
+        entry(
+            Backend::QemuMcu,
+            on_path(vxedge_core::zones::QEMU_MCU_BIN),
+            format!("needs `{}` on PATH", vxedge_core::zones::QEMU_MCU_BIN),
+        ),
     ]
 }
 
