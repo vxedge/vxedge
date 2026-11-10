@@ -173,6 +173,9 @@ pub(super) fn argv(
             board.machine(),
             "-cpu",
             board.cpu(),
+            // No default devices: QEMU refuses `-nographic` with `-daemonize` while a default
+            // serial, parallel or monitor would go to stdio. The board's UART and NIC stay.
+            "-nodefaults",
             "-no-user-config",
             "-nographic",
             "-monitor",
@@ -273,6 +276,10 @@ mod tests {
         assert!(
             !argv.iter().any(|a| a == "-append"),
             "an MCU has no kernel command line"
+        );
+        assert!(
+            argv.iter().any(|a| a == "-nodefaults"),
+            "QEMU refuses -nographic with -daemonize while default devices are on"
         );
     }
 
