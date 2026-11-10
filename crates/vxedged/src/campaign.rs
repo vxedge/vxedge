@@ -75,7 +75,8 @@ pub(crate) fn plan_of(
         .map_err(|e| errors::invalid(R::WorkspaceInvalid, e.to_string()))?;
     let model = vxedge_core::model::load_yaml(&text)
         .map_err(|e| errors::invalid(R::WorkspaceInvalid, e.to_string()))?;
-    let (intent, intent_problems) = vxedge_core::intent::read(&doc);
+    let (intent, mut intent_problems) = vxedge_core::intent::read(&doc);
+    intent_problems.extend(ws.scenario_problems());
     let mut problems: Vec<PlanProblem> = intent_problems
         .iter()
         .map(|p| {
@@ -83,6 +84,7 @@ pub(crate) fn plan_of(
                 vxedge_core::intent::ProblemKind::Parameter => R::ParameterInvalid,
                 vxedge_core::intent::ProblemKind::Criterion => R::CriterionInvalid,
                 vxedge_core::intent::ProblemKind::Measurement => R::MeasurementInvalid,
+                vxedge_core::intent::ProblemKind::Scenario => R::ScenarioInvalid,
             };
             problem(reason, &subject, p.to_string())
         })

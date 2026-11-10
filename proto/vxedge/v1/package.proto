@@ -202,6 +202,41 @@ message PackageInfo {
   repeated PlannedEntity entities = 16;
   // Every problem with its documents and typed intent. Empty for a package `up` would accept.
   repeated PlanProblem problems = 17;
+  // The scenario the experiment runs on, when it names one.
+  PackageScenario scenario = 18;
+}
+
+// A storyboard parameter a campaign may turn, with the value the storyboard declares.
+message ScenarioParameter {
+  string name = 1;
+  string unit = 2;
+  optional double min = 3;
+  optional double max = 4;
+  // The `ParameterDeclaration`'s type and value in the storyboard.
+  string declared_type = 5;
+  string declared_value = 6;
+}
+
+// A scenario (`kind: scenario`): an OpenSCENARIO storyboard on an OpenDRIVE road, unchanged in
+// the package, with what a reproducible trial needs.
+message PackageScenario {
+  string id = 1;
+  // The road's id and its `.xodr` file.
+  string road = 2;
+  string road_network = 3;
+  // The `.xosc` file.
+  string storyboard = 4;
+  // `esmini` or `carla`.
+  string simulator = 5;
+  uint32 clock_tick_ms = 6;
+  // `synchronous`: the simulator is the master clock.
+  string clock_mode = 7;
+  optional uint64 seed = 8;
+  // OpenSCENARIO entity name to the vxedge vehicle it is. Every other entity is traffic.
+  map<string, string> actors = 9;
+  // Every entity of the storyboard.
+  repeated string entities = 10;
+  repeated ScenarioParameter parameters = 11;
 }
 
 message PackageListRequest {}

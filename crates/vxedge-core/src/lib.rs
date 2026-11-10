@@ -20,6 +20,7 @@ pub mod package;
 pub mod pkg;
 pub mod registry;
 pub mod scaffold;
+pub mod scenario;
 pub mod services;
 pub mod sonic;
 pub mod status;

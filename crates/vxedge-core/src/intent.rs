@@ -14,14 +14,16 @@ use serde::{Deserialize, Serialize};
 use serde_yaml_ng::Value;
 
 /// Which kind of problem: a parameter (including the campaign that sets parameters), a
-/// criterion, or a measurement ([`crate::measurements`]). vxAPI reports them as
-/// `ERROR_REASON_PARAMETER_INVALID`, `ERROR_REASON_CRITERION_INVALID` and
-/// `ERROR_REASON_MEASUREMENT_INVALID`.
+/// criterion, a measurement ([`crate::measurements`]) or a scenario or road
+/// ([`crate::scenario`]). vxAPI reports them as `ERROR_REASON_PARAMETER_INVALID`,
+/// `ERROR_REASON_CRITERION_INVALID`, `ERROR_REASON_MEASUREMENT_INVALID` and
+/// `ERROR_REASON_SCENARIO_INVALID`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProblemKind {
     Parameter,
     Criterion,
     Measurement,
+    Scenario,
 }
 
 /// One problem with an experiment's typed intent: the field it is in, as a path from the

@@ -6,6 +6,20 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Scenarios and roads** (decision X-8). A package carries ASAM OpenDRIVE and OpenSCENARIO files
+  unchanged in `assets/`.
+  - **The kinds:** `kind: road` names an `.xodr` network. `kind: scenario` names a road, a
+    storyboard `.xosc`, the simulator (`esmini` or `carla`), its clock and seed, the storyboard
+    entity that is the vehicle under test (`actors`), and the storyboard parameters a campaign may
+    turn, with units and bounds.
+  - **The experiment** names its scenario with `scenario:`. The legacy `world:` reads as it.
+  - **Checks:** `Plan`, `experiment validate` and `up` check every file and reference, each as
+    the new `ERROR_REASON_SCENARIO_INVALID` (34). vxedge reads only the storyboard's entity names
+    and parameter declarations.
+  - **Inspect:** `PackageService.Inspect` returns the scenario typed (`PackageInfo.scenario`).
+
 ## [0.14.1] - 2026-11-10
 
 Air-gapped hosts. A package packed with `pkg pack --offline` now brings up its container nodes on

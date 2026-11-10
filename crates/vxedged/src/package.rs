@@ -125,6 +125,59 @@ fn type_name(t: intent::ParamType) -> &'static str {
     }
 }
 
+/// The scenario the experiment runs on, typed, with what its storyboard declares. `None` when
+/// it names none, or names one the package does not hold (a problem reported on its own).
+fn scenario_info(ws: &vxedge_core::Workspace) -> Option<vxedge_api::v1::PackageScenario> {
+    use vxedge_api::v1::{PackageScenario, ScenarioParameter};
+    let id = ws
+        .experiments
+        .first()
+        .and_then(vxedge_core::workspace::ExperimentDoc::scenario_ref)?;
+    let s = ws.scenarios.iter().find(|s| s.id == id)?;
+    let board = std::fs::read_to_string(ws.root.join(&s.storyboard))
+        .ok()
+        .and_then(|t| vxedge_core::scenario::read_storyboard(&t).ok())
+        .unwrap_or_default();
+    Some(PackageScenario {
+        id: s.id.clone(),
+        road: s.road.clone(),
+        road_network: ws
+            .road_docs
+            .iter()
+            .find(|r| r.id == s.road)
+            .map(|r| r.network.clone())
+            .unwrap_or_default(),
+        storyboard: s.storyboard.clone(),
+        simulator: s.simulator.clone(),
+        clock_tick_ms: s.clock.as_ref().map_or(0, |c| c.tick_ms),
+        clock_mode: s.clock.as_ref().map(|c| c.mode.clone()).unwrap_or_default(),
+        seed: s.seed,
+        actors: s
+            .actors
+            .iter()
+            .map(|(entity, a)| (entity.clone(), a.vehicle.clone()))
+            .collect(),
+        entities: board.entities.iter().cloned().collect(),
+        parameters: s
+            .parameters
+            .iter()
+            .map(|(name, p)| {
+                let declared = board.parameters.get(name);
+                ScenarioParameter {
+                    name: name.clone(),
+                    unit: p.unit.clone().unwrap_or_default(),
+                    min: p.min,
+                    max: p.max,
+                    declared_type: declared
+                        .map(|d| d.parameter_type.clone())
+                        .unwrap_or_default(),
+                    declared_value: declared.map(|d| d.value.clone()).unwrap_or_default(),
+                }
+            })
+            .collect(),
+    })
+}
+
 fn kind_name(k: intent::MetricKind) -> &'static str {
     match k {
         intent::MetricKind::Counter => "counter",
@@ -339,6 +392,7 @@ fn intent_reason(kind: intent::ProblemKind) -> R {
         intent::ProblemKind::Parameter => R::ParameterInvalid,
         intent::ProblemKind::Criterion => R::CriterionInvalid,
         intent::ProblemKind::Measurement => R::MeasurementInvalid,
+        intent::ProblemKind::Scenario => R::ScenarioInvalid,
     }
 }
 
@@ -443,6 +497,12 @@ pub(crate) fn inspect(
             detail: p.to_string(),
         }));
     }
+    problems.extend(ws.scenario_problems().into_iter().map(|p| PlanProblem {
+        reason: intent_reason(p.kind) as i32,
+        subject: subject.clone(),
+        detail: p.to_string(),
+    }));
+    info.scenario = scenario_info(&ws);
     let text = vxedge_core::Workspace::read_text(root).unwrap_or_default();
     match vxedge_core::model::load_yaml(&text) {
         Ok(model) => {
