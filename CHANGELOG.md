@@ -6,6 +6,12 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-10
+
+Microcontroller firmware as a zone node. A new backend, `qemu-mcu`, boots a firmware image on an
+emulated Cortex-M board and joins it to the zone network like any other guest. vxAPI stays
+`vxedge.v1`, and the change is additive: one new `NodeBackend` value.
+
 ### Added
 
 - **`backend: qemu-mcu`, microcontroller firmware as a zone node.** The node's bundle is
