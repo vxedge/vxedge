@@ -82,6 +82,8 @@ All notable changes to this repo are documented here. Format follows
   `ERROR_REASON_HOST_REQUIREMENT_UNMET`, a pinned container device that runs a host process (which
   vxedge does not pin) or whose Podman has no `cpuset` cgroup controller (rootless Podman gets it
   only when the user's systemd service delegates it). A container without pins keeps its spec hash.
+- `Plan` and `up` refuse, under `ERROR_REASON_HOST_REQUIREMENT_UNMET`, an `attach` device that declares
+  `realtime.pinned_cpus`: its platform starts its processes, and the pins used to be dropped without a word.
 - Two `vxedge-core` tests shared a temporary folder, `vxpkg-<pid>-legacy`, and could fail when
   run in parallel. `package.rs`'s tests now use their own prefix.
 

@@ -460,7 +460,26 @@ pub(crate) async fn preflight(
             vxedge_core::containers::cpuset_available,
         ),
     );
+    pf.check("attach pinning", attach_pinning_problem(nodes));
     pf
+}
+
+/// An `attach` device runs on its platform's own stack, whose processes vxedge does not start, so
+/// it has nothing to apply `realtime.pinned_cpus` to. The pins are refused rather than dropped.
+fn attach_pinning_problem(nodes: &[NodePlan]) -> Option<(R, String, String)> {
+    let n = nodes
+        .iter()
+        .find(|n| n.backend == Backend::Attach && !n.pinned_cpus.is_empty())?;
+    Some((
+        R::HostRequirementUnmet,
+        n.node_id.clone(),
+        format!(
+            "`{}` declares `realtime.pinned_cpus`, but it is an `attach` device: its platform starts \
+             its processes, and vxedge does not pin them. Pin them in the adapter's own `start`, or \
+             drop the pins.",
+            n.node_id
+        ),
+    ))
 }
 
 /// A container device's `realtime.pinned_cpus` is applied as the containers' cpuset, so it is
@@ -851,6 +870,18 @@ mod pinning_tests {
         assert_eq!(reason, R::HostRequirementUnmet);
         assert_eq!(subject, "n1");
         assert!(detail.contains("cpuset"), "{detail}");
+    }
+
+    #[test]
+    fn a_pinned_attach_node_is_refused_and_an_unpinned_one_is_not() {
+        let mut n = node(None, Vec::new());
+        n.backend = Backend::Attach;
+        assert!(attach_pinning_problem(std::slice::from_ref(&n)).is_none());
+        n.pinned_cpus = vec![3];
+        let (reason, subject, detail) = attach_pinning_problem(&[n]).unwrap();
+        assert_eq!(reason, R::HostRequirementUnmet);
+        assert_eq!(subject, "n1");
+        assert!(detail.contains("attach"), "{detail}");
     }
 
     #[test]
