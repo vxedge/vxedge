@@ -733,9 +733,25 @@ fn left_behind_reason(name: &str, is_dir: bool) -> &'static str {
 /// The `vendored` entries are written even when the package stops building, which is the usual
 /// first step (the scaffold's `main.yaml` names the vehicle the copy replaced); the report says
 /// so and the full re-lock waits for `pkg lock`.
-/// The local paths the documents at `paths` reference as parts or artifact stores: every `ref` or
-/// `artifacts` string that starts with `./`, as a `/`-separated path inside the folder. A path
-/// that would leave the folder is ignored: a document cannot vendor what is outside it.
+/// A relative path inside the folder, `/`-separated, or `None` for one that would leave it.
+fn inside(path: &str) -> Option<String> {
+    let rel = path
+        .strip_prefix("./")
+        .unwrap_or(path)
+        .trim_end_matches('/');
+    let safe = !rel.is_empty()
+        && !rel.starts_with('/')
+        && rel
+            .split('/')
+            .all(|c| !c.is_empty() && c != "." && c != "..");
+    safe.then(|| rel.to_string())
+}
+
+/// The local paths the documents at `paths` reference: every `ref` or `artifacts` string that
+/// starts with `./` (parts and artifact stores), and a road's `network` and a scenario's
+/// `storyboard` (their OpenDRIVE and OpenSCENARIO files), each as a `/`-separated path inside
+/// the folder. A path that would leave the folder is ignored: a document cannot vendor what is
+/// outside it.
 fn referenced_local_paths(paths: &[PathBuf]) -> Vec<String> {
     fn walk(v: &serde_yaml_ng::Value, out: &mut BTreeSet<String>) {
         match v {
@@ -768,6 +784,14 @@ fn referenced_local_paths(paths: &[PathBuf]) -> Vec<String> {
         for doc in serde_yaml_ng::Deserializer::from_str(&text) {
             if let Ok(v) = serde_yaml_ng::Value::deserialize(doc) {
                 walk(&v, &mut out);
+                let file = match v.get("kind").and_then(|k| k.as_str()) {
+                    Some("road") => v.get("network"),
+                    Some("scenario") => v.get("storyboard"),
+                    _ => None,
+                };
+                if let Some(rel) = file.and_then(|f| f.as_str()).and_then(inside) {
+                    out.insert(rel);
+                }
             }
         }
     }
@@ -1783,6 +1807,41 @@ mod tests {
 
     /// A part folder the documents reference travels with them when git tracks it, as a vehicle's
     /// committed adapter does, and a build output the documents reference stays behind.
+    #[test]
+    fn vendoring_a_scenario_copies_its_road_and_storyboard() {
+        let root = locked_workspace("vscen");
+        let src = vehicle_source("vscen", "car1");
+        fs::create_dir_all(src.join("assets")).unwrap();
+        fs::write(src.join("assets/grid.xodr"), "<OpenDRIVE/>").unwrap();
+        fs::write(src.join("assets/stop.xosc"), "<OpenSCENARIO/>").unwrap();
+        fs::write(src.join("assets/notes.txt"), "untracked").unwrap();
+        fs::write(
+            src.join("scenario.yaml"),
+            "kind: road\nid: grid\nnetwork: assets/grid.xodr\n---\nkind: scenario\nid: stop\n\
+             road: grid\nstoryboard: ./assets/stop.xosc\nsimulator: esmini\n",
+        )
+        .unwrap();
+        let tracked: Vec<String> = [
+            "assets/grid.xodr",
+            "assets/stop.xosc",
+            "parts.yaml",
+            "scenario.yaml",
+            "vehicle.yaml",
+        ]
+        .map(String::from)
+        .to_vec();
+        let id = "vxedge/vxperiments/scenarios/stop";
+        let report = vendor(&root, &src, id, true, "0.7.0", Some(&tracked)).unwrap();
+        let files: Vec<&str> = report.copied.iter().map(|v| v.file.as_str()).collect();
+        assert!(files.contains(&"assets/grid.xodr"), "{files:?}");
+        assert!(files.contains(&"assets/stop.xosc"), "{files:?}");
+        assert!(!root.join("assets/notes.txt").exists());
+        assert_eq!(
+            fs::read(root.join("assets/stop.xosc")).unwrap(),
+            b"<OpenSCENARIO/>"
+        );
+    }
+
     #[test]
     fn vendoring_copies_the_part_folders_git_tracks() {
         let root = locked_workspace("vparts");

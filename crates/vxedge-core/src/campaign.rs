@@ -212,6 +212,11 @@ pub fn bind(
         let (Some(path), Some(value)) = (p.binds.as_deref(), values.get(name)) else {
             continue;
         };
+        // A storyboard parameter is not a field of the experiment document: its value travels
+        // with the trial's parameters, for the simulator that runs the scenario.
+        if path.starts_with(crate::intent::SCENARIO_BIND) {
+            continue;
+        }
         let value = match (p.ty, value.as_f64()) {
             // A YAML integer stays an integer in an integer field.
             (ParamType::Integer, Some(x)) if x.fract() == 0.0 => Value::from(x as i64),

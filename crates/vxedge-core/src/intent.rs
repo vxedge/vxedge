@@ -495,6 +495,10 @@ pub fn set(doc: &mut Value, path: &str, value: Value) -> Result<(), String> {
     Ok(())
 }
 
+/// The prefix of a bind into the scenario's storyboard parameters:
+/// `scenario.parameters.<ParameterDeclaration name>`.
+pub const SCENARIO_BIND: &str = "scenario.parameters.";
+
 fn check_parameters(c: &mut Checker<'_>, intent: &Intent) {
     let mut bound: BTreeMap<&str, &str> = BTreeMap::new();
     for (name, p) in &intent.parameters {
@@ -529,6 +533,18 @@ fn check_parameters(c: &mut Checker<'_>, intent: &Intent) {
         let Some(path) = p.binds.as_deref() else {
             continue;
         };
+        // A storyboard parameter lives in the scenario document, which `crate::scenario` checks
+        // with the workspace in hand.
+        if path.starts_with(SCENARIO_BIND) {
+            if let Some(other) = bound.insert(path, name) {
+                c.push(
+                    ProblemKind::Parameter,
+                    field("binds"),
+                    format!("`{path}` is already bound by parameter `{other}`"),
+                );
+            }
+            continue;
+        }
         match resolve(c.doc, path) {
             Err(why) => c.push(ProblemKind::Parameter, field("binds"), why),
             Ok(target) if !has_type(target, p.ty) => c.push(
@@ -1280,6 +1296,17 @@ campaign:
         );
         let mistyped = check(&edited("bandwidth_mbps: 0 }", "bandwidth_mbps: fast }"));
         assert!(mistyped[0].detail.contains("is a string"), "{mistyped:?}");
+    }
+
+    /// A bind into the scenario's storyboard parameters is not resolved in the experiment
+    /// document; `crate::scenario` checks it.
+    #[test]
+    fn a_scenario_bind_is_left_to_the_scenario_check() {
+        let d = edited(
+            "binds: \"traffic_profiles[bg].bandwidth_mbps\"",
+            "binds: \"scenario.parameters.EgoTargetSpeed\"",
+        );
+        assert_eq!(check(&d), Vec::new());
     }
 
     #[test]
