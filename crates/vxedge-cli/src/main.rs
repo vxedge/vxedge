@@ -670,6 +670,12 @@ enum CampaignCmd {
     /// The experiment's criteria judged over a campaign's archived trials, read from the
     /// archives (`ResultService.Verdict`).
     Verdict { campaign_id: String },
+    /// A campaign against a reference campaign: each metric's median at each point against the
+    /// reference's median and IQR, and each criterion's outcome (`ResultService.Compare`).
+    Compare {
+        campaign_id: String,
+        reference_campaign_id: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -2039,6 +2045,75 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 );
                             }
+                        }
+                    }
+                }
+                CampaignCmd::Compare {
+                    campaign_id,
+                    reference_campaign_id,
+                } => {
+                    use vxedge_api::v1::ResultCompareRequest;
+                    use vxedge_api::v1::result_service_client::ResultServiceClient;
+                    let c = ResultServiceClient::new(channel.clone())
+                        .compare(ResultCompareRequest {
+                            campaign_id: campaign_id.clone(),
+                            reference_campaign_id: reference_campaign_id.clone(),
+                        })
+                        .await?
+                        .into_inner();
+                    if cli.json {
+                        let out = serde_json::json!({
+                            "campaign_id": c.campaign_id,
+                            "reference_campaign_id": c.reference_campaign_id,
+                            "outcome": outcome_name(c.outcome),
+                            "reference_outcome": outcome_name(c.reference_outcome),
+                            "within": c.within,
+                            "metrics": c.metrics.iter().map(|m| serde_json::json!({
+                                "metric": m.metric, "point": m.point, "count": m.count,
+                                "reference_count": m.reference_count, "median": m.median,
+                                "iqr": m.iqr, "reference_median": m.reference_median,
+                                "reference_iqr": m.reference_iqr, "delta": m.delta,
+                                "within_reference_iqr": m.within_reference_iqr,
+                            })).collect::<Vec<_>>(),
+                            "criteria": c.criteria.iter().map(|d| serde_json::json!({
+                                "id": d.id, "outcome": outcome_name(d.outcome),
+                                "reference_outcome": outcome_name(d.reference_outcome),
+                            })).collect::<Vec<_>>(),
+                        });
+                        println!("{}", serde_json::to_string_pretty(&out)?);
+                    } else {
+                        println!(
+                            "{} vs {}: {} of {} within the reference's IQR; verdict {} (reference {})",
+                            c.campaign_id,
+                            c.reference_campaign_id,
+                            c.within,
+                            c.metrics.len(),
+                            outcome_name(c.outcome),
+                            outcome_name(c.reference_outcome)
+                        );
+                        for m in &c.metrics {
+                            println!(
+                                "  {:<16} {:<20} {:>12.6} vs {:>12.6} ± {:<12.6} {:+.6} {}",
+                                m.metric,
+                                m.point,
+                                m.median,
+                                m.reference_median,
+                                m.reference_iqr,
+                                m.delta,
+                                if m.within_reference_iqr {
+                                    "within"
+                                } else {
+                                    "outside"
+                                }
+                            );
+                        }
+                        for d in &c.criteria {
+                            println!(
+                                "  {:<20} {} (reference {})",
+                                d.id,
+                                outcome_name(d.outcome),
+                                outcome_name(d.reference_outcome)
+                            );
                         }
                     }
                 }

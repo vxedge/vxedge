@@ -15,6 +15,12 @@ All notable changes to this repo are documented here. Format follows
 - **A campaign records its verdict when it finishes:** in `campaign.json`, as
   `CampaignStatus.verdict` (shown by `vxedge campaign status`), and in full as `verdict.json`
   beside the archives.
+- **`ResultService.Compare`** sets a campaign against a reference campaign from their archives.
+  Per metric at each point it gives both medians and IQRs and whether the difference is within
+  the reference's IQR, the reproducibility check exp-001's reruns use. It also gives each
+  criterion's outcome on both sides. `vxedge campaign compare <id> <reference id>` prints it.
+  Over the published exp-001 reruns, the same comparison gives the notebook's counts: 9 and 8 of
+  15 against the frozen campaign, 13 of 15 between the October reruns.
 
 ### Changed
 

@@ -2669,7 +2669,9 @@ fn write_v1_archive(path: &Path, p99: f64) {
 async fn a_campaign_verdict_is_judged_from_its_archives() {
     use vxedge_api::v1::campaign_service_client::CampaignServiceClient;
     use vxedge_api::v1::result_service_client::ResultServiceClient;
-    use vxedge_api::v1::{CampaignGetRequest, ResultVerdictRequest, VerdictOutcome};
+    use vxedge_api::v1::{
+        CampaignGetRequest, ResultCompareRequest, ResultVerdictRequest, VerdictOutcome,
+    };
     let (dir, _) = experiment_workspace();
     let main = std::fs::read_to_string(dir.join("main.yaml")).unwrap();
     let intent = "\nhypothesis: { id: H1, statement: busy p99 stays within 2x of idle }\n\
@@ -2693,14 +2695,30 @@ criteria:\n  - { id: h1, op: le, lhs: { metric: p99, aggregate: median, select: 
             "state": "succeeded", "archive": archive.display().to_string(), "sha256": "ab",
         }));
     }
-    let record = serde_json::json!({
-        "campaign_id": "c-1", "state": "succeeded", "job_id": "j", "experiment_id": "e1",
-        "workspace": dir.display().to_string(), "results_dir": results.display().to_string(),
-        "trials": trials, "started_unix_ms": 1, "finished_unix_ms": 2, "verdict": "pass",
-    });
+    let record = |id: &str, trials: &[serde_json::Value]| {
+        serde_json::json!({
+            "campaign_id": id, "state": "succeeded", "job_id": "j", "experiment_id": "e1",
+            "workspace": dir.display().to_string(), "results_dir": results.display().to_string(),
+            "trials": trials, "started_unix_ms": 1, "finished_unix_ms": 2, "verdict": "pass",
+        })
+    };
+    // The reference: the same idle trials, and a busy point twice as slow, so busy is outside.
+    let mut reference = trials[..1].to_vec();
+    reference.push(trials[2].clone());
+    for (rep, p99) in [(1, 0.004), (2, 0.005)] {
+        let id = format!("r{rep}-busy");
+        let archive = dir.join(format!("results/ref/{id}.zip"));
+        write_v1_archive(&archive, p99);
+        reference.push(serde_json::json!({
+            "id": id, "arm": "busy", "repetition": rep, "parameters": { "load_mbps": 600 },
+            "state": "succeeded", "archive": archive.display().to_string(), "sha256": "cd",
+        }));
+    }
+    let (c1, c2) = (record("c-1", &trials), record("ref", &reference));
     let daemon = Daemon::start_with(|rt| {
         std::fs::create_dir_all(rt.join("campaigns")).unwrap();
-        std::fs::write(rt.join("campaigns/c-1.json"), record.to_string()).unwrap();
+        std::fs::write(rt.join("campaigns/c-1.json"), c1.to_string()).unwrap();
+        std::fs::write(rt.join("campaigns/ref.json"), c2.to_string()).unwrap();
     });
     let channel = daemon.channel().await;
     let v = ResultServiceClient::new(channel.clone())
@@ -2727,6 +2745,27 @@ criteria:\n  - { id: h1, op: le, lhs: { metric: p99, aggregate: median, select: 
         .unwrap()
         .into_inner();
     assert_eq!(status.verdict, VerdictOutcome::Pass as i32);
+
+    let c = ResultServiceClient::new(channel.clone())
+        .compare(ResultCompareRequest {
+            campaign_id: "c-1".into(),
+            reference_campaign_id: "ref".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let points: Vec<(&str, bool)> = c
+        .metrics
+        .iter()
+        .map(|m| (m.point.as_str(), m.within_reference_iqr))
+        .collect();
+    assert_eq!(points, [("idle", true), ("busy", false)], "{c:?}");
+    assert_eq!(c.within, 1);
+    assert_eq!(
+        (c.outcome, c.reference_outcome),
+        (VerdictOutcome::Pass as i32, VerdictOutcome::Fail as i32)
+    );
+    assert_eq!(c.criteria[0].id, "h1");
 
     let unknown = ResultServiceClient::new(channel)
         .verdict(ResultVerdictRequest {

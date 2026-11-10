@@ -492,6 +492,117 @@ pub fn verdict(intent: &Intent, trials: Vec<Trial>) -> Verdict {
     }
 }
 
+/// The point a trial ran: its id without the `r<repetition>-` prefix, so the repetitions of one
+/// point share it.
+pub fn point(t: &Trial) -> &str {
+    t.id.strip_prefix('r')
+        .and_then(|rest| rest.split_once('-'))
+        .filter(|(n, _)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        .map_or(t.id.as_str(), |(_, p)| p)
+}
+
+/// One metric at one point, in a result and in its reference: each side's median and IQR over
+/// its repetitions, and whether the result's median is within the reference's IQR of the
+/// reference's median.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MetricDelta {
+    pub metric: String,
+    pub point: String,
+    pub count: usize,
+    pub reference_count: usize,
+    pub median: f64,
+    pub iqr: f64,
+    pub reference_median: f64,
+    pub reference_iqr: f64,
+    /// `median - reference_median`.
+    pub delta: f64,
+    pub within_reference_iqr: bool,
+}
+
+/// One criterion's outcome in a result and in its reference.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CriterionDelta {
+    pub id: String,
+    pub outcome: Outcome,
+    pub reference_outcome: Outcome,
+}
+
+/// A result against its reference, metric by metric at every point both ran, and criterion by
+/// criterion.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Comparison {
+    pub outcome: Outcome,
+    pub reference_outcome: Outcome,
+    pub metrics: Vec<MetricDelta>,
+    pub criteria: Vec<CriterionDelta>,
+    /// How many of `metrics` are within the reference's IQR.
+    pub within: usize,
+}
+
+fn by_point<'a>(trials: &'a [Trial], metric: &str) -> Vec<(&'a str, Vec<f64>)> {
+    let mut out: Vec<(&str, Vec<f64>)> = Vec::new();
+    for t in trials {
+        let Some(v) = t.values.get(metric).and_then(|v| v.value) else {
+            continue;
+        };
+        let p = point(t);
+        match out.iter_mut().find(|(q, _)| *q == p) {
+            Some((_, vs)) => vs.push(v),
+            None => out.push((p, vec![v])),
+        }
+    }
+    out
+}
+
+/// Compare `trials` with `reference`, both judged by `intent`: every metric at every point both
+/// ran, in the reference's order, and every criterion's outcome on each side.
+pub fn compare(intent: &Intent, trials: Vec<Trial>, reference: Vec<Trial>) -> Comparison {
+    let mut metrics = Vec::new();
+    for m in &intent.metrics {
+        let ours = by_point(&trials, &m.id);
+        for (p, theirs) in by_point(&reference, &m.id) {
+            let Some((_, mine)) = ours.iter().find(|(q, _)| *q == p) else {
+                continue;
+            };
+            let stat = |v: &[f64], a: &str| intent::aggregate(v, a).unwrap_or(f64::NAN);
+            let (median, iqr) = (stat(mine, "median"), stat(mine, "iqr"));
+            let (reference_median, reference_iqr) = (stat(&theirs, "median"), stat(&theirs, "iqr"));
+            let delta = median - reference_median;
+            metrics.push(MetricDelta {
+                metric: m.id.clone(),
+                point: p.to_string(),
+                count: mine.len(),
+                reference_count: theirs.len(),
+                median,
+                iqr,
+                reference_median,
+                reference_iqr,
+                delta,
+                within_reference_iqr: delta.abs() <= reference_iqr,
+            });
+        }
+    }
+    let ours = verdict(intent, trials);
+    let theirs = verdict(intent, reference);
+    let criteria = ours
+        .criteria
+        .iter()
+        .zip(&theirs.criteria)
+        .map(|(a, b)| CriterionDelta {
+            id: a.id.clone().unwrap_or_else(|| a.rule.clone()),
+            outcome: a.outcome,
+            reference_outcome: b.outcome,
+        })
+        .collect();
+    Comparison {
+        outcome: ours.outcome,
+        reference_outcome: theirs.outcome,
+        within: metrics.iter().filter(|m| m.within_reference_iqr).count(),
+        metrics,
+        criteria,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -721,5 +832,49 @@ campaign:
         let v = verdict(&intent, trials);
         assert_eq!(v.outcome, Outcome::Inconclusive);
         assert!(v.criteria[0].why.as_deref().unwrap().contains("incomplete"));
+    }
+
+    /// Repetitions of one point compare by median against the reference's median and IQR, as
+    /// exp-001's reproducibility check does.
+    #[test]
+    fn a_comparison_is_per_metric_per_point_against_the_reference_iqr() {
+        let doc: Value = serde_yaml_ng::from_str(
+            "kind: experiment\nid: e\nmetrics:\n  - { id: p99, kind: gauge, unit: s, entity: m, series: s }\n",
+        )
+        .unwrap();
+        let (intent, _) = intent::read(&doc);
+        let set = |vals: &[(u32, &str, f64)]| -> Vec<Trial> {
+            vals.iter()
+                .map(|(r, p, v)| t(&format!("r{r}-{p}"), "", 0, *v))
+                .collect()
+        };
+        let reference = set(&[
+            (1, "idle", 10.0),
+            (2, "idle", 11.0),
+            (3, "idle", 12.0),
+            (4, "idle", 13.0),
+            (5, "idle", 14.0),
+            (1, "load_mbps=600", 20.0),
+        ]);
+        let rerun = set(&[
+            (1, "idle", 14.5),
+            (2, "idle", 15.0),
+            (1, "load_mbps=600", 30.0),
+        ]);
+        assert_eq!(point(&rerun[2]), "load_mbps=600");
+        let c = compare(&intent, rerun, reference);
+        assert_eq!(c.metrics.len(), 2);
+        let idle = &c.metrics[0];
+        assert_eq!(
+            (idle.point.as_str(), idle.count, idle.reference_count),
+            ("idle", 2, 5)
+        );
+        assert_eq!(
+            (idle.reference_median, idle.reference_iqr, idle.median),
+            (12.0, 3.0, 14.75)
+        );
+        assert!(idle.within_reference_iqr);
+        assert!(!c.metrics[1].within_reference_iqr);
+        assert_eq!(c.within, 1);
     }
 }

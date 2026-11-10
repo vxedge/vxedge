@@ -23,8 +23,8 @@ fn digest(sha256: &str) -> String {
     }
 }
 
-/// Judge `rec`'s experiment, as its workspace holds it, over the trials it archived.
-pub(crate) fn of_campaign(rec: &CampaignRecord) -> Result<Verdict, String> {
+/// The typed intent of `rec`'s experiment, as its workspace holds it.
+fn intent_of(rec: &CampaignRecord) -> Result<intent::Intent, String> {
     let root = Path::new(&rec.workspace);
     let ws =
         vxedge_core::Workspace::load(root).map_err(|e| format!("`{}`: {e}", root.display()))?;
@@ -33,9 +33,12 @@ pub(crate) fn of_campaign(rec: &CampaignRecord) -> Result<Verdict, String> {
         .first()
         .cloned()
         .ok_or("the campaign's workspace has no `kind: experiment` document")?;
-    let (intent, _) = intent::read(&doc);
-    let trials = rec
-        .trials
+    Ok(intent::read(&doc).0)
+}
+
+/// The trials `rec` archived, each with `intent`'s metrics read from its archive.
+fn trials_of(rec: &CampaignRecord, intent: &intent::Intent) -> Result<Vec<verdict::Trial>, String> {
+    rec.trials
         .iter()
         .filter(|t| t.state == "succeeded" && !t.archive.is_empty())
         .map(|t| {
@@ -60,10 +63,69 @@ pub(crate) fn of_campaign(rec: &CampaignRecord) -> Result<Verdict, String> {
                 Some(who),
                 &intent.metrics,
             )
-            .map_err(|e| format!("trial `{}`: {e}", t.id))
+            .map_err(|e| format!("campaign `{}`, trial `{}`: {e}", rec.campaign_id, t.id))
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(verdict::verdict(&intent, trials))
+        .collect()
+}
+
+/// Judge `rec`'s experiment, as its workspace holds it, over the trials it archived.
+pub(crate) fn of_campaign(rec: &CampaignRecord) -> Result<Verdict, String> {
+    let intent = intent_of(rec)?;
+    Ok(verdict::verdict(&intent, trials_of(rec, &intent)?))
+}
+
+/// `rec` against `reference`, both judged by `rec`'s experiment.
+pub(crate) fn compare(
+    rec: &CampaignRecord,
+    reference: &CampaignRecord,
+) -> Result<verdict::Comparison, String> {
+    let intent = intent_of(rec)?;
+    Ok(verdict::compare(
+        &intent,
+        trials_of(rec, &intent)?,
+        trials_of(reference, &intent)?,
+    ))
+}
+
+/// `c` as vxAPI's `ResultComparison`.
+pub(crate) fn comparison_to_proto(
+    rec: &CampaignRecord,
+    reference: &CampaignRecord,
+    c: &verdict::Comparison,
+) -> vxedge_api::v1::ResultComparison {
+    use vxedge_api::v1::{CriterionDelta, MetricDelta};
+    vxedge_api::v1::ResultComparison {
+        campaign_id: rec.campaign_id.clone(),
+        reference_campaign_id: reference.campaign_id.clone(),
+        outcome: outcome(c.outcome) as i32,
+        reference_outcome: outcome(c.reference_outcome) as i32,
+        metrics: c
+            .metrics
+            .iter()
+            .map(|m| MetricDelta {
+                metric: m.metric.clone(),
+                point: m.point.clone(),
+                count: m.count as u32,
+                reference_count: m.reference_count as u32,
+                median: m.median,
+                iqr: m.iqr,
+                reference_median: m.reference_median,
+                reference_iqr: m.reference_iqr,
+                delta: m.delta,
+                within_reference_iqr: m.within_reference_iqr,
+            })
+            .collect(),
+        criteria: c
+            .criteria
+            .iter()
+            .map(|d| CriterionDelta {
+                id: d.id.clone(),
+                outcome: outcome(d.outcome) as i32,
+                reference_outcome: outcome(d.reference_outcome) as i32,
+            })
+            .collect(),
+        within: c.within as u32,
+    }
 }
 
 pub(crate) fn outcome(o: Outcome) -> VerdictOutcome {
