@@ -22,6 +22,7 @@ mod services;
 mod status;
 mod telemetry;
 mod vehicle;
+mod verdict;
 
 use clap::Parser;
 use std::sync::Arc;

@@ -67,6 +67,79 @@ message ResultChunk {
   bytes data = 3;
 }
 
+message ResultVerdictRequest {
+  // The campaign whose trials are judged.
+  string campaign_id = 1;
+}
+
+// What a criterion, or a whole verdict, found. `inconclusive` is never a pass.
+enum VerdictOutcome {
+  VERDICT_OUTCOME_UNSPECIFIED = 0;
+  VERDICT_OUTCOME_PASS = 1;
+  VERDICT_OUTCOME_FAIL = 2;
+  VERDICT_OUTCOME_INCONCLUSIVE = 3;
+}
+
+// One metric a criterion read: under which selection, from which trials, and the aggregate taken.
+message VerdictRead {
+  string metric = 1;
+  string aggregate = 2;
+  map<string, ParamValue> select = 3;
+  // The trials read, and each one's value, in the same order.
+  repeated string trials = 4;
+  repeated double values = 5;
+  // Whether every selected trial gave a value from complete telemetry.
+  bool complete = 6;
+  // The aggregate, before the operand's factor and offset; unset when there is none.
+  optional double value = 7;
+}
+
+// How one criterion was judged.
+message CriterionVerdict {
+  string id = 1;
+  VerdictOutcome outcome = 2;
+  // `lt`, `le`, `gt`, `ge`, `within` or `outside` for a comparison; `all` or `any` for a group.
+  string rule = 3;
+  // The operands' values, and the tolerance's; unset when an operand has none.
+  optional double lhs = 4;
+  optional double rhs = 5;
+  optional double tolerance = 6;
+  repeated VerdictRead reads = 7;
+  repeated CriterionVerdict members = 8;
+  repeated CriterionVerdict guards = 9;
+  // Why it is inconclusive, for people.
+  string why = 10;
+}
+
+// One metric's value in one trial.
+message TrialMetricValue {
+  optional double value = 1;
+  bool complete = 2;
+  string why = 3;
+}
+
+message VerdictTrial {
+  string trial_id = 1;
+  string arm = 2;
+  uint32 repetition = 3;
+  map<string, ParamValue> parameters = 4;
+  // `sha256:<hex>` of the trial's archive.
+  string archive_digest = 5;
+  map<string, TrialMetricValue> values = 6;
+}
+
+// An experiment's criteria judged over a campaign's archives.
+message ResultVerdict {
+  string campaign_id = 1;
+  string experiment_id = 2;
+  string hypothesis = 3;
+  // `pass` when every criterion passes, `fail` when one fails, else `inconclusive`.
+  VerdictOutcome outcome = 4;
+  repeated CriterionVerdict criteria = 5;
+  // The archived trials judged. A trial that failed or was not archived is not among them.
+  repeated VerdictTrial trials = 6;
+}
+
 service ResultService {
   // The archives the host's campaigns wrote, and those in a workspace's `results/`, newest first.
   rpc List(ResultListRequest) returns (ResultList);
@@ -75,4 +148,7 @@ service ResultService {
   // The archive's bytes, by digest, so a client that shares no filesystem with the daemon can
   // rerun from it.
   rpc Fetch(ResultFetchRequest) returns (stream ResultChunk);
+  // The experiment's criteria judged over a campaign's archives, read again from the archives
+  // each time.
+  rpc Verdict(ResultVerdictRequest) returns (ResultVerdict);
 }

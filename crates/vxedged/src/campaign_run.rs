@@ -92,6 +92,10 @@ pub struct CampaignRecord {
     pub started_unix_ms: i64,
     #[serde(default)]
     pub finished_unix_ms: i64,
+    /// `pass`, `fail` or `inconclusive`, judged when the campaign finished; empty before, and for
+    /// an experiment without criteria.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub verdict: String,
 }
 
 fn trial_state(s: &str) -> TrialState {
@@ -143,6 +147,7 @@ impl CampaignRecord {
                 .collect(),
             started_unix_ms: self.started_unix_ms,
             finished_unix_ms: self.finished_unix_ms,
+            verdict: crate::verdict::outcome_named(&self.verdict) as i32,
         }
     }
 

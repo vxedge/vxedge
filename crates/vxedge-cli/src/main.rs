@@ -667,6 +667,9 @@ enum CampaignCmd {
     },
     /// One campaign by id, or every campaign on the daemon.
     Status { campaign_id: Option<String> },
+    /// The experiment's criteria judged over a campaign's archived trials, read from the
+    /// archives (`ResultService.Verdict`).
+    Verdict { campaign_id: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1993,6 +1996,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         "id": t.id, "arm": t.arm, "state": t.state, "phase": t.phase,
                                         "archive": t.archive, "sha256": t.sha256, "error": t.error,
                                     })).collect::<Vec<_>>(),
+                                    "verdict": outcome_name(c.verdict),
                                 })
                             })
                             .collect();
@@ -2006,8 +2010,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         .to_lowercase()
                                 })
                                 .unwrap_or_default();
+                            let verdict = vxedge_api::v1::VerdictOutcome::try_from(c.verdict)
+                                .ok()
+                                .filter(|v| *v != vxedge_api::v1::VerdictOutcome::Unspecified)
+                                .map(|v| format!(" verdict {}", outcome_name(v as i32)))
+                                .unwrap_or_default();
                             println!(
-                                "{} {} {} ({})",
+                                "{} {} {}{verdict} ({})",
                                 c.campaign_id, c.experiment_id, state, c.results_dir
                             );
                             for t in &c.trials {
@@ -2030,6 +2039,47 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 );
                             }
+                        }
+                    }
+                }
+                CampaignCmd::Verdict { campaign_id } => {
+                    use vxedge_api::v1::ResultVerdictRequest;
+                    use vxedge_api::v1::result_service_client::ResultServiceClient;
+                    let v = ResultServiceClient::new(channel.clone())
+                        .verdict(ResultVerdictRequest {
+                            campaign_id: campaign_id.clone(),
+                        })
+                        .await?
+                        .into_inner();
+                    if cli.json {
+                        let out = serde_json::json!({
+                            "campaign_id": v.campaign_id, "experiment_id": v.experiment_id,
+                            "hypothesis": v.hypothesis, "outcome": outcome_name(v.outcome),
+                            "criteria": v.criteria.iter().map(criterion_json).collect::<Vec<_>>(),
+                            "trials": v.trials.iter().map(|t| serde_json::json!({
+                                "trial_id": t.trial_id, "arm": t.arm, "repetition": t.repetition,
+                                "archive_digest": t.archive_digest,
+                                "values": t.values.iter().map(|(k, m)| (k.clone(), serde_json::json!({
+                                    "value": m.value, "complete": m.complete, "why": m.why,
+                                }))).collect::<serde_json::Map<_, _>>(),
+                            })).collect::<Vec<_>>(),
+                        });
+                        println!("{}", serde_json::to_string_pretty(&out)?);
+                    } else {
+                        let hypothesis = if v.hypothesis.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" {}", v.hypothesis)
+                        };
+                        println!(
+                            "{} {}{hypothesis}: {} over {} trials",
+                            v.campaign_id,
+                            v.experiment_id,
+                            outcome_name(v.outcome),
+                            v.trials.len()
+                        );
+                        for c in &v.criteria {
+                            print_criterion(c, 1);
                         }
                     }
                 }
@@ -2494,6 +2544,60 @@ impl From<&Job> for JsonJob {
             message: j.message.clone(),
             error: j.error.clone(),
         }
+    }
+}
+
+/// `pass`, `fail`, `inconclusive`, or empty for none.
+fn outcome_name(o: i32) -> &'static str {
+    match vxedge_api::v1::VerdictOutcome::try_from(o) {
+        Ok(vxedge_api::v1::VerdictOutcome::Pass) => "pass",
+        Ok(vxedge_api::v1::VerdictOutcome::Fail) => "fail",
+        Ok(vxedge_api::v1::VerdictOutcome::Inconclusive) => "inconclusive",
+        _ => "",
+    }
+}
+
+fn criterion_json(c: &vxedge_api::v1::CriterionVerdict) -> serde_json::Value {
+    serde_json::json!({
+        "id": c.id, "outcome": outcome_name(c.outcome), "rule": c.rule,
+        "lhs": c.lhs, "rhs": c.rhs, "tolerance": c.tolerance, "why": c.why,
+        "reads": c.reads.iter().map(|r| serde_json::json!({
+            "metric": r.metric, "aggregate": r.aggregate, "trials": r.trials,
+            "values": r.values, "complete": r.complete, "value": r.value,
+        })).collect::<Vec<_>>(),
+        "members": c.members.iter().map(criterion_json).collect::<Vec<_>>(),
+        "guards": c.guards.iter().map(criterion_json).collect::<Vec<_>>(),
+    })
+}
+
+fn print_criterion(c: &vxedge_api::v1::CriterionVerdict, depth: usize) {
+    let pad = "  ".repeat(depth);
+    let num = |v: Option<f64>| v.map_or("-".to_string(), |v| format!("{v:.6}"));
+    let values = if c.members.is_empty() {
+        let tolerance = c
+            .tolerance
+            .map(|t| format!(" ± {}", num(Some(t))))
+            .unwrap_or_default();
+        format!(" {} {} {}{tolerance}", num(c.lhs), c.rule, num(c.rhs))
+    } else {
+        format!(" {}", c.rule)
+    };
+    let why = if c.why.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", c.why)
+    };
+    println!(
+        "{pad}{:<20} {:<12}{values}{why}",
+        if c.id.is_empty() { "-" } else { &c.id },
+        outcome_name(c.outcome)
+    );
+    for m in &c.members {
+        print_criterion(m, depth + 1);
+    }
+    for g in &c.guards {
+        println!("{pad}  guard:");
+        print_criterion(g, depth + 2);
     }
 }
 

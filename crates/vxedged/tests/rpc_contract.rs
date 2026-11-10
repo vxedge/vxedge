@@ -2640,6 +2640,103 @@ async fn results_are_listed_from_their_metadata_and_fetched_by_digest() {
     assert_eq!(reason(&unknown), "ERROR_REASON_RESULT_UNKNOWN");
 }
 
+/// A `vxarchive/1` archive whose probe served `p99` as its last 0.99 quantile.
+fn write_v1_archive(path: &Path, p99: f64) {
+    use std::io::Write;
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+    let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default();
+    zip.start_file("metadata.json", opts).unwrap();
+    zip.write_all(br#"{"experiment_id":"e1","ingest":{"scrapes_failed":0}}"#)
+        .unwrap();
+    zip.start_file("ingest/samples.jsonl", opts).unwrap();
+    for (ts, v) in [(1, p99 / 2.0), (2, p99)] {
+        writeln!(
+            zip,
+            "{}",
+            serde_json::json!({ "ts_unix_ms": ts, "target": "10.0.0.2:9801",
+                "metric": "vxprobe_rtt_seconds", "labels": "{quantile=\"0.99\"}", "value": v })
+        )
+        .unwrap();
+    }
+    zip.finish().unwrap();
+}
+
+/// `ResultService.Verdict` judges the experiment's criteria over a campaign's archived trials,
+/// reading the archives; `CampaignStatus` carries the verdict recorded at the end; an unknown
+/// campaign is `CAMPAIGN_UNKNOWN`.
+#[tokio::test]
+async fn a_campaign_verdict_is_judged_from_its_archives() {
+    use vxedge_api::v1::campaign_service_client::CampaignServiceClient;
+    use vxedge_api::v1::result_service_client::ResultServiceClient;
+    use vxedge_api::v1::{CampaignGetRequest, ResultVerdictRequest, VerdictOutcome};
+    let (dir, _) = experiment_workspace();
+    let main = std::fs::read_to_string(dir.join("main.yaml")).unwrap();
+    let intent = "\nhypothesis: { id: H1, statement: busy p99 stays within 2x of idle }\n\
+parameters:\n  load_mbps: { type: integer, unit: Mbit/s, default: 0, min: 0, max: 1000 }\n\
+metrics:\n  - { id: p99, kind: gauge, unit: s, entity: measurements/rtt, series: vxprobe_rtt_seconds, labels: { quantile: \"0.99\" } }\n\
+criteria:\n  - { id: h1, op: le, lhs: { metric: p99, aggregate: median, select: { arm: busy } }, rhs: { metric: p99, aggregate: median, select: { arm: idle }, factor: 2.0 } }\n";
+    std::fs::write(dir.join("main.yaml"), format!("{main}{intent}")).unwrap();
+    let results = dir.join("results/c-1");
+    let mut trials = Vec::new();
+    for (rep, arm, load, p99) in [
+        (1, "idle", 0, 0.001),
+        (1, "busy", 600, 0.0015),
+        (2, "idle", 0, 0.002),
+        (2, "busy", 600, 0.0025),
+    ] {
+        let id = format!("r{rep}-{arm}");
+        let archive = results.join(format!("{id}.zip"));
+        write_v1_archive(&archive, p99);
+        trials.push(serde_json::json!({
+            "id": id, "arm": arm, "repetition": rep, "parameters": { "load_mbps": load },
+            "state": "succeeded", "archive": archive.display().to_string(), "sha256": "ab",
+        }));
+    }
+    let record = serde_json::json!({
+        "campaign_id": "c-1", "state": "succeeded", "job_id": "j", "experiment_id": "e1",
+        "workspace": dir.display().to_string(), "results_dir": results.display().to_string(),
+        "trials": trials, "started_unix_ms": 1, "finished_unix_ms": 2, "verdict": "pass",
+    });
+    let daemon = Daemon::start_with(|rt| {
+        std::fs::create_dir_all(rt.join("campaigns")).unwrap();
+        std::fs::write(rt.join("campaigns/c-1.json"), record.to_string()).unwrap();
+    });
+    let channel = daemon.channel().await;
+    let v = ResultServiceClient::new(channel.clone())
+        .verdict(ResultVerdictRequest {
+            campaign_id: "c-1".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(v.outcome, VerdictOutcome::Pass as i32, "{v:?}");
+    assert_eq!(v.hypothesis, "H1");
+    assert_eq!(v.trials.len(), 4);
+    assert_eq!(v.trials[0].archive_digest, "sha256:ab");
+    let h1 = &v.criteria[0];
+    assert_eq!((h1.id.as_str(), h1.rule.as_str()), ("h1", "le"));
+    assert_eq!((h1.lhs, h1.rhs), (Some(0.002), Some(0.003)));
+    assert_eq!(h1.reads[0].trials, ["r1-busy", "r2-busy"]);
+
+    let status = CampaignServiceClient::new(channel.clone())
+        .get(CampaignGetRequest {
+            campaign_id: "c-1".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(status.verdict, VerdictOutcome::Pass as i32);
+
+    let unknown = ResultServiceClient::new(channel)
+        .verdict(ResultVerdictRequest {
+            campaign_id: "nope".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&unknown), "ERROR_REASON_CAMPAIGN_UNKNOWN");
+}
+
 /// Typed intent that holds adds no problem.
 #[tokio::test]
 async fn typed_intent_that_holds_plans_clean() {

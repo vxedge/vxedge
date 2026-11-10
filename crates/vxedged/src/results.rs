@@ -13,7 +13,7 @@ use tonic::{Request, Response, Status};
 use vxedge_api::v1::result_service_server::ResultService;
 use vxedge_api::v1::{
     ResultChunk, ResultFetchRequest, ResultGetRequest, ResultInfo, ResultList, ResultListRequest,
-    ResultTrial,
+    ResultTrial, ResultVerdict, ResultVerdictRequest,
 };
 
 use crate::errors::{self, R};
@@ -211,6 +211,23 @@ impl ResultService for ResultSvc {
             .await
             .map_err(|e| Status::internal(format!("get task panicked: {e}")))??;
         Ok(Response::new(info))
+    }
+
+    async fn verdict(
+        &self,
+        req: Request<ResultVerdictRequest>,
+    ) -> Result<Response<ResultVerdict>, Status> {
+        let id = req.into_inner().campaign_id;
+        let rec = crate::campaign_run::read(&self.runtime_dir, &id)
+            .ok_or_else(|| crate::campaign::unknown(&id))?;
+        let judged = tokio::task::spawn_blocking(move || {
+            crate::verdict::of_campaign(&rec).map(|v| crate::verdict::to_proto(&rec, &v))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("verdict task panicked: {e}")))?;
+        judged
+            .map(Response::new)
+            .map_err(|e| errors::precondition(R::ResultUnknown, e))
     }
 
     async fn fetch(
