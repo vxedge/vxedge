@@ -24,6 +24,7 @@ tun = { workspace = true }
 bollard = { workspace = true }
 cloud-hypervisor-client = { workspace = true }
 zip = { workspace = true }
+roxmltree = { workspace = true }
 zstd = { workspace = true }
 
 [dev-dependencies]

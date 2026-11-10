@@ -2256,6 +2256,104 @@ async fn inspect_types_parameters_criteria_campaign_and_measurements() {
     assert!(info.problems.is_empty(), "{:?}", info.problems);
 }
 
+/// A minimal OpenSCENARIO storyboard and OpenDRIVE road, written for these tests.
+const STORYBOARD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<OpenSCENARIO>
+  <FileHeader revMajor="1" revMinor="2" date="2026-11-10T00:00:00" description="test" author="vxedge"/>
+  <ParameterDeclarations>
+    <ParameterDeclaration name="EgoTargetSpeed" parameterType="double" value="13.9"/>
+  </ParameterDeclarations>
+  <Entities><ScenarioObject name="Ego"/><ScenarioObject name="Lead"/></Entities>
+</OpenSCENARIO>"#;
+
+/// `Inspect` returns a package's scenario typed, read through the legacy `world:` too; a
+/// scenario that cannot run is `ERROR_REASON_SCENARIO_INVALID` in `Plan`, and `up` refuses it
+/// before anything is provisioned.
+#[tokio::test]
+async fn a_scenario_is_typed_in_inspect_and_checked_by_plan() {
+    use vxedge_api::v1::package_service_client::PackageServiceClient;
+    use vxedge_api::v1::{ErrorReason, PackageInspectRequest};
+    let daemon = Daemon::start();
+    let channel = daemon.channel().await;
+    let (dir, _) = experiment_workspace();
+    let vehicle = vxedge_core::Workspace::load(&dir).unwrap().vehicles[0]
+        .id
+        .clone();
+    std::fs::create_dir_all(dir.join("assets")).unwrap();
+    std::fs::write(dir.join("assets/stop.xosc"), STORYBOARD).unwrap();
+    std::fs::write(
+        dir.join("assets/grid.xodr"),
+        "<?xml version=\"1.0\"?><OpenDRIVE><header revMajor=\"1\" revMinor=\"6\"/></OpenDRIVE>",
+    )
+    .unwrap();
+    let docs = |actor: &str| {
+        format!(
+            "kind: road\nid: grid\nnetwork: assets/grid.xodr\n---\nkind: scenario\nid: stop\nroad: grid\n\
+             storyboard: assets/stop.xosc\nsimulator: esmini\nclock: {{ tick_ms: 10 }}\nseed: 42\n\
+             actors: {{ {actor}: {{ vehicle: {vehicle} }} }}\n\
+             parameters: {{ EgoTargetSpeed: {{ unit: m/s, min: 0, max: 22.2 }} }}\n"
+        )
+    };
+    std::fs::write(dir.join("scenario.yaml"), docs("Ego")).unwrap();
+    let main = std::fs::read_to_string(dir.join("main.yaml")).unwrap();
+    std::fs::write(dir.join("main.yaml"), format!("{main}\nworld: stop\n")).unwrap();
+
+    let info = PackageServiceClient::new(channel.clone())
+        .inspect(PackageInspectRequest {
+            package: path_ref(&dir),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(info.problems.is_empty(), "{:?}", info.problems);
+    let sc = info.scenario.expect("the scenario, through `world:`");
+    assert_eq!(
+        (
+            sc.id.as_str(),
+            sc.road_network.as_str(),
+            sc.simulator.as_str()
+        ),
+        ("stop", "assets/grid.xodr", "esmini")
+    );
+    assert_eq!((sc.clock_tick_ms, sc.seed), (10, Some(42)));
+    assert_eq!(sc.actors["Ego"], vehicle);
+    assert_eq!(sc.entities, ["Ego", "Lead"]);
+    let p = &sc.parameters[0];
+    assert_eq!(
+        (p.name.as_str(), p.max, p.declared_value.as_str()),
+        ("EgoTargetSpeed", Some(22.2), "13.9")
+    );
+
+    // An actor the storyboard does not have.
+    std::fs::write(dir.join("scenario.yaml"), docs("Truck")).unwrap();
+    let plan = plan_of(&channel, &dir).await;
+    let scenario: Vec<_> = plan
+        .problems
+        .iter()
+        .filter(|p| p.reason == ErrorReason::ScenarioInvalid as i32)
+        .collect();
+    assert_eq!(scenario.len(), 1, "{:?}", plan.problems);
+    assert!(
+        scenario[0].detail.contains("`Truck` is not an entity"),
+        "{scenario:?}"
+    );
+    let refused = vxedge_api::v1::experiment_service_client::ExperimentServiceClient::new(channel)
+        .up(vxedge_api::v1::ExperimentUpRequest {
+            manifest: path_ref(&dir),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        [
+            "ERROR_REASON_SCENARIO_INVALID",
+            "ERROR_REASON_LOCAL_IMAGE_MISSING"
+        ]
+        .contains(&reason(&refused).as_str()),
+        "{refused:?}"
+    );
+}
+
 /// A package imported by its bytes is listed, and every verb then reaches it by digest.
 #[tokio::test]
 async fn an_imported_package_is_listed_and_addressed_by_digest() {

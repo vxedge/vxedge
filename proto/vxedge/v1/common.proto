@@ -153,6 +153,11 @@ enum ErrorReason {
   ERROR_REASON_CAMPAIGN_UNKNOWN = 32;
   // An archive digest this host's results do not hold.
   ERROR_REASON_RESULT_UNKNOWN = 33;
+  // A scenario or road the package cannot run: a file missing or not OpenSCENARIO or OpenDRIVE,
+  // a road id that does not resolve, an actor that is not an entity of the storyboard or a
+  // vehicle of the package, or a parameter the storyboard does not declare. `Plan` names every
+  // one before anything runs.
+  ERROR_REASON_SCENARIO_INVALID = 34;
 }
 
 // Names one run. See `RunService`.

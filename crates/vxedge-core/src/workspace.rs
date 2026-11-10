@@ -266,6 +266,7 @@ pub enum Kind {
     Experiment,
     Vehicle,
     Road,
+    Scenario,
     Baseline,
     Component,
 }
@@ -276,6 +277,7 @@ impl Kind {
             Kind::Experiment => "experiment",
             Kind::Vehicle => "vehicle",
             Kind::Road => "road",
+            Kind::Scenario => "scenario",
             Kind::Baseline => "baseline",
             Kind::Component => "component",
         }
@@ -321,8 +323,12 @@ pub struct ExperimentDoc {
     pub vehicles: Vec<String>,
     #[serde(default)]
     pub baseline: Option<String>,
+    /// The legacy name of `scenario`, read as it for two minor releases (decision X-8).
     #[serde(default)]
     pub world: Option<String>,
+    /// The `kind: scenario` document the experiment runs on, by id.
+    #[serde(default)]
+    pub scenario: Option<String>,
     #[serde(default)]
     pub network: Option<NetworkDoc>,
     #[serde(default)]
@@ -350,6 +356,13 @@ pub struct ExperimentDoc {
     pub criteria: Option<serde_yaml_ng::Value>,
     #[serde(default)]
     pub campaign: Option<serde_yaml_ng::Value>,
+}
+
+impl ExperimentDoc {
+    /// The scenario the experiment runs on: `scenario`, or the legacy `world` naming it.
+    pub fn scenario_ref(&self) -> Option<&str> {
+        self.scenario.as_deref().or(self.world.as_deref())
+    }
 }
 
 /// `tunnels`/`nos_check`/`data_plane`/`defaults` are opaque `Value`s for the same reason
@@ -832,6 +845,9 @@ pub struct Workspace {
     pub vehicles: Vec<VehicleDoc>,
     pub baselines: Vec<BaselineDoc>,
     pub roads: Vec<String>,
+    /// The `kind: road` documents, in the order read (their ids are also in `roads`).
+    pub road_docs: Vec<crate::scenario::RoadDoc>,
+    pub scenarios: Vec<crate::scenario::ScenarioDoc>,
     pub components: Vec<String>,
     /// The `.vxp` descriptor, when the directory holds one. Always `None` for a workspace read
     /// from text: an inline manifest carries no descriptor.
@@ -1011,7 +1027,11 @@ impl Workspace {
                 }
                 Kind::Vehicle => self.vehicles.push(doc(value, path)?),
                 Kind::Baseline => self.baselines.push(doc(value, path)?),
-                Kind::Road => self.roads.push(header.id),
+                Kind::Road => {
+                    self.road_docs.push(doc(value, path)?);
+                    self.roads.push(header.id);
+                }
+                Kind::Scenario => self.scenarios.push(doc(value, path)?),
                 Kind::Component => self.components.push(header.id),
             }
         }
@@ -1062,6 +1082,9 @@ impl Workspace {
         }
         for id in &self.roads {
             note(id, Kind::Road, &mut errors);
+        }
+        for d in &self.scenarios {
+            note(&d.id, Kind::Scenario, &mut errors);
         }
 
         // Component ids must be unique workspace-wide: `target_ids` is flat, so an id repeated
@@ -1318,10 +1341,34 @@ impl Workspace {
     /// their `binds`, the campaign and the criteria, each typed as a parameter or a criterion
     /// problem. Public so `Plan` and `up` run exactly the checks `experiment validate` does.
     pub fn intent_problems(&self) -> Vec<crate::intent::Problem> {
-        self.experiments_raw
+        let mut problems: Vec<_> = self
+            .experiments_raw
             .iter()
             .flat_map(crate::intent::check)
-            .collect()
+            .collect();
+        problems.extend(self.scenario_problems());
+        problems
+    }
+
+    /// Every problem with the workspace's roads and scenarios, and with the experiment's
+    /// `scenario` reference (`ARCHITECTURE.md` §6.0.3), typed as scenario problems.
+    pub fn scenario_problems(&self) -> Vec<crate::intent::Problem> {
+        let experiment = self.experiments.first();
+        if self.scenarios.is_empty()
+            && self.road_docs.is_empty()
+            && experiment.and_then(ExperimentDoc::scenario_ref).is_none()
+        {
+            return Vec::new();
+        }
+        let vehicles: Vec<String> = self.vehicles.iter().map(|v| v.id.clone()).collect();
+        crate::scenario::check(&crate::scenario::Inputs {
+            root: &self.root,
+            experiment: experiment.map_or("?", |e| e.id.as_str()),
+            scenario_ref: experiment.and_then(ExperimentDoc::scenario_ref),
+            roads: &self.road_docs,
+            scenarios: &self.scenarios,
+            vehicles: &vehicles,
+        })
     }
 
     /// The `.vxp` descriptor's agreement with the documents: its `id` is the experiment's id,

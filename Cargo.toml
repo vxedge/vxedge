@@ -50,6 +50,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3"
 zip = { version = "9", default-features = false, features = ["deflate"] }
+# Reads a scenario's OpenSCENARIO entities and parameter declarations; pure Rust, read-only.
+roxmltree = "0.21"
 # Archive v2 members are zstd-compressed (decision X-7); the verdict engine reads them.
 zstd = { version = "0.13", default-features = false }
 # Podman's Docker-compatible REST API over the rootless user socket. Unix-socket transport
