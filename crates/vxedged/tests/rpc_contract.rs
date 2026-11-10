@@ -779,6 +779,7 @@ devices:
   d: { role: ecu, zone: z, backend: cloud-hypervisor }
   e: { role: sensor, zone: z, backend: wasm-capsule }
   f: { role: ecu, zone: z, backend: container }
+  g: { role: ecu, zone: z, backend: qemu-mcu }
   idle: { role: ecu, zone: z, backend: container }
 functions:
   fa: { deployed_on: a }
@@ -787,6 +788,7 @@ functions:
   fd: { deployed_on: d }
   fe: { deployed_on: e }
   ff: { deployed_on: f }
+  fg: { deployed_on: g }
 links:
   - { id: la, endpoints: [{ node: a, port: eth0, ip: 10.2.0.1/24 }], slice: adas }
   - { id: lb, endpoints: [{ node: b, port: eth0, ip: 10.2.0.2/24 }], slice: adas }
@@ -794,6 +796,7 @@ links:
   - { id: ld, endpoints: [{ node: d, port: eth0, ip: 10.2.0.4/24 }], slice: adas }
   - { id: le, endpoints: [{ node: e, port: eth0, ip: 10.2.0.5/24 }], slice: adas }
   - { id: lf, endpoints: [{ node: f, port: eth0, ip: 10.2.0.6/24 }], slice: adas }
+  - { id: lg, endpoints: [{ node: g, port: eth0, ip: 10.2.0.7/24 }], slice: adas }
 ---
 kind: baseline
 id: bl
@@ -803,6 +806,7 @@ parts:
     digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     target_ids: fa
   - { ref: ./bundle, kind: bundle, target_ids: [fb, fc, fd] }
+  - { ref: ./firmware, kind: bundle, target_ids: fg }
   - { ref: ./capsule.wasm, kind: wasm, target_ids: fe }
 "#;
 
@@ -983,6 +987,7 @@ async fn node_status_is_typed_on_every_backend() {
         ("d", NodeBackend::CloudHypervisor, PayloadKind::GuestBundle),
         ("e", NodeBackend::WasmCapsule, PayloadKind::Wasm),
         ("f", NodeBackend::Container, PayloadKind::HostProcess),
+        ("g", NodeBackend::QemuMcu, PayloadKind::GuestBundle),
     ] {
         let node = spec(id);
         assert_eq!(node.backend, backend as i32, "{id}");
@@ -1028,7 +1033,7 @@ async fn a_declared_device_nothing_provisions_is_unprovisioned() {
         .into_inner();
     let idle = status.components.iter().find(|c| c.vxid == "idle").unwrap();
     assert_eq!(idle.state, ResourceState::Unprovisioned as i32);
-    assert_eq!(status.nodes.len(), 6, "typed entries for provisioned nodes");
+    assert_eq!(status.nodes.len(), 7, "typed entries for provisioned nodes");
 }
 
 #[tokio::test]
@@ -1590,7 +1595,7 @@ async fn host_capabilities_cover_every_backend() {
         .into_inner();
     let mut backends: Vec<i32> = caps.backends.iter().map(|b| b.backend).collect();
     backends.sort();
-    assert_eq!(backends, [1, 2, 3, 4, 5, 6]);
+    assert_eq!(backends, [1, 2, 3, 4, 5, 6, 7]);
     assert!(
         caps.backends
             .iter()

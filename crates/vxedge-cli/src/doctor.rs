@@ -306,6 +306,16 @@ fn tier2() -> Vec<Check> {
         ),
     ));
 
+    // Optional: only `backend: qemu-mcu` needs it.
+    c.push(check(
+        2,
+        "QEMU Arm (qemu-system-arm)",
+        false,
+        present("qemu-system-arm", &["--version"]),
+        cmd_version("qemu-system-arm", &["--version"]).unwrap_or_else(|| "not found".to_string()),
+        Some("needed only for `backend: qemu-mcu`: apt install qemu-system-arm"),
+    ));
+
     c.push(check(
         2,
         "libvirt >= 10.x",

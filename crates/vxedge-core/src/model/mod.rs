@@ -152,16 +152,20 @@ pub enum Backend {
     /// A guest that brings its own host stack: vxedge runs the part's adapter and adopts the
     /// network interface the platform creates (ARCHITECTURE.md §9).
     Attach,
+    /// Microcontroller firmware on an emulated board: QEMU's `mps2-an385` (Cortex-M3) under TCG,
+    /// with the command line passed through semihosting (ARCHITECTURE.md §9).
+    QemuMcu,
 }
 
 impl Backend {
-    pub const ALL: [Backend; 6] = [
+    pub const ALL: [Backend; 7] = [
         Self::Container,
         Self::QemuMicrovm,
         Self::Libvirt,
         Self::CloudHypervisor,
         Self::WasmCapsule,
         Self::Attach,
+        Self::QemuMcu,
     ];
 
     /// The name a manifest uses: the one table every reader of a backend name goes through.
@@ -173,6 +177,7 @@ impl Backend {
             Self::CloudHypervisor => "cloud-hypervisor",
             Self::WasmCapsule => "wasm-capsule",
             Self::Attach => "attach",
+            Self::QemuMcu => "qemu-mcu",
         }
     }
 }

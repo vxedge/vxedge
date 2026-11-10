@@ -178,6 +178,8 @@ enum NodeBackend {
   NODE_BACKEND_WASM_CAPSULE = 5;
   // A guest that brings its own host stack: the node's part is an adapter (ARCHITECTURE.md §9).
   NODE_BACKEND_ATTACH = 6;
+  // Microcontroller firmware on an emulated board, under TCG (ARCHITECTURE.md §9).
+  NODE_BACKEND_QEMU_MCU = 7;
 }
 
 // What a node runs.
@@ -233,9 +235,10 @@ message ResourceStatus {
 message NodeStatus {
   ResourceStatus status = 1;
   NodeSpec spec = 2;
-  // The instruction set of the machine a running VM guest runs on (`x86_64`, `aarch64`; a 32-bit
-  // x86 guest runs on an `x86_64` machine), read from the guest's own emulator. Empty when the node
-  // is not a running `qemu-microvm` guest.
+  // The instruction set of the machine a running VM guest runs on (`x86_64`, `aarch64`, or
+  // `armv7m` for a `qemu-mcu` microcontroller; a 32-bit x86 guest runs on an `x86_64` machine),
+  // read from the guest's own emulator. Empty when the node is not a running `qemu-microvm` or
+  // `qemu-mcu` guest.
   string arch = 3;
   // How that guest's CPU runs: `kvm`, or `tcg` (QEMU's emulator, on a host of another
   // instruction set). A `tcg` result is functional evidence only and is never timed. Empty when

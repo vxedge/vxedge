@@ -237,7 +237,11 @@ fn end_problems(
         return;
     };
     if let Some(
-        b @ (Backend::QemuMicrovm | Backend::Libvirt | Backend::CloudHypervisor | Backend::Attach),
+        b @ (Backend::QemuMicrovm
+        | Backend::Libvirt
+        | Backend::CloudHypervisor
+        | Backend::Attach
+        | Backend::QemuMcu),
     ) = device.backend
     {
         push(
