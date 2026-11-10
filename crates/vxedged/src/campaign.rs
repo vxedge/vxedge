@@ -199,7 +199,7 @@ fn campaign_id(request_id: &str, root: &Path) -> String {
     format!("c-{}", &hex[..12])
 }
 
-fn unknown(id: &str) -> Status {
+pub(crate) fn unknown(id: &str) -> Status {
     errors::not_found(
         R::CampaignUnknown,
         format!("no campaign `{id}` on this daemon (`CampaignService.List` names them)"),
@@ -368,6 +368,7 @@ impl CampaignService for CampaignSvc {
             trials,
             started_unix_ms: now_ms(),
             finished_unix_ms: 0,
+            verdict: String::new(),
         }));
         let (steps, runtime_dir) = (self.steps.clone(), self.runtime_dir.clone());
         let rec = record.clone();
@@ -428,7 +429,27 @@ impl CampaignService for CampaignSvc {
                         }
                         save(&r);
                     }
+                    // The verdict over what was archived, from the archives, before the campaign
+                    // reads as finished.
+                    let snapshot = rec.lock().expect("campaign record").clone();
+                    let judged =
+                        tokio::task::spawn_blocking(move || crate::verdict::of_campaign(&snapshot))
+                            .await
+                            .map_err(|e| e.to_string())
+                            .and_then(|v| v);
                     let mut r = rec.lock().expect("campaign record");
+                    match judged {
+                        Ok(v) if !v.criteria.is_empty() => {
+                            r.verdict = v.outcome.as_str().to_string();
+                            let path = PathBuf::from(&r.results_dir).join("verdict.json");
+                            let _ = std::fs::write(
+                                &path,
+                                serde_json::to_vec_pretty(&v).unwrap_or_default(),
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(campaign = %id, "no verdict: {e}"),
+                    }
                     let failed = r.trials.iter().filter(|t| t.state == "failed").count();
                     r.state = if cancelled {
                         "cancelled".into()

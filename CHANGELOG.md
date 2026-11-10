@@ -6,6 +6,16 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`ResultService.Verdict`** judges the experiment's criteria over a campaign's archived trials,
+  reading them from the archives on every call. Per criterion it gives the outcome, the operand
+  values, every metric read with its trials and values, and why it is inconclusive when it is.
+  `vxedge campaign verdict <id>` prints it.
+- **A campaign records its verdict when it finishes:** in `campaign.json`, as
+  `CampaignStatus.verdict` (shown by `vxedge campaign status`), and in full as `verdict.json`
+  beside the archives.
+
 ### Changed
 
 - **Criteria read results one value per trial** (decisions X-24, X-25). A metric names its

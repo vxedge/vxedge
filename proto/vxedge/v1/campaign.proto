@@ -5,6 +5,7 @@ package vxedge.v1;
 import "vxedge/v1/common.proto";
 import "vxedge/v1/jobs.proto";
 import "vxedge/v1/package.proto";
+import "vxedge/v1/results.proto";
 import "vxedge/v1/workspace.proto";
 
 // ---------------------------------------------------------------------------
@@ -111,6 +112,8 @@ message CampaignStatus {
   repeated CampaignTrialStatus trials = 10;
   int64 started_unix_ms = 11;
   int64 finished_unix_ms = 12;
+  // The verdict judged when the campaign finished; unspecified until then.
+  VerdictOutcome verdict = 13;
 }
 
 message CampaignGetRequest {
