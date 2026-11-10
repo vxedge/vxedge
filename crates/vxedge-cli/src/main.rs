@@ -119,6 +119,12 @@ enum Command {
         #[command(subcommand)]
         cmd: ExperimentCmd,
     },
+    /// An experiment's criteria judged over results archives on this machine, offline: no
+    /// daemon, no campaign record (ARCHITECTURE.md §6.0.3).
+    Results {
+        #[command(subcommand)]
+        cmd: ResultsCmd,
+    },
     /// `vxp/1` packages: scaffold, validate, lock, pack, unpack and inspect (local and offline,
     /// ARCHITECTURE.md §6.0.7).
     Pkg {
@@ -679,6 +685,33 @@ enum CampaignCmd {
 }
 
 #[derive(Subcommand, Debug)]
+enum ResultsCmd {
+    /// Judge the experiment's criteria over these archives (files, or folders of `.zip`).
+    Verdict {
+        /// The experiment: a workspace folder, or a file holding its `kind: experiment` document.
+        #[arg(long)]
+        experiment: std::path::PathBuf,
+        archives: Vec<std::path::PathBuf>,
+        /// Who each trial is, from its file name, for archives written before campaigns named
+        /// their trials: `rep{repetition}-load{load_mbps}`, `rep{repetition}-{arm}`.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Set these archives against reference archives, per metric at each point and per
+    /// criterion, as `ResultService.Compare` does.
+    Compare {
+        #[arg(long)]
+        experiment: std::path::PathBuf,
+        #[arg(long, num_args = 1.., required = true)]
+        archives: Vec<std::path::PathBuf>,
+        #[arg(long, num_args = 1.., required = true)]
+        reference: Vec<std::path::PathBuf>,
+        #[arg(long)]
+        name: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum MeasureCmd {
     /// Start measurements: each one's reflector, then its sender.
     Start {
@@ -858,6 +891,178 @@ fn scaffold_package(
 }
 
 /// The `pkg` verbs. All local: no daemon, no network.
+/// The typed intent of the experiment at `path`: a workspace folder, or a file of YAML documents
+/// one of which is `kind: experiment`.
+fn experiment_intent(
+    path: &std::path::Path,
+) -> Result<vxedge_core::intent::Intent, Box<dyn std::error::Error>> {
+    use serde::Deserialize as _;
+    let doc = if path.is_dir() {
+        vxedge_core::Workspace::load(path)?
+            .experiments_raw
+            .first()
+            .cloned()
+    } else {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        serde_yaml_ng::Deserializer::from_str(&text)
+            .filter_map(|d| serde_yaml_ng::Value::deserialize(d).ok())
+            .find(|d| d.get("kind").and_then(|k| k.as_str()) == Some("experiment"))
+    }
+    .ok_or_else(|| format!("{}: no `kind: experiment` document", path.display()))?;
+    let (intent, problems) = vxedge_core::intent::read(&doc);
+    if let Some(p) = problems.first() {
+        return Err(format!("{p}").into());
+    }
+    Ok(intent)
+}
+
+/// The trials in `paths` (archives, or folders of them), named by `name` or by their metadata.
+fn local_trials(
+    paths: &[std::path::PathBuf],
+    name: Option<&str>,
+    metrics: &[vxedge_core::intent::Metric],
+) -> Result<Vec<vxedge_core::verdict::Trial>, Box<dyn std::error::Error>> {
+    let mut files = Vec::new();
+    for p in paths {
+        if p.is_dir() {
+            let mut zips: Vec<_> = std::fs::read_dir(p)?
+                .flatten()
+                .map(|e| e.path())
+                .filter(|f| f.extension().is_some_and(|x| x == "zip"))
+                .collect();
+            zips.sort();
+            files.extend(zips);
+        } else {
+            files.push(p.clone());
+        }
+    }
+    files
+        .iter()
+        .map(|f| {
+            let stem = f.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+            let who = match name {
+                Some(pattern) => Some(
+                    vxedge_core::verdict::identity_from_name(pattern, stem).ok_or_else(|| {
+                        format!("{}: does not match --name `{pattern}`", f.display())
+                    })?,
+                ),
+                None => None,
+            };
+            let digest = vxedge_core::pkg::sha256(&std::fs::read(f)?);
+            Ok(vxedge_core::verdict::trial(f, digest, who, metrics)?)
+        })
+        .collect()
+}
+
+fn print_judgement(j: &vxedge_core::intent::Judgement, depth: usize) {
+    let pad = "  ".repeat(depth);
+    let num = |v: Option<f64>| v.map_or("-".to_string(), |v| format!("{v:.6}"));
+    let values = if j.members.is_empty() {
+        let tolerance = j
+            .tolerance
+            .map(|t| format!(" ± {}", num(Some(t))))
+            .unwrap_or_default();
+        format!(" {} {} {}{tolerance}", num(j.lhs), j.rule, num(j.rhs))
+    } else {
+        format!(" {}", j.rule)
+    };
+    let why = j
+        .why
+        .as_deref()
+        .map(|w| format!(" ({w})"))
+        .unwrap_or_default();
+    println!(
+        "{pad}{:<20} {:<12}{values}{why}",
+        j.id.as_deref().unwrap_or("-"),
+        j.outcome.as_str()
+    );
+    for m in &j.members {
+        print_judgement(m, depth + 1);
+    }
+    for g in &j.guards {
+        println!("{pad}  guard:");
+        print_judgement(g, depth + 2);
+    }
+}
+
+fn results(cmd: &ResultsCmd, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    match cmd {
+        ResultsCmd::Verdict {
+            experiment,
+            archives,
+            name,
+        } => {
+            let intent = experiment_intent(experiment)?;
+            let trials = local_trials(archives, name.as_deref(), &intent.metrics)?;
+            let v = vxedge_core::verdict::verdict(&intent, trials);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&v)?);
+            } else {
+                let hypothesis = v
+                    .hypothesis
+                    .as_deref()
+                    .map(|h| format!("{h}: "))
+                    .unwrap_or_default();
+                println!(
+                    "{hypothesis}{} over {} trials",
+                    v.outcome.as_str(),
+                    v.trials.len()
+                );
+                for c in &v.criteria {
+                    print_judgement(c, 1);
+                }
+            }
+        }
+        ResultsCmd::Compare {
+            experiment,
+            archives,
+            reference,
+            name,
+        } => {
+            let intent = experiment_intent(experiment)?;
+            let ours = local_trials(archives, name.as_deref(), &intent.metrics)?;
+            let theirs = local_trials(reference, name.as_deref(), &intent.metrics)?;
+            let c = vxedge_core::verdict::compare(&intent, ours, theirs);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&c)?);
+            } else {
+                println!(
+                    "{} of {} within the reference's IQR; verdict {} (reference {})",
+                    c.within,
+                    c.metrics.len(),
+                    c.outcome.as_str(),
+                    c.reference_outcome.as_str()
+                );
+                for m in &c.metrics {
+                    println!(
+                        "  {:<16} {:<20} {:>12.6} vs {:>12.6} ± {:<12.6} {:+.6} {}",
+                        m.metric,
+                        m.point,
+                        m.median,
+                        m.reference_median,
+                        m.reference_iqr,
+                        m.delta,
+                        if m.within_reference_iqr {
+                            "within"
+                        } else {
+                            "outside"
+                        }
+                    );
+                }
+                for d in &c.criteria {
+                    println!(
+                        "  {:<20} {} (reference {})",
+                        d.id,
+                        d.outcome.as_str(),
+                        d.reference_outcome.as_str()
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn pkg(cmd: &PkgCmd, json: bool) -> Result<(), Box<dyn std::error::Error>> {
     use vxedge_core::pkg;
     let fail = |problems: &[String], root: &std::path::Path| -> ! {
@@ -2224,6 +2429,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Command::Pkg { cmd } => pkg(cmd, cli.json)?,
+        Command::Results { cmd } => results(cmd, cli.json)?,
         Command::Manifest { cmd } => match cmd {
             ManifestCmd::Validate { manifest } => {
                 // A §6.0 workspace: a directory, or one file of `---`-separated documents.

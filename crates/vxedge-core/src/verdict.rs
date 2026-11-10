@@ -5,7 +5,8 @@
 //! on its entity inside the trial's measure phase, or the whole archive when it records no phases.
 //! A criterion's aggregates then run across the trials it selects. A `vxarchive/1` archive names
 //! no entities, so its series is matched by name and labels, and refused as ambiguous when more
-//! than one scrape target served it.
+//! than one scrape target served it. It counts failed scrapes without placing them in time, so
+//! they are noted on the value instead of making it incomplete.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read as _;
@@ -210,8 +211,8 @@ pub fn read_archive(path: &Path) -> Result<Records, String> {
     Ok(records)
 }
 
-/// A metric's value in one trial, whether its telemetry was complete, and why it has no value
-/// when it has none.
+/// A metric's value in one trial, whether its telemetry was complete, and a note: why it has no
+/// value, or what about the value cannot be known.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TrialValue {
     pub value: Option<f64>,
@@ -281,18 +282,29 @@ fn series_value(records: &Records, m: &Metric, series: &str, window: (i64, i64))
             m.entity
         ));
     };
-    let complete = if v1 {
-        records.metadata["ingest"]["scrapes_failed"]
+    if v1 {
+        // A vxarchive/1 archive counts its failed scrapes but cannot place them in time, and
+        // its runs scraped on after the probe had stopped, so a count is not a gap in the series.
+        let failed = records.metadata["ingest"]["scrapes_failed"]
             .as_u64()
-            .is_none_or(|n| n == 0)
-    } else {
-        !records.gaps.iter().any(|g| {
-            g.entity == m.entity
-                && g.metric.as_deref().is_none_or(|x| x == series)
-                && g.from_ns < to
-                && g.to_ns > from
-        })
-    };
+            .unwrap_or(0);
+        return TrialValue {
+            value: Some(last.value),
+            complete: true,
+            why: (failed > 0).then(|| {
+                format!(
+                    "the run counted {failed} failed scrapes, which a vxarchive/1 archive cannot \
+                     place in time"
+                )
+            }),
+        };
+    }
+    let complete = !records.gaps.iter().any(|g| {
+        g.entity == m.entity
+            && g.metric.as_deref().is_none_or(|x| x == series)
+            && g.from_ns < to
+            && g.to_ns > from
+    });
     TrialValue {
         value: Some(last.value),
         complete,
@@ -380,6 +392,80 @@ impl Identity {
             parameters,
         })
     }
+}
+
+/// Who a trial is, from its archive's file stem and a `pattern` such as
+/// `rep{repetition}-load{load_mbps}` or `rep{repetition}-{arm}`, for an archive written before
+/// campaigns named their trials. `{repetition}` and `{arm}` set those; any other name sets that
+/// parameter, read as a YAML scalar. The id is `r<repetition>-<point>`, where the point is the arm
+/// or the parameters as `name=value`, so repetitions of one point share it. `None` when the stem
+/// does not match.
+pub fn identity_from_name(pattern: &str, stem: &str) -> Option<Identity> {
+    enum Part<'a> {
+        Text(&'a str),
+        Field(&'a str),
+    }
+    let mut parts = Vec::new();
+    let mut rest = pattern;
+    while let Some(open) = rest.find('{') {
+        let close = rest[open..].find('}')? + open;
+        if open > 0 {
+            parts.push(Part::Text(&rest[..open]));
+        }
+        parts.push(Part::Field(&rest[open + 1..close]));
+        rest = &rest[close + 1..];
+    }
+    if !rest.is_empty() {
+        parts.push(Part::Text(rest));
+    }
+    // Match left to right; a field takes the shortest non-empty text before the next literal.
+    fn go<'a>(parts: &[Part<'_>], s: &'a str, out: &mut Vec<&'a str>) -> bool {
+        match parts.split_first() {
+            None => s.is_empty(),
+            Some((Part::Text(t), more)) => s.strip_prefix(t).is_some_and(|r| go(more, r, out)),
+            Some((Part::Field(_), more)) => {
+                for end in s.char_indices().map(|(i, _)| i).skip(1).chain([s.len()]) {
+                    out.push(&s[..end]);
+                    if go(more, &s[end..], out) {
+                        return true;
+                    }
+                    out.pop();
+                }
+                false
+            }
+        }
+    }
+    let mut values = Vec::new();
+    if !go(&parts, stem, &mut values) {
+        return None;
+    }
+    let names = parts.iter().filter_map(|p| match p {
+        Part::Field(n) => Some(*n),
+        Part::Text(_) => None,
+    });
+    let mut who = Identity::default();
+    for (name, value) in names.zip(values) {
+        match name {
+            "repetition" => who.repetition = value.parse().ok()?,
+            "arm" => who.arm = Some(value.to_string()),
+            _ => {
+                let v = serde_yaml_ng::from_str(value).unwrap_or(Value::from(value));
+                who.parameters.insert(name.to_string(), v);
+            }
+        }
+    }
+    let point = who.arm.clone().unwrap_or_else(|| {
+        who.parameters
+            .iter()
+            .map(|(k, v)| {
+                let text = serde_yaml_ng::to_string(v).unwrap_or_default();
+                format!("{k}={}", text.trim())
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    });
+    who.id = format!("r{}-{point}", who.repetition);
+    Some(who)
 }
 
 /// The trial in the archive at `path`: `identity` when given, else its `metadata.trial`.
@@ -636,7 +722,7 @@ mod tests {
     }
 
     /// A v1 archive: the series' last sample of the whole run, matched by labels; a failed scrape
-    /// makes it incomplete; a second target makes it ambiguous.
+    /// is noted, as it cannot be placed in time; a second target makes it ambiguous.
     #[test]
     fn a_v1_trial_value_is_the_last_sample_of_the_run() {
         let dir = tempfile::tempdir().unwrap();
@@ -681,7 +767,11 @@ mod tests {
             ],
         );
         let v = &values(&read_archive(&path).unwrap(), std::slice::from_ref(&p99))["p99"];
-        assert_eq!((v.value, v.complete), (Some(0.7), false));
+        assert_eq!((v.value, v.complete), (Some(0.7), true));
+        assert!(
+            v.why.as_deref().unwrap().contains("1 failed scrapes"),
+            "{v:?}"
+        );
 
         let two = samples + &line(3, "b:9801", "0.99", 0.9);
         zip_with(
@@ -876,5 +966,30 @@ campaign:
         assert!(idle.within_reference_iqr);
         assert!(!c.metrics[1].within_reference_iqr);
         assert_eq!(c.within, 1);
+    }
+
+    #[test]
+    fn an_old_archive_is_named_by_a_pattern_over_its_file_name() {
+        let w = identity_from_name("rep{repetition}-load{load_mbps}", "rep3-load600").unwrap();
+        assert_eq!((w.id.as_str(), w.repetition), ("r3-load_mbps=600", 3));
+        assert_eq!(w.parameters["load_mbps"].as_u64(), Some(600));
+        let w = identity_from_name("rep{repetition}-{arm}", "rep2-microvm-mmio").unwrap();
+        assert_eq!(
+            (w.id.as_str(), w.arm.as_deref()),
+            ("r2-microvm-mmio", Some("microvm-mmio"))
+        );
+        assert_eq!(
+            point(&Trial {
+                id: w.id,
+                arm: w.arm,
+                repetition: 2,
+                parameters: BTreeMap::new(),
+                archive: String::new(),
+                values: BTreeMap::new()
+            }),
+            "microvm-mmio"
+        );
+        assert!(identity_from_name("rep{repetition}-load{load_mbps}", "rep1-container").is_none());
+        assert!(identity_from_name("rep{repetition}", "repx").is_none());
     }
 }

@@ -22,6 +22,11 @@ All notable changes to this repo are documented here. Format follows
   Over the published exp-001 reruns, the same comparison gives the notebook's counts: 9 and 8 of
   15 against the frozen campaign, 13 of 15 between the October reruns.
 
+- **`vxedge results verdict` and `compare`** judge and compare archives on this machine, offline,
+  with no daemon or campaign record. `--name 'rep{repetition}-load{load_mbps}'` names the trials
+  of archives written before campaigns did. Over every full published dataset whose archives hold
+  samples (exp-001, 002, 002b, 003 and 014, 13 campaigns), they give the notebooks' verdicts.
+
 ### Changed
 
 - **Criteria read results one value per trial** (decisions X-24, X-25). A metric names its
@@ -34,8 +39,8 @@ All notable changes to this repo are documented here. Format follows
   - **Upgrading:** a metric without a `series` or a `ratio` is now a criterion problem. The
     per-kind aggregates `last` and `total` are gone.
 - **The verdict engine** (`vxedge_core::verdict`) judges an experiment's criteria over its
-  trials' archives, `vxarchive/1` and `vxarchive/2`. On the published exp-001 and exp-003
-  archives it gives the notebooks' verdicts.
+  trials' archives, `vxarchive/1` and `vxarchive/2`. A v1 archive counts failed scrapes without
+  placing them in time, so the count is noted on each value rather than making it incomplete.
 
 ### Fixed
 
