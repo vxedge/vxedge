@@ -6,6 +6,30 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-10
+
+Campaigns run through vxAPI. vxAPI stays `vxedge.v1`, and the changes are additive.
+- **Packages:** `PackageService` inspects, lists, pulls and imports them, and every verb can
+  address a cached package by digest.
+- **Campaigns:** `CampaignService` expands a campaign into trials (every sweep point and every
+  arm) and runs them one by one: each is provisioned, warmed up, measured, cooled down,
+  archived and torn down, with phase markers in its records.
+- **Results:** `ResultService` lists and fetches the archives by digest. `vxedge campaign`
+  drives it all from the workspace's folder.
+- **Zones:** `libvirt` guests get their NIC and pin every thread, and a container's pinned CPUs
+  are applied or refused.
+
+**Upgrading from 0.12.x.**
+- **No manifest change:** a campaign only needs the experiment's own telemetry service (a
+  `services` entry of `type: telemetry`).
+- **vxtelemetry:** campaign archives record the trial and its phases with vxtelemetry 0.6.0 or
+  later. An older one archives the trial without them.
+- **Rust clients:** a client that builds `TrafficUpRequest` or `CollectRequest` as a struct
+  literal needs `..Default::default()` for their new fields.
+- **Behaviour changes:** a `container` device with `realtime.pinned_cpus` is now pinned, or
+  refused where the host cannot pin it, and `pinned_cpus` on an `attach` device is refused.
+  Both used to be dropped silently.
+
 ### Added
 
 - `ResultService` (new service, additive): `List`, `Get` and `Fetch`.
@@ -18,8 +42,6 @@ All notable changes to this repo are documented here. Format follows
   - **Fetching:** `Fetch` streams an archive's bytes by digest, so a client on another
     filesystem can rerun from it.
   - **Errors:** an unknown digest is the new `ERROR_REASON_RESULT_UNKNOWN` (33).
-
-### Added
 
 - `CampaignService.Start`, `Get`, `List` and `Watch`: run a campaign's trials serially as one
   `campaign.run` job.
@@ -51,8 +73,6 @@ All notable changes to this repo are documented here. Format follows
   `CollectRequest.archive_version` picks the archive format. Both are additive, and 0 keeps
   today's behaviour.
 
-### Added
-
 - `CampaignService.Plan` (new service, additive): the trials an experiment's campaign asks for,
   checked before any runs (decisions X-22, X-23).
   - Every sweep point is a trial, and a sweep over several parameters is their product. Every
@@ -68,6 +88,21 @@ All notable changes to this repo are documented here. Format follows
   - An experiment without a campaign is one point at its defaults, with its `method`'s
     repetitions and windows.
   - The package is never written: values are bound in memory.
+
+- `PackageService` (new service, additive): `Inspect`, `List`, `Pull` and `Import`.
+  - `Inspect` reads a workspace folder, a packed `.vxp` file or a cached package. It returns the
+    descriptor, the package digest, the lock state, the host requirements, the typed intent
+    (hypothesis, parameters with bounds, metrics, structured criteria with a one-line
+    rendering, campaign), the measurements, the entities and every problem `Plan` would report.
+    It touches nothing.
+  - `List` reports the packages in this host's cache.
+  - `Pull` (`package.pull`) and `Import` (`package.import`, client-streamed bytes) put a
+    package in the cache. Its bytes must hash to its digest and be a canonical packed package.
+    Under a trust policy that requires signatures, `Pull` refuses an unverified digest before it
+    fetches anything, as `up` does.
+- `ManifestRef.package`: any verb can address a cached package by its digest (`sha256:<hex>`),
+  which the daemon unpacks once into its cache. An unknown digest is the new
+  `ERROR_REASON_PACKAGE_UNKNOWN` (31).
 
 ### Fixed
 
@@ -86,23 +121,6 @@ All notable changes to this repo are documented here. Format follows
   `realtime.pinned_cpus`: its platform starts its processes, and the pins used to be dropped without a word.
 - Two `vxedge-core` tests shared a temporary folder, `vxpkg-<pid>-legacy`, and could fail when
   run in parallel. `package.rs`'s tests now use their own prefix.
-
-### Added
-
-- `PackageService` (new service, additive): `Inspect`, `List`, `Pull` and `Import`.
-  - `Inspect` reads a workspace folder, a packed `.vxp` file or a cached package. It returns the
-    descriptor, the package digest, the lock state, the host requirements, the typed intent
-    (hypothesis, parameters with bounds, metrics, structured criteria with a one-line
-    rendering, campaign), the measurements, the entities and every problem `Plan` would report.
-    It touches nothing.
-  - `List` reports the packages in this host's cache.
-  - `Pull` (`package.pull`) and `Import` (`package.import`, client-streamed bytes) put a
-    package in the cache. Its bytes must hash to its digest and be a canonical packed package.
-    Under a trust policy that requires signatures, `Pull` refuses an unverified digest before it
-    fetches anything, as `up` does.
-- `ManifestRef.package`: any verb can address a cached package by its digest (`sha256:<hex>`),
-  which the daemon unpacks once into its cache. An unknown digest is the new
-  `ERROR_REASON_PACKAGE_UNKNOWN` (31).
 
 ## [0.12.0] - 2026-11-09
 
