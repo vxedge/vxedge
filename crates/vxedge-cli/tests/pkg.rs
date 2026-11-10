@@ -599,12 +599,17 @@ fn a_package_is_signed_verified_and_recorded_by_its_digest() {
 fn fake_offline_tools(dir: &Path) {
     std::fs::create_dir_all(dir).unwrap();
     let d = dir.display();
+    // The pause image's real index, as `oras manifest fetch` returns it (its sha256 is the pinned
+    // digest, which `pack --offline` checks).
+    let index = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pause-index.json");
+    let index = index.display();
     let scripts = [
         (
             "oras",
             format!(
                 r#"#!/bin/sh
 echo "oras $@" >> "{d}/calls"
+[ "$1" = manifest ] && {{ cat "{index}"; exit 0; }}
 [ "$1" = copy ] && {{ layout=$(echo "$4" | cut -d: -f1); mkdir -p "$layout"; echo "$3" >> "$layout/copied"; }}
 [ "$1" = pull ] && {{ mkdir -p "$5"; echo part > "$5/meta.json"; }}
 exit 0
@@ -637,7 +642,8 @@ esac
     }
 }
 
-/// `pack --offline` carries what the lock pins beside the package, and refuses a tag-only ref;
+/// `pack --offline` carries what the lock pins beside the package, and vxedge's own infra image,
+/// and refuses a tag-only ref;
 /// `pull --layout` loads parts and images, and a second load finds them already there.
 #[test]
 fn an_offline_layout_carries_the_lock_and_loads_without_a_registry() {
@@ -660,11 +666,40 @@ fn an_offline_layout_carries_the_lock_and_loads_without_a_registry() {
     let (ok, out, err) = vxedge_with(&root, &fake, &cache, &["pkg", "pack", "--offline"]);
     assert!(ok, "{out}{err}");
     let layout = base.join("demo-0.1.0.parts");
-    assert!(out.contains("(1 parts and images)"), "{out}");
+    // The pinned probe, and the infra image vxedge runs every container node with.
+    assert!(out.contains("(2 parts and images)"), "{out}");
     let index = std::fs::read_to_string(layout.join("vxedge-parts.json")).unwrap();
     assert!(
         index.contains(r#""kind": "image""#) && index.contains(&digest),
         "{index}"
+    );
+    assert!(
+        index.contains(r#""ref": "registry.k8s.io/pause""#),
+        "{index}"
+    );
+    // Its Linux platforms travel and its Windows ones do not, and the index blob is in the layout
+    // under the pinned digest.
+    let calls = std::fs::read_to_string(fake.join("calls")).unwrap();
+    let pause_copies: Vec<&str> = calls
+        .lines()
+        .filter(|l| l.starts_with("oras copy") && l.contains("registry.k8s.io/pause@"))
+        .collect();
+    assert_eq!(pause_copies.len(), 5, "{calls}");
+    assert!(!calls.contains("abce690161824d5950c0064ed836f397c6316a833d1abca92b79017d19949482"));
+    let (_, pause_digest) = vxedge_core::containers::spec::PAUSE_IMAGE
+        .split_once('@')
+        .unwrap();
+    let blob = layout
+        .join("blobs/sha256")
+        .join(pause_digest.trim_start_matches("sha256:"));
+    assert_eq!(
+        vxedge_core::pkg::sha256(&std::fs::read(&blob).unwrap()),
+        pause_digest
+    );
+    let layout_index = std::fs::read_to_string(layout.join("index.json")).unwrap();
+    assert!(
+        layout_index.contains(&pause_digest.replace(':', "-")),
+        "{layout_index}"
     );
     let calls = std::fs::read_to_string(fake.join("calls")).unwrap();
     assert!(

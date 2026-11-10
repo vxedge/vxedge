@@ -89,7 +89,15 @@ pub fn layout_path(packed: &Path) -> PathBuf {
     packed.with_extension("parts")
 }
 
-/// What the lock says must travel: every published part and image, each with its digest.
+/// The images vxedge itself runs on a host, whatever the package declares: the infra container of
+/// every container node and 5G group ([`crate::containers::spec::PAUSE_IMAGE`]). They travel with
+/// every package, since the lock lists only what the documents name. Only their Linux platforms
+/// travel: the pause index also lists Windows images of several hundred megabytes, which no
+/// vxedge host runs. The index itself travels unchanged, so its digest still resolves.
+pub const RUNTIME_IMAGES: &[&str] = &[crate::containers::spec::PAUSE_IMAGE];
+
+/// What must travel: every published part and image the lock lists, each with its digest, then
+/// vxedge's own [`RUNTIME_IMAGES`].
 pub fn entries(lock: &Lock) -> Result<Vec<Entry>, OfflineError> {
     let mut unpinned = Vec::new();
     let mut out = Vec::new();
@@ -110,6 +118,19 @@ pub fn entries(lock: &Lock) -> Result<Vec<Entry>, OfflineError> {
     if !unpinned.is_empty() {
         return Err(OfflineError::Unpinned(unpinned));
     }
+    for pinned in RUNTIME_IMAGES {
+        let (reference, digest) = pinned.split_once('@').expect("runtime images are pinned");
+        if !out
+            .iter()
+            .any(|e| e.reference == reference && e.digest == digest)
+        {
+            out.push(Entry {
+                reference: reference.to_string(),
+                digest: digest.to_string(),
+                kind: Kind::Image,
+            });
+        }
+    }
     Ok(out)
 }
 
@@ -127,12 +148,107 @@ fn run(tool: &'static str, reference: &str, cmd: &mut Command) -> Result<(), Off
     })
 }
 
+fn is_runtime(e: &Entry) -> bool {
+    RUNTIME_IMAGES
+        .iter()
+        .any(|p| p.split_once('@') == Some((e.reference.as_str(), e.digest.as_str())))
+}
+
+/// Copy a runtime image's index and only its Linux platforms into the layout, tagged by the
+/// index digest as every other entry is. `skopeo` loads the host's platform from it under the
+/// index digest; the missing Windows children are never read.
+fn pack_linux_only(e: &Entry, layout: &Path) -> Result<(), OfflineError> {
+    let pinned = format!("{}@{}", e.reference, e.digest);
+    let out = Command::new("oras")
+        .args(["manifest", "fetch", &pinned])
+        .output()
+        .map_err(|source| OfflineError::Spawn {
+            tool: "oras",
+            source,
+        })?;
+    let tool_err = |stderr: String| OfflineError::Tool {
+        tool: "oras",
+        reference: pinned.clone(),
+        stderr,
+    };
+    if !out.status.success() {
+        return Err(tool_err(
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ));
+    }
+    let bytes = out.stdout;
+    let got = crate::pkg::sha256(&bytes);
+    if got != e.digest {
+        return Err(tool_err(format!("the manifest fetched hashes to {got}")));
+    }
+    let index: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|err| tool_err(format!("not JSON: {err}")))?;
+    let Some(children) = index["manifests"].as_array() else {
+        // A single-platform manifest: nothing to leave out.
+        return run(
+            "oras",
+            &pinned,
+            Command::new("oras")
+                .args(["copy", "--to-oci-layout", &pinned])
+                .arg(format!("{}:{}", layout.display(), e.tag())),
+        );
+    };
+    for child in children.iter().filter(|c| c["platform"]["os"] == "linux") {
+        let Some(digest) = child["digest"].as_str() else {
+            continue;
+        };
+        run(
+            "oras",
+            &pinned,
+            Command::new("oras")
+                .args(["copy", "--to-oci-layout"])
+                .arg(format!("{}@{digest}", e.reference))
+                .arg(format!("{}:{}", layout.display(), digest.replace(':', "-"))),
+        )?;
+    }
+    let hex = e.digest.trim_start_matches("sha256:");
+    let blob = layout.join("blobs/sha256").join(hex);
+    std::fs::create_dir_all(blob.parent().expect("a blob has a folder"))
+        .map_err(io("creating", &blob))?;
+    std::fs::write(&blob, &bytes).map_err(io("writing", &blob))?;
+    let index_path = layout.join("index.json");
+    let mut layout_index: serde_json::Value = match std::fs::read(&index_path) {
+        Ok(b) => serde_json::from_slice(&b).map_err(|err| OfflineError::NotALayout {
+            layout: layout.to_path_buf(),
+            detail: format!("index.json: {err}"),
+        })?,
+        Err(_) => serde_json::json!({ "schemaVersion": 2, "manifests": [] }),
+    };
+    let media_type = index["mediaType"]
+        .as_str()
+        .unwrap_or("application/vnd.oci.image.index.v1+json");
+    let manifests =
+        layout_index["manifests"]
+            .as_array_mut()
+            .ok_or_else(|| OfflineError::NotALayout {
+                layout: layout.to_path_buf(),
+                detail: "index.json has no `manifests`".into(),
+            })?;
+    manifests.push(serde_json::json!({
+        "mediaType": media_type,
+        "digest": e.digest,
+        "size": bytes.len(),
+        "annotations": { "org.opencontainers.image.ref.name": e.tag() },
+    }));
+    let json = serde_json::to_vec_pretty(&layout_index).expect("an index always serializes");
+    std::fs::write(&index_path, json).map_err(io("writing", &index_path))
+}
+
 /// Copy everything `lock` references into the layout at `layout`, then write its index. Refuses a
 /// reference pinned by tag only before copying anything.
 pub fn pack(lock: &Lock, layout: &Path) -> Result<Vec<Entry>, OfflineError> {
     let entries = entries(lock)?;
     std::fs::create_dir_all(layout).map_err(io("creating", layout))?;
     for e in &entries {
+        if is_runtime(e) {
+            pack_linux_only(e, layout)?;
+            continue;
+        }
         let from = format!("{}@{}", e.reference, e.digest);
         run(
             "oras",
@@ -266,9 +382,20 @@ mod tests {
             vec![r("ghcr.io/vxedge/parts/agent/p", Some(d))],
         ))
         .unwrap();
-        assert_eq!(got.len(), 2);
+        // The lock's two, then the infra image every container node needs, which no lock lists.
+        assert_eq!(got.len(), 3);
         assert_eq!((got[0].kind, got[1].kind), (Kind::Part, Kind::Image));
         assert_eq!(got[0].tag(), "sha256-aa");
+        assert_eq!(
+            format!("{}@{}", got[2].reference, got[2].digest),
+            crate::containers::spec::PAUSE_IMAGE
+        );
+        // A package that names the infra image itself carries it once.
+        let (pause, digest) = crate::containers::spec::PAUSE_IMAGE
+            .split_once('@')
+            .unwrap();
+        let once = entries(&lock(vec![], vec![r(pause, Some(digest))])).unwrap();
+        assert_eq!(once.len(), 1);
         let refused = entries(&lock(vec![], vec![r("docker.io/library/busybox", None)]));
         assert!(
             matches!(&refused, Err(OfflineError::Unpinned(v)) if v == &["docker.io/library/busybox"])
