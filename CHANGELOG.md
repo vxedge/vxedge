@@ -6,6 +6,11 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-11-10
+
+Air-gapped hosts. A package packed with `pkg pack --offline` now brings up its container nodes on
+a host with no network, which X7's air-gapped proof showed it could not. No other change.
+
 ### Fixed
 
 - **`pkg pack --offline` carries the infra image every container node runs.** vxedge runs each
