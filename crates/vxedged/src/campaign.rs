@@ -276,17 +276,37 @@ impl CampaignService for CampaignSvc {
         let (mut campaign, experiment_id, package_digest) = prepared;
         campaign.unlocked = req.unlocked;
 
-        // One campaign at a time (decision X-6).
+        let id = campaign_id(&req.request_id, &root);
+        // A retry names the campaign it retries, with the same profile, or it is refused: a
+        // resumed campaign is never merged with another (ARCHITECTURE.md §6.0.3).
+        if let Some(previous) =
+            run::read(&self.runtime_dir, &id).filter(|_| !req.request_id.is_empty())
+            && previous.profile != profile.clone().unwrap_or_default()
+        {
+            return Err(errors::precondition(
+                R::ParameterInvalid,
+                format!(
+                    "request_id `{}` started campaign `{id}` with profile `{}`, not `{}`; a retry \
+                     uses the same profile, and another campaign another request_id",
+                    req.request_id,
+                    previous.profile,
+                    profile.clone().unwrap_or_default()
+                ),
+            ));
+        }
+
+        // One campaign at a time (decision X-6). A retry of the running one gets its job.
         for active in run::all(&self.runtime_dir) {
             if active.is_terminal() {
                 continue;
             }
-            let live = self
-                .steps
-                .engine
-                .get(&active.job_id)
-                .await
+            let job = self.steps.engine.get(&active.job_id).await;
+            let live = job
+                .as_ref()
                 .is_some_and(|j| !crate::jobs::is_terminal(j.state));
+            if live && active.campaign_id == id && !req.request_id.is_empty() {
+                return Ok(Response::new(job.expect("a live job")));
+            }
             if live {
                 let left = active
                     .trials
@@ -308,7 +328,6 @@ impl CampaignService for CampaignSvc {
             }
         }
 
-        let id = campaign_id(&req.request_id, &root);
         let results_dir = if !req.results_dir.is_empty() {
             let d = PathBuf::from(&req.results_dir);
             if d.is_absolute() { d } else { root.join(d) }
