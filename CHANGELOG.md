@@ -6,6 +6,18 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **`pkg pack --offline` carries the infra image every container node runs.** vxedge runs each
+  container node and 5G group with `registry.k8s.io/pause`, pinned in the code. No lock lists it,
+  so an air-gapped `up` of a package with a container node failed trying to pull it. It now
+  travels in every offline layout, with its Linux platforms only: the index's Windows images are
+  several hundred megabytes and no vxedge host runs them. The index travels unchanged, so Podman
+  still resolves its pinned digest.
+  - **Checked:** the six-zone reference sedan, vendored, packed, signed and loaded into a host
+    with no network, comes up whole: the gateway, six microvm zones, the container compute node,
+    Kuksa and OTA. Its layout grows from 87 to 88 MB.
+
 ## [0.14.0] - 2026-11-10
 
 Verdicts through vxAPI. vxAPI stays `vxedge.v1`, and the changes are additive.
