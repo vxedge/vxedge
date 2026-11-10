@@ -6,11 +6,15 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-11-10
+
+A campaign retried with its `request_id` behaves as the spec says. Found by the done-means gate,
+which drives a campaign through `vxmcp`. No manifest or wire change.
+
 ### Fixed
 
 - **`CampaignService.Start` retried while its campaign runs** returned `ERROR_REASON_BUSY`. A
-  retry with the same `request_id` now returns the running campaign's job, as the spec says.
-  Found by the done-means gate through `vxmcp`.
+  retry with the same `request_id` now returns the running campaign's job.
 - **A retry with the same `request_id` and another profile** resumed the earlier campaign under
   the new profile. It is now refused as `ERROR_REASON_PARAMETER_INVALID`, never merged.
 
