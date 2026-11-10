@@ -19,6 +19,14 @@ All notable changes to this repo are documented here. Format follows
     the new `ERROR_REASON_SCENARIO_INVALID` (34). vxedge reads only the storyboard's entity names
     and parameter declarations.
   - **Inspect:** `PackageService.Inspect` returns the scenario typed (`PackageInfo.scenario`).
+- **`requires.simulator`** in the `vxp/1` descriptor names the simulators a package's scenario
+  runs on (`esmini`, `carla`).
+  - **On the host:** a simulator is available when one of its executables is on vxedged's
+    `PATH`, and `HostService.Capabilities` lists them (`simulators`).
+  - **Refusal:** `Plan` and `up` refuse a package whose simulator the host lacks with the new
+    `ERROR_REASON_SIMULATOR_UNAVAILABLE` (35).
+  - **Scenario check:** a scenario's `simulator` must be in the list, or it is a scenario
+    problem.
 
 ## [0.14.1] - 2026-11-10
 

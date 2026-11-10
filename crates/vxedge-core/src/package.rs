@@ -106,6 +106,7 @@ impl PackageDoc {
                 kvm: d.requires.kvm.unwrap_or(false),
                 preempt_rt: d.requires.kernel.as_ref().and_then(|k| k.preempt_rt),
                 backends: d.requires.backends.clone(),
+                simulators: d.requires.simulator.clone(),
             },
             Self::Legacy(d) => d.requires.clone(),
         }
@@ -249,6 +250,22 @@ pub struct RequiresV1 {
     pub kernel: Option<KernelRequires>,
     #[serde(default, deserialize_with = "backends")]
     pub backends: Vec<Backend>,
+    /// The simulators the package's scenario needs (`esmini`, `carla`), each on the host.
+    #[serde(default, deserialize_with = "simulators")]
+    pub simulator: Vec<String>,
+}
+
+fn simulators<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    let names = Vec::<String>::deserialize(d)?;
+    for n in &names {
+        if !crate::scenario::SIMULATORS.contains(&n.as_str()) {
+            return Err(serde::de::Error::custom(format!(
+                "unknown simulator `{n}`; expected one of {}",
+                crate::scenario::SIMULATORS.join(", ")
+            )));
+        }
+    }
+    Ok(names)
 }
 
 fn backends<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Backend>, D::Error> {
@@ -320,6 +337,9 @@ pub struct Requires {
     /// Every backend listed must be available on this host.
     #[serde(skip)]
     pub backends: Vec<Backend>,
+    /// Every simulator listed must be on this host ([`crate::scenario::available_simulators`]).
+    #[serde(skip)]
+    pub simulators: Vec<String>,
 }
 
 /// Tier 2's GPU floor, from `TESTBED-SETUP.md`: RTX-class, >= 12 GB VRAM.
@@ -351,6 +371,8 @@ pub struct HostCapabilities {
     /// Podman answers is an async question the daemon asks, so it fills this in. A backend not
     /// listed counts as unavailable, never as present.
     pub backends: Vec<BackendProbe>,
+    /// The simulators on vxedged's `PATH` ([`crate::scenario::available_simulators`]).
+    pub simulators: Vec<String>,
 }
 
 /// One backend as the daemon found it: `unavailable` says why it cannot run here.
@@ -429,6 +451,7 @@ impl HostCapabilities {
             kvm: Path::new("/dev/kvm").exists(),
             preempt_rt: RunningKernel::probe().preempt_rt,
             backends: Vec::new(),
+            simulators: crate::scenario::available_simulators(),
         }
     }
 
@@ -489,6 +512,16 @@ pub enum RequirementError {
 }
 
 impl Requires {
+    /// The simulators this package needs that `host` does not have. Kept apart from
+    /// [`Requires::check`]: vxAPI reports them as `ERROR_REASON_SIMULATOR_UNAVAILABLE`.
+    pub fn missing_simulators(&self, host: &HostCapabilities) -> Vec<String> {
+        self.simulators
+            .iter()
+            .filter(|s| !host.simulators.contains(s))
+            .cloned()
+            .collect()
+    }
+
     /// Whether `host` can run this workspace: every unmet requirement, not only the first, so
     /// `Plan` can name them all. Pure.
     pub fn check(
@@ -890,7 +923,8 @@ mod tests {
                         gpu: none\n  \
                         kvm: true\n  \
                         kernel: { preempt_rt: preferred }\n  \
-                        backends: [container, qemu-microvm]\n\
+                        backends: [container, qemu-microvm]\n  \
+                        simulator: [esmini]\n\
                       provenance:\n  \
                         generated_by: { tool: vxmodel, version: 0.3.0 }\n\
                       x-oem-acme: { cost_centre: 4711 }\n";
@@ -918,6 +952,25 @@ mod tests {
         assert!(range.matches(&semver::Version::new(0, 7, 3)));
         assert!(!range.matches(&semver::Version::new(0, 8, 0)));
         assert_eq!(v1.requires.kvm, Some(true));
+        assert_eq!(v1.requires.simulator, ["esmini"]);
+        let requires = ws.package.host_requires();
+        assert_eq!(
+            requires.missing_simulators(&HostCapabilities::default()),
+            ["esmini"]
+        );
+        let with_esmini = HostCapabilities {
+            simulators: vec!["esmini".into()],
+            ..Default::default()
+        };
+        assert!(requires.missing_simulators(&with_esmini).is_empty());
+        let unknown = v1_with(
+            &tmp("v1-sim"),
+            &V1.replace("simulator: [esmini]", "simulator: [unity]"),
+        );
+        assert!(
+            format!("{:?}", unknown.unwrap_err()).contains("unknown simulator `unity`"),
+            "an unknown simulator is refused"
+        );
         assert_eq!(
             v1.requires.backends,
             vec![

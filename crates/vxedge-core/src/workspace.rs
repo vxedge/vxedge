@@ -1361,6 +1361,10 @@ impl Workspace {
             return Vec::new();
         }
         let vehicles: Vec<String> = self.vehicles.iter().map(|v| v.id.clone()).collect();
+        let required = match &self.package {
+            Some(p @ crate::package::PackageDoc::V1(_)) => Some(p.host_requires().simulators),
+            _ => None,
+        };
         crate::scenario::check(&crate::scenario::Inputs {
             root: &self.root,
             experiment: experiment.map_or("?", |e| e.id.as_str()),
@@ -1368,6 +1372,7 @@ impl Workspace {
             roads: &self.road_docs,
             scenarios: &self.scenarios,
             vehicles: &vehicles,
+            required_simulators: required.as_deref(),
         })
     }
 

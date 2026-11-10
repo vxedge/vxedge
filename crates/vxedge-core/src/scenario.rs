@@ -18,6 +18,34 @@ use crate::intent::{Problem, ProblemKind};
 /// The simulators a scenario may name.
 pub const SIMULATORS: &[&str] = &["esmini", "carla"];
 
+/// The executables that make a simulator available: `esmini`, or CARLA's server launcher.
+pub fn binaries(simulator: &str) -> &'static [&'static str] {
+    match simulator {
+        "esmini" => &["esmini"],
+        "carla" => &["CarlaUE4.sh", "CarlaUnreal.sh"],
+        _ => &[],
+    }
+}
+
+fn on_path(bin: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| {
+            std::fs::metadata(dir.join(bin))
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+    })
+}
+
+/// The simulators available here: those with one of their [`binaries`] on `PATH`.
+pub fn available_simulators() -> Vec<String> {
+    SIMULATORS
+        .iter()
+        .filter(|s| binaries(s).iter().any(|b| on_path(b)))
+        .map(|s| s.to_string())
+        .collect()
+}
+
 /// A road network: an ASAM OpenDRIVE file, unchanged.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -172,6 +200,8 @@ pub struct Inputs<'a> {
     pub scenarios: &'a [ScenarioDoc],
     /// The vehicle ids the package declares.
     pub vehicles: &'a [String],
+    /// The descriptor's `requires.simulator`, when the package has a `vxp/1` descriptor.
+    pub required_simulators: Option<&'a [String]>,
 }
 
 /// Every problem with the workspace's roads and scenarios.
@@ -236,6 +266,17 @@ pub fn check(inputs: &Inputs<'_>) -> Vec<Problem> {
                     "`{}` is not a simulator vxedge knows: {}",
                     s.simulator,
                     SIMULATORS.join(", ")
+                ),
+            );
+        } else if let Some(required) = inputs.required_simulators
+            && !required.contains(&s.simulator)
+        {
+            push(
+                at("simulator"),
+                format!(
+                    "`{}` is not in the descriptor's `requires.simulator`, so a host could \
+                     accept the package without it",
+                    s.simulator
                 ),
             );
         }
@@ -400,6 +441,7 @@ mod tests {
                 roads: &roads,
                 scenarios: s,
                 vehicles: &vehicles,
+                required_simulators: None,
             })
         };
         assert_eq!(inputs(std::slice::from_ref(&good), Some("stop")), vec![]);
@@ -443,6 +485,22 @@ mod tests {
         let p = inputs(&[missing], None);
         assert_eq!(fields(p.clone()), ["scenarios[stop].storyboard"]);
         assert_eq!(p[0].kind, ProblemKind::Scenario);
-        assert_eq!(fields(inputs(&[good.clone(), good], None)), ["scenario"]);
+        assert_eq!(
+            fields(inputs(&[good.clone(), good.clone()], None)),
+            ["scenario"]
+        );
+        // A vxp/1 package names the scenario's simulator in `requires.simulator`.
+        let carla_only = vec!["carla".to_string()];
+        let p = check(&Inputs {
+            root: dir.path(),
+            experiment: "e",
+            scenario_ref: Some("stop"),
+            roads: &roads,
+            scenarios: std::slice::from_ref(&good),
+            vehicles: &vehicles,
+            required_simulators: Some(&carla_only),
+        });
+        assert_eq!(fields(p.clone()), ["scenarios[stop].simulator"]);
+        assert!(p[0].detail.contains("requires.simulator"), "{p:?}");
     }
 }

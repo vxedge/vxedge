@@ -271,6 +271,26 @@ pub(crate) async fn preflight(
         "host requirements",
         unmet.map(|detail| (R::HostRequirementUnmet, model.id.clone(), detail)),
     );
+    let missing = missing_simulators(dir);
+    pf.check(
+        "simulators",
+        (!missing.is_empty()).then(|| {
+            (
+                R::SimulatorUnavailable,
+                model.id.clone(),
+                format!(
+                    "the package's `requires.simulator` names {}, and this host has none of its \
+                     executables on vxedged's PATH (HostService.Capabilities lists the simulators \
+                     it has)",
+                    missing
+                        .iter()
+                        .map(|s| format!("`{s}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            )
+        }),
+    );
 
     // After the descriptor and host checks, so `up` refuses a package this daemon cannot run for
     // that reason first. Hashes every input once, as `pkg lock --check` does.
@@ -568,6 +588,18 @@ async fn host_requirements(dir: Option<&Path>) -> (Option<String>, Option<Vec<Ba
     (unmet, probed)
 }
 
+/// The simulators the package at `dir` requires that this host does not have.
+fn missing_simulators(dir: Option<&Path>) -> Vec<String> {
+    let Some(found) = dir.and_then(|d| vxedge_core::discover(d).ok()) else {
+        return Vec::new();
+    };
+    let host = vxedge_core::package::HostCapabilities {
+        simulators: vxedge_core::scenario::available_simulators(),
+        ..Default::default()
+    };
+    found.package.host_requires().missing_simulators(&host)
+}
+
 pub struct PlanSvc {
     pub gateway: Arc<GatewaySvc>,
     pub runtime_dir: PathBuf,
@@ -785,6 +817,7 @@ impl HostService for PlanSvc {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            simulators: vxedge_core::scenario::available_simulators(),
         }))
     }
 }
