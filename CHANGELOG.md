@@ -6,6 +6,21 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Criteria read results one value per trial** (decisions X-24, X-25). A metric names its
+  `series` and `labels`, or the `ratio` of two metrics, such as a loss percentage. Its value in a
+  trial is the series' last sample inside the trial's measure phase. Aggregates run across the
+  trials a criterion selects, and add `median`, `iqr`, `sum` and `stddev`. Operands combine as
+  `ratio`, `diff`, `max` and `min` and take an `offset`. A tolerance can be an operand, `outside`
+  joins the ops, and `guards` make a criterion inconclusive unless they pass.
+  `PackageService.Inspect` reports all of it.
+  - **Upgrading:** a metric without a `series` or a `ratio` is now a criterion problem. The
+    per-kind aggregates `last` and `total` are gone.
+- **The verdict engine** (`vxedge_core::verdict`) judges an experiment's criteria over its
+  trials' archives, `vxarchive/1` and `vxarchive/2`. On the published exp-001 and exp-003
+  archives it gives the notebooks' verdicts.
+
 ### Fixed
 
 - `vehicle down` and `zone down` stop a container node in about 2 s instead of 10: its payload container is
