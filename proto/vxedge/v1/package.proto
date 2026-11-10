@@ -49,15 +49,24 @@ message PackageParameter {
   string binds = 8;
 }
 
+// A metric gives each trial one value: the last sample of `series` (the line `labels` pick) on
+// `entity` inside the trial's measure phase, or the `ratio` of two metrics in the same trial,
+// times `factor`.
 message PackageMetric {
   string id = 1;
   // `counter`, `gauge` or `histogram`.
   string kind = 2;
   string unit = 3;
   string entity = 4;
+  string series = 5;
+  map<string, string> labels = 6;
+  // The two metric ids divided, for a ratio.
+  repeated string ratio = 7;
+  optional double factor = 8;
 }
 
-// One side of a comparison: an aggregate of a metric's samples, or a constant.
+// One side of a comparison: an aggregate of a metric's values over the trials it selects, a
+// constant, or a combination of operands.
 message CriterionOperand {
   message MetricOperand {
     string metric = 1;
@@ -65,24 +74,38 @@ message CriterionOperand {
     // `arm` or parameter names to the value selected.
     map<string, ParamValue> select = 3;
     optional double factor = 4;
+    // Added after `factor`, in the metric's unit.
+    optional double offset = 5;
   }
   message Constant {
     double value = 1;
     string unit = 2;
   }
+  // `ratio` (a / b), `diff` (a - b), `max` or `min` of `operands`, times `factor`, plus `offset`.
+  message Combined {
+    string rule = 1;
+    repeated CriterionOperand operands = 2;
+    optional double factor = 3;
+    optional double offset = 4;
+  }
   oneof operand {
     MetricOperand metric = 1;
     Constant constant = 2;
+    Combined combined = 3;
   }
 }
 
 message CriterionComparison {
-  // `lt`, `le`, `gt`, `ge` or `within`.
+  // `lt`, `le`, `gt`, `ge`, `within` or `outside`.
   string op = 1;
   CriterionOperand lhs = 2;
   CriterionOperand rhs = 3;
+  // A `within` or `outside` tolerance given as a number, in the operands' unit.
   optional double tolerance = 4;
+  // The fewest trial values each metric operand needs.
   optional uint64 min_samples = 5;
+  // A `within` or `outside` tolerance given as an operand.
+  CriterionOperand tolerance_operand = 6;
 }
 
 message CriterionGroup {
@@ -100,6 +123,8 @@ message PackageCriterion {
   }
   // A one-line rendering for people. Nothing parses it.
   string text = 4;
+  // Criteria that must pass for this one to be conclusive.
+  repeated PackageCriterion guards = 5;
 }
 
 message CampaignArm {

@@ -50,6 +50,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3"
 zip = { version = "9", default-features = false, features = ["deflate"] }
+# Archive v2 members are zstd-compressed (decision X-7); the verdict engine reads them.
+zstd = { version = "0.13", default-features = false }
 # Podman's Docker-compatible REST API over the rootless user socket. Unix-socket transport
 # only: no TLS stack, no HTTP/SSH remotes.
 cloud-hypervisor-client = "=0.6.0"

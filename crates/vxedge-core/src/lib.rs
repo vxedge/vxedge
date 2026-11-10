@@ -25,6 +25,7 @@ pub mod sonic;
 pub mod status;
 pub mod traffic;
 pub mod trust;
+pub mod verdict;
 pub mod workspace;
 pub mod zones;
 

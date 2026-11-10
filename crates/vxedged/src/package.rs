@@ -140,6 +140,7 @@ fn op_name(op: intent::Op) -> &'static str {
         intent::Op::Gt => "gt",
         intent::Op::Ge => "ge",
         intent::Op::Within => "within",
+        intent::Op::Outside => "outside",
     }
 }
 
@@ -150,6 +151,7 @@ fn op_symbol(op: intent::Op) -> &'static str {
         intent::Op::Gt => ">",
         intent::Op::Ge => ">=",
         intent::Op::Within => "within",
+        intent::Op::Outside => "outside",
     }
 }
 
@@ -175,8 +177,30 @@ fn operand_text(o: &intent::Operand) -> String {
                 format!("[{}]", parts.join(", "))
             };
             let factor = m.factor.map(|f| format!("{f} x ")).unwrap_or_default();
-            format!("{factor}{}({}){select}", m.aggregate, m.metric)
+            let offset = m.offset.map(|o| format!(" + {o}")).unwrap_or_default();
+            format!("{factor}{}({}){select}{offset}", m.aggregate, m.metric)
         }
+        intent::Operand::Combined(k) => {
+            let Some((rule, members)) = k.rule() else {
+                return "?".into();
+            };
+            let inner: Vec<String> = members.iter().map(operand_text).collect();
+            let body = match rule {
+                "ratio" => format!("({})", inner.join(" / ")),
+                "diff" => format!("({})", inner.join(" - ")),
+                _ => format!("{rule}({})", inner.join(", ")),
+            };
+            let factor = k.factor.map(|f| format!("{f} x ")).unwrap_or_default();
+            let offset = k.offset.map(|o| format!(" + {o}")).unwrap_or_default();
+            format!("{factor}{body}{offset}")
+        }
+    }
+}
+
+fn tolerance_text(t: &intent::Tolerance) -> String {
+    match t {
+        intent::Tolerance::Value(v) => v.to_string(),
+        intent::Tolerance::Operand(o) => operand_text(o),
     }
 }
 
@@ -197,7 +221,17 @@ fn operand(o: &intent::Operand) -> CriterionOperand {
                     .map(|(k, v)| (k.clone(), param_value(v, None)))
                     .collect(),
                 factor: m.factor,
+                offset: m.offset,
             }),
+            intent::Operand::Combined(k) => {
+                let (rule, members) = k.rule().unwrap_or(("", &[]));
+                Operand::Combined(criterion_operand::Combined {
+                    rule: rule.to_string(),
+                    operands: members.iter().map(operand).collect(),
+                    factor: k.factor,
+                    offset: k.offset,
+                })
+            }
         }),
     }
 }
@@ -211,15 +245,26 @@ fn criterion(c: &intent::Criterion) -> PackageCriterion {
                 operand_text(&cmp.lhs),
                 op_symbol(cmp.op),
                 operand_text(&cmp.rhs),
-                cmp.tolerance.map(|t| format!(" ± {t}")).unwrap_or_default()
+                cmp.tolerance
+                    .as_ref()
+                    .map(|t| format!(" ± {}", tolerance_text(t)))
+                    .unwrap_or_default()
             ),
+            guards: cmp.guards.iter().map(criterion).collect(),
             criterion: Some(package_criterion::Criterion::Comparison(
                 CriterionComparison {
                     op: op_name(cmp.op).to_string(),
                     lhs: Some(operand(&cmp.lhs)),
                     rhs: Some(operand(&cmp.rhs)),
-                    tolerance: cmp.tolerance,
+                    tolerance: match &cmp.tolerance {
+                        Some(intent::Tolerance::Value(v)) => Some(*v),
+                        _ => None,
+                    },
                     min_samples: cmp.min_samples,
+                    tolerance_operand: match &cmp.tolerance {
+                        Some(intent::Tolerance::Operand(o)) => Some(operand(o)),
+                        _ => None,
+                    },
                 },
             )),
         },
@@ -245,6 +290,7 @@ fn criterion(c: &intent::Criterion) -> PackageCriterion {
                     rule: rule.to_string(),
                     members,
                 })),
+                guards: g.guards.iter().map(criterion).collect(),
             }
         }
     }
@@ -380,6 +426,10 @@ pub(crate) fn inspect(
                 kind: kind_name(m.kind).to_string(),
                 unit: m.unit.clone(),
                 entity: m.entity.clone(),
+                series: m.series.clone().unwrap_or_default(),
+                labels: m.labels.clone().into_iter().collect(),
+                ratio: m.ratio.clone().unwrap_or_default(),
+                factor: m.factor,
             })
             .collect();
         info.criteria = typed.criteria.iter().map(criterion).collect();
