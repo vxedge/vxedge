@@ -151,6 +151,11 @@ pub struct ContainerSpec {
     /// container without pins keeps the hash it had before this field existed.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub cpuset_cpus: Vec<u32>,
+    /// Seconds Podman waits after SIGTERM before it kills the container, when it stops or
+    /// force-removes it. `None` keeps Podman's default (10 s). Left out of the spec hash: it
+    /// changes how a container is stopped, not what runs, so a container is not recreated for it.
+    #[serde(skip)]
+    pub stop_timeout_s: Option<u32>,
 }
 
 /// A validated group: a name every member is prefixed with, and the infra container that owns
