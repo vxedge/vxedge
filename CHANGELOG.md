@@ -6,6 +6,26 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-10
+
+Scenarios in the package. vxAPI stays `vxedge.v1`, and the changes are additive.
+- **Carried unchanged:** a package carries ASAM OpenDRIVE roads and OpenSCENARIO storyboards as
+  they are. `kind: road` and `kind: scenario` say what a reproducible trial needs: the simulator,
+  its clock and seed, which storyboard entity is the vehicle under test, and the storyboard
+  parameters a campaign may turn.
+- **Checked and typed:** vxedge checks every file and reference before anything runs, and
+  `PackageService.Inspect` returns the scenario typed.
+- **Running them is not here:** that is the simulator work that follows.
+
+**Upgrading from 0.14.x.**
+- **No manifest change:** a package without a scenario is read as before.
+- **Legacy `world:`:** an experiment's `world:` now names a `kind: scenario`, so one that names
+  anything else is a scenario problem. No published experiment sets it.
+- **`requires.simulator`:** a package that declares it needs vxedge 0.15.0, so it sets
+  `requires.vxedge` to `>=0.15.0`.
+- **Rust clients:** a client that builds `PackageInfo` or `HostCapabilities` as a struct literal
+  needs `..Default::default()` for their new fields.
+
 ### Added
 
 - **Scenarios and roads** (decision X-8). A package carries ASAM OpenDRIVE and OpenSCENARIO files
