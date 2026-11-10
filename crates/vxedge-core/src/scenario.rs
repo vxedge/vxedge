@@ -202,6 +202,8 @@ pub struct Inputs<'a> {
     pub vehicles: &'a [String],
     /// The descriptor's `requires.simulator`, when the package has a `vxp/1` descriptor.
     pub required_simulators: Option<&'a [String]>,
+    /// The experiment's typed parameters, whose `binds` may name a storyboard parameter.
+    pub parameters: &'a BTreeMap<String, crate::intent::Parameter>,
 }
 
 /// Every problem with the workspace's roads and scenarios.
@@ -245,6 +247,68 @@ pub fn check(inputs: &Inputs<'_>) -> Vec<Problem> {
                 if let Some(why) = road_problem(&text) {
                     push(field, format!("`{}` {why}", r.network));
                 }
+            }
+        }
+    }
+    let named = inputs
+        .scenario_ref
+        .and_then(|id| inputs.scenarios.iter().find(|s| s.id == id));
+    for (name, p) in inputs.parameters {
+        let Some(target) = p
+            .binds
+            .as_deref()
+            .and_then(|b| b.strip_prefix(crate::intent::SCENARIO_BIND))
+        else {
+            continue;
+        };
+        let field = format!("parameters.{name}.binds");
+        let Some(s) = named else {
+            push(
+                field,
+                "binds a storyboard parameter, and the experiment names no scenario of this \
+                 package"
+                    .into(),
+            );
+            continue;
+        };
+        let Some(declared) = s.parameters.get(target) else {
+            push(
+                field,
+                format!(
+                    "`{target}` is not one of scenario `{}`'s `parameters`; it lists {}",
+                    s.id,
+                    list(&s.parameters.keys().cloned().collect())
+                ),
+            );
+            continue;
+        };
+        use crate::intent::ParamType as T;
+        let numeric = matches!(p.ty, T::Integer | T::Number);
+        if numeric {
+            let below = declared.min.zip(p.min).is_some_and(|(lo, x)| x < lo)
+                || (declared.min.is_some() && p.min.is_none());
+            let above = declared.max.zip(p.max).is_some_and(|(hi, x)| x > hi)
+                || (declared.max.is_some() && p.max.is_none());
+            if below || above {
+                push(
+                    field.clone(),
+                    format!(
+                        "the parameter's bounds [{}, {}] are not inside `{target}`'s [{}, {}], so \
+                         a campaign could set a value the scenario does not allow",
+                        p.min.map_or("-inf".into(), |v| v.to_string()),
+                        p.max.map_or("inf".into(), |v| v.to_string()),
+                        declared.min.map_or("-inf".into(), |v| v.to_string()),
+                        declared.max.map_or("inf".into(), |v| v.to_string()),
+                    ),
+                );
+            }
+            if let (Some(pu), Some(du)) = (p.unit.as_deref(), declared.unit.as_deref())
+                && pu != du
+            {
+                push(
+                    field,
+                    format!("the parameter is in `{pu}`, and `{target}` is in `{du}`"),
+                );
             }
         }
     }
@@ -442,6 +506,7 @@ mod tests {
                 scenarios: s,
                 vehicles: &vehicles,
                 required_simulators: None,
+                parameters: &BTreeMap::new(),
             })
         };
         assert_eq!(inputs(std::slice::from_ref(&good), Some("stop")), vec![]);
@@ -499,8 +564,62 @@ mod tests {
             scenarios: std::slice::from_ref(&good),
             vehicles: &vehicles,
             required_simulators: Some(&carla_only),
+            parameters: &BTreeMap::new(),
         });
         assert_eq!(fields(p.clone()), ["scenarios[stop].simulator"]);
         assert!(p[0].detail.contains("requires.simulator"), "{p:?}");
+    }
+
+    /// An experiment parameter may bind a storyboard parameter the scenario declares, within its
+    /// bounds and in its unit.
+    #[test]
+    fn a_bind_into_the_scenario_is_checked_against_its_declaration() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        std::fs::write(dir.path().join("assets/stop.xosc"), XOSC).unwrap();
+        std::fs::write(dir.path().join("assets/grid.xodr"), XODR).unwrap();
+        let roads = vec![RoadDoc {
+            kind: "road".into(),
+            id: "grid".into(),
+            network: "assets/grid.xodr".into(),
+        }];
+        let sc = scenario(
+            "kind: scenario\nid: stop\nroad: grid\nstoryboard: assets/stop.xosc\nsimulator: esmini\n\
+             parameters: { EgoTargetSpeed: { unit: m/s, min: 0, max: 22.2 } }\n",
+        );
+        let param = |yaml: &str| -> BTreeMap<String, crate::intent::Parameter> {
+            BTreeMap::from([("speed".to_string(), serde_yaml_ng::from_str(yaml).unwrap())])
+        };
+        let run = |ps: &BTreeMap<String, crate::intent::Parameter>, r: Option<&str>| {
+            check(&Inputs {
+                root: dir.path(),
+                experiment: "e",
+                scenario_ref: r,
+                roads: &roads,
+                scenarios: std::slice::from_ref(&sc),
+                vehicles: &[],
+                required_simulators: None,
+                parameters: ps,
+            })
+            .into_iter()
+            .map(|p| p.detail)
+            .collect::<Vec<_>>()
+        };
+        let ok = param(
+            "{ type: number, unit: m/s, default: 10, min: 5, max: 20, binds: scenario.parameters.EgoTargetSpeed }",
+        );
+        assert_eq!(run(&ok, Some("stop")), Vec::<String>::new());
+        assert!(run(&ok, None)[0].contains("names no scenario"));
+        let wide = param(
+            "{ type: number, unit: m/s, default: 10, min: 5, max: 40, binds: scenario.parameters.EgoTargetSpeed }",
+        );
+        assert!(run(&wide, Some("stop"))[0].contains("not inside"));
+        let kmh = param(
+            "{ type: number, unit: km/h, default: 10, min: 5, max: 20, binds: scenario.parameters.EgoTargetSpeed }",
+        );
+        assert!(run(&kmh, Some("stop"))[0].contains("is in `km/h`"));
+        let unknown =
+            param("{ type: number, unit: m/s, default: 10, binds: scenario.parameters.Rain }");
+        assert!(run(&unknown, Some("stop"))[0].contains("`Rain` is not one of"));
     }
 }

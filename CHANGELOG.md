@@ -27,6 +27,15 @@ All notable changes to this repo are documented here. Format follows
     `ERROR_REASON_SIMULATOR_UNAVAILABLE` (35).
   - **Scenario check:** a scenario's `simulator` must be in the list, or it is a scenario
     problem.
+- **A campaign parameter can turn a storyboard parameter:** `binds:
+  scenario.parameters.<name>`.
+  - **Checks:** the scenario must declare the name, and the parameter's bounds must lie inside
+    the scenario's, in the same unit. Each problem is a scenario problem.
+  - **Where the value goes:** it travels with the trial's parameters. The experiment document is
+    not changed.
+- **`pkg vendor` carries a scenario's files:** vendoring a folder copies the OpenDRIVE and
+  OpenSCENARIO files its road and scenario documents name, when its git checkout tracks them,
+  and the lock records them.
 
 ## [0.14.1] - 2026-11-10
 

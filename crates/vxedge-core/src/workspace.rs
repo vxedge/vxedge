@@ -1354,13 +1354,26 @@ impl Workspace {
     /// `scenario` reference (`ARCHITECTURE.md` §6.0.3), typed as scenario problems.
     pub fn scenario_problems(&self) -> Vec<crate::intent::Problem> {
         let experiment = self.experiments.first();
+        let binds_scenario = self.experiments_raw.first().is_some_and(|doc| {
+            crate::intent::read(doc).0.parameters.values().any(|p| {
+                p.binds
+                    .as_deref()
+                    .is_some_and(|b| b.starts_with(crate::intent::SCENARIO_BIND))
+            })
+        });
         if self.scenarios.is_empty()
             && self.road_docs.is_empty()
             && experiment.and_then(ExperimentDoc::scenario_ref).is_none()
+            && !binds_scenario
         {
             return Vec::new();
         }
         let vehicles: Vec<String> = self.vehicles.iter().map(|v| v.id.clone()).collect();
+        let parameters = self
+            .experiments_raw
+            .first()
+            .map(|doc| crate::intent::read(doc).0.parameters)
+            .unwrap_or_default();
         let required = match &self.package {
             Some(p @ crate::package::PackageDoc::V1(_)) => Some(p.host_requires().simulators),
             _ => None,
@@ -1373,6 +1386,7 @@ impl Workspace {
             scenarios: &self.scenarios,
             vehicles: &vehicles,
             required_simulators: required.as_deref(),
+            parameters: &parameters,
         })
     }
 
