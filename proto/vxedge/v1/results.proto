@@ -140,6 +140,47 @@ message ResultVerdict {
   repeated VerdictTrial trials = 6;
 }
 
+message ResultCompareRequest {
+  // The result, and the campaign it is compared with. Both are judged by the result's experiment.
+  string campaign_id = 1;
+  string reference_campaign_id = 2;
+}
+
+// One metric at one point: each side's median and IQR over its repetitions, and whether the
+// result's median is within the reference's IQR of the reference's median.
+message MetricDelta {
+  string metric = 1;
+  // The trial id without its `r<repetition>-` prefix: an arm's name, or parameter values.
+  string point = 2;
+  uint32 count = 3;
+  uint32 reference_count = 4;
+  double median = 5;
+  double iqr = 6;
+  double reference_median = 7;
+  double reference_iqr = 8;
+  // `median - reference_median`.
+  double delta = 9;
+  bool within_reference_iqr = 10;
+}
+
+message CriterionDelta {
+  string id = 1;
+  VerdictOutcome outcome = 2;
+  VerdictOutcome reference_outcome = 3;
+}
+
+message ResultComparison {
+  string campaign_id = 1;
+  string reference_campaign_id = 2;
+  VerdictOutcome outcome = 3;
+  VerdictOutcome reference_outcome = 4;
+  // Every metric at every point both campaigns archived, in the reference's order.
+  repeated MetricDelta metrics = 5;
+  repeated CriterionDelta criteria = 6;
+  // How many of `metrics` are within the reference's IQR.
+  uint32 within = 7;
+}
+
 service ResultService {
   // The archives the host's campaigns wrote, and those in a workspace's `results/`, newest first.
   rpc List(ResultListRequest) returns (ResultList);
@@ -151,4 +192,7 @@ service ResultService {
   // The experiment's criteria judged over a campaign's archives, read again from the archives
   // each time.
   rpc Verdict(ResultVerdictRequest) returns (ResultVerdict);
+  // A campaign against a reference campaign, metric by metric at each point and criterion by
+  // criterion, from their archives.
+  rpc Compare(ResultCompareRequest) returns (ResultComparison);
 }

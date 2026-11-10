@@ -12,8 +12,8 @@ use tonic::{Request, Response, Status};
 
 use vxedge_api::v1::result_service_server::ResultService;
 use vxedge_api::v1::{
-    ResultChunk, ResultFetchRequest, ResultGetRequest, ResultInfo, ResultList, ResultListRequest,
-    ResultTrial, ResultVerdict, ResultVerdictRequest,
+    ResultChunk, ResultCompareRequest, ResultComparison, ResultFetchRequest, ResultGetRequest,
+    ResultInfo, ResultList, ResultListRequest, ResultTrial, ResultVerdict, ResultVerdictRequest,
 };
 
 use crate::errors::{self, R};
@@ -226,6 +226,27 @@ impl ResultService for ResultSvc {
         .await
         .map_err(|e| Status::internal(format!("verdict task panicked: {e}")))?;
         judged
+            .map(Response::new)
+            .map_err(|e| errors::precondition(R::ResultUnknown, e))
+    }
+
+    async fn compare(
+        &self,
+        req: Request<ResultCompareRequest>,
+    ) -> Result<Response<ResultComparison>, Status> {
+        let req = req.into_inner();
+        let read = |id: &str| {
+            crate::campaign_run::read(&self.runtime_dir, id)
+                .ok_or_else(|| crate::campaign::unknown(id))
+        };
+        let (rec, reference) = (read(&req.campaign_id)?, read(&req.reference_campaign_id)?);
+        let compared = tokio::task::spawn_blocking(move || {
+            crate::verdict::compare(&rec, &reference)
+                .map(|c| crate::verdict::comparison_to_proto(&rec, &reference, &c))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("compare task panicked: {e}")))?;
+        compared
             .map(Response::new)
             .map_err(|e| errors::precondition(R::ResultUnknown, e))
     }
