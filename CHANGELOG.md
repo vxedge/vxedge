@@ -6,48 +6,74 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-10
+
+Verdicts through vxAPI. vxAPI stays `vxedge.v1`, and the changes are additive.
+- **Criteria:** they read one value per trial and combine operands, which is enough to state the
+  published notebooks' acceptance rules as typed intent.
+- **Verdicts:** `ResultService.Verdict` judges a campaign from its archives, and a campaign records
+  its verdict when it finishes.
+- **Comparing:** `ResultService.Compare` sets a campaign against a reference.
+- **Offline:** `vxedge results verdict` and `compare` do both over archives on disk. Over the 13
+  full published campaigns whose archives hold samples, they give the notebooks' verdicts.
+- **Zones:** `down` stops a container node in about 2 s.
+
+**Upgrading from 0.13.x.**
+- **Metrics:** a metric now names a `series` (with `labels`) or the `ratio` of two metrics.
+  One that names neither is a criterion problem in `Plan` and `up`.
+- **Aggregates:** `last` and `total` are gone, and every aggregate now runs across trials.
+- **Rust clients:** a client that builds `CampaignStatus`, `PackageMetric`, `CriterionComparison`,
+  `PackageCriterion` or `CriterionOperand.MetricOperand` as a struct literal needs
+  `..Default::default()` for their new fields.
+
 ### Added
 
 - **`ResultService.Verdict`** judges the experiment's criteria over a campaign's archived trials,
-  reading them from the archives on every call. Per criterion it gives the outcome, the operand
-  values, every metric read with its trials and values, and why it is inconclusive when it is.
-  `vxedge campaign verdict <id>` prints it.
+  reading them from the archives on every call.
+  - **Per criterion:** the outcome, the operand values, every metric read with its trials and
+    values, and why it is inconclusive when it is.
+  - **CLI:** `vxedge campaign verdict <id>` prints it.
 - **A campaign records its verdict when it finishes:** in `campaign.json`, as
   `CampaignStatus.verdict` (shown by `vxedge campaign status`), and in full as `verdict.json`
   beside the archives.
 - **`ResultService.Compare`** sets a campaign against a reference campaign from their archives.
-  Per metric at each point it gives both medians and IQRs and whether the difference is within
-  the reference's IQR, the reproducibility check exp-001's reruns use. It also gives each
-  criterion's outcome on both sides. `vxedge campaign compare <id> <reference id>` prints it.
-  Over the published exp-001 reruns, the same comparison gives the notebook's counts: 9 and 8 of
-  15 against the frozen campaign, 13 of 15 between the October reruns.
-
-- **`vxedge results verdict` and `compare`** judge and compare archives on this machine, offline,
-  with no daemon or campaign record. `--name 'rep{repetition}-load{load_mbps}'` names the trials
-  of archives written before campaigns did. Over every full published dataset whose archives hold
-  samples (exp-001, 002, 002b, 003 and 014, 13 campaigns), they give the notebooks' verdicts.
+  - **Per metric at each point:** both medians and IQRs, and whether the difference is within
+    the reference's IQR. This is the reproducibility check exp-001's reruns use.
+  - **Per criterion:** the outcome on both sides.
+  - **CLI:** `vxedge campaign compare <id> <reference id>` prints it.
+  - **Checked:** over the published exp-001 reruns, the same comparison gives the notebook's
+    counts: 9 and 8 of 15 against the frozen campaign, 13 of 15 between the October reruns.
+- **`vxedge results verdict` and `compare`** judge and compare archives on this machine,
+  offline, with no daemon or campaign record.
+  - `--name 'rep{repetition}-load{load_mbps}'` names the trials of archives written before
+    campaigns did.
+  - Over every full published dataset whose archives hold samples (exp-001, 002, 002b, 003 and
+    014; 13 campaigns), they give the notebooks' verdicts.
 
 ### Changed
 
-- **Criteria read results one value per trial** (decisions X-24, X-25). A metric names its
-  `series` and `labels`, or the `ratio` of two metrics, such as a loss percentage. Its value in a
-  trial is the series' last sample inside the trial's measure phase. Aggregates run across the
-  trials a criterion selects, and add `median`, `iqr`, `sum` and `stddev`. Operands combine as
-  `ratio`, `diff`, `max` and `min` and take an `offset`. A tolerance can be an operand, `outside`
-  joins the ops, and `guards` make a criterion inconclusive unless they pass.
-  `PackageService.Inspect` reports all of it.
-  - **Upgrading:** a metric without a `series` or a `ratio` is now a criterion problem. The
-    per-kind aggregates `last` and `total` are gone.
+- **Criteria read results one value per trial** (decisions X-24, X-25).
+  - **Metrics:** a metric names its `series` and `labels`, or the `ratio` of two metrics, such
+    as a loss percentage. Its value in a trial is the series' last sample inside the trial's
+    measure phase.
+  - **Aggregates** run across the trials a criterion selects, and add `median`, `iqr`, `sum`
+    and `stddev`.
+  - **Operands** combine as `ratio`, `diff`, `max` and `min`, and take an `offset`.
+  - **Comparisons:** a tolerance can be an operand, and `outside` joins the ops.
+  - **Guards** make a criterion inconclusive unless they pass.
+  - `PackageService.Inspect` reports all of it.
 - **The verdict engine** (`vxedge_core::verdict`) judges an experiment's criteria over its
   trials' archives, `vxarchive/1` and `vxarchive/2`. A v1 archive counts failed scrapes without
   placing them in time, so the count is noted on each value rather than making it incomplete.
 
 ### Fixed
 
-- `vehicle down` and `zone down` stop a container node in about 2 s instead of 10: its payload container is
-  created with a 2 s stop timeout. A payload that is PID 1 and installs no SIGTERM handler (the probe
-  reflector) ignored SIGTERM, so Podman waited its full default before killing it. The timeout is not part of
-  the container's spec hash, so a running container is not recreated for it.
+- **A container node stops in about 2 s instead of 10** on `vehicle down` and `zone down`.
+  - **Why it was slow:** a payload that is PID 1 and installs no SIGTERM handler, such as the
+    probe reflector, ignored SIGTERM, so Podman waited its full default before killing it.
+  - **The fix:** the payload container is created with a 2 s stop timeout.
+  - **No restart:** the timeout is not part of the container's spec hash, so a running
+    container is not recreated for it.
 
 ## [0.13.0] - 2026-11-10
 
