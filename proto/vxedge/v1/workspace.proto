@@ -105,6 +105,9 @@ message HostCapabilities {
   // The package descriptor schemas this daemon reads, such as `vxp/1` (`ARCHITECTURE.md`
   // §6.0.3). A legacy descriptor has no schema and is not listed.
   repeated string package_schemas = 5;
+  // The simulators a scenario can run on here (`esmini`, `carla`): those with an executable on
+  // vxedged's `PATH` (`esmini`; `CarlaUE4.sh` or `CarlaUnreal.sh`).
+  repeated string simulators = 6;
 }
 
 message HostGpu {

@@ -2354,6 +2354,49 @@ async fn a_scenario_is_typed_in_inspect_and_checked_by_plan() {
     );
 }
 
+/// A package whose `requires.simulator` names a simulator the host lacks is
+/// `ERROR_REASON_SIMULATOR_UNAVAILABLE` in `Plan`; with the simulator's executable on vxedged's
+/// PATH it is not, and `HostService.Capabilities` lists it.
+#[tokio::test]
+async fn a_required_simulator_is_checked_against_the_host() {
+    use vxedge_api::v1::ErrorReason;
+    let root = scaffolded_package();
+    let descriptor = std::fs::read_to_string(root.join("vxp.yaml")).unwrap();
+    std::fs::write(
+        root.join("vxp.yaml"),
+        descriptor.replace("  gpu: none\n", "  gpu: none\n  simulator: [esmini]\n"),
+    )
+    .unwrap();
+    let has = |plan: &vxedge_api::v1::WorkspacePlan| {
+        plan.problems
+            .iter()
+            .any(|p| p.reason == ErrorReason::SimulatorUnavailable as i32)
+    };
+    // An empty PATH plus the system's, without any esmini.
+    let bare = scratch();
+    let daemon = Daemon::start_env(|_| {}, &[("PATH", &bare.join("none:/usr/bin:/bin"))]);
+    let channel = daemon.channel().await;
+    let plan = plan_of(&channel, &root).await;
+    assert!(has(&plan), "{:?}", plan.problems);
+    drop(daemon);
+
+    let fake = scratch();
+    let esmini = fake.join("esmini");
+    std::fs::write(&esmini, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&esmini, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let path = PathBuf::from(format!("{}:/usr/bin:/bin", fake.display()));
+    let daemon = Daemon::start_env(|_| {}, &[("PATH", &path)]);
+    let channel = daemon.channel().await;
+    let plan = plan_of(&channel, &root).await;
+    assert!(!has(&plan), "{:?}", plan.problems);
+    let caps = vxedge_api::v1::host_service_client::HostServiceClient::new(channel)
+        .capabilities(vxedge_api::v1::HostCapabilitiesRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(caps.simulators, ["esmini"]);
+}
+
 /// A package imported by its bytes is listed, and every verb then reaches it by digest.
 #[tokio::test]
 async fn an_imported_package_is_listed_and_addressed_by_digest() {

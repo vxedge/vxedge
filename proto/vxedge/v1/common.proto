@@ -158,6 +158,9 @@ enum ErrorReason {
   // vehicle of the package, or a parameter the storyboard does not declare. `Plan` names every
   // one before anything runs.
   ERROR_REASON_SCENARIO_INVALID = 34;
+  // The package's `requires.simulator` names a simulator this host does not have: none of its
+  // executables is on vxedged's `PATH`. `HostService.Capabilities` lists the ones it has.
+  ERROR_REASON_SIMULATOR_UNAVAILABLE = 35;
 }
 
 // Names one run. See `RunService`.
