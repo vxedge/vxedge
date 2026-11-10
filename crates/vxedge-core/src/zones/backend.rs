@@ -579,6 +579,11 @@ fn payload_group(np: &NodePlan) -> Result<GroupSpec, ZoneBackendError> {
     .map_err(|e| ct(np, e.into()))
 }
 
+/// Seconds a zone payload gets to exit after SIGTERM before Podman kills it. A payload that is
+/// PID 1 and installs no handler ignores SIGTERM, so Podman's default 10 s was spent in full on
+/// every such container at `down`.
+const PAYLOAD_STOP_TIMEOUT_S: u32 = 2;
+
 /// The payload: the planned image with its own default command, on the device's pinned CPUs if
 /// it has any. Nothing else is set, so what runs is exactly what was published under that digest.
 fn payload_spec(image: &str, pinned_cpus: &[u32]) -> ContainerSpec {
@@ -586,6 +591,7 @@ fn payload_spec(image: &str, pinned_cpus: &[u32]) -> ContainerSpec {
         name: "payload".to_string(),
         image: image.to_string(),
         cpuset_cpus: pinned_cpus.to_vec(),
+        stop_timeout_s: Some(PAYLOAD_STOP_TIMEOUT_S),
         ..Default::default()
     }
 }
@@ -1611,6 +1617,10 @@ mod tests {
         np.pinned_cpus = vec![8];
         assert_eq!(payload_spec("img", &np.pinned_cpus).cpuset_cpus, vec![8]);
         assert_eq!(payload_group(&np).unwrap().infra().cpuset_cpus, vec![8]);
+        assert_eq!(
+            payload_spec("img", &[]).stop_timeout_s,
+            Some(PAYLOAD_STOP_TIMEOUT_S)
+        );
     }
 
     /// `status` reports and never fails: with no socket (CI) or no such group (a dev host), an

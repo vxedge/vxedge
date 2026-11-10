@@ -6,6 +6,13 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- `vehicle down` and `zone down` stop a container node in about 2 s instead of 10: its payload container is
+  created with a 2 s stop timeout. A payload that is PID 1 and installs no SIGTERM handler (the probe
+  reflector) ignored SIGTERM, so Podman waited its full default before killing it. The timeout is not part of
+  the container's spec hash, so a running container is not recreated for it.
+
 ## [0.13.0] - 2026-11-10
 
 Campaigns run through vxAPI. vxAPI stays `vxedge.v1`, and the changes are additive.

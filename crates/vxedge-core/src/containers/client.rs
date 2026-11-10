@@ -492,6 +492,7 @@ pub(crate) fn create_body(
             }),
             ..Default::default()
         }),
+        stop_timeout: spec.stop_timeout_s.map(i64::from),
         ..Default::default()
     }
 }
@@ -583,6 +584,26 @@ mod tests {
     }
 
     #[test]
+    fn create_body_carries_a_stop_timeout_and_the_hash_ignores_it() {
+        let quick = ContainerSpec {
+            image: "probe".into(),
+            stop_timeout_s: Some(2),
+            ..Default::default()
+        };
+        let body = create_body(&quick, BTreeMap::new(), None);
+        assert_eq!(body.stop_timeout, Some(2));
+        let default = ContainerSpec {
+            stop_timeout_s: None,
+            ..quick.clone()
+        };
+        assert_eq!(
+            crate::containers::spec::spec_hash(&quick, "none"),
+            crate::containers::spec::spec_hash(&default, "none"),
+            "a running container is not recreated for its stop timeout"
+        );
+    }
+
+    #[test]
     fn create_body_carries_pinned_cpus_as_a_cpuset() {
         let body = create_body(
             &ContainerSpec {
@@ -621,6 +642,7 @@ mod tests {
         assert_eq!(hc.cap_add, None);
         assert_eq!(hc.devices, None);
         assert_eq!(hc.cpuset_cpus, None, "no pins, no cpuset");
+        assert_eq!(body.stop_timeout, None, "Podman's default stop timeout");
     }
 
     #[test]
