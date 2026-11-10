@@ -2514,7 +2514,7 @@ async fn a_campaign_records_each_trial_and_keeps_going_past_a_failure() {
         dir.join("main.yaml"),
         format!(
             "{main}\n{TELEMETRY_SERVICE}parameters:\n  n: {{ type: integer, unit: \"1\", default: 1 }}\n\
-             campaign:\n  sweep: {{ n: [1, 2] }}\n  duration_s: 1\n"
+             campaign:\n  sweep: {{ n: [1, 2] }}\n  duration_s: 1\n  profiles: {{ quick: {{ repetitions: 1 }} }}\n"
         ),
     )
     .unwrap();
@@ -2578,7 +2578,9 @@ async fn a_campaign_records_each_trial_and_keeps_going_past_a_failure() {
     assert!(phases.contains("\"phase\":\"provision\""), "{phases}");
 
     let mut watch = client
-        .watch(CampaignWatchRequest { campaign_id: id })
+        .watch(CampaignWatchRequest {
+            campaign_id: id.clone(),
+        })
         .await
         .unwrap()
         .into_inner();
@@ -2588,6 +2590,32 @@ async fn a_campaign_records_each_trial_and_keeps_going_past_a_failure() {
         .unwrap();
     assert_eq!(first.state, CampaignState::Failed as i32);
     assert!(tokio_stream::StreamExt::next(&mut watch).await.is_none());
+
+    // A retry with the same request_id and another profile is refused, never merged; with the
+    // same profile it resumes the same campaign.
+    let retry = |profile: &str| CampaignStartRequest {
+        manifest: path_ref(&dir),
+        request_id: "contract-1".into(),
+        profile: profile.into(),
+        unlocked: true,
+        ..Default::default()
+    };
+    let refused = client.start(retry("quick")).await.unwrap_err();
+    assert_eq!(reason(&refused), "ERROR_REASON_PARAMETER_INVALID");
+    assert!(
+        refused.message().contains("profile"),
+        "{}",
+        refused.message()
+    );
+    let again = client.start(retry("")).await.unwrap().into_inner();
+    wait_for_job(channel.clone(), again.id.clone()).await;
+    let list = client
+        .list(CampaignListRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(list.campaigns.len(), 1);
+    assert_eq!(list.campaigns[0].campaign_id, id);
 
     let unknown = client
         .get(CampaignGetRequest {

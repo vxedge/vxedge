@@ -6,6 +6,14 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **`CampaignService.Start` retried while its campaign runs** returned `ERROR_REASON_BUSY`. A
+  retry with the same `request_id` now returns the running campaign's job, as the spec says.
+  Found by the done-means gate through `vxmcp`.
+- **A retry with the same `request_id` and another profile** resumed the earlier campaign under
+  the new profile. It is now refused as `ERROR_REASON_PARAMETER_INVALID`, never merged.
+
 ## [0.15.0] - 2026-11-10
 
 Scenarios in the package. vxAPI stays `vxedge.v1`, and the changes are additive.
