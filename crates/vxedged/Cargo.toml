@@ -24,6 +24,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml_ng = { workspace = true }
 tempfile = { workspace = true }
+zip = { workspace = true }
 
 [dev-dependencies]
 tonic-types = { workspace = true }

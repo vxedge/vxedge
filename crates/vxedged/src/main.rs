@@ -16,6 +16,7 @@ mod measure;
 mod package;
 mod plan;
 mod records;
+mod results;
 mod runs;
 mod services;
 mod status;
@@ -39,6 +40,7 @@ use vxedge_api::v1::log_service_server::LogServiceServer;
 use vxedge_api::v1::measurement_service_server::MeasurementServiceServer;
 use vxedge_api::v1::nos_check_service_server::NosCheckServiceServer;
 use vxedge_api::v1::package_service_server::PackageServiceServer;
+use vxedge_api::v1::result_service_server::ResultServiceServer;
 use vxedge_api::v1::run_service_server::RunServiceServer;
 use vxedge_api::v1::svc_service_server::SvcServiceServer;
 use vxedge_api::v1::telemetry_service_server::TelemetryServiceServer;
@@ -334,6 +336,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             audit: audit.clone(),
             runtime_dir: args.runtime_dir.clone(),
+        }))
+        .add_service(ResultServiceServer::new(results::ResultSvc {
+            runtime_dir: args.runtime_dir.clone(),
+            seen: Default::default(),
         }))
         .add_service(PackageServiceServer::new(package::PackageSvc {
             engine: engine.clone(),

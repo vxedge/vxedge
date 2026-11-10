@@ -1,0 +1,78 @@
+syntax = "proto3";
+
+package vxedge.v1;
+
+import "vxedge/v1/common.proto";
+import "vxedge/v1/package.proto";
+
+// ---------------------------------------------------------------------------
+// Results (ARCHITECTURE.md section 13): the archives a host holds, described from each archive's
+// own `metadata.json` only, and fetched by digest. An archive is found from a campaign's record,
+// or in a workspace's `results/` folder.
+// ---------------------------------------------------------------------------
+
+message ResultListRequest {
+  // Only this campaign's trial archives.
+  string campaign_id = 1;
+  // Also every archive under this workspace's `results/` folder.
+  ManifestRef workspace = 2;
+}
+
+message ResultTrial {
+  string campaign_id = 1;
+  string trial_id = 2;
+  string arm = 3;
+  uint32 repetition = 4;
+  map<string, ParamValue> parameters = 5;
+}
+
+message ResultInfo {
+  // `sha256:<hex>` of the archive's bytes: how `Get` and `Fetch` name it.
+  string digest = 1;
+  // Where it is on the daemon's host.
+  string path = 2;
+  uint64 size_bytes = 3;
+  // `vxarchive/2`, or `vxarchive/1` for an archive that names none.
+  string archive = 4;
+  string experiment_id = 5;
+  // The package it ran, when its metadata names one.
+  string package_id = 6;
+  string package_version = 7;
+  string package_digest = 8;
+  // Whether the run checked the package's lock; unset when the archive does not say.
+  optional bool package_locked = 9;
+  // The trial it is, when a campaign wrote it.
+  ResultTrial trial = 10;
+  int64 collected_unix_ms = 11;
+  string vxtelemetry_version = 12;
+  string kernel_release = 13;
+}
+
+message ResultList {
+  repeated ResultInfo results = 1;
+}
+
+message ResultGetRequest {
+  string digest = 1;
+}
+
+message ResultFetchRequest {
+  string digest = 1;
+}
+
+// One part of an archive. The first carries its digest and size.
+message ResultChunk {
+  string digest = 1;
+  uint64 size_bytes = 2;
+  bytes data = 3;
+}
+
+service ResultService {
+  // The archives the host's campaigns wrote, and those in a workspace's `results/`, newest first.
+  rpc List(ResultListRequest) returns (ResultList);
+  // One archive by digest.
+  rpc Get(ResultGetRequest) returns (ResultInfo);
+  // The archive's bytes, by digest, so a client that shares no filesystem with the daemon can
+  // rerun from it.
+  rpc Fetch(ResultFetchRequest) returns (stream ResultChunk);
+}

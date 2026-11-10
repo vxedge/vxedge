@@ -741,8 +741,26 @@ async fn no_rpc_of_the_agent_surface_is_a_stub() {
                 .map(|_| ()),
         ),
         code(
-            campaign_service_client::CampaignServiceClient::new(ch)
+            campaign_service_client::CampaignServiceClient::new(ch.clone())
                 .watch(CampaignWatchRequest::default())
+                .await
+                .map(|_| ()),
+        ),
+        code(
+            result_service_client::ResultServiceClient::new(ch.clone())
+                .list(ResultListRequest::default())
+                .await
+                .map(|_| ()),
+        ),
+        code(
+            result_service_client::ResultServiceClient::new(ch.clone())
+                .get(ResultGetRequest::default())
+                .await
+                .map(|_| ()),
+        ),
+        code(
+            result_service_client::ResultServiceClient::new(ch)
+                .fetch(ResultFetchRequest::default())
                 .await
                 .map(|_| ()),
         ),
@@ -2517,6 +2535,108 @@ async fn campaign_plan_expands_trials_and_checks_each_point() {
         "{}",
         broken.problems[0].detail
     );
+}
+
+/// A trial archive with a trial in its metadata, as a campaign writes one.
+fn write_archive(path: &Path, trial_id: &str) {
+    use std::io::Write;
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+    let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default();
+    zip.start_file("metadata.json", opts).unwrap();
+    zip.write_all(
+        serde_json::json!({
+            "archive": "vxarchive/2", "experiment_id": "e1",
+            "package": { "id": "local/e1", "version": "0.1.0", "digest": "sha256:abc", "locked": false },
+            "collected_at_unix_ms": 1, "vxtelemetry_version": "0.5.0", "kernel": { "release": "7.0.0" },
+            "trial": { "campaign_id": "c-1", "trial_id": trial_id, "arm": "idle", "repetition": 2,
+                       "parameters": { "load_mbps": 600 } },
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .unwrap();
+    zip.finish().unwrap();
+}
+
+/// `ResultService` lists archives from their metadata only, finds them again by digest, and
+/// streams their bytes; an unknown digest is `RESULT_UNKNOWN`.
+#[tokio::test]
+async fn results_are_listed_from_their_metadata_and_fetched_by_digest() {
+    use vxedge_api::v1::result_service_client::ResultServiceClient;
+    use vxedge_api::v1::{ResultFetchRequest, ResultGetRequest, ResultListRequest, param_value};
+    let daemon = Daemon::start();
+    let channel = daemon.channel().await;
+    let ws = scratch();
+    let archive = ws.join("results/c-1/r2-idle.zip");
+    write_archive(&archive, "r2-idle");
+    let bytes = std::fs::read(&archive).unwrap();
+    let digest = vxedge_core::pkg::sha256(&bytes);
+    let mut client = ResultServiceClient::new(channel);
+    let list = client
+        .list(ResultListRequest {
+            workspace: path_ref(&ws),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(list.results.len(), 1, "{:?}", list.results);
+    let r = &list.results[0];
+    assert_eq!(
+        (
+            r.digest.as_str(),
+            r.archive.as_str(),
+            r.experiment_id.as_str()
+        ),
+        (digest.as_str(), "vxarchive/2", "e1")
+    );
+    assert_eq!(
+        (r.package_id.as_str(), r.package_locked),
+        ("local/e1", Some(false))
+    );
+    let t = r.trial.as_ref().unwrap();
+    assert_eq!(
+        (t.trial_id.as_str(), t.arm.as_str(), t.repetition),
+        ("r2-idle", "idle", 2)
+    );
+    assert_eq!(
+        t.parameters["load_mbps"].value,
+        Some(param_value::Value::Integer(600))
+    );
+    let got = client
+        .get(ResultGetRequest {
+            digest: digest.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(got.size_bytes, bytes.len() as u64);
+    let mut stream = client
+        .fetch(ResultFetchRequest {
+            digest: digest.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut fetched = Vec::new();
+    let mut first = true;
+    while let Some(chunk) = tokio_stream::StreamExt::next(&mut stream).await {
+        let chunk = chunk.unwrap();
+        if first {
+            assert_eq!(chunk.digest, digest);
+            first = false;
+        }
+        fetched.extend(chunk.data);
+    }
+    assert_eq!(fetched, bytes);
+    let unknown = client
+        .get(ResultGetRequest {
+            digest: format!("sha256:{}", "0".repeat(64)),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&unknown), "ERROR_REASON_RESULT_UNKNOWN");
 }
 
 /// Typed intent that holds adds no problem.
