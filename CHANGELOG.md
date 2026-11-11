@@ -6,6 +6,12 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-11-11
+
+Compare against a frozen reference. `ResultService.Compare` takes a reference this host did not
+run, recorded in a workspace's `results/` with its archives, and checks each archive against the
+record. vxAPI stays `vxedge.v1`, and the change is additive: one field on `ResultCompareRequest`.
+
 ### Added
 
 - **`ResultService.Compare` against a reference this host did not run.** The new
