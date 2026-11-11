@@ -59,6 +59,7 @@ pub struct TrialRecord {
     #[serde(default)]
     pub arm: String,
     pub repetition: u32,
+    #[serde(default)]
     pub parameters: serde_json::Value,
     pub state: String,
     #[serde(default)]
@@ -75,8 +76,12 @@ pub struct TrialRecord {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CampaignRecord {
     pub campaign_id: String,
+    // A record published with a frozen campaign's archives names its trials and no more.
+    #[serde(default)]
     pub state: String,
+    #[serde(default)]
     pub job_id: String,
+    #[serde(default)]
     pub experiment_id: String,
     #[serde(default)]
     pub package_digest: String,
@@ -86,9 +91,12 @@ pub struct CampaignRecord {
     pub caller: String,
     #[serde(default)]
     pub unlocked: bool,
+    #[serde(default)]
     pub workspace: String,
+    #[serde(default)]
     pub results_dir: String,
     pub trials: Vec<TrialRecord>,
+    #[serde(default)]
     pub started_unix_ms: i64,
     #[serde(default)]
     pub finished_unix_ms: i64,

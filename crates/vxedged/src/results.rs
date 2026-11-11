@@ -169,26 +169,133 @@ fn find(runtime_dir: &Path, seen: Option<PathBuf>, digest: &str) -> Result<Resul
         })
 }
 
+/// The folder of a workspace named by `m`: a directory, a file's directory, or a cached package.
+/// Only the folder matters here, not its documents: a results folder is read as it is. `None` when
+/// `m` names no folder.
+fn folder_of(m: Option<&vxedge_api::v1::ManifestRef>) -> Result<Option<PathBuf>, Status> {
+    use vxedge_api::v1::manifest_ref::Source;
+    Ok(match m.and_then(|m| m.source.as_ref()) {
+        Some(Source::Path(p)) => {
+            let p = PathBuf::from(p);
+            Some(if p.is_dir() {
+                p
+            } else {
+                p.parent().map(PathBuf::from).unwrap_or(p)
+            })
+        }
+        Some(Source::Package(digest)) => Some(crate::package::cached_dir(digest)?),
+        _ => None,
+    })
+}
+
+/// The campaign recorded in `root`'s `results/<id>/campaign.json`, for a campaign this host did
+/// not run. Each archive it names is read from that folder: a relative path below it, or an
+/// absolute one by its file name, as when the record was written on another host. Each must hash
+/// to the record's `sha256`, so the reference is the one that was published.
+fn recorded_in(root: &Path, id: &str) -> Result<crate::campaign_run::CampaignRecord, Status> {
+    use std::path::Component;
+    let one_name = |p: &Path| {
+        let mut parts = p.components();
+        matches!(
+            (parts.next(), parts.next()),
+            (Some(Component::Normal(_)), None)
+        )
+    };
+    if !one_name(Path::new(id)) {
+        return Err(errors::not_found(
+            R::CampaignUnknown,
+            format!("`{id}` names no campaign: it must be one folder name under `results/`"),
+        ));
+    }
+    let folder = root.join("results").join(id);
+    let file = folder.join("campaign.json");
+    let bytes = std::fs::read(&file).map_err(|_| {
+        errors::not_found(
+            R::CampaignUnknown,
+            format!("no campaign record `{}`", file.display()),
+        )
+    })?;
+    let mut rec: crate::campaign_run::CampaignRecord =
+        serde_json::from_slice(&bytes).map_err(|e| {
+            errors::precondition(
+                R::ResultUnknown,
+                format!("`{}` is not a campaign record: {e}", file.display()),
+            )
+        })?;
+    if rec.campaign_id != id {
+        return Err(errors::precondition(
+            R::ResultUnknown,
+            format!(
+                "`{}` records campaign `{}`, not `{id}`",
+                file.display(),
+                rec.campaign_id
+            ),
+        ));
+    }
+    for t in rec
+        .trials
+        .iter_mut()
+        .filter(|t| t.state == "succeeded" && !t.archive.is_empty())
+    {
+        let named = Path::new(&t.archive);
+        let below = named
+            .components()
+            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
+        let path = if named.is_relative() && below {
+            folder.join(named)
+        } else if let Some(name) = named.is_absolute().then(|| named.file_name()).flatten() {
+            folder.join(name)
+        } else {
+            return Err(errors::precondition(
+                R::ResultUnknown,
+                format!(
+                    "`{}`, trial `{}`: archive `{}` is outside the record's folder",
+                    file.display(),
+                    t.id,
+                    t.archive
+                ),
+            ));
+        };
+        let want = t.sha256.strip_prefix("sha256:").unwrap_or(&t.sha256);
+        let got = sha256_file(&path).ok_or_else(|| {
+            errors::not_found(
+                R::ResultUnknown,
+                format!("trial `{}`: no archive `{}`", t.id, path.display()),
+            )
+        })?;
+        if want.is_empty() {
+            return Err(errors::precondition(
+                R::ChecksumMismatch,
+                format!(
+                    "`{}`, trial `{}`: the record names no sha256",
+                    file.display(),
+                    t.id
+                ),
+            ));
+        }
+        if got.strip_prefix("sha256:") != Some(want) {
+            return Err(errors::precondition(
+                R::ChecksumMismatch,
+                format!(
+                    "trial `{}`: `{}` is {got}, the record says `{}`",
+                    t.id,
+                    path.display(),
+                    t.sha256
+                ),
+            ));
+        }
+        t.archive = path.display().to_string();
+    }
+    Ok(rec)
+}
+
 #[tonic::async_trait]
 impl ResultService for ResultSvc {
     type FetchStream = Pin<Box<dyn Stream<Item = Result<ResultChunk, Status>> + Send>>;
 
     async fn list(&self, req: Request<ResultListRequest>) -> Result<Response<ResultList>, Status> {
         let req = req.into_inner();
-        // Only the folder matters here, not its documents: a results folder is listed as it is.
-        use vxedge_api::v1::manifest_ref::Source;
-        let root = match req.workspace.as_ref().and_then(|m| m.source.as_ref()) {
-            Some(Source::Path(p)) => {
-                let p = PathBuf::from(p);
-                Some(if p.is_dir() {
-                    p
-                } else {
-                    p.parent().map(PathBuf::from).unwrap_or(p)
-                })
-            }
-            Some(Source::Package(digest)) => Some(crate::package::cached_dir(digest)?),
-            _ => None,
-        };
+        let root = folder_of(req.workspace.as_ref())?;
         let runtime_dir = self.runtime_dir.clone();
         let results = tokio::task::spawn_blocking(move || {
             listed(&runtime_dir, &req.campaign_id, root.as_deref())
@@ -235,20 +342,30 @@ impl ResultService for ResultSvc {
         req: Request<ResultCompareRequest>,
     ) -> Result<Response<ResultComparison>, Status> {
         let req = req.into_inner();
-        let read = |id: &str| {
-            crate::campaign_run::read(&self.runtime_dir, id)
-                .ok_or_else(|| crate::campaign::unknown(id))
-        };
-        let (rec, reference) = (read(&req.campaign_id)?, read(&req.reference_campaign_id)?);
+        let rec = crate::campaign_run::read(&self.runtime_dir, &req.campaign_id)
+            .ok_or_else(|| crate::campaign::unknown(&req.campaign_id))?;
+        let root = folder_of(req.reference_workspace.as_ref())?;
+        if req.reference_workspace.is_some() && root.is_none() {
+            return Err(errors::invalid(
+                R::WorkspaceInvalid,
+                "`reference_workspace` names a folder: a path or a package digest, not inline YAML",
+            ));
+        }
+        let runtime_dir = self.runtime_dir.clone();
         let compared = tokio::task::spawn_blocking(move || {
+            let id = &req.reference_campaign_id;
+            let reference = match root {
+                Some(root) => recorded_in(&root, id)?,
+                None => crate::campaign_run::read(&runtime_dir, id)
+                    .ok_or_else(|| crate::campaign::unknown(id))?,
+            };
             crate::verdict::compare(&rec, &reference)
                 .map(|c| crate::verdict::comparison_to_proto(&rec, &reference, &c))
+                .map_err(|e| errors::precondition(R::ResultUnknown, e))
         })
         .await
         .map_err(|e| Status::internal(format!("compare task panicked: {e}")))?;
-        compared
-            .map(Response::new)
-            .map_err(|e| errors::precondition(R::ResultUnknown, e))
+        compared.map(Response::new)
     }
 
     async fn fetch(
