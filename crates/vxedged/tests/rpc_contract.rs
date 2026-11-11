@@ -2838,7 +2838,9 @@ fn write_v1_archive(path: &Path, p99: f64) {
 
 /// `ResultService.Verdict` judges the experiment's criteria over a campaign's archived trials,
 /// reading the archives; `CampaignStatus` carries the verdict recorded at the end; an unknown
-/// campaign is `CAMPAIGN_UNKNOWN`.
+/// campaign is `CAMPAIGN_UNKNOWN`. `Compare` sets the campaign against a reference this host ran,
+/// and against the same reference frozen in another workspace's `results/`, whose archives must
+/// hash to its record and stay inside its folder.
 #[tokio::test]
 async fn a_campaign_verdict_is_judged_from_its_archives() {
     use vxedge_api::v1::campaign_service_client::CampaignServiceClient;
@@ -2924,6 +2926,7 @@ criteria:\n  - { id: h1, op: le, lhs: { metric: p99, aggregate: median, select: 
         .compare(ResultCompareRequest {
             campaign_id: "c-1".into(),
             reference_campaign_id: "ref".into(),
+            reference_workspace: None,
         })
         .await
         .unwrap()
@@ -2940,6 +2943,86 @@ criteria:\n  - { id: h1, op: le, lhs: { metric: p99, aggregate: median, select: 
         (VerdictOutcome::Pass as i32, VerdictOutcome::Fail as i32)
     );
     assert_eq!(c.criteria[0].id, "h1");
+
+    // The same reference, frozen: published in another workspace's `results/` with a record that
+    // names its trials. One archive is named relative to the record, one by the absolute path
+    // of the host that wrote it; both are read from the record's folder and hashed.
+    let frozen = tempfile::tempdir().unwrap();
+    let folder = frozen.path().join("results/exp-ref");
+    let sha = |p: &Path| {
+        use sha2::Digest;
+        let d = sha2::Sha256::digest(std::fs::read(p).unwrap());
+        d.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    };
+    let mut published = Vec::new();
+    for (i, t) in reference.iter().enumerate() {
+        let id = t["id"].as_str().unwrap();
+        let copy = folder.join(format!("{id}.zip"));
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::copy(t["archive"].as_str().unwrap(), &copy).unwrap();
+        let named = if i == 0 {
+            format!("{id}.zip")
+        } else {
+            format!("/elsewhere/results/exp-ref/{id}.zip")
+        };
+        let mut t = t.clone();
+        t["archive"] = named.into();
+        t["sha256"] = sha(&copy).into();
+        published.push(t);
+    }
+    let record = serde_json::json!({ "campaign_id": "exp-ref", "trials": published });
+    std::fs::write(folder.join("campaign.json"), record.to_string()).unwrap();
+    let workspace = vxedge_api::v1::ManifestRef {
+        source: Some(vxedge_api::v1::manifest_ref::Source::Path(
+            frozen.path().display().to_string(),
+        )),
+        ..Default::default()
+    };
+    let against = |id: &str| ResultCompareRequest {
+        campaign_id: "c-1".into(),
+        reference_campaign_id: id.into(),
+        reference_workspace: Some(workspace.clone()),
+    };
+    let f = ResultServiceClient::new(channel.clone())
+        .compare(against("exp-ref"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(f.reference_campaign_id, "exp-ref");
+    assert_eq!(
+        (&f.metrics, &f.criteria, f.within),
+        (&c.metrics, &c.criteria, c.within)
+    );
+    assert_eq!(f.reference_outcome, c.reference_outcome);
+
+    // An archive that is not the one published is refused, as is one outside the folder.
+    let mut tampered = record.clone();
+    tampered["trials"][1]["sha256"] = "00".into();
+    std::fs::write(folder.join("campaign.json"), tampered.to_string()).unwrap();
+    let err = ResultServiceClient::new(channel.clone())
+        .compare(against("exp-ref"))
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&err), "ERROR_REASON_CHECKSUM_MISMATCH", "{err:?}");
+    let mut outside = record.clone();
+    outside["trials"][0]["archive"] = "../c-1/r1-idle.zip".into();
+    std::fs::write(folder.join("campaign.json"), outside.to_string()).unwrap();
+    let err = ResultServiceClient::new(channel.clone())
+        .compare(against("exp-ref"))
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&err), "ERROR_REASON_RESULT_UNKNOWN", "{err:?}");
+    for id in ["nope", "../exp-ref"] {
+        let err = ResultServiceClient::new(channel.clone())
+            .compare(against(id))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            reason(&err),
+            "ERROR_REASON_CAMPAIGN_UNKNOWN",
+            "{id}: {err:?}"
+        );
+    }
 
     let unknown = ResultServiceClient::new(channel)
         .verdict(ResultVerdictRequest {

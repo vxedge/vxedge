@@ -144,6 +144,12 @@ message ResultCompareRequest {
   // The result, and the campaign it is compared with. Both are judged by the result's experiment.
   string campaign_id = 1;
   string reference_campaign_id = 2;
+  // The workspace that holds the reference, for a campaign this host did not run, such as a
+  // frozen campaign published with its archives. The reference is then that workspace's
+  // `results/<reference_campaign_id>/campaign.json`. Each archive it names is read from that
+  // folder, and must hash to the record's `sha256`, else `ERROR_REASON_CHECKSUM_MISMATCH`.
+  // Unset: the reference is a campaign this host ran.
+  ManifestRef reference_workspace = 3;
 }
 
 // One metric at one point: each side's median and IQR over its repetitions, and whether the
@@ -193,6 +199,7 @@ service ResultService {
   // each time.
   rpc Verdict(ResultVerdictRequest) returns (ResultVerdict);
   // A campaign against a reference campaign, metric by metric at each point and criterion by
-  // criterion, from their archives.
+  // criterion, from their archives. The reference is one this host ran, or one recorded in a
+  // workspace's `results/` folder.
   rpc Compare(ResultCompareRequest) returns (ResultComparison);
 }

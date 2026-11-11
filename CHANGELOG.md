@@ -6,6 +6,16 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`ResultService.Compare` against a reference this host did not run.** The new
+  `reference_workspace` names a workspace whose `results/<reference_campaign_id>/campaign.json`
+  is the reference, such as a frozen campaign published with its archives. Such a record needs
+  only the campaign id and its trials. Each archive is read from the record's folder and must hash
+  to the record's `sha256`, else `ERROR_REASON_CHECKSUM_MISMATCH`; a path outside the folder is
+  refused. The change to vxAPI is additive: one field on `ResultCompareRequest`.
+  - **CLI:** `vxedge campaign compare <id> <reference> --reference-workspace <path>`.
+
 ## [0.16.0] - 2026-11-10
 
 Microcontroller firmware as a zone node. A new backend, `qemu-mcu`, boots a firmware image on an

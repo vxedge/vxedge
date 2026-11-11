@@ -681,6 +681,10 @@ enum CampaignCmd {
     Compare {
         campaign_id: String,
         reference_campaign_id: String,
+        /// A workspace whose `results/<reference_campaign_id>/campaign.json` is the reference,
+        /// for a campaign this host did not run, such as a frozen one.
+        #[arg(long)]
+        reference_workspace: Option<String>,
     },
 }
 
@@ -2256,6 +2260,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 CampaignCmd::Compare {
                     campaign_id,
                     reference_campaign_id,
+                    reference_workspace,
                 } => {
                     use vxedge_api::v1::ResultCompareRequest;
                     use vxedge_api::v1::result_service_client::ResultServiceClient;
@@ -2263,6 +2268,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         .compare(ResultCompareRequest {
                             campaign_id: campaign_id.clone(),
                             reference_campaign_id: reference_campaign_id.clone(),
+                            reference_workspace: manifest_ref(reference_workspace),
                         })
                         .await?
                         .into_inner();
