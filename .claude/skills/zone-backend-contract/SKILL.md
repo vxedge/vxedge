@@ -48,6 +48,7 @@ guest OS.
   `org.vxedge.machine`): `mps2-an385`. `arch`, if present, is `armv7m`.
 - The firmware reads `vx.ip=<cidr> vx.node=<id>` from the semihosting command line, takes its MAC from
   the NIC (QEMU loads it into the LAN9118), prints to UART0 and echoes UDP on :9800.
+- It declares that reflector as `org.vxedge.reflector: udp/9800`, as a VM guest bundle does (below).
 
 ## Guest bundle contract (what every new zone-class image in vxparts must produce)
 
@@ -72,6 +73,9 @@ must follow, not just imitate loosely:
 - Document, in the recipe's own README, exactly which `backend:` values the image
   supports — a recipe for a guest that production runs under a Type-1 hypervisor must state
   the RTOS-as-guest inversion fidelity caveat (ARCHITECTURE §9) inline, not leave it implicit.
+- A guest that answers a measurement echoes UDP on :9800 at its `vx.ip` address and declares it as
+  `org.vxedge.reflector: udp/9800`. Each VM backend's privileged test (`zones_qemu_microvm.rs`,
+  `zones_cloud_hypervisor.rs`, `zones_qemu_mcu.rs`) checks the reflector answers at the pinned address.
 - Agents (`vxagents`) are injected per experiment, never baked into the image
   (`vxparts/AGENTS.md`) — a guest image that assumes vxprobe/vxtraffic is already
   present breaks the inject-per-experiment model.
