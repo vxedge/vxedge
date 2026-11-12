@@ -220,8 +220,12 @@ pub struct Campaign {
 
 /// The trial's experiment document: its values bound, and the telemetry service's ingest window
 /// sized to the trial.
-fn trial_document(c: &Campaign, t: &Trial) -> Result<String, String> {
-    let mut doc = vxedge_core::campaign::bind(&c.doc, &c.parameters, &t.parameters)?;
+fn trial_document(
+    c: &Campaign,
+    t: &Trial,
+    parameters: &std::collections::BTreeMap<String, Value>,
+) -> Result<String, String> {
+    let mut doc = vxedge_core::campaign::bind(&c.doc, &c.parameters, parameters)?;
     let window = (t.warmup_s + t.duration_s).ceil() as u64 + 15;
     if let Some(svc) = doc
         .get_mut("services")
@@ -238,11 +242,14 @@ fn trial_document(c: &Campaign, t: &Trial) -> Result<String, String> {
     vxedge_core::campaign::with_experiment(&c.text, &doc)
 }
 
-fn phase_marker(ingest_dir: &Path, trial: &str, phase: &str) {
+fn phase_marker(ingest_dir: &Path, trial: &str, phase: &str, window: Option<&str>) {
     use std::io::Write;
-    let line = serde_json::json!({
+    let mut line = serde_json::json!({
         "record": "phase", "ts_ns": now_ms() * 1_000_000, "trial": trial, "phase": phase,
     });
+    if let Some(w) = window {
+        line["window"] = w.into();
+    }
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -276,6 +283,86 @@ async fn sleep_s(s: f64) {
     }
 }
 
+/// Start the measurements for `duration_s`, wait it out, then wait for the senders' last
+/// summary, a few seconds at most.
+async fn measure(
+    steps: &Steps,
+    c: &Campaign,
+    manifest: &Option<ManifestRef>,
+    duration_s: f64,
+    p: &Progress,
+    parent: &str,
+    label: &str,
+) -> Result<(), JobFailure> {
+    if c.has_measurements {
+        let job = MeasurementService::start(
+            &*steps.measure,
+            stage(
+                MeasurementStartRequest {
+                    manifest: manifest.clone(),
+                    duration_s: duration_s.ceil() as u32,
+                    ..Default::default()
+                },
+                parent,
+            ),
+        )
+        .await
+        .map_err(|s| JobFailure::from_status(&s).context("measure start"))?
+        .into_inner();
+        await_job(&steps.engine, job, p, 30, &format!("{label} measure")).await?;
+    }
+    sleep_s(duration_s).await;
+    if c.has_measurements {
+        for _ in 0..20 {
+            let st = MeasurementService::status(
+                &*steps.measure,
+                tonic::Request::new(MeasurementStatusRequest {
+                    manifest: manifest.clone(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map(|r| r.into_inner())
+            .ok();
+            let running = st.is_some_and(|s| {
+                s.measurements
+                    .iter()
+                    .any(|m| m.state == vxedge_api::v1::MeasurementState::Running as i32)
+            });
+            if !running {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+    Ok(())
+}
+
+async fn stop_measurements(
+    steps: &Steps,
+    manifest: &Option<ManifestRef>,
+    p: &Progress,
+    parent: &str,
+    label: &str,
+) -> Result<(), JobFailure> {
+    let job = MeasurementService::stop(
+        &*steps.measure,
+        stage(
+            MeasurementStopRequest {
+                manifest: manifest.clone(),
+                ..Default::default()
+            },
+            parent,
+        ),
+    )
+    .await
+    .map_err(|s| JobFailure::from_status(&s).context("measure stop"))?
+    .into_inner();
+    await_job(&steps.engine, job, p, 40, &format!("{label} measure stop"))
+        .await
+        .map(|_| ())
+}
+
 /// Run one trial and return its archive and sha256. `down` runs whenever provisioning started.
 pub async fn run_trial(
     steps: &Steps,
@@ -287,7 +374,7 @@ pub async fn run_trial(
     mut set_phase: impl FnMut(&str),
 ) -> Result<(String, String), JobFailure> {
     let parent = p.job_id().to_string();
-    let yaml = trial_document(c, t).map_err(JobFailure::from)?;
+    let yaml = trial_document(c, t, &t.parameters).map_err(JobFailure::from)?;
     let manifest = Some(ManifestRef {
         source: Some(Source::InlineYaml(yaml)),
         resolved_dir: c.root.display().to_string(),
@@ -298,7 +385,7 @@ pub async fn run_trial(
         ..Default::default()
     });
     prepare_ingest(&c.ingest_dir, campaign_id, t).map_err(JobFailure::from)?;
-    let mark = |phase: &str| phase_marker(&c.ingest_dir, &t.id, phase);
+    let mark = |phase: &str| phase_marker(&c.ingest_dir, &t.id, phase, None);
 
     set_phase("provision");
     mark("provision");
@@ -340,66 +427,30 @@ pub async fn run_trial(
         }
         sleep_s(t.warmup_s).await;
         set_phase("measure");
-        mark("measure");
-        if c.has_measurements {
-            let job = MeasurementService::start(
-                &*steps.measure,
-                stage(
-                    MeasurementStartRequest {
-                        manifest: manifest.clone(),
-                        duration_s: t.duration_s.ceil() as u32,
-                        ..Default::default()
-                    },
-                    &parent,
-                ),
-            )
-            .await
-            .map_err(|s| JobFailure::from_status(&s).context("measure start"))?
-            .into_inner();
-            await_job(&steps.engine, job, p, 30, &format!("{} measure", t.id)).await?;
+        if t.windows.is_empty() {
+            mark("measure");
+            measure(steps, c, &manifest, t.duration_s, p, &parent, &t.id).await?;
         }
-        sleep_s(t.duration_s).await;
-        if c.has_measurements {
-            // The senders end with their duration; wait for the last summary, a few seconds at most.
-            for _ in 0..20 {
-                let st = MeasurementService::status(
-                    &*steps.measure,
-                    tonic::Request::new(MeasurementStatusRequest {
-                        manifest: manifest.clone(),
-                        ..Default::default()
-                    }),
-                )
-                .await
-                .map(|r| r.into_inner())
-                .ok();
-                let running = st.is_some_and(|s| {
-                    s.measurements
-                        .iter()
-                        .any(|m| m.state == vxedge_api::v1::MeasurementState::Running as i32)
-                });
-                if !running {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(500)).await;
+        // Each window runs the measurements afresh, with its own parameters, and stops them, so
+        // the next window's senders start from nothing.
+        for w in &t.windows {
+            phase_marker(&c.ingest_dir, &t.id, "measure", Some(&w.id));
+            let yaml = trial_document(c, t, &w.parameters).map_err(JobFailure::from)?;
+            let window = Some(ManifestRef {
+                source: Some(Source::InlineYaml(yaml)),
+                resolved_dir: c.root.display().to_string(),
+                ..Default::default()
+            });
+            let label = format!("{} {}", t.id, w.id);
+            measure(steps, c, &window, w.duration_s, p, &parent, &label).await?;
+            if c.has_measurements {
+                stop_measurements(steps, &window, p, &parent, &label).await?;
             }
         }
         set_phase("cooldown");
         mark("cooldown");
         if c.has_measurements {
-            let job = MeasurementService::stop(
-                &*steps.measure,
-                stage(
-                    MeasurementStopRequest {
-                        manifest: manifest.clone(),
-                        ..Default::default()
-                    },
-                    &parent,
-                ),
-            )
-            .await
-            .map_err(|s| JobFailure::from_status(&s).context("measure stop"))?
-            .into_inner();
-            await_job(&steps.engine, job, p, 40, &format!("{} measure stop", t.id)).await?;
+            stop_measurements(steps, &manifest, p, &parent, &t.id).await?;
         }
         if c.has_traffic {
             let job = TrafficService::down(

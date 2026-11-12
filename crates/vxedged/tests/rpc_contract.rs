@@ -2710,6 +2710,57 @@ async fn campaign_plan_expands_trials_and_checks_each_point() {
         "{}",
         broken.problems[0].detail
     );
+
+    // Measure windows: the plan lists each trial's windows with their own values, and checks
+    // each window's document, since that is what the window runs.
+    write(
+        "  repetitions: 2
+  windows:
+    - { id: cold, duration_s: 3, set: { pps: 20 } }
+    - { id: steady, duration_s: 60 }
+",
+    );
+    let windowed = client
+        .plan(CampaignPlanRequest {
+            manifest: path_ref(&dir),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(windowed.problems.is_empty(), "{:?}", windowed.problems);
+    let t = &windowed.trials[0];
+    assert_eq!(t.duration_s, 63.0);
+    let windows: Vec<(&str, f64)> = t
+        .windows
+        .iter()
+        .map(|w| (w.id.as_str(), w.duration_s))
+        .collect();
+    assert_eq!(windows, [("cold", 3.0), ("steady", 60.0)]);
+    use vxedge_api::v1::param_value::Value as V;
+    assert_eq!(t.windows[0].parameters["pps"].value, Some(V::Integer(20)));
+    assert_eq!(t.windows[1].parameters["pps"].value, Some(V::Integer(100)));
+
+    write(
+        "  windows:
+    - { id: cold, duration_s: 3, set: { pps: 0 } }
+    - { id: steady, duration_s: 60 }
+",
+    );
+    let broken = client
+        .plan(CampaignPlanRequest {
+            manifest: path_ref(&dir),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(broken.problems.len(), 1, "{:?}", broken.problems);
+    assert!(
+        broken.problems[0].detail.contains("window `cold`"),
+        "{}",
+        broken.problems[0].detail
+    );
 }
 
 /// A trial archive with a trial in its metadata, as a campaign writes one.

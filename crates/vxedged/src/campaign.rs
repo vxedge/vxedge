@@ -12,7 +12,8 @@ use tonic::{Code, Request, Response, Status};
 use vxedge_api::v1::campaign_service_server::CampaignService;
 use vxedge_api::v1::{
     CampaignGetRequest, CampaignList, CampaignListRequest, CampaignPlan, CampaignPlanRequest,
-    CampaignStartRequest, CampaignStatus, CampaignTrial, CampaignWatchRequest, Job, PlanProblem,
+    CampaignStartRequest, CampaignStatus, CampaignTrial, CampaignWatchRequest, CampaignWindow, Job,
+    PlanProblem,
 };
 use vxedge_core::campaign;
 
@@ -132,24 +133,35 @@ pub(crate) fn plan_of(
                 .split_once('-')
                 .map(|(_, p)| p)
                 .unwrap_or(&trial.id);
-            let bound = campaign::bind(&doc, &intent.parameters, &trial.parameters)
-                .and_then(|d| campaign::with_experiment(&text, &d))
-                .and_then(|t| vxedge_core::model::load_yaml(&t).map_err(|e| e.to_string()));
-            match bound {
-                Err(e) => problems.push(problem(
-                    R::ParameterInvalid,
-                    &subject,
-                    format!("point `{point}`: {e}"),
-                )),
-                Ok(m) => problems.extend(vxedge_core::measurements::problems(&m).into_iter().map(
-                    |p| {
-                        problem(
-                            R::MeasurementInvalid,
-                            &subject,
-                            format!("point `{point}`: {p}"),
-                        )
-                    },
-                )),
+            // A trial with windows runs each window's document; one without runs the point's.
+            let documents: Vec<(
+                String,
+                &std::collections::BTreeMap<String, serde_yaml_ng::Value>,
+            )> = if trial.windows.is_empty() {
+                vec![(format!("point `{point}`"), &trial.parameters)]
+            } else {
+                trial
+                    .windows
+                    .iter()
+                    .map(|w| (format!("point `{point}`, window `{}`", w.id), &w.parameters))
+                    .collect()
+            };
+            for (what, values) in documents {
+                let bound = campaign::bind(&doc, &intent.parameters, values)
+                    .and_then(|d| campaign::with_experiment(&text, &d))
+                    .and_then(|t| vxedge_core::model::load_yaml(&t).map_err(|e| e.to_string()));
+                match bound {
+                    Err(e) => problems.push(problem(
+                        R::ParameterInvalid,
+                        &subject,
+                        format!("{what}: {e}"),
+                    )),
+                    Ok(m) => {
+                        problems.extend(vxedge_core::measurements::problems(&m).into_iter().map(
+                            |p| problem(R::MeasurementInvalid, &subject, format!("{what}: {p}")),
+                        ))
+                    }
+                }
             }
         }
     }
@@ -179,6 +191,24 @@ pub(crate) fn plan_of(
                 repetition: t.repetition,
                 warmup_s: t.warmup_s,
                 duration_s: t.duration_s,
+                windows: t
+                    .windows
+                    .iter()
+                    .map(|w| CampaignWindow {
+                        id: w.id.clone(),
+                        duration_s: w.duration_s,
+                        parameters: w
+                            .parameters
+                            .iter()
+                            .map(|(k, v)| {
+                                (
+                                    k.clone(),
+                                    crate::package::param_value(v, types.get(k.as_str()).copied()),
+                                )
+                            })
+                            .collect(),
+                    })
+                    .collect(),
             })
             .collect(),
         points: plan.points,

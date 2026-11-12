@@ -33,7 +33,20 @@ message CampaignTrial {
   // From 1.
   uint32 repetition = 4;
   double warmup_s = 5;
+  // The measure phase's length: the campaign's `duration_s`, or its windows' sum.
   double duration_s = 6;
+  // The measure windows, in order, when the campaign declares `windows`; else empty.
+  repeated CampaignWindow windows = 7;
+}
+
+// One measure window of a trial: the measurements run for `duration_s` with these parameter
+// values, then stop, before the next window starts them afresh.
+message CampaignWindow {
+  string id = 1;
+  double duration_s = 2;
+  // Every declared parameter's value while the window runs: the trial's, with the window's
+  // `set` applied.
+  map<string, ParamValue> parameters = 3;
 }
 
 message CampaignPlan {

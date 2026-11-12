@@ -6,6 +6,30 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Measure windows (X9.7).** `campaign.windows` splits each trial's measure phase into named
+  windows that run one after another, for a protocol that measures twice in one trial, such as
+  exp-005's cold burst the moment the zone is up followed by a steady window.
+  - **Per window:** an `id`, a `duration_s`, and an optional `set` of parameter values for that
+    window only. A window may set only a parameter that binds a measurement's field, since the
+    rest of the trial is already up.
+  - **Running:** each window starts the measurements with its own values, runs them, and stops
+    them, so the next window starts from nothing. Each window has its own `measure` phase record,
+    which names it (`window` in `phases.jsonl` and on vxAPI's `PhaseRecord`).
+  - **Metrics:** with windows, every series metric names the `window` it reads and its value is
+    the last sample inside that window. A `ratio` may divide values from two windows of one
+    trial.
+  - **Plan:** `CampaignTrial.windows` lists each trial's windows with their values. `Plan` checks
+    each window's document, and its problems name the window. The CLI's `campaign plan` prints
+    the windows.
+  - **Refused at plan time** (`ERROR_REASON_PARAMETER_INVALID`, `ERROR_REASON_CRITERION_INVALID`):
+    a campaign `duration_s` or a profile `duration_s` beside windows, a duplicate or empty window
+    id, a duration of 0, a `set` of a parameter that binds no measurement field or of a value out
+    of bounds, a series metric without a window or naming an unknown one, a metric `window`
+    without campaign windows, and a `window` on a ratio.
+  - **vxAPI:** additive. `CampaignTrial.windows` (`CampaignWindow`) and `PhaseRecord.window`.
+
 ## [0.17.0] - 2026-11-11
 
 Compare against a frozen reference. `ResultService.Compare` takes a reference this host did not
