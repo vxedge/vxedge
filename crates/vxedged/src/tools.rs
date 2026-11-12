@@ -58,7 +58,8 @@ pub struct Tools {
     configured: Vec<(String, String)>,
     /// The daemon's own entry, read at the first list.
     own: tokio::sync::OnceCell<Tool>,
-    cache: Mutex<HashMap<PathBuf, (FileKey, Tool)>>,
+    /// Per tool name, the file last read and what it was.
+    cache: Mutex<HashMap<String, (FileKey, Tool)>>,
 }
 
 impl Tools {
@@ -128,7 +129,7 @@ fn own() -> Tool {
 async fn read_tool(
     name: &str,
     configured: &str,
-    cache: &mut HashMap<PathBuf, (FileKey, Tool)>,
+    cache: &mut HashMap<String, (FileKey, Tool)>,
 ) -> Tool {
     let failed = |error: String| Tool {
         name: name.into(),
@@ -146,9 +147,9 @@ async fn read_tool(
         Ok(m) => file_key(&m),
         Err(e) => return failed(format!("cannot stat `{}`: {e}", path.display())),
     };
-    if let Some((k, tool)) = cache.get(&path)
+    if let Some((k, tool)) = cache.get(name)
         && *k == key
-        && tool.name == name
+        && Path::new(&tool.path) == path
     {
         return tool.clone();
     }
@@ -174,7 +175,7 @@ async fn read_tool(
             tool.error.get_or_insert(e);
         }
     }
-    cache.insert(path, (key, tool.clone()));
+    cache.insert(name.to_string(), (key, tool.clone()));
     tool
 }
 

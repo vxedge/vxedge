@@ -5,6 +5,7 @@
 //! returns the archive through `Job.artifact` with its sha256. `StreamRecords` and
 //! `StreamMetrics` tail what the service is ingesting (`records`), and `LogService.Follow` the log
 //! lines it reads.
+
 use sha2::Digest;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
