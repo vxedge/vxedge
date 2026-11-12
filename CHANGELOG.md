@@ -24,6 +24,13 @@ All notable changes to this repo are documented here. Format follows
     a bad name, size or address, a `fetch.target` that `publish` does not make, more than 16
     clients, and `publish` or `fetch` on a placed service (`ERROR_REASON_WORKSPACE_INVALID`).
 
+### Fixed
+
+- A campaign trial's archive lists the entities of the trial's own bound document. `entities.json`
+  was rebuilt from the package's defaults when the trial was collected, so whatever a parameter
+  bound, such as a measurement's `to` per arm or an arm's OTA clients, was missing or wrong there,
+  while the samples themselves were right.
+
 ## [0.22.0] - 2026-11-12
 
 Functional checks. An experiment can be a suite, not a measurement: tools run in the nodes'

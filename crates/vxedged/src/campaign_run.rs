@@ -446,10 +446,6 @@ pub async fn run_trial(
         resolved_dir: c.root.display().to_string(),
         ..Default::default()
     });
-    let path_ref = Some(ManifestRef {
-        source: Some(Source::Path(c.root.display().to_string())),
-        ..Default::default()
-    });
     prepare_ingest(&c.ingest_dir, campaign_id, t).map_err(JobFailure::from)?;
     // A step's output from the trial before is gone before this trial's ingest starts, or the
     // ingest would read it as this trial's.
@@ -567,8 +563,11 @@ pub async fn run_trial(
         let job = TelemetryService::collect(
             &*steps.telemetry,
             stage(
+                // The trial's bound document, read from its folder: the archive's
+                // `entities.json` then names what this trial ran, such as an arm's fetch
+                // clients, not the defaults the package declares.
                 CollectRequest {
-                    manifest: path_ref.clone(),
+                    manifest: manifest.clone(),
                     out_path: archive.display().to_string(),
                     archive_version: 2,
                 },
