@@ -490,6 +490,9 @@ pub struct DeviceDoc {
     pub resources: Option<serde_yaml_ng::Value>,
     #[serde(default)]
     pub realtime: Option<serde_yaml_ng::Value>,
+    /// `qemu-microvm` only: `{ machine: microvm | q35, transport: mmio | pci, vhost: bool }`.
+    #[serde(default)]
+    pub qemu: Option<serde_yaml_ng::Value>,
     /// COVESA VSS path, for a sensor or actuator.
     #[serde(default)]
     pub vss: Option<String>,

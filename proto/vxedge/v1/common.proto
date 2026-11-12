@@ -223,6 +223,19 @@ message NodeSpec {
   uint32 vlan = 7;
   string slice = 8;
   NodePayload payload = 9;
+  // A `qemu-microvm` node's QEMU, from the device's `qemu:` block or its defaults. Unset for every
+  // other backend.
+  QemuOptions qemu = 10;
+}
+
+// How a `qemu-microvm` node's QEMU is built.
+message QemuOptions {
+  // `microvm` or `q35`.
+  string machine = 1;
+  // The NIC's virtio transport: `mmio` or `pci`.
+  string transport = 2;
+  // The NIC's data path runs in the host kernel (`vhost-net`).
+  bool vhost = 3;
 }
 
 // Observed status of a single resource, as reported by the reconciler.

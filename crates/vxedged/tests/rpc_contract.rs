@@ -774,7 +774,7 @@ id: five
 zones: { z: {} }
 devices:
   a: { role: zone-controller, zone: z, backend: container }
-  b: { role: ecu, zone: z, backend: qemu-microvm }
+  b: { role: ecu, zone: z, backend: qemu-microvm, qemu: { machine: q35, transport: pci, vhost: true } }
   c: { role: ecu, zone: z, backend: libvirt }
   d: { role: ecu, zone: z, backend: cloud-hypervisor }
   e: { role: sensor, zone: z, backend: wasm-capsule }
@@ -992,6 +992,17 @@ async fn node_status_is_typed_on_every_backend() {
         let node = spec(id);
         assert_eq!(node.backend, backend as i32, "{id}");
         assert_eq!(node.payload.unwrap().kind, kind as i32, "{id}");
+    }
+    // A qemu-microvm node reports the QEMU it is built as; no other backend has one.
+    let b = spec("b")
+        .qemu
+        .expect("a qemu-microvm node carries its qemu options");
+    assert_eq!(
+        (b.machine.as_str(), b.transport.as_str(), b.vhost),
+        ("q35", "pci", true)
+    );
+    for id in ["a", "c", "d", "e", "f", "g"] {
+        assert!(spec(id).qemu.is_none(), "{id}");
     }
     let a = spec("a");
     assert_eq!(a.zone, "z");
