@@ -675,7 +675,13 @@ enum CampaignCmd {
     Status { campaign_id: Option<String> },
     /// The experiment's criteria judged over a campaign's archived trials, read from the
     /// archives (`ResultService.Verdict`).
-    Verdict { campaign_id: String },
+    Verdict {
+        campaign_id: String,
+        /// A workspace whose `results/<campaign>/campaign.json` records the reference campaigns
+        /// the experiment declares (`references`), such as a frozen one.
+        #[arg(long)]
+        reference_workspace: Option<String>,
+    },
     /// A campaign against a reference campaign: each metric's median at each point against the
     /// reference's median and IQR, and each criterion's outcome (`ResultService.Compare`).
     Compare {
@@ -2339,12 +2345,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
-                CampaignCmd::Verdict { campaign_id } => {
+                CampaignCmd::Verdict {
+                    campaign_id,
+                    reference_workspace,
+                } => {
                     use vxedge_api::v1::ResultVerdictRequest;
                     use vxedge_api::v1::result_service_client::ResultServiceClient;
                     let v = ResultServiceClient::new(channel.clone())
                         .verdict(ResultVerdictRequest {
                             campaign_id: campaign_id.clone(),
+                            reference_workspace: manifest_ref(reference_workspace),
                         })
                         .await?
                         .into_inner();

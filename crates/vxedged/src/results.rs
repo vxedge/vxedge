@@ -192,7 +192,10 @@ fn folder_of(m: Option<&vxedge_api::v1::ManifestRef>) -> Result<Option<PathBuf>,
 /// not run. Each archive it names is read from that folder: a relative path below it, or an
 /// absolute one by its file name, as when the record was written on another host. Each must hash
 /// to the record's `sha256`, so the reference is the one that was published.
-fn recorded_in(root: &Path, id: &str) -> Result<crate::campaign_run::CampaignRecord, Status> {
+pub(crate) fn recorded_in(
+    root: &Path,
+    id: &str,
+) -> Result<crate::campaign_run::CampaignRecord, Status> {
     use std::path::Component;
     let one_name = |p: &Path| {
         let mut parts = p.components();
@@ -324,11 +327,24 @@ impl ResultService for ResultSvc {
         &self,
         req: Request<ResultVerdictRequest>,
     ) -> Result<Response<ResultVerdict>, Status> {
-        let id = req.into_inner().campaign_id;
+        let req = req.into_inner();
+        let id = req.campaign_id;
         let rec = crate::campaign_run::read(&self.runtime_dir, &id)
             .ok_or_else(|| crate::campaign::unknown(&id))?;
+        let root = folder_of(req.reference_workspace.as_ref())?;
+        if req.reference_workspace.is_some() && root.is_none() {
+            return Err(errors::invalid(
+                R::WorkspaceInvalid,
+                "`reference_workspace` names a folder: a path or a package digest, not inline YAML",
+            ));
+        }
+        let runtime_dir = self.runtime_dir.clone();
         let judged = tokio::task::spawn_blocking(move || {
-            crate::verdict::of_campaign(&rec).map(|v| crate::verdict::to_proto(&rec, &v))
+            let lookup = crate::verdict::Lookup {
+                runtime_dir: &runtime_dir,
+                workspace: root.as_deref(),
+            };
+            crate::verdict::of_campaign(&rec, &lookup).map(|v| crate::verdict::to_proto(&rec, &v))
         })
         .await
         .map_err(|e| Status::internal(format!("verdict task panicked: {e}")))?;
@@ -354,12 +370,16 @@ impl ResultService for ResultSvc {
         let runtime_dir = self.runtime_dir.clone();
         let compared = tokio::task::spawn_blocking(move || {
             let id = &req.reference_campaign_id;
-            let reference = match root {
-                Some(root) => recorded_in(&root, id)?,
+            let reference = match &root {
+                Some(root) => recorded_in(root, id)?,
                 None => crate::campaign_run::read(&runtime_dir, id)
                     .ok_or_else(|| crate::campaign::unknown(id))?,
             };
-            crate::verdict::compare(&rec, &reference)
+            let lookup = crate::verdict::Lookup {
+                runtime_dir: &runtime_dir,
+                workspace: root.as_deref(),
+            };
+            crate::verdict::compare(&rec, &reference, &lookup)
                 .map(|c| crate::verdict::comparison_to_proto(&rec, &reference, &c))
                 .map_err(|e| errors::precondition(R::ResultUnknown, e))
         })

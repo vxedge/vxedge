@@ -483,11 +483,17 @@ impl CampaignService for CampaignSvc {
                     // The verdict over what was archived, from the archives, before the campaign
                     // reads as finished.
                     let snapshot = rec.lock().expect("campaign record").clone();
-                    let judged =
-                        tokio::task::spawn_blocking(move || crate::verdict::of_campaign(&snapshot))
-                            .await
-                            .map_err(|e| e.to_string())
-                            .and_then(|v| v);
+                    let runtime_dir = runtime_dir.clone();
+                    let judged = tokio::task::spawn_blocking(move || {
+                        let lookup = crate::verdict::Lookup {
+                            runtime_dir: &runtime_dir,
+                            workspace: None,
+                        };
+                        crate::verdict::of_campaign(&snapshot, &lookup)
+                    })
+                    .await
+                    .map_err(|e| e.to_string())
+                    .and_then(|v| v);
                     let mut r = rec.lock().expect("campaign record");
                     match judged {
                         Ok(v) if !v.criteria.is_empty() => {

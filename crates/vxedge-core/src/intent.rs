@@ -189,6 +189,9 @@ pub struct MetricOperand {
     /// Added after `factor`, in the metric's unit.
     #[serde(default)]
     pub offset: Option<f64>,
+    /// Read from this declared reference campaign's trials instead of the campaign judged.
+    #[serde(default)]
+    pub reference: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -286,10 +289,23 @@ pub struct Campaign {
     pub profiles: BTreeMap<String, Profile>,
 }
 
+/// A campaign another experiment's criteria read (`references`): exp-010's H2 compares its own
+/// growth with exp-001's. Its trials are read with this experiment's metrics, as `Compare` reads a
+/// reference.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Reference {
+    /// The campaign's id: one this host ran, or a record in a workspace's `results/<campaign>/`.
+    pub campaign: String,
+    #[serde(default)]
+    pub statement: Option<String>,
+}
+
 /// An experiment's typed intent, as far as it parses.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Intent {
     pub hypothesis: Option<Hypothesis>,
+    pub references: BTreeMap<String, Reference>,
     pub parameters: BTreeMap<String, Parameter>,
     pub metrics: Vec<Metric>,
     pub criteria: Vec<Criterion>,
@@ -343,6 +359,9 @@ pub fn read(doc: &Value) -> (Intent, Vec<Problem>) {
     };
     let intent = Intent {
         hypothesis: c.section("hypothesis", ProblemKind::Parameter),
+        references: c
+            .section("references", ProblemKind::Criterion)
+            .unwrap_or_default(),
         parameters: c
             .section("parameters", ProblemKind::Parameter)
             .unwrap_or_default(),
@@ -358,6 +377,23 @@ pub fn read(doc: &Value) -> (Intent, Vec<Problem>) {
     check_campaign(&mut c, &intent);
     campaign_and_method(&mut c);
     check_metrics(&mut c, &intent);
+    for (name, r) in &intent.references {
+        let mut parts = std::path::Path::new(&r.campaign).components();
+        let one = matches!(
+            (parts.next(), parts.next()),
+            (Some(std::path::Component::Normal(_)), None)
+        );
+        if !one {
+            c.push(
+                ProblemKind::Criterion,
+                format!("references.{name}.campaign"),
+                format!(
+                    "`{}` is not a campaign id: it names one folder under `results/`",
+                    r.campaign
+                ),
+            );
+        }
+    }
     let mut ids = BTreeSet::new();
     for (i, criterion) in intent.criteria.iter().enumerate() {
         check_criterion(
@@ -849,6 +885,15 @@ fn check_operand(
             })
         }
         Operand::Metric(m) => {
+            if let Some(r) = &m.reference
+                && !intent.references.contains_key(r)
+            {
+                c.push(
+                    ProblemKind::Criterion,
+                    format!("{field}.reference"),
+                    format!("`{r}` is not a declared reference"),
+                );
+            }
             let Some(metric) = intent.metrics.iter().find(|x| x.id == m.metric) else {
                 c.push(
                     ProblemKind::Criterion,
@@ -872,8 +917,10 @@ fn check_operand(
                 let at = format!("{field}.select.{key}");
                 if key == "arm" {
                     // A campaign that does not read is reported on its own; its arms are unknown,
-                    // not missing.
-                    if intent.campaign.is_none() && c.doc.get("campaign").is_some() {
+                    // not missing. A reference's arms are its own campaign's.
+                    if (intent.campaign.is_none() && c.doc.get("campaign").is_some())
+                        || m.reference.is_some()
+                    {
                         continue;
                     }
                     let arm = value.as_str().unwrap_or_default();
@@ -1059,6 +1106,16 @@ pub struct Samples {
 pub trait SampleSource {
     /// The values of `metric` under `select`, or `None` when no trial is selected at all.
     fn samples(&self, metric: &str, select: &BTreeMap<String, Value>) -> Option<Samples>;
+
+    /// The same from the trials of the reference campaign `reference`, or why they cannot be read.
+    fn reference_samples(
+        &self,
+        reference: &str,
+        _metric: &str,
+        _select: &BTreeMap<String, Value>,
+    ) -> Result<Option<Samples>, String> {
+        Err(format!("reference `{reference}` was not given"))
+    }
 }
 
 /// `aggregate` of `values`, which are not empty. Percentiles are nearest-rank; `median` and
@@ -1113,6 +1170,9 @@ pub fn aggregate(values: &[f64], aggregate: &str) -> Option<f64> {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Read {
     pub metric: String,
+    /// The reference campaign it was read from, when not the campaign judged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
     pub aggregate: String,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub select: BTreeMap<String, Value>,
@@ -1168,11 +1228,18 @@ fn operand_value(
     match operand {
         Operand::Constant(k) => Ok(k.value),
         Operand::Metric(m) => {
-            let s = src.samples(&m.metric, &m.select).unwrap_or_default();
+            let (s, unavailable) = match &m.reference {
+                None => (src.samples(&m.metric, &m.select).unwrap_or_default(), None),
+                Some(r) => match src.reference_samples(r, &m.metric, &m.select) {
+                    Ok(s) => (s.unwrap_or_default(), None),
+                    Err(why) => (Samples::default(), Some(why)),
+                },
+            };
             let value = aggregate(&s.values, &m.aggregate)
                 .map(|v| v * m.factor.unwrap_or(1.0) + m.offset.unwrap_or(0.0));
             reads.push(Read {
                 metric: m.metric.clone(),
+                reference: m.reference.clone(),
                 aggregate: m.aggregate.clone(),
                 select: m.select.clone(),
                 trials: s.trials.clone(),
@@ -1181,8 +1248,15 @@ fn operand_value(
                 value,
             });
             let n = s.values.len() as u64;
-            if n == 0 {
-                Err(format!("no trial gives `{}` a value", m.metric))
+            let from = m
+                .reference
+                .as_ref()
+                .map(|r| format!(" in reference `{r}`"))
+                .unwrap_or_default();
+            if let Some(why) = unavailable {
+                Err(why)
+            } else if n == 0 {
+                Err(format!("no trial{from} gives `{}` a value", m.metric))
             } else if !s.complete {
                 Err(format!("`{}`'s telemetry is incomplete", m.metric))
             } else if n < min_samples.max(1) {
@@ -1645,6 +1719,7 @@ campaign:
                 select: BTreeMap::new(),
                 factor: None,
                 offset: None,
+                reference: None,
             }),
             rhs: Operand::Constant(Constant {
                 value: 2.0,
@@ -1897,6 +1972,46 @@ campaign:
         assert_eq!(
             fields(&problems),
             [(ProblemKind::Criterion, "metrics[0].window".into())]
+        );
+    }
+
+    #[test]
+    fn a_reference_is_declared_and_names_one_campaign() {
+        let with = |refs: &str, operand: &str| {
+            EXP.replacen("hypothesis:", &format!("{refs}hypothesis:"), 1).replacen(
+                "rhs: { metric: ctl_rtt_seconds, aggregate: median, select: { arm: idle }, factor: 2.0 }",
+                operand,
+                1,
+            )
+        };
+        let declared = "references:\n  vlan: { campaign: exp-001 }\n";
+        let good = with(
+            declared,
+            "rhs: { metric: ctl_rtt_seconds, aggregate: median, select: { arm: saturated-ref }, reference: vlan }",
+        );
+        let (intent, problems) = read(&doc(&good));
+        assert_eq!(
+            problems,
+            Vec::new(),
+            "a reference's arms are its own campaign's"
+        );
+        assert_eq!(intent.references["vlan"].campaign, "exp-001");
+
+        let undeclared = with(
+            "",
+            "rhs: { metric: ctl_rtt_seconds, aggregate: median, reference: vlan }",
+        );
+        assert_eq!(
+            fields(&read(&doc(&undeclared)).1),
+            [(ProblemKind::Criterion, "criteria[0].rhs.reference".into())]
+        );
+        let path = with(
+            "references:\n  vlan: { campaign: ../exp-001 }\n",
+            "rhs: { metric: ctl_rtt_seconds, aggregate: median, reference: vlan }",
+        );
+        assert_eq!(
+            fields(&read(&doc(&path)).1),
+            [(ProblemKind::Criterion, "references.vlan.campaign".into())]
         );
     }
 }

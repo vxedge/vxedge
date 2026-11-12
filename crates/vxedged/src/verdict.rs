@@ -68,22 +68,70 @@ fn trials_of(rec: &CampaignRecord, intent: &intent::Intent) -> Result<Vec<verdic
         .collect()
 }
 
+/// Where a verdict finds the reference campaigns an experiment declares: in `workspace`'s
+/// `results/<campaign>/campaign.json` when given, else among this host's campaigns, else in the
+/// judged campaign's own workspace's `results/`.
+pub(crate) struct Lookup<'a> {
+    pub runtime_dir: &'a Path,
+    pub workspace: Option<&'a Path>,
+}
+
+/// The trials of each reference `intent` declares, read with `intent`'s metrics.
+fn references(
+    intent: &intent::Intent,
+    rec: &CampaignRecord,
+    lookup: &Lookup<'_>,
+) -> verdict::References {
+    intent
+        .references
+        .iter()
+        .map(|(name, r)| {
+            let id = &r.campaign;
+            let found = match lookup.workspace {
+                Some(root) => {
+                    crate::results::recorded_in(root, id).map_err(|s| s.message().to_string())
+                }
+                None => crate::campaign_run::read(lookup.runtime_dir, id)
+                    .map(Ok)
+                    .unwrap_or_else(|| {
+                        crate::results::recorded_in(Path::new(&rec.workspace), id).map_err(|_| {
+                            format!(
+                                "campaign `{id}` is not on this host or in the campaign's \
+                                 workspace; give the workspace that records it \
+                                 (`reference_workspace`)"
+                            )
+                        })
+                    }),
+            };
+            (name.clone(), found.and_then(|r| trials_of(&r, intent)))
+        })
+        .collect()
+}
+
 /// Judge `rec`'s experiment, as its workspace holds it, over the trials it archived.
-pub(crate) fn of_campaign(rec: &CampaignRecord) -> Result<Verdict, String> {
+pub(crate) fn of_campaign(rec: &CampaignRecord, lookup: &Lookup<'_>) -> Result<Verdict, String> {
     let intent = intent_of(rec)?;
-    Ok(verdict::verdict(&intent, trials_of(rec, &intent)?))
+    let refs = references(&intent, rec, lookup);
+    Ok(verdict::verdict_with(
+        &intent,
+        trials_of(rec, &intent)?,
+        &refs,
+    ))
 }
 
 /// `rec` against `reference`, both judged by `rec`'s experiment.
 pub(crate) fn compare(
     rec: &CampaignRecord,
     reference: &CampaignRecord,
+    lookup: &Lookup<'_>,
 ) -> Result<verdict::Comparison, String> {
     let intent = intent_of(rec)?;
-    Ok(verdict::compare(
+    let refs = references(&intent, rec, lookup);
+    Ok(verdict::compare_with(
         &intent,
         trials_of(rec, &intent)?,
         trials_of(reference, &intent)?,
+        &refs,
     ))
 }
 
@@ -173,6 +221,7 @@ fn criterion(j: &Judgement) -> CriterionVerdict {
                 values: r.values.clone(),
                 complete: r.complete,
                 value: r.value,
+                reference: r.reference.clone().unwrap_or_default(),
             })
             .collect(),
         members: j.members.iter().map(criterion).collect(),
