@@ -22,6 +22,17 @@ All notable changes to this repo are documented here. Format follows
   - A tool that is not found, cannot be read or fails `--version` is still listed, with what is
     known and an `error`.
 
+### Changed
+
+- **The signal plane's lifecycle checks are a vxedged test (X9.11a).** `vehicle_lifecycle_live`
+  brings a vehicle with a databroker up through a real `vxedged` on the host's gateway, and checks
+  what exp-015's script did before it became a package: a second `up` changes nothing; `status`,
+  `up` and `down` of another vehicle are refused as `ERROR_REASON_WRONG_WORKSPACE` and change
+  nothing, before and after a daemon restart; the restarted daemon reports the signal plane up and
+  brings the vehicle down, twice; `down` after a failed `up` leaves nothing behind; and a
+  databroker that exits as it starts fails the job, naming `kuksa-databroker`. It needs file
+  capabilities on vxedged, so it is ignored by default and does not run in CI.
+
 ## [0.23.0] - 2026-11-12
 
 OTA arm setup. A host-process `ota` service can sign its own store at every start and run clients
