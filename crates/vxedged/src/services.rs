@@ -3048,6 +3048,7 @@ mod tests {
             runtime_dir,
             bins: vxedge_core::services::ServiceBinaries {
                 vxota: "vxota".into(),
+                vxota_probe: "vxota-probe".into(),
                 vxtelemetry: "vxtelemetry".into(),
             },
             cache_dir: PathBuf::from("/nonexistent/vxedged-svc-test-cache"),

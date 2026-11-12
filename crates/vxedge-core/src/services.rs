@@ -11,6 +11,7 @@
 //! meant finding it again per service.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -169,14 +170,229 @@ pub fn svc_status(runtime_dir: &Path, service_type: &str) -> SvcState {
     }
 }
 
-/// OTA config, as read from the manifest's `services.<key>.config` block
-/// (ARCHITECTURE.md §16 worked example).
+/// OTA config, as read from the manifest's `services.<key>.config` block (`ARCHITECTURE.md` §8).
+/// The store is `artifacts`, one already signed, or `publish`, artifacts the daemon makes and signs
+/// when the service starts. `fetch` runs clients that download one of them back to back while the
+/// service is up: the load of an update in progress.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OtaConfig {
-    artifacts: String,
+    #[serde(default)]
+    artifacts: Option<String>,
+    #[serde(default)]
+    publish: BTreeMap<String, Publish>,
+    #[serde(default)]
+    fetch: Option<Fetch>,
     #[serde(default = "default_listen")]
     listen: String,
+}
+
+/// One artifact `publish` makes: `size_bytes` of random data, signed under its name.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Publish {
+    size_bytes: u64,
+}
+
+/// The clients `fetch` runs: `clients` processes, each downloading and verifying `target` again
+/// `interval_s` after the last delivery ends, with a Prometheus exporter on `metrics` (the port
+/// rising by one per client).
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Fetch {
+    target: String,
+    #[serde(default = "one")]
+    clients: u32,
+    #[serde(default)]
+    interval_s: u64,
+    #[serde(default = "default_fetch_metrics")]
+    metrics: String,
+}
+
+fn one() -> u32 {
+    1
+}
+
+fn default_fetch_metrics() -> String {
+    "127.0.0.1:9902".to_string()
+}
+
+/// The most `fetch` clients one service runs.
+const MAX_FETCH_CLIENTS: u32 = 16;
+
+/// Largest artifact `publish` makes: 1 GiB.
+const MAX_PUBLISH_BYTES: u64 = 1 << 30;
+
+/// Where a service's published store and its signing key live, under the runtime dir. The key is
+/// outside the store, which `vxota serve` publishes whole.
+fn ota_work_dir(def: &ServiceDef, runtime_dir: &Path) -> PathBuf {
+    runtime_dir.join(format!("ota-{}", def.id))
+}
+
+impl OtaConfig {
+    fn read(def: &ServiceDef) -> Result<Self, ServiceBackendError> {
+        let cfg: Self = typed_config(def, "an ota service needs `artifacts` or `publish`")?;
+        let bad = |detail: String| ServiceBackendError::BadConfig {
+            svc: def.id.clone(),
+            detail,
+        };
+        match (&cfg.artifacts, cfg.publish.is_empty()) {
+            (Some(_), false) => {
+                return Err(bad(
+                    "`artifacts` and `publish` are two stores; give one".into()
+                ));
+            }
+            (None, true) => {
+                return Err(bad(
+                    "an ota service needs `artifacts` (a signed store) or `publish` (artifacts                      the daemon signs)"
+                        .into(),
+                ));
+            }
+            _ => {}
+        }
+        for (name, p) in &cfg.publish {
+            if name.is_empty() || name.contains(['/', '\\']) || name.starts_with('.') {
+                return Err(bad(format!(
+                    "publish `{name}`: a name is one path component"
+                )));
+            }
+            if p.size_bytes == 0 || p.size_bytes > MAX_PUBLISH_BYTES {
+                return Err(bad(format!(
+                    "publish `{name}`: size_bytes must be 1 to {MAX_PUBLISH_BYTES}"
+                )));
+            }
+        }
+        cfg.listen
+            .parse::<std::net::SocketAddr>()
+            .map_err(|e| bad(format!("listen `{}`: {e}", cfg.listen)))?;
+        if let Some(f) = &cfg.fetch {
+            if f.clients > MAX_FETCH_CLIENTS {
+                return Err(bad(format!("fetch.clients is at most {MAX_FETCH_CLIENTS}")));
+            }
+            if !cfg.publish.is_empty() && !cfg.publish.contains_key(&f.target) {
+                return Err(bad(format!(
+                    "fetch.target `{}` is not one of `publish`",
+                    f.target
+                )));
+            }
+            let m: std::net::SocketAddr = f
+                .metrics
+                .parse()
+                .map_err(|e| bad(format!("fetch.metrics `{}`: {e}", f.metrics)))?;
+            if u32::from(m.port()) + f.clients > 65536 {
+                return Err(bad(
+                    "fetch.metrics: the clients' ports run past 65535".into()
+                ));
+            }
+        }
+        Ok(cfg)
+    }
+
+    /// The store `vxota serve` publishes: `artifacts` as written, or the runtime dir's.
+    fn store_dir(&self, def: &ServiceDef, runtime_dir: &Path) -> String {
+        match &self.artifacts {
+            Some(dir) => dir.clone(),
+            None => ota_work_dir(def, runtime_dir)
+                .join("store")
+                .display()
+                .to_string(),
+        }
+    }
+
+    /// Each fetch client's exporter address, in client order. Empty without `fetch`.
+    fn fetch_metrics(&self) -> Vec<String> {
+        let Some(f) = &self.fetch else {
+            return Vec::new();
+        };
+        let Ok(m) = f.metrics.parse::<std::net::SocketAddr>() else {
+            return Vec::new();
+        };
+        (0..f.clients)
+            .map(|n| std::net::SocketAddr::new(m.ip(), m.port() + n as u16).to_string())
+            .collect()
+    }
+}
+
+/// Checks an `ota` service's config without starting anything: `Plan` reports what `up` would
+/// refuse. A store or a fetch client runs on the host only, so a placed service may not
+/// `publish` or `fetch`. Other service types pass.
+pub fn check_config(def: &ServiceDef) -> Result<(), ServiceBackendError> {
+    if def.service_type != ServiceType::Ota {
+        return Ok(());
+    }
+    let cfg = OtaConfig::read(def)?;
+    if def.on.is_some() && (!cfg.publish.is_empty() || cfg.fetch.is_some()) {
+        return Err(ServiceBackendError::BadConfig {
+            svc: def.id.clone(),
+            detail: "`publish` and `fetch` run on the host, so a placed service takes                      `artifacts` only"
+                .into(),
+        });
+    }
+    Ok(())
+}
+
+/// The exporters of an `ota` service's fetch clients, which telemetry scrapes beside the
+/// workspace's own targets. Empty for another service, or one with no clients.
+pub fn fetch_targets(def: &ServiceDef) -> Vec<String> {
+    if def.service_type != ServiceType::Ota || def.on.is_some() {
+        return Vec::new();
+    }
+    OtaConfig::read(def)
+        .map(|c| c.fetch_metrics())
+        .unwrap_or_default()
+}
+
+/// The pubkey `vxota keygen` signed a store's `root.json` with: what a client pins as its trust
+/// root.
+fn trust_root(store: &Path) -> Result<String, String> {
+    let path = store.join("root.json");
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let root: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    let keys = &root["signed"]["keys"];
+    let id = root["signed"]["roles"]["root"]["keyids"][0]
+        .as_str()
+        .ok_or_else(|| format!("{}: no root key id", path.display()))?;
+    keys[id]["public"]
+        .as_str()
+        .map(String::from)
+        .ok_or_else(|| format!("{}: no public key for `{id}`", path.display()))
+}
+
+/// Runs `bin args` to completion, its output kept for the error.
+fn run_tool(svc: &str, bin: &str, args: &[String]) -> Result<(), ServiceBackendError> {
+    let out = Command::new(bin)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|source| ServiceBackendError::Spawn {
+            svc: svc.to_string(),
+            bin: bin.to_string(),
+            source,
+        })?;
+    if !out.status.success() {
+        return Err(ServiceBackendError::Runtime(
+            svc.to_string(),
+            format!(
+                "`{bin} {}` failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// `size` bytes from the kernel's random source into `path`.
+fn random_file(path: &Path, size: u64) -> std::io::Result<()> {
+    use std::io::Read;
+    let mut src = std::fs::File::open("/dev/urandom")?.take(size);
+    let mut dst = std::fs::File::create(path)?;
+    let n = std::io::copy(&mut src, &mut dst)?;
+    if n != size {
+        return Err(std::io::Error::other(format!("{n} of {size} random bytes")));
+    }
+    Ok(())
 }
 
 /// Where an `ota` service's artifact store comes from, read from `config.artifacts` by shape, as a
@@ -206,7 +422,8 @@ pub fn ota_store(def: &ServiceDef) -> Option<ArtifactStore> {
     (def.service_type == ServiceType::Ota)
         .then(|| typed_config::<OtaConfig>(def, "").ok())
         .flatten()
-        .map(|c| ArtifactStore::parse(&c.artifacts))
+        .and_then(|c| c.artifacts)
+        .map(|a| ArtifactStore::parse(&a))
 }
 
 /// The local artifact store an `ota` service serves, as its `config.artifacts` writes it (relative
@@ -267,7 +484,16 @@ fn default_duration_s() -> u64 {
 #[derive(Debug, Clone)]
 pub struct ServiceBinaries {
     pub vxota: String,
+    /// The OTA client an `ota` service's `fetch` runs.
+    pub vxota_probe: String,
     pub vxtelemetry: String,
+}
+
+/// The processes a service runs beside its own, once `wait_for` answers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Companions {
+    pub wait_for: Option<std::net::SocketAddr>,
+    pub specs: Vec<SpawnSpec>,
 }
 
 /// What to run for one service, resolved from its manifest `config` block.
@@ -294,6 +520,18 @@ pub struct SpawnSpec {
 pub trait ServiceBackend {
     fn service_type(&self) -> ServiceType;
 
+    /// What must exist before the service starts, made here, and the companion processes that run
+    /// beside it, started once it answers and stopped before it. The one place a backend has side
+    /// effects; most have none.
+    fn prepare(
+        &self,
+        _def: &ServiceDef,
+        _bins: &ServiceBinaries,
+        _runtime_dir: &Path,
+    ) -> Result<Companions, ServiceBackendError> {
+        Ok(Companions::default())
+    }
+
     fn command(
         &self,
         def: &ServiceDef,
@@ -318,26 +556,139 @@ impl ServiceBackend for OtaBackend {
         _workspace_dir: &Path,
         _runtime_dir: &Path,
     ) -> Result<SpawnSpec, ServiceBackendError> {
-        let cfg: OtaConfig = typed_config(def, "config.artifacts is required for an ota service")?;
-        if let ArtifactStore::Published { .. } = ArtifactStore::parse(&cfg.artifacts) {
+        let cfg = OtaConfig::read(def)?;
+        if let Some(ArtifactStore::Published { .. }) =
+            cfg.artifacts.as_deref().map(ArtifactStore::parse)
+        {
             return Err(ServiceBackendError::BadConfig {
                 svc: def.id.clone(),
                 detail: "a published artifact store needs a placed service (`on:`)".into(),
             });
         }
+        let store = cfg.store_dir(def, _runtime_dir);
         Ok(SpawnSpec {
             bin: bins.vxota.clone(),
             args: vec![
                 "serve".into(),
                 "--artifacts-dir".into(),
-                cfg.artifacts.clone(),
+                store.clone(),
                 "--listen".into(),
                 cfg.listen.clone(),
             ],
             summary: format!(
-                "{} serve --artifacts-dir {} --listen {}",
-                bins.vxota, cfg.artifacts, cfg.listen
+                "{} serve --artifacts-dir {store} --listen {}",
+                bins.vxota, cfg.listen
             ),
+        })
+    }
+
+    /// `publish`: a fresh signing key and store for this run, each artifact random bytes signed
+    /// into it. `fetch`: its clients, pinned to the store's root key.
+    fn prepare(
+        &self,
+        def: &ServiceDef,
+        bins: &ServiceBinaries,
+        runtime_dir: &Path,
+    ) -> Result<Companions, ServiceBackendError> {
+        let cfg = OtaConfig::read(def)?;
+        let work = ota_work_dir(def, runtime_dir);
+        let store = PathBuf::from(cfg.store_dir(def, runtime_dir));
+        let io = |e: std::io::Error| ServiceBackendError::Runtime(def.id.clone(), e.to_string());
+        if !cfg.publish.is_empty() {
+            if work.exists() {
+                std::fs::remove_dir_all(&work).map_err(io)?;
+            }
+            std::fs::create_dir_all(&work).map_err(io)?;
+            let key = work.join("root.key").display().to_string();
+            run_tool(
+                &def.id,
+                &bins.vxota,
+                &[
+                    "keygen".into(),
+                    "--artifacts-dir".into(),
+                    store.display().to_string(),
+                    "--out-priv".into(),
+                    key.clone(),
+                ],
+            )?;
+            for (name, p) in &cfg.publish {
+                let file = work.join(format!("{name}.bin"));
+                random_file(&file, p.size_bytes).map_err(io)?;
+                run_tool(
+                    &def.id,
+                    &bins.vxota,
+                    &[
+                        "publish".into(),
+                        "--artifacts-dir".into(),
+                        store.display().to_string(),
+                        "--file".into(),
+                        file.display().to_string(),
+                        "--name".into(),
+                        name.clone(),
+                        "--signing-key".into(),
+                        key.clone(),
+                    ],
+                )?;
+                std::fs::remove_file(&file).map_err(io)?;
+            }
+        }
+        let Some(fetch) = cfg.fetch.as_ref().filter(|f| f.clients > 0) else {
+            return Ok(Companions::default());
+        };
+        let root =
+            trust_root(&store).map_err(|e| ServiceBackendError::Runtime(def.id.clone(), e))?;
+        let listen: std::net::SocketAddr =
+            cfg.listen
+                .parse()
+                .map_err(|e| ServiceBackendError::BadConfig {
+                    svc: def.id.clone(),
+                    detail: format!("listen `{}`: {e}", cfg.listen),
+                })?;
+        // A client reaches a server listening on every address through loopback.
+        let server = if listen.ip().is_unspecified() {
+            std::net::SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), listen.port())
+        } else {
+            listen
+        };
+        std::fs::create_dir_all(&work).map_err(io)?;
+        let specs = cfg
+            .fetch_metrics()
+            .into_iter()
+            .enumerate()
+            .map(|(n, metrics)| {
+                let out = work.join(format!("fetch-{n}.bin")).display().to_string();
+                let args = vec![
+                    "fetch".into(),
+                    "--server".into(),
+                    format!("http://{server}"),
+                    "--target".into(),
+                    fetch.target.clone(),
+                    "--trust-root".into(),
+                    root.clone(),
+                    "--out".into(),
+                    out,
+                    // Until the service stops it: a delivery takes milliseconds at least, so this
+                    // outlasts any trial.
+                    "--repeat".into(),
+                    u64::MAX.to_string(),
+                    "--interval-s".into(),
+                    fetch.interval_s.to_string(),
+                    "--metrics".into(),
+                    metrics.clone(),
+                ];
+                SpawnSpec {
+                    summary: format!(
+                        "{} fetch {} from {server}, metrics {metrics}",
+                        bins.vxota_probe, fetch.target
+                    ),
+                    bin: bins.vxota_probe.clone(),
+                    args,
+                }
+            })
+            .collect();
+        Ok(Companions {
+            wait_for: Some(server),
+            specs,
         })
     }
 }
@@ -505,8 +856,10 @@ pub fn placed_spec(
     if def.service_type != ServiceType::Ota {
         return Err(ServiceBackendError::Unsupported(def.id.clone()));
     }
-    let cfg: OtaConfig = typed_config(def, "config.artifacts is required for an ota service")?;
-    let host = match ArtifactStore::parse(&cfg.artifacts) {
+    check_config(def)?;
+    let cfg = OtaConfig::read(def)?;
+    let artifacts = cfg.artifacts.clone().unwrap_or_default();
+    let host = match ArtifactStore::parse(&artifacts) {
         ArtifactStore::Local(dir) => {
             let host = workspace_dir.join(dir);
             if !host.is_dir() {
@@ -570,17 +923,56 @@ pub fn svc_up(
     }
 
     let spec = backend.command(def, bins, workspace_dir, runtime_dir)?;
+    // Companions left by a run that did not come down are stopped before new ones start.
+    stop_companions(runtime_dir, type_name);
+    let companions = backend.prepare(def, bins, runtime_dir)?;
 
     let log_path = runtime_dir.join(format!("svc-{type_name}.log"));
-    let log = std::fs::File::create(&log_path).map_err(|e| {
-        ServiceBackendError::Runtime(
+    let pid = spawn_logged(&def.id, &spec, &log_path, &pidfile(runtime_dir, type_name))?;
+    let mut summary = format!(
+        "{type_name} service up — {} (pid {pid}, log {})",
+        spec.summary,
+        log_path.display()
+    );
+    if companions.specs.is_empty() {
+        return Ok(summary);
+    }
+    if let Some(addr) = companions.wait_for
+        && !answers(addr, std::time::Duration::from_secs(10))
+    {
+        return Err(ServiceBackendError::Runtime(
             def.id.clone(),
+            format!("does not answer on {addr} after 10 s, so its companions were not started"),
+        ));
+    }
+    for (n, c) in companions.specs.iter().enumerate() {
+        let pid = spawn_logged(
+            &def.id,
+            c,
+            &companion_log(runtime_dir, type_name, n),
+            &companion_pidfile(runtime_dir, type_name, n),
+        )?;
+        summary.push_str(&format!("; {} (pid {pid})", c.summary));
+    }
+    Ok(summary)
+}
+
+/// Starts `spec` with its output in `log_path` and its pid in `pid_path`, and returns the pid.
+fn spawn_logged(
+    svc: &str,
+    spec: &SpawnSpec,
+    log_path: &Path,
+    pid_path: &Path,
+) -> Result<u32, ServiceBackendError> {
+    let log = std::fs::File::create(log_path).map_err(|e| {
+        ServiceBackendError::Runtime(
+            svc.to_string(),
             format!("cannot open log {}: {e}", log_path.display()),
         )
     })?;
     let log_err = log
         .try_clone()
-        .map_err(|e| ServiceBackendError::Runtime(def.id.clone(), e.to_string()))?;
+        .map_err(|e| ServiceBackendError::Runtime(svc.to_string(), e.to_string()))?;
     let mut child = Command::new(&spec.bin)
         .args(&spec.args)
         .stdin(Stdio::null())
@@ -588,13 +980,13 @@ pub fn svc_up(
         .stderr(Stdio::from(log_err))
         .spawn()
         .map_err(|source| ServiceBackendError::Spawn {
-            svc: def.id.clone(),
+            svc: svc.to_string(),
             bin: spec.bin.clone(),
             source,
         })?;
     let pid = child.id();
-    std::fs::write(pidfile(runtime_dir, type_name), pid.to_string()).map_err(|e| {
-        ServiceBackendError::Runtime(def.id.clone(), format!("cannot write pidfile: {e}"))
+    std::fs::write(pid_path, pid.to_string()).map_err(|e| {
+        ServiceBackendError::Runtime(svc.to_string(), format!("cannot write pidfile: {e}"))
     })?;
     // vxedged is this child's OS-level parent regardless of whether we keep the `Child` handle;
     // without a `wait()` somewhere, a killed child becomes a zombie forever — /proc/<pid> and
@@ -606,21 +998,61 @@ pub fn svc_up(
     std::thread::spawn(move || {
         let _ = child.wait();
     });
-    Ok(format!(
-        "{type_name} service up — {} (pid {pid}, log {})",
-        spec.summary,
-        log_path.display()
-    ))
+    Ok(pid)
+}
+
+/// Whether a TCP connection to `addr` succeeds within `limit`.
+fn answers(addr: std::net::SocketAddr, limit: std::time::Duration) -> bool {
+    let until = std::time::Instant::now() + limit;
+    while std::time::Instant::now() < until {
+        if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(200))
+            .is_ok()
+        {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    false
+}
+
+fn companion_pidfile(runtime_dir: &Path, service_type: &str, n: usize) -> PathBuf {
+    runtime_dir.join(format!("svc-{service_type}-{n}.pid"))
+}
+
+/// The log a service's `n`th companion writes, `svc-<type>-<n>.log`, so entities can list it.
+pub fn companion_log(runtime_dir: &Path, service_type: &str, n: usize) -> PathBuf {
+    runtime_dir.join(format!("svc-{service_type}-{n}.log"))
+}
+
+/// Stops each companion of `service_type` whose pidfile is in `runtime_dir`.
+fn stop_companions(runtime_dir: &Path, service_type: &str) {
+    for n in 0..MAX_FETCH_CLIENTS as usize {
+        let path = companion_pidfile(runtime_dir, service_type, n);
+        if let Some(pid) = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| t.trim().parse::<i32>().ok())
+        {
+            stop_pid(pid);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// SIGTERM, then SIGKILL if it is still alive 300 ms later.
+fn stop_pid(pid: i32) {
+    let _ = Command::new("kill").arg(pid.to_string()).output();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    if alive(pid) {
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
+    }
 }
 
 /// Tear the named service type down. Idempotent: no pidfile/dead pid is a no-op.
 pub fn svc_down(service_type: &str, runtime_dir: &Path) -> Result<String, ServiceBackendError> {
+    // Companions first: a fetch client outliving its server would only count failures.
+    stop_companions(runtime_dir, service_type);
     if let Some(pid) = read_pid(runtime_dir, service_type) {
-        let _ = Command::new("kill").arg(pid.to_string()).output();
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        if alive(pid) {
-            let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
-        }
+        stop_pid(pid);
     }
     let _ = std::fs::remove_file(pidfile(runtime_dir, service_type));
     Ok(format!("{service_type} service down"))
@@ -633,6 +1065,7 @@ mod tests {
     fn bins() -> ServiceBinaries {
         ServiceBinaries {
             vxota: "vxota".into(),
+            vxota_probe: "vxota-probe".into(),
             vxtelemetry: "vxtelemetry".into(),
         }
     }
@@ -900,5 +1333,181 @@ mod tests {
             kuksa_spec(&kuksa("hpc1:55555")),
             Err(ServiceBackendError::BadConfig { .. })
         ));
+    }
+
+    /// A stand-in `vxota`: `keygen` writes a root.json signed by key `k1`, `publish` records the
+    /// name and the size of the file it signs, `serve` waits.
+    fn fake_vxota(dir: &Path) -> String {
+        let bin = dir.join("vxota");
+        std::fs::write(
+            &bin,
+            r#"#!/bin/sh
+set -e
+cmd=$1; shift
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --artifacts-dir) store=$2 ;; --out-priv) key=$2 ;; --file) file=$2 ;; --name) name=$2 ;;
+  esac
+  shift 2
+done
+case "$cmd" in
+  keygen) mkdir -p "$store"; echo secret > "$key"
+          echo '{"signed":{"keys":{"k1":{"public":"abcd"}},"roles":{"root":{"keyids":["k1"]}}}}' > "$store/root.json" ;;
+  publish) echo "$name $(wc -c < "$file")" >> "$store/published" ;;
+  serve) exec sleep 30 ;;
+esac
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin.display().to_string()
+    }
+
+    #[test]
+    fn an_ota_store_is_artifacts_or_publish_never_both_or_neither() {
+        assert!(check_config(&ota_def("artifacts: ./store")).is_ok());
+        assert!(check_config(&ota_def("publish: { a: { size_bytes: 10 } }")).is_ok());
+        let both = check_config(&ota_def(
+            "artifacts: ./store\npublish: { a: { size_bytes: 10 } }",
+        ))
+        .unwrap_err();
+        assert!(both.to_string().contains("two stores"), "{both}");
+        let neither = check_config(&ota_def("listen: 127.0.0.1:9900")).unwrap_err();
+        assert!(neither.to_string().contains("`publish`"), "{neither}");
+        for bad in [
+            "publish: { a: { size_bytes: 0 } }",
+            "publish: { ../a: { size_bytes: 1 } }",
+            "publish: { a: { size_bytes: 1 } }\nfetch: { target: b }",
+            "publish: { a: { size_bytes: 1 } }\nfetch: { target: a, clients: 17 }",
+            "publish: { a: { size_bytes: 1 } }\nfetch: { target: a, metrics: nowhere }",
+            "publish: { a: { size_bytes: 1 } }\nlisten: nowhere",
+        ] {
+            assert!(check_config(&ota_def(bad)).is_err(), "{bad}");
+        }
+        let mut placed = ota_def("publish: { a: { size_bytes: 1 } }");
+        placed.on = Some("hpc1".into());
+        assert!(
+            check_config(&placed)
+                .unwrap_err()
+                .to_string()
+                .contains("host")
+        );
+    }
+
+    #[test]
+    fn fetch_clients_export_on_consecutive_ports() {
+        let def = ota_def(
+            "publish: { a: { size_bytes: 1 } }\nfetch: { target: a, clients: 3, metrics: 127.0.0.1:9910 }",
+        );
+        assert_eq!(
+            fetch_targets(&def),
+            ["127.0.0.1:9910", "127.0.0.1:9911", "127.0.0.1:9912"]
+        );
+        assert!(fetch_targets(&ota_def("publish: { a: { size_bytes: 1 } }")).is_empty());
+        let none = ota_def("publish: { a: { size_bytes: 1 } }\nfetch: { target: a, clients: 0 }");
+        assert!(fetch_targets(&none).is_empty());
+    }
+
+    #[test]
+    fn publish_signs_fresh_artifacts_and_fetch_pins_the_new_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bins = ServiceBinaries {
+            vxota: fake_vxota(tmp.path()),
+            ..bins()
+        };
+        let def = ota_def(
+            "publish: { burst: { size_bytes: 4096 } }\nlisten: 0.0.0.0:9900\nfetch: { target: burst }",
+        );
+        let rt = tmp.path().join("rt");
+        std::fs::create_dir_all(&rt).unwrap();
+        let spec = backend_for(ServiceType::Ota)
+            .command(&def, &bins, tmp.path(), &rt)
+            .unwrap();
+        let store = rt.join("ota-ota-01/store");
+        assert_eq!(spec.args[2], store.display().to_string());
+
+        let c = backend_for(ServiceType::Ota)
+            .prepare(&def, &bins, &rt)
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(store.join("published"))
+                .unwrap()
+                .trim(),
+            "burst 4096"
+        );
+        // The key stays outside the store, and the random file is gone once signed.
+        assert!(rt.join("ota-ota-01/root.key").exists());
+        assert!(!rt.join("ota-ota-01/burst.bin").exists());
+        assert_eq!(c.wait_for, Some("127.0.0.1:9900".parse().unwrap()));
+        assert_eq!(c.specs.len(), 1);
+        let a = &c.specs[0].args;
+        assert_eq!(c.specs[0].bin, "vxota-probe");
+        let at = |flag: &str| a[a.iter().position(|x| x == flag).unwrap() + 1].clone();
+        assert_eq!(at("--server"), "http://127.0.0.1:9900");
+        assert_eq!(at("--target"), "burst");
+        assert_eq!(at("--trust-root"), "abcd");
+        assert_eq!(at("--interval-s"), "0");
+        assert_eq!(at("--metrics"), "127.0.0.1:9902");
+
+        // A second start makes a new store, not one more artifact in the old.
+        backend_for(ServiceType::Ota)
+            .prepare(&def, &bins, &rt)
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(store.join("published"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn companions_start_once_the_service_answers_and_stop_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let bins = ServiceBinaries {
+            vxota: fake_vxota(tmp.path()),
+            vxota_probe: "sleep".into(),
+            ..bins()
+        };
+        // `sleep fetch …` exits at once on its bad argument; what is checked is that it was
+        // started, with a pidfile and a log of its own.
+        let def = ota_def(&format!(
+            "publish: {{ a: {{ size_bytes: 8 }} }}\nlisten: {addr}\nfetch: {{ target: a, clients: 2 }}"
+        ));
+        let summary = svc_up(&def, &bins, tmp.path(), tmp.path()).unwrap();
+        assert!(summary.contains("metrics 127.0.0.1:9903"), "{summary}");
+        assert!(companion_pidfile(tmp.path(), "ota", 0).exists());
+        assert!(companion_pidfile(tmp.path(), "ota", 1).exists());
+        assert!(companion_log(tmp.path(), "ota", 1).exists());
+        svc_down("ota", tmp.path()).unwrap();
+        assert!(!companion_pidfile(tmp.path(), "ota", 0).exists());
+        assert_eq!(svc_status(tmp.path(), "ota"), SvcState::Down);
+        drop(listener);
+    }
+
+    #[test]
+    fn companions_never_start_against_a_service_that_does_not_answer() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A port nothing listens on: bind one, then let it go.
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let bins = ServiceBinaries {
+            vxota: fake_vxota(tmp.path()),
+            vxota_probe: "sleep".into(),
+            ..bins()
+        };
+        let def = ota_def(&format!(
+            "publish: {{ a: {{ size_bytes: 8 }} }}\nlisten: {addr}\nfetch: {{ target: a }}"
+        ));
+        let err = svc_up(&def, &bins, tmp.path(), tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("does not answer"), "{err}");
+        assert!(!companion_pidfile(tmp.path(), "ota", 0).exists());
+        svc_down("ota", tmp.path()).unwrap();
     }
 }

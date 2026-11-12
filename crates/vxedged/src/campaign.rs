@@ -169,7 +169,14 @@ pub(crate) fn plan_of(
                                 };
                                 problem(reason, &subject, format!("{what}: {p}"))
                             },
-                        ))
+                        ));
+                        // A bound value may also break a service's config, such as a client
+                        // count past what `fetch` runs.
+                        problems.extend(m.services.values().filter_map(|def| {
+                            vxedge_core::services::check_config(def).err().map(|e| {
+                                problem(R::WorkspaceInvalid, &subject, format!("{what}: {e}"))
+                            })
+                        }));
                     }
                 }
             }

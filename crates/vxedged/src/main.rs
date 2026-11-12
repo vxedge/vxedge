@@ -71,6 +71,11 @@ struct Args {
     #[arg(long, default_value = "vxota", env = "VXEDGE_VXOTA_BIN")]
     vxota_bin: String,
 
+    /// Path to the `vxota-probe` binary an `ota` service's `fetch` clients run. Same
+    /// co-location caveat as `--vxota-bin`.
+    #[arg(long, default_value = "vxota-probe", env = "VXEDGE_VXOTA_PROBE_BIN")]
+    vxota_probe_bin: String,
+
     /// Path to the `vxtelemetry` binary the service backend spawns for `telemetry` services.
     /// Same co-location caveat as `--vxota-bin`.
     #[arg(long, default_value = "vxtelemetry", env = "VXEDGE_VXTELEMETRY_BIN")]
@@ -241,6 +246,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         runtime_dir: args.runtime_dir.clone(),
         bins: vxedge_core::services::ServiceBinaries {
             vxota: args.vxota_bin.clone(),
+            vxota_probe: args.vxota_probe_bin.clone(),
             vxtelemetry: args.vxtelemetry_bin.clone(),
         },
         cache_dir: cache_dir.clone(),
