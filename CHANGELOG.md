@@ -6,6 +6,29 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **A metric reduces its samples over the measure window (X9.16).** A series metric takes
+  `reduce`, which says how its samples inside the trial's measure phase (or its `window`) become
+  the trial's one value: `last` (the default, and what every metric did before), `delta` (the last
+  sample less the first), `rate` (that delta per second between them), `mean`, `min` or `max`. A
+  node's share of a CPU over the window is `rate` of `vxedge_node_cpu_seconds_total`, and its mean
+  resident memory is `mean` of `vxedge_node_memory_bytes`, the two figures exp-002b reports per
+  arm.
+  - A counter that goes down restarted, and is counted on from 0, as Prometheus's `increase` reads
+    it; the value notes how many times. A gauge's `delta` is its last sample less its first.
+  - `delta` and `rate` need two samples in the window. A reduction other than `last` refuses two
+    lines of the series that the metric's `labels` do not tell apart.
+  - The plan refuses an unknown reduction, `reduce` on a ratio, `rate` on a gauge, and `mean`,
+    `min` or `max` on a counter or a histogram.
+  - `PackageMetric` carries `reduce`, and `window`, which it lacked.
+- **CPU and memory for a container node that runs no image.** Such a node is a bare network
+  namespace, and had no `vxedge_node_*` series, so exp-002b's container arm had no cost to set
+  against its VM arms. The daemon's exporter now sums the CPU time and resident memory of the
+  processes in the node's namespace, such as the reflector a measurement starts there, under the
+  same series names and units as a VM node's VMM, with `source="netns"`. An empty namespace has no
+  series.
+
 ## [0.24.0] - 2026-11-12
 
 Tool provenance in results. A result now names the build of every tool the daemon runs, so an

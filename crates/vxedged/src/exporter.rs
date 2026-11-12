@@ -7,15 +7,17 @@
 //! writes `entities.json`. Every series carries `entity="<path>"`, so one target serves many
 //! entities. Nothing is cached: each scrape reads the kernel's counters as they are then.
 //!
-//! - `vxedge_node_cpu_seconds_total`, `vxedge_node_memory_bytes`: a node's container cgroup, or
-//!   its VMM or runner process (`source` says which). A node nothing on this host runs (a bare
-//!   namespace, an attached platform, a node that is down) has no series.
+//! - `vxedge_node_cpu_seconds_total`, `vxedge_node_memory_bytes`: a node's container cgroup, its
+//!   VMM or runner process, or, for a container node that runs no image, the processes in its
+//!   network namespace, such as a measurement's reflector (`source` says which: `cgroup`,
+//!   `process` or `netns`). A node nothing on this host runs (an empty namespace, an attached
+//!   platform, a node that is down) has no series.
 //! - `vxedge_slice_*`: the counters of the slice's HTB class on the gateway uplink. The class is
 //!   the gateway's, so every vehicle whose links use the slice reports the same queue.
 //! - `vxedge_process_*{process="vxedged"}` on `host`: the observer's own cost.
 
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -24,8 +26,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, warn};
 
 use vxedge_core::entities::{self, HOST};
-use vxedge_core::gateway::{GatewayPlan, Shell};
-use vxedge_core::model::Experiment;
+use vxedge_core::gateway::{GatewayPlan, Shell, netlink};
+use vxedge_core::model::{Backend, Experiment};
 use vxedge_core::zones::usage::{self, Source};
 
 use crate::services::SharedState;
@@ -226,16 +228,20 @@ fn render(
         let nodes =
             vxedge_core::zones::plan_nodes_from_model(model, gateway, dir).unwrap_or_default();
         for np in nodes.iter().filter(|n| seen.insert(n.node_id.clone())) {
-            let (Some(path), Some(source)) = (
-                entities::node_path(model, &np.node_id),
-                vxedge_core::zones::node_usage_source(sh, np, runtime_dir),
-            ) else {
+            let Some(path) = entities::node_path(model, &np.node_id) else {
                 continue;
             };
-            let Some(u) = usage::read(&source) else {
+            let read = match vxedge_core::zones::node_usage_source(sh, np, runtime_dir) {
+                Some(source) => usage::read(&source).map(|u| (u, source.kind())),
+                None if np.backend == Backend::Container && np.image.is_none() => {
+                    namespace_usage(&netlink::netns_path(&np.runtime_name())).map(|u| (u, "netns"))
+                }
+                None => None,
+            };
+            let Some((u, kind)) = read else {
                 continue;
             };
-            let labels = vec![("entity", path), ("source", source.kind().to_string())];
+            let labels = vec![("entity", path), ("source", kind.to_string())];
             cpu.samples.push((labels.clone(), u.cpu_seconds));
             mem.samples.push((labels, u.memory_bytes as f64));
         }
@@ -267,6 +273,43 @@ fn render(
     families.extend([own_cpu, own_mem]);
     // Each running measurement's sender, read inside its own namespace (`measurements/<id>`).
     text(&families) + &vxedge_core::measurements::run::collect_metrics(runtime_dir)
+}
+
+/// What the processes in the network namespace at `ns` use together, or `None` when it runs
+/// none. A container node that runs no image is its namespace: nothing else holds its cost, and
+/// what runs there (a measurement's reflector, a traffic generator) is what the node does, as a
+/// VM node's guest is its VMM. A process is in it when its `/proc/<pid>/ns/net` is the same
+/// namespace file (device and inode, as `ip netns identify` matches). A process this daemon may
+/// not inspect is not counted; the ones it starts there are its own.
+fn namespace_usage(ns: &Path) -> Option<usage::Usage> {
+    use std::os::unix::fs::MetadataExt as _;
+    let ns = std::fs::metadata(ns).ok()?;
+    let mut total: Option<usage::Usage> = None;
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let Ok(net) = std::fs::metadata(entry.path().join("ns/net")) else {
+            continue;
+        };
+        if (net.dev(), net.ino()) != (ns.dev(), ns.ino()) {
+            continue;
+        }
+        let Some(u) = usage::read(&Source::Process(pid)) else {
+            continue;
+        };
+        let t = total.get_or_insert(usage::Usage {
+            cpu_seconds: 0.0,
+            memory_bytes: 0,
+        });
+        t.cpu_seconds += u.cpu_seconds;
+        t.memory_bytes += u.memory_bytes;
+    }
+    total
 }
 
 /// Prometheus text exposition (0.0.4). A family with no samples is left out.
@@ -313,6 +356,17 @@ mod tests {
              vxedge_node_memory_bytes{entity=\"car/front/ecu1\",source=\"cgroup\"} 512000\n"
         );
         assert_eq!(escape("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
+    }
+
+    /// A namespace's cost is its processes' together: this test's own namespace holds at least
+    /// this process, so it reads some memory; a path that is no namespace reads nothing.
+    #[test]
+    fn a_namespace_sums_the_processes_in_it() {
+        let own = namespace_usage(Path::new("/proc/self/ns/net")).expect("this process is in it");
+        let me = usage::read(&Source::Process(std::process::id() as i32)).unwrap();
+        assert!(own.memory_bytes >= me.memory_bytes, "{own:?} {me:?}");
+        assert!(own.cpu_seconds >= 0.0);
+        assert_eq!(namespace_usage(Path::new("/nonexistent/ns")), None);
     }
 
     #[test]

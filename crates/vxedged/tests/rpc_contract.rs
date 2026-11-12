@@ -2528,6 +2528,7 @@ async fn inspect_types_parameters_criteria_campaign_and_measurements() {
         format!(
             "{main}\nparameters:\n  load_mbps: {{ type: integer, unit: Mbit/s, default: 0, min: 0, max: 1000 }}\n\
              metrics:\n  - {{ id: rtt_seconds, kind: histogram, unit: s, entity: measurements/rtt, series: vxprobe_rtt_seconds }}\n\
+             \x20 - {{ id: sent_pps, kind: counter, unit: 1/s, entity: measurements/rtt, series: vxprobe_sent_total, reduce: rate }}\n\
              criteria:\n  - {{ id: bound, op: le, lhs: {{ metric: rtt_seconds, aggregate: p99, select: {{ arm: busy }} }}, rhs: {{ value: 1, unit: s }} }}\n\
              campaign:\n  arms: {{ idle: {{ load_mbps: 0 }}, busy: {{ load_mbps: 600 }} }}\n  repetitions: 5\n\
              measurements:\n  rtt: {{ kind: rtt-probe, from: ecu1, to: internet, slice: adas }}\n"
@@ -2562,6 +2563,14 @@ async fn inspect_types_parameters_criteria_campaign_and_measurements() {
     let campaign = info.campaign.unwrap();
     assert_eq!((campaign.arms.len(), campaign.repetitions), (2, Some(5)));
     assert_eq!(info.metrics[0].series, "vxprobe_rtt_seconds");
+    // A series metric says how it reduces its samples: the last one unless it names another.
+    let reduce: Vec<(&str, &str)> = info
+        .metrics
+        .iter()
+        .map(|m| (m.id.as_str(), m.reduce.as_str()))
+        .collect();
+    assert_eq!(reduce, [("rtt_seconds", "last"), ("sent_pps", "rate")]);
+    assert_eq!(info.metrics[1].window, "");
     assert_eq!(info.measurements[0].entity, "measurements/rtt");
     assert!(info.entities.iter().any(|e| e.path == "measurements/rtt"));
     assert!(info.problems.is_empty(), "{:?}", info.problems);

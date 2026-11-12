@@ -1,9 +1,9 @@
 //! **Verdicts** (`ARCHITECTURE.md` §6.0.3): an experiment's criteria judged over the archives of
 //! its trials, from their records alone.
 //!
-//! Each trial gives each metric one value (decision X-24): the last sample of the metric's series
-//! on its entity inside the trial's measure phase, or the whole archive when it records no phases.
-//! A criterion's aggregates then run across the trials it selects. A `vxarchive/1` archive names
+//! Each trial gives each metric one value (decision X-24): the metric's series on its entity
+//! inside the trial's measure phase, or the whole archive when it records no phases, reduced as
+//! the metric's `reduce` says (the last sample, by default). A criterion's aggregates then run across the trials it selects. A `vxarchive/1` archive names
 //! no entities, so its series is matched by name and labels, and refused as ambiguous when more
 //! than one scrape target served it. It counts failed scrapes without placing them in time, so
 //! they are noted on the value instead of making it incomplete.
@@ -319,11 +319,15 @@ fn series_value(records: &Records, m: &Metric, series: &str, window: (i64, i64))
             ));
         }
     }
-    let Some(last) = matching.iter().max_by_key(|s| s.ts_ns) else {
+    if matching.is_empty() {
         return TrialValue::none(format!(
             "no `{series}` sample on `{}` while the trial measured",
             m.entity
         ));
+    }
+    let (value, note) = match reduce(m, series, matching) {
+        Ok(v) => v,
+        Err(why) => return TrialValue::none(why),
     };
     if v1 {
         // A vxarchive/1 archive counts its failed scrapes but cannot place them in time, and
@@ -332,14 +336,16 @@ fn series_value(records: &Records, m: &Metric, series: &str, window: (i64, i64))
             .as_u64()
             .unwrap_or(0);
         return TrialValue {
-            value: Some(last.value),
+            value: Some(value),
             complete: true,
-            why: (failed > 0).then(|| {
-                format!(
-                    "the run counted {failed} failed scrapes, which a vxarchive/1 archive cannot \
-                     place in time"
-                )
-            }),
+            why: (failed > 0)
+                .then(|| {
+                    format!(
+                        "the run counted {failed} failed scrapes, which a vxarchive/1 archive \
+                         cannot place in time"
+                    )
+                })
+                .or(note),
         };
     }
     let complete = !records.gaps.iter().any(|g| {
@@ -349,9 +355,81 @@ fn series_value(records: &Records, m: &Metric, series: &str, window: (i64, i64))
             && g.to_ns > from
     });
     TrialValue {
-        value: Some(last.value),
+        value: Some(value),
         complete,
-        why: (!complete).then(|| format!("`{}` has a gap while the trial measured", m.entity)),
+        why: (!complete)
+            .then(|| format!("`{}` has a gap while the trial measured", m.entity))
+            .or(note),
+    }
+}
+
+/// The metric's samples inside the window, at least one, reduced as `m.reduce` says
+/// ([`intent::REDUCTIONS`]), with a note on the value when there is one to make.
+fn reduce(
+    m: &Metric,
+    series: &str,
+    mut samples: Vec<&Sample>,
+) -> Result<(f64, Option<String>), String> {
+    samples.sort_by_key(|s| s.ts_ns);
+    let reduction = m.reduction();
+    let last = samples[samples.len() - 1];
+    if reduction == "last" {
+        return Ok((last.value, None));
+    }
+    // A reduction over time reads one line of the series: two lines' samples interleaved would
+    // be neither line's change or mean.
+    let lines: BTreeSet<&BTreeMap<String, String>> = samples.iter().map(|s| &s.labels).collect();
+    if lines.len() > 1 {
+        return Err(format!(
+            "`{series}` has {} lines on `{}` that `labels` do not tell apart, and `{reduction}` \
+             reads one",
+            lines.len(),
+            m.entity
+        ));
+    }
+    let values = samples.iter().map(|s| s.value);
+    let n = samples.len() as f64;
+    match reduction {
+        "mean" => Ok((values.sum::<f64>() / n, None)),
+        "min" => Ok((values.fold(f64::INFINITY, f64::min), None)),
+        "max" => Ok((values.fold(f64::NEG_INFINITY, f64::max), None)),
+        "delta" | "rate" => {
+            let first = samples[0];
+            if samples.len() < 2 || last.ts_ns == first.ts_ns {
+                return Err(format!(
+                    "`{reduction}` needs two samples of `{series}` on `{}` while the trial \
+                     measured; there is one",
+                    m.entity
+                ));
+            }
+            // A gauge's change is its last sample less its first. A counter only grows, so a
+            // sample below the one before it restarted from 0 (its process restarted), and
+            // counts from there, as Prometheus's `increase` reads one.
+            let (delta, resets) = if m.kind == intent::MetricKind::Gauge {
+                (last.value - first.value, 0)
+            } else {
+                samples.windows(2).fold((0.0, 0), |(sum, resets), w| {
+                    if w[1].value < w[0].value {
+                        (sum + w[1].value, resets + 1)
+                    } else {
+                        (sum + w[1].value - w[0].value, resets)
+                    }
+                })
+            };
+            let note = (resets > 0).then(|| {
+                format!(
+                    "`{series}` restarted {resets} time(s) while the trial measured, and is \
+                     counted from 0 after each"
+                )
+            });
+            let value = if reduction == "rate" {
+                delta / ((last.ts_ns - first.ts_ns) as f64 / 1e9)
+            } else {
+                delta
+            };
+            Ok((value, note))
+        }
+        other => Err(format!("`{other}` is not a reduction")),
     }
 }
 
@@ -1231,6 +1309,131 @@ criteria:
         .unwrap();
         assert!(!t.values["lost"].complete);
         assert!(!t.values["loss_pct"].complete);
+    }
+
+    /// A metric reduces its samples inside the measure phase: a counter's `delta` and `rate`
+    /// from its first to its last sample, counting on from 0 after a restart; a gauge's `mean`,
+    /// `min`, `max` and `delta`. Samples before or after the phase are not read, a reduction over
+    /// time needs two samples, and it refuses two lines of the series it cannot tell apart.
+    #[test]
+    fn a_metric_reduces_its_samples_in_the_measure_phase() {
+        let node = "car/front/ecu";
+        let s = |ts_s: f64, metric: &str, source: &str, v: f64| Sample {
+            ts_ns: (ts_s * 1e9) as i64,
+            entity: Some(node.into()),
+            target: None,
+            metric: metric.into(),
+            labels: BTreeMap::from([("source".into(), source.into())]),
+            value: v,
+        };
+        let cpu = "vxedge_node_cpu_seconds_total";
+        let mem = "vxedge_node_memory_bytes";
+        let records = |samples: Vec<Sample>| Records {
+            archive: "vxarchive/2".into(),
+            samples,
+            phases: vec![
+                Phase {
+                    ts_ns: 0,
+                    phase: "warmup".into(),
+                    window: None,
+                },
+                Phase {
+                    ts_ns: 10_000_000_000,
+                    phase: "measure".into(),
+                    window: None,
+                },
+                Phase {
+                    ts_ns: 71_000_000_000,
+                    phase: "cooldown".into(),
+                    window: None,
+                },
+            ],
+            ..Records::default()
+        };
+        let metrics: Vec<Metric> = [
+            "{ id: cpu_s, kind: counter, unit: s, entity: car/front/ecu, series: vxedge_node_cpu_seconds_total, reduce: delta }",
+            "{ id: cpu, kind: counter, unit: s/s, entity: car/front/ecu, series: vxedge_node_cpu_seconds_total, reduce: rate }",
+            "{ id: cpu_last, kind: counter, unit: s, entity: car/front/ecu, series: vxedge_node_cpu_seconds_total }",
+            "{ id: rss, kind: gauge, unit: B, entity: car/front/ecu, series: vxedge_node_memory_bytes, reduce: mean }",
+            "{ id: rss_min, kind: gauge, unit: B, entity: car/front/ecu, series: vxedge_node_memory_bytes, reduce: min }",
+            "{ id: rss_max, kind: gauge, unit: B, entity: car/front/ecu, series: vxedge_node_memory_bytes, reduce: max }",
+            "{ id: rss_growth, kind: gauge, unit: B, entity: car/front/ecu, series: vxedge_node_memory_bytes, reduce: delta }",
+        ]
+        .iter()
+        .map(|y| metric(y))
+        .collect();
+        // 5 % of a CPU from 10 s to 70 s, after a busy warmup; memory grows by 4 kB.
+        let mut samples = vec![s(5.0, cpu, "netns", 0.0), s(5.0, mem, "netns", 1e9)];
+        for i in 0..=30 {
+            let t = 10.0 + 2.0 * i as f64;
+            samples.push(s(t, cpu, "netns", 100.0 + 0.05 * (t - 10.0)));
+            samples.push(s(
+                t,
+                mem,
+                "netns",
+                8_000_000.0 + if i < 15 { 0.0 } else { 4096.0 },
+            ));
+        }
+        samples.push(s(75.0, cpu, "netns", 500.0));
+        let v = values(&records(samples.clone()), &metrics);
+        let close = |a: Option<f64>, b: f64| a.is_some_and(|a| (a - b).abs() < 1e-9);
+        assert!(close(v["cpu_s"].value, 3.0), "{:?}", v["cpu_s"]);
+        assert!(close(v["cpu"].value, 0.05), "{:?}", v["cpu"]);
+        assert!(close(v["cpu_last"].value, 103.0), "{:?}", v["cpu_last"]);
+        assert!(close(v["rss"].value, 8_000_000.0 + 4096.0 * 16.0 / 31.0));
+        assert_eq!(
+            (v["rss_min"].value, v["rss_max"].value),
+            (Some(8e6), Some(8_004_096.0))
+        );
+        assert_eq!(v["rss_growth"].value, Some(4096.0));
+        assert!(v.values().all(|x| x.complete && x.why.is_none()), "{v:?}");
+
+        // The counter restarts at 40 s (its process restarted): it counts on from 0.
+        let restarted: Vec<Sample> = samples
+            .iter()
+            .map(
+                |x| match x.metric == cpu && (40.0e9..=70.0e9).contains(&(x.ts_ns as f64)) {
+                    true => Sample {
+                        value: x.value - 101.5 + 0.1,
+                        ..x.clone()
+                    },
+                    false => x.clone(),
+                },
+            )
+            .collect();
+        let v = values(&records(restarted), &metrics);
+        assert!(
+            close(v["cpu_s"].value, 3.0 - 0.05 * 2.0 + 0.1),
+            "{:?}",
+            v["cpu_s"]
+        );
+        assert!(
+            v["cpu_s"]
+                .why
+                .as_deref()
+                .unwrap()
+                .contains("restarted 1 time")
+        );
+
+        // One sample in the phase: no change to read.
+        let one = vec![s(5.0, cpu, "netns", 0.0), s(30.0, cpu, "netns", 1.0)];
+        let v = values(&records(one), &metrics);
+        assert_eq!(v["cpu"].value, None);
+        assert!(
+            v["cpu"]
+                .why
+                .as_deref()
+                .unwrap()
+                .contains("needs two samples")
+        );
+
+        // Two lines the metric's labels do not pick between.
+        let mut two = samples.clone();
+        two.push(s(20.0, cpu, "process", 7.0));
+        let v = values(&records(two), &metrics);
+        assert_eq!(v["cpu"].value, None);
+        assert!(v["cpu"].why.as_deref().unwrap().contains("2 lines"));
+        assert_eq!(v["cpu_last"].value, Some(103.0), "`last` reads as before");
     }
 
     /// A campaign with windows: each windowed metric is the last sample inside its own window, and
