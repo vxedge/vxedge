@@ -6,6 +6,13 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-11-12
+
+Functional checks. An experiment can be a suite, not a measurement: tools run in the nodes'
+namespaces, each step's output is archived with the trial, and typed cases judge it, which lets
+exp-015 and exp-017 run as packages. A run's `entities.json` also stops naming traffic logs that
+never exist. vxAPI stays `vxedge.v1`, and every change is additive.
+
 ### Added
 
 - **Functional checks (X9.11).** A `kind: experiment` can declare a suite, not a measurement, in
