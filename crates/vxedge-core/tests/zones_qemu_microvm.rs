@@ -6,9 +6,12 @@
 //! Needs root (the namespace and QEMU's `ip netns exec`), `socat`, and the guest's emulator on
 //! root's PATH (`qemu-system-x86_64` for an x86_64 or i386 bundle, `qemu-system-aarch64` for an
 //! aarch64 one). `VXEDGE_TEST_BUNDLE` names a bundle directory (`vmlinuz`, `initrd.img`,
-//! `meta.json`), for example a pulled `zone/*/stack/probe-bundle`. Run with:
+//! `meta.json`), for example a pulled `zone/*/stack/probe-bundle`. `VXEDGE_TEST_QEMU`, optional,
+//! gives the device a `qemu:` block as `<machine>,<transport>[,vhost]` (`q35,pci,vhost`); a PCI
+//! transport needs a bundle that declares `org.vxedge.virtio-pci`. Run with:
 //!   cargo test -p vxedge-core --test zones_qemu_microvm --no-run
-//!   sudo env "PATH=$PATH" VXEDGE_TEST_BUNDLE=/path/to/bundle <test-binary> --ignored --nocapture
+//!   sudo env "PATH=$PATH" VXEDGE_TEST_BUNDLE=/path/to/bundle [VXEDGE_TEST_QEMU=q35,pci] \
+//!     <test-binary> --ignored --nocapture
 
 #![cfg(target_os = "linux")]
 
@@ -27,7 +30,44 @@ const GUEST_IP: &str = "10.101.0.2";
 const FAR_SIDE_CIDR: &str = "10.101.0.1/24";
 const REFLECTOR_PORT: u16 = 9800;
 
-fn workspace(bundle: &str) -> String {
+/// The `qemu:` block `VXEDGE_TEST_QEMU` asks for, and the `-M` and NIC QEMU must then run.
+struct Arm {
+    block: String,
+    machine: &'static str,
+    nic: &'static str,
+    vhost: bool,
+}
+
+fn arm() -> Arm {
+    let spec = std::env::var("VXEDGE_TEST_QEMU").unwrap_or_default();
+    let parts: Vec<&str> = spec.split(',').filter(|s| !s.is_empty()).collect();
+    let (machine, transport) = match parts.as_slice() {
+        [] => ("microvm", "mmio"),
+        [m, t, ..] => (*m, *t),
+        _ => panic!("VXEDGE_TEST_QEMU is <machine>,<transport>[,vhost]: {spec}"),
+    };
+    let vhost = parts.get(2) == Some(&"vhost");
+    Arm {
+        block: if parts.is_empty() {
+            String::new()
+        } else {
+            format!(", qemu: {{ machine: {machine}, transport: {transport}, vhost: {vhost} }}")
+        },
+        machine: match (machine, transport) {
+            ("q35", _) => "q35",
+            ("microvm", "pci") => "microvm,pcie=on,acpi=on",
+            _ => "microvm,acpi=off",
+        },
+        nic: if transport == "pci" {
+            "virtio-net-pci"
+        } else {
+            "virtio-net-device"
+        },
+        vhost,
+    }
+}
+
+fn workspace(bundle: &str, qemu: &str) -> String {
     format!(
         r#"
 kind: experiment
@@ -42,7 +82,7 @@ kind: vehicle
 id: veh
 zones: {{ front-left: {{}} }}
 devices:
-  ecu-vm: {{ role: ecu, zone: front-left, backend: qemu-microvm }}
+  ecu-vm: {{ role: ecu, zone: front-left, backend: qemu-microvm{qemu} }}
 functions:
   fn-vm: {{ deployed_on: ecu-vm }}
 links:
@@ -136,6 +176,7 @@ fn wait_for_reflector(ns: &str, serial: &Path, within: Duration) {
 fn a_probe_guest_boots_on_the_gateway_tap_and_its_reflector_answers_at_the_pinned_ip() {
     let bundle = std::env::var("VXEDGE_TEST_BUNDLE").expect("VXEDGE_TEST_BUNDLE names a bundle");
     let arch = bundle_arch(&bundle);
+    let arm = arm();
     let ns = format!("vxmvmtest{}", std::process::id());
     let created = Command::new("ip")
         .args(["netns", "add", &ns])
@@ -157,7 +198,8 @@ fn a_probe_guest_boots_on_the_gateway_tap_and_its_reflector_answers_at_the_pinne
         escalate: false,
     };
 
-    let model = vxedge_core::model::load_yaml(&workspace(&bundle)).expect("workspace loads");
+    let model =
+        vxedge_core::model::load_yaml(&workspace(&bundle, &arm.block)).expect("workspace loads");
     let plan = GatewayPlan::from_model(&model).unwrap();
     apply(&sh, &plan).unwrap();
     let nodes = plan_nodes_from_model(&model, &plan, Path::new("/")).unwrap();
@@ -196,6 +238,24 @@ fn a_probe_guest_boots_on_the_gateway_tap_and_its_reflector_answers_at_the_pinne
     assert_eq!(
         platform.arch, arch,
         "the guest runs another instruction set than its bundle names"
+    );
+    // QEMU runs the machine, NIC and data path the device's `qemu:` block names.
+    let pid = guest(&runtime).expect("the guest is running");
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap();
+    let argv: Vec<String> = String::from_utf8_lossy(&cmdline)
+        .split('\0')
+        .map(str::to_string)
+        .collect();
+    let after = |flag: &str| {
+        let i = argv.iter().position(|a| a == flag).expect(flag);
+        argv[i + 1].clone()
+    };
+    assert_eq!(after("-M"), arm.machine);
+    assert!(after("-device").starts_with(arm.nic), "{argv:?}");
+    assert_eq!(
+        after("-netdev").ends_with(",vhost=on"),
+        arm.vhost,
+        "{argv:?}"
     );
     // An emulated guest boots slower; it is functional evidence only, never timed.
     let within = match platform.acceleration {

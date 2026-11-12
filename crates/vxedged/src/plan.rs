@@ -914,6 +914,7 @@ mod pinning_tests {
             image: image.map(String::from),
             module: None,
             pinned_cpus: pinned,
+            qemu: Default::default(),
         }
     }
 

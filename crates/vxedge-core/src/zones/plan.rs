@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::gateway::plan::{EndpointKind, GatewayPlan};
-use crate::model::{Backend, DeviceRole};
+use crate::model::{Backend, DeviceRole, QemuOptions};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ZonePlanError {
@@ -106,6 +106,8 @@ pub struct NodePlan {
     /// `local/…:host-process` part means, so no existing workspace changes behaviour.
     pub image: Option<String>,
     pub pinned_cpus: Vec<u32>,
+    /// `qemu-microvm` only: the machine, NIC transport and vhost the device's `qemu:` block names.
+    pub qemu: QemuOptions,
 }
 
 /// The runtime name of node `node_id`: `vx-` and the id, each character that is not ASCII
@@ -361,6 +363,7 @@ pub fn plan_nodes_from_model(
                     module,
                     image,
                     pinned_cpus: device.pinned_cpus.clone(),
+                    qemu: device.qemu,
                 });
             }
         }
