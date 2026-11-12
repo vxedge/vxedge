@@ -9,7 +9,7 @@ authors:
     affiliation: "Independent Researcher"
 repository-code: "https://github.com/vxedge/vxedge"
 url: "https://vxedge.dev"
-version: "0.22.0"
+version: "0.23.0"
 date-released: "2026-11-12"
 license: "Apache-2.0"
 keywords:

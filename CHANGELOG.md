@@ -6,6 +6,13 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-11-12
+
+OTA arm setup. A host-process `ota` service can sign its own store at every start and run clients
+that download from it back to back, which lets exp-003's baseline and burst arms run as a package
+with nothing built on the host first. A campaign trial's archive also lists the entities of the
+trial's bound document. vxAPI stays `vxedge.v1`, with no wire change.
+
 ### Added
 
 - **An OTA store made per run, and an update in progress (X9.12).** A host-process `ota` service
