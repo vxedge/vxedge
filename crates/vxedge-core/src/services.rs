@@ -554,7 +554,7 @@ impl ServiceBackend for OtaBackend {
         def: &ServiceDef,
         bins: &ServiceBinaries,
         _workspace_dir: &Path,
-        _runtime_dir: &Path,
+        runtime_dir: &Path,
     ) -> Result<SpawnSpec, ServiceBackendError> {
         let cfg = OtaConfig::read(def)?;
         if let Some(ArtifactStore::Published { .. }) =
@@ -565,7 +565,7 @@ impl ServiceBackend for OtaBackend {
                 detail: "a published artifact store needs a placed service (`on:`)".into(),
             });
         }
-        let store = cfg.store_dir(def, _runtime_dir);
+        let store = cfg.store_dir(def, runtime_dir);
         Ok(SpawnSpec {
             bin: bins.vxota.clone(),
             args: vec![
