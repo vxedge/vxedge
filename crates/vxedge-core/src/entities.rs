@@ -314,11 +314,15 @@ pub fn add_logs(records: &mut [EntityRecord], model: &Experiment, runtime_dir: &
         _ => None,
     };
     for p in &model.traffic {
-        for (role, end) in [
-            ("send", &p.source),
-            ("load", &p.source),
-            ("reflect", &p.target),
-        ] {
+        // The roles `traffic::lifecycle::profile_up` spawns: a round-trip probe (`pps`) is a
+        // `vxprobe send` and its reflector, a load (`bandwidth_mbps`) is one `vxtraffic`. Listing
+        // a role it never spawns names a log file that never exists.
+        let roles: &[(&str, &crate::model::TrafficEndpoint)] = if p.pps.is_some() {
+            &[("send", &p.source), ("reflect", &p.target)]
+        } else {
+            &[("load", &p.source)]
+        };
+        for &(role, end) in roles {
             let path = node_of(end).unwrap_or_else(|| HOST.to_string());
             add(
                 &path,
@@ -418,8 +422,16 @@ telemetry:
             id: "bulk".into(),
             source: crate::model::TrafficEndpoint::Device("ecu1".into()),
             target: crate::model::TrafficEndpoint::Internet,
-            pps: None,
+            pps: Some(100),
             bandwidth_mbps: None,
+            payload_bytes: None,
+        });
+        m.traffic.push(crate::model::TrafficProfile {
+            id: "fill".into(),
+            source: crate::model::TrafficEndpoint::Device("ecu1".into()),
+            target: crate::model::TrafficEndpoint::Internet,
+            pps: None,
+            bandwidth_mbps: Some(400),
             payload_bytes: None,
         });
         let rt = std::path::Path::new("/run/vx");
@@ -443,7 +455,7 @@ telemetry:
             logs("car/front/ecu1"),
             [
                 ("traffic-bulk-send".into(), rt.join("traffic-bulk-send.log")),
-                ("traffic-bulk-load".into(), rt.join("traffic-bulk-load.log")),
+                ("traffic-fill-load".into(), rt.join("traffic-fill-load.log")),
             ]
         );
         assert_eq!(
