@@ -1,10 +1,10 @@
 //! `TelemetryService`: the results archive of a run, built by `vxtelemetry collect`.
 //!
-//! `Collect` archives what the workspace's telemetry service ingested, with the workspace itself
-//! and the digests of every image it runs, and returns the archive through `Job.artifact` with its
-//! sha256. `StreamRecords` and `StreamMetrics` tail what the service is ingesting (`records`), and
-//! `LogService.Follow` the log lines it reads.
-
+//! `Collect` archives what the workspace's telemetry service ingested, with the workspace itself,
+//! the digests of every image it runs and the tool binaries the daemon runs (`tools.json`), and
+//! returns the archive through `Job.artifact` with its sha256. `StreamRecords` and
+//! `StreamMetrics` tail what the service is ingesting (`records`), and `LogService.Follow` the log
+//! lines it reads.
 use sha2::Digest;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -29,6 +29,8 @@ pub struct TelemetrySvc {
     pub audit: Arc<Audit>,
     pub runtime_dir: PathBuf,
     pub vxtelemetry_bin: String,
+    /// The tool binaries this daemon runs, written to the ingest folder at every collect.
+    pub tools: Arc<crate::tools::Tools>,
 }
 
 /// Every entity of `model`, with this daemon's exporter bound to `host` and the log files it
@@ -212,6 +214,16 @@ impl TelemetryService for TelemetrySvc {
             errors::invalid(
                 R::Unspecified,
                 format!("cannot write `{}`: {e}", entities_file.display()),
+            )
+        })?;
+        // The binaries this daemon runs, which vxtelemetry records as `metadata.json`'s `tools`.
+        self.tools.write(&ingest).await.map_err(|e| {
+            errors::invalid(
+                R::Unspecified,
+                format!(
+                    "cannot write `{}`: {e}",
+                    ingest.join(crate::tools::FILE).display()
+                ),
             )
         })?;
         let out = if req.out_path.is_empty() {

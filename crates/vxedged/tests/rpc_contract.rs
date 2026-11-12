@@ -1748,6 +1748,38 @@ async fn collect_returns_the_archive_and_its_digest() {
     );
     let locked = std::fs::read_to_string(bin.parent().unwrap().join("locked")).unwrap();
     assert_eq!(locked.trim(), "unset", "no run, so nothing to say");
+    // The binaries the daemon runs, beside what vxtelemetry archives: every tool flag, the
+    // daemon first.
+    let tools: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(daemon.root.join("run/ingest/tools.json")).unwrap())
+            .unwrap();
+    let names: Vec<&str> = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "vxedged",
+            "vxprobe",
+            "vxtraffic",
+            "vxota",
+            "vxota-probe",
+            "vxtelemetry"
+        ]
+    );
+    let telemetry = &tools[5];
+    assert_eq!(
+        telemetry["path"],
+        bin.canonicalize().unwrap().to_string_lossy().as_ref()
+    );
+    assert_eq!(telemetry["sha256"].as_str().unwrap().len(), 64);
+    assert_eq!(
+        telemetry["profile"], "unknown",
+        "the stand-in reports no profile"
+    );
 }
 
 /// `collect` tells vxtelemetry whether the live run of this workspace checked its lock, and

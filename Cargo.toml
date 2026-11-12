@@ -58,3 +58,8 @@ zstd = { version = "0.13", default-features = false }
 # only: no TLS stack, no HTTP/SSH remotes.
 cloud-hypervisor-client = "=0.6.0"
 bollard = { version = "0.21", default-features = false, features = ["pipe"] }
+
+# vxedged hashes the tool binaries it runs (and its own, which is large in a debug build); an
+# unoptimised sha256 makes that take seconds in every debug test that collects.
+[profile.dev.package.sha2]
+opt-level = 3

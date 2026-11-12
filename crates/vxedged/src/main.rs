@@ -21,6 +21,7 @@ mod runs;
 mod services;
 mod status;
 mod telemetry;
+mod tools;
 mod vehicle;
 mod verdict;
 
@@ -306,11 +307,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         vxtraffic_bin: args.vxtraffic_bin.clone(),
         containers: containers.clone(),
     });
+    // Every tool flag, read at the first collect and again only when a file changed.
+    let tools = Arc::new(tools::Tools::new(
+        [
+            ("vxprobe", &args.vxprobe_bin),
+            ("vxtraffic", &args.vxtraffic_bin),
+            ("vxota", &args.vxota_bin),
+            ("vxota-probe", &args.vxota_probe_bin),
+            ("vxtelemetry", &args.vxtelemetry_bin),
+        ]
+        .into_iter()
+        .map(|(name, bin)| (name.to_string(), bin.clone()))
+        .collect(),
+    ));
     let telemetry = Arc::new(telemetry::TelemetrySvc {
         engine: telemetry_engine,
         audit: telemetry_audit,
         runtime_dir: args.runtime_dir.clone(),
         vxtelemetry_bin: args.vxtelemetry_bin.clone(),
+        tools,
     });
     Server::builder()
         .add_service(GatewayServiceServer::from_arc(gateway))
