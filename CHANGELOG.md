@@ -6,6 +6,15 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-11-13
+
+Check samples, metric reductions and QEMU options. A check step's output can carry the numbers a
+tool measures, read as series that metrics and criteria aggregate, which lets exp-016 run kuksa-perf
+as a package. A series metric reduces its samples over the measure window (`last`, `delta`, `rate`,
+`mean`, `min`, `max`), and a container node that runs no image reports its namespace's CPU and
+memory. A `qemu-microvm` device can set its machine, NIC transport and vhost. vxAPI stays
+`vxedge.v1`; `NodeSpec.qemu` and `PackageMetric`'s `reduce` and `window` are additive.
+
 ### Added
 
 - **Samples from a check step's output (X9.15).** A tool step can declare that its lines carry
