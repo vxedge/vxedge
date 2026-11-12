@@ -15,6 +15,10 @@
 //! criterion `{ id, cases: [...] }` passes when every case it names passes in every trial it
 //! selects. A case marked `observe` records what it found and is never judged.
 //!
+//! A tool step may also declare the `samples` its lines carry, such as kuksa-perf's latency
+//! percentiles: each line a declaration selects is one sample of a series on the step's entity,
+//! so a metric reads it as it reads a probe's, and criteria aggregate it across trials.
+//!
 //! This module is pure: the shape, its problems, and the judging of lines. [`run`] runs the steps.
 
 pub mod run;
@@ -24,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 
-use crate::intent::{Outcome, Problem, ProblemKind};
+use crate::intent::{Metric, Outcome, Problem, ProblemKind};
 use crate::model::{Backend, Experiment};
 
 /// Where a tool step's output and each observation are written, under the runtime folder, and
@@ -74,6 +78,23 @@ impl Observe {
             Self::Port => "port",
         }
     }
+}
+
+/// A series a tool step's lines yield (`samples`): each line its `where` selects that holds a
+/// number at `value` is one sample of `series` on the step's entity `checks/<step>`, at the time
+/// the line was recorded, labelled with the values of the line's `labels` fields.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SampleSeries {
+    pub series: String,
+    #[serde(default, rename = "where")]
+    pub select: BTreeMap<String, Json>,
+    /// The field holding the number, as a dotted path.
+    pub value: String,
+    pub unit: String,
+    /// Fields of the line whose values label the sample, each under its own name.
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 /// One step. Exactly one of `tool`, `observe`, `wait`, `stop` and `sleep_s` says what it does.
@@ -128,6 +149,9 @@ pub struct Step {
     pub stop: Option<String>,
     #[serde(default)]
     pub sleep_s: Option<f64>,
+    /// The series a tool step's lines yield, which metrics read like any other.
+    #[serde(default)]
+    pub samples: Vec<SampleSeries>,
 }
 
 impl Step {
@@ -317,6 +341,23 @@ fn plain_id(id: &str) -> bool {
         && id != ".."
 }
 
+/// A series name as Prometheus writes one.
+fn series_name(s: &str) -> bool {
+    let mut c = s.chars();
+    c.next()
+        .is_some_and(|f| f.is_ascii_alphabetic() || matches!(f, '_' | ':'))
+        && c.all(|x| x.is_ascii_alphanumeric() || matches!(x, '_' | ':'))
+}
+
+/// A label name as Prometheus writes one; `__` names are reserved.
+fn label_name(s: &str) -> bool {
+    let mut c = s.chars();
+    c.next()
+        .is_some_and(|f| f.is_ascii_alphabetic() || f == '_')
+        && c.all(|x| x.is_ascii_alphanumeric() || x == '_')
+        && !s.starts_with("__")
+}
+
 /// Whether `image` names content a run can reproduce: a digest, or this host's own store.
 pub fn pinned(image: &str) -> bool {
     image.starts_with("localhost/")
@@ -460,6 +501,48 @@ pub fn problems(experiment: &str, checks: &Checks) -> Vec<Problem> {
             if s.every_s.is_some_and(|t| !(t >= 0.0 && t.is_finite())) {
                 push(at(".every_s"), "`every_s` is a number of seconds".into());
             }
+            let mut series = BTreeSet::new();
+            for (j, d) in s.samples.iter().enumerate() {
+                let at = |f: &str| at(&format!(".samples[{j}]{f}"));
+                if !series_name(&d.series) {
+                    push(
+                        at(".series"),
+                        format!(
+                            "`{}` is not a series name: a letter, `_` or `:`, then letters, \
+                             digits, `_` or `:`",
+                            d.series
+                        ),
+                    );
+                } else if !series.insert(d.series.as_str()) {
+                    push(
+                        at(".series"),
+                        format!("the step declares `{}` twice", d.series),
+                    );
+                }
+                if d.value.is_empty() || d.value.split('.').any(str::is_empty) {
+                    push(
+                        at(".value"),
+                        format!("`{}` is not a field path such as `p50_us`", d.value),
+                    );
+                }
+                if d.unit.is_empty() {
+                    push(at(".unit"), "a sample series needs a `unit`".into());
+                }
+                let mut seen = BTreeSet::new();
+                for l in &d.labels {
+                    if !label_name(l) {
+                        push(
+                            at(".labels"),
+                            format!(
+                                "`{l}` is not a label name: a letter or `_`, then letters, digits \
+                                 or `_`, not starting `__`"
+                            ),
+                        );
+                    } else if !seen.insert(l.as_str()) {
+                        push(at(".labels"), format!("`{l}` is named twice"));
+                    }
+                }
+            }
         } else {
             let tool_only = [
                 ("with", s.with.is_some()),
@@ -470,6 +553,7 @@ pub fn problems(experiment: &str, checks: &Checks) -> Vec<Problem> {
                 ("until", s.until.is_some()),
                 ("every_s", s.every_s.is_some()),
                 ("attempts", s.attempts.is_some()),
+                ("samples", !s.samples.is_empty()),
             ];
             for (field, set) in tool_only {
                 if set {
@@ -638,6 +722,94 @@ pub fn model_problems(model: &Experiment, checks: &Checks) -> Vec<Problem> {
         }
     }
     out
+}
+
+/// The entity prefix of a check step's output.
+const ENTITY_PREFIX: &str = "checks/";
+
+/// Every problem with a metric that reads a check step (`entity: checks/<step>`): the step must
+/// be a tool step declaring the metric's `series` in `samples`, in the metric's unit, with every
+/// label the metric picks.
+pub fn metric_problems(
+    experiment: &str,
+    checks: Option<&Checks>,
+    metrics: &[Metric],
+) -> Vec<Problem> {
+    let mut out = Vec::new();
+    for (i, m) in metrics.iter().enumerate() {
+        let Some(step) = m.entity.strip_prefix(ENTITY_PREFIX) else {
+            continue;
+        };
+        let mut push = |field: &str, detail: String| {
+            out.push(Problem {
+                kind: ProblemKind::Check,
+                experiment: experiment.to_string(),
+                field: format!("metrics[{i}].{field}"),
+                detail,
+            })
+        };
+        let declared = checks
+            .into_iter()
+            .flat_map(|k| &k.steps)
+            .find(|s| s.tool.is_some() && s.id.as_deref() == Some(step));
+        let Some(declared) = declared else {
+            push(
+                "entity",
+                format!("`{step}` is not a tool step under `checks.steps`"),
+            );
+            continue;
+        };
+        let Some(series) = m.series.as_deref() else {
+            continue;
+        };
+        let Some(d) = declared.samples.iter().find(|d| d.series == series) else {
+            push(
+                "series",
+                format!("step `{step}` declares no `samples` series `{series}`"),
+            );
+            continue;
+        };
+        if m.unit != d.unit {
+            push(
+                "unit",
+                format!(
+                    "step `{step}`'s `{series}` samples are in `{}`, not `{}`",
+                    d.unit, m.unit
+                ),
+            );
+        }
+        for label in m.labels.keys() {
+            if !d.labels.contains(label) {
+                push(
+                    &format!("labels.{label}"),
+                    format!("step `{step}`'s `{series}` samples carry no label `{label}`"),
+                );
+            }
+        }
+    }
+    out
+}
+
+/// The sample `decl` reads from `line`: its value and labels, or none when the line is not
+/// selected, its `value` is not a number, or a label field is missing or not a scalar.
+pub fn sample(decl: &SampleSeries, line: &Json) -> Option<(f64, BTreeMap<String, String>)> {
+    if !matches(line, &decl.select) {
+        return None;
+    }
+    let value = field(line, &decl.value)?.as_f64()?;
+    let labels = decl
+        .labels
+        .iter()
+        .map(|l| {
+            let v = match field(line, l)? {
+                Json::String(s) => s.clone(),
+                v @ (Json::Number(_) | Json::Bool(_)) => v.to_string(),
+                _ => return None,
+            };
+            Some((l.clone(), v))
+        })
+        .collect::<Option<_>>()?;
+    Some((value, labels))
 }
 
 /// The package files the steps mount that `root` does not hold.
@@ -1217,6 +1389,97 @@ criteria:
                 .any(|p| p.kind == ProblemKind::Check && p.detail.contains("measure duration")),
             "{details:?}"
         );
+    }
+
+    #[test]
+    fn sample_declarations_are_checked_with_the_metrics_that_read_them() {
+        let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(
+            r#"
+id: e
+campaign: { repetitions: 1, duration_s: 60 }
+checks:
+  tools: { perf: { image: "localhost/perf:1" } }
+  steps:
+    - id: run
+      tool: perf
+      on: a
+      samples:
+        - { series: latency_us, where: { op: latency }, value: us, unit: us, labels: [quantile] }
+        - { series: latency_us, value: us, unit: us }
+        - { series: 9bad, value: "a..b", unit: "", labels: [__x, q, q] }
+    - { id: st, observe: member, on: a, member: m, samples: [{ series: x, value: v, unit: "1" }] }
+metrics:
+  - { id: ok, kind: gauge, unit: us, entity: checks/run, series: latency_us, labels: { quantile: "50" } }
+  - { id: unit, kind: gauge, unit: s, entity: checks/run, series: latency_us }
+  - { id: label, kind: gauge, unit: us, entity: checks/run, series: latency_us, labels: { op: x } }
+  - { id: series, kind: gauge, unit: us, entity: checks/run, series: nope }
+  - { id: step, kind: gauge, unit: "1", entity: checks/st, series: x }
+"#,
+        )
+        .unwrap();
+        let problems = crate::intent::read(&doc).1;
+        let check: Vec<String> = problems
+            .iter()
+            .filter(|p| p.kind == ProblemKind::Check)
+            .map(|p| p.field.clone())
+            .collect();
+        for want in [
+            "checks.steps[0].samples[1].series",
+            "checks.steps[0].samples[2].series",
+            "checks.steps[0].samples[2].value",
+            "checks.steps[0].samples[2].unit",
+            "checks.steps[0].samples[2].labels",
+            "checks.steps[1].samples",
+            "metrics[1].unit",
+            "metrics[2].labels.op",
+            "metrics[3].series",
+            "metrics[4].entity",
+        ] {
+            assert!(
+                check.iter().any(|f| f == want),
+                "{want} missing from {check:?}"
+            );
+        }
+        assert!(
+            !check.iter().any(|f| f.starts_with("metrics[0]")),
+            "{check:?}"
+        );
+        let labels = problems
+            .iter()
+            .filter(|p| p.field == "checks.steps[0].samples[2].labels")
+            .count();
+        assert_eq!(labels, 2, "`__x` and the second `q`");
+    }
+
+    #[test]
+    fn a_selected_line_with_a_number_is_one_sample() {
+        let d: SampleSeries = serde_yaml_ng::from_str(
+            "{ series: l, where: { op: latency }, value: us, unit: us, labels: [quantile, ok] }",
+        )
+        .unwrap();
+        let (v, labels) = sample(
+            &d,
+            &json!({"op": "latency", "quantile": "0.5", "ok": true, "us": 66}),
+        )
+        .unwrap();
+        assert_eq!(v, 66.0);
+        assert_eq!(
+            labels,
+            BTreeMap::from([
+                ("ok".to_string(), "true".to_string()),
+                ("quantile".to_string(), "0.5".to_string())
+            ])
+        );
+        let quantile = json!({"op": "latency", "quantile": 50, "ok": false, "us": 1});
+        assert_eq!(sample(&d, &quantile).unwrap().1["quantile"], "50");
+        for not in [
+            json!({"op": "summary", "quantile": "0.5", "ok": true, "us": 66}),
+            json!({"op": "latency", "quantile": "0.5", "ok": true, "us": "66"}),
+            json!({"op": "latency", "ok": true, "us": 66}),
+            json!({"op": "latency", "quantile": ["0.5"], "ok": true, "us": 66}),
+        ] {
+            assert_eq!(sample(&d, &not), None, "{not}");
+        }
     }
 
     #[test]

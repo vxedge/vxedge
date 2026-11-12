@@ -423,6 +423,11 @@ pub fn read(doc: &Value) -> (Intent, Vec<Problem>) {
     check_campaign(&mut c, &intent);
     campaign_and_method(&mut c);
     check_metrics(&mut c, &intent);
+    c.problems.extend(crate::checks::metric_problems(
+        &c.experiment,
+        intent.checks.as_ref(),
+        &intent.metrics,
+    ));
     for (name, r) in &intent.references {
         let mut parts = std::path::Path::new(&r.campaign).components();
         let one = matches!(

@@ -8,6 +8,24 @@ All notable changes to this repo are documented here. Format follows
 
 ### Added
 
+- **Samples from a check step's output (X9.15).** A tool step can declare that its lines carry
+  numbers a metric reads, such as kuksa-perf's latency percentiles, so exp-016 runs as a package:
+  ```yaml
+  samples:
+    - { series: kuksa_perf_latency_us, where: { op: latency }, value: us, unit: us, labels: [quantile] }
+  ```
+  - Each line `where` selects that holds a number at `value` is one sample of `series` on the
+    step's entity `checks/<step>`, at the time the line was recorded, labelled with the values
+    of its `labels` fields. A metric reads it as it reads a probe's series, reduced over the
+    measure phase (`reduce`, `last` by default), and criteria aggregate it across trials.
+  - The samples are read from the step's archived output when a trial is judged, so
+    `results verdict` gives the same values offline as the daemon does.
+  - `Plan` refuses `samples` on a step that is not a tool step, a bad series or label name, a
+    series declared twice on one step, an empty `value` path or `unit`, and a metric on
+    `checks/<step>` whose step is not a tool step, does not declare its series, declares it in
+    another unit, or lacks a label the metric picks (`ERROR_REASON_CHECK_INVALID`).
+
+
 - **A metric reduces its samples over the measure window (X9.16).** A series metric takes
   `reduce`, which says how its samples inside the trial's measure phase (or its `window`) become
   the trial's one value: `last` (the default, and what every metric did before), `delta` (the last

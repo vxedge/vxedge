@@ -51,6 +51,8 @@ pub struct Records {
     pub phases: Vec<Phase>,
     /// Each check step's output, by step id, line by line as recorded (`crate::checks`).
     pub checks: BTreeMap<String, Vec<serde_json::Value>>,
+    /// When each of those lines was recorded, in the same order.
+    pub check_times: BTreeMap<String, Vec<i64>>,
 }
 
 /// A trial entering a phase; a `measure` phase of a campaign with windows names its window.
@@ -245,6 +247,11 @@ pub fn read_archive(path: &Path) -> Result<Records, String> {
                     .entry(step.to_string())
                     .or_default()
                     .push(crate::checks::line(text));
+                records
+                    .check_times
+                    .entry(step.to_string())
+                    .or_default()
+                    .push(v["ts_ns"].as_i64().unwrap_or_default());
             }
         }
     }
@@ -593,6 +600,40 @@ pub fn identity_from_name(pattern: &str, stem: &str) -> Option<Identity> {
     Some(who)
 }
 
+/// The samples the check steps' `samples` declarations read from their recorded lines, each on
+/// the step's entity `checks/<step>` at the time its line was recorded.
+pub fn check_samples(records: &Records, checks: &crate::checks::Checks) -> Vec<Sample> {
+    let mut out = Vec::new();
+    for s in checks.steps.iter().filter(|s| !s.samples.is_empty()) {
+        let Some(id) = s.id.as_deref() else { continue };
+        let lines = records
+            .checks
+            .get(id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let times = records
+            .check_times
+            .get(id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        for (i, line) in lines.iter().enumerate() {
+            for d in &s.samples {
+                if let Some((value, labels)) = crate::checks::sample(d, line) {
+                    out.push(Sample {
+                        ts_ns: times.get(i).copied().unwrap_or_default(),
+                        entity: Some(crate::checks::entity(id)),
+                        target: None,
+                        metric: d.series.clone(),
+                        labels,
+                        value,
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
 /// What each of `intent`'s check cases found in the trial `records` hold.
 pub fn cases(records: &Records, intent: &Intent) -> BTreeMap<String, crate::checks::CaseResult> {
     intent
@@ -604,14 +645,19 @@ pub fn cases(records: &Records, intent: &Intent) -> BTreeMap<String, crate::chec
 }
 
 /// The trial in the archive at `path`, read with `intent`'s metrics and check cases: `identity`
-/// when given, else its `metadata.trial`.
+/// when given, else its `metadata.trial`. The samples its check steps declare join the archive's
+/// own before the metrics are read.
 pub fn trial(
     path: &Path,
     archive: String,
     identity: Option<Identity>,
     intent: &Intent,
 ) -> Result<Trial, String> {
-    let records = read_archive(path)?;
+    let mut records = read_archive(path)?;
+    if let Some(k) = &intent.checks {
+        let samples = check_samples(&records, k);
+        records.samples.extend(samples);
+    }
     let who = identity
         .or_else(|| Identity::from_metadata(&records.metadata))
         .ok_or_else(|| {
@@ -1002,6 +1048,98 @@ mod tests {
 
     fn metric(yaml: &str) -> Metric {
         serde_yaml_ng::from_str(yaml).unwrap()
+    }
+
+    /// A step's `samples` are series on its entity, read from its recorded lines at their times:
+    /// a metric takes the last inside the measure phase, and criteria aggregate across trials.
+    #[test]
+    fn check_samples_are_series_that_metrics_and_criteria_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let doc: Value = serde_yaml_ng::from_str(
+            r#"
+id: e
+campaign: { repetitions: 3, duration_s: 600 }
+checks:
+  tools: { perf: { image: "localhost/perf:1" } }
+  steps:
+    - id: near
+      tool: perf
+      on: hpc1
+      samples: [{ series: latency_us, where: { op: latency }, value: us, unit: us, labels: [quantile] }]
+    - id: far
+      tool: perf
+      on: cabin1
+      samples: [{ series: latency_us, where: { op: latency }, value: us, unit: us, labels: [quantile] }]
+metrics:
+  - { id: near_p50, kind: gauge, unit: us, entity: checks/near, series: latency_us, labels: { quantile: "50" } }
+  - { id: far_p50, kind: gauge, unit: us, entity: checks/far, series: latency_us, labels: { quantile: "50" } }
+criteria:
+  - id: slice
+    op: gt
+    lhs: { metric: far_p50, aggregate: median }
+    rhs: { metric: near_p50, aggregate: median }
+"#,
+        )
+        .unwrap();
+        let (intent, problems) = intent::read(&doc);
+        assert_eq!(problems, vec![]);
+        let log = |step: &str, lines: &[(i64, String)]| {
+            let records: String = lines
+                .iter()
+                .map(|(ts, l)| {
+                    serde_json::json!({
+                        "record": "log", "ts_ns": ts, "entity": format!("checks/{step}"),
+                        "stream": "output", "line": l,
+                    })
+                    .to_string()
+                        + "\n"
+                })
+                .collect();
+            zstd::encode_all(records.as_bytes(), 3).unwrap()
+        };
+        let pct = |q: &str, us: u32| format!(r#"{{"op":"latency","quantile":"{q}","us":{us}}}"#);
+        let mut trials = Vec::new();
+        for (n, near, far) in [(1, 58, 66), (2, 57, 67), (3, 59, 65)] {
+            let path = dir.path().join(format!("{n}.zip"));
+            zip_with(
+                &path,
+                &[
+                    ("metadata.json", br#"{"archive":"vxarchive/2"}"#.to_vec()),
+                    (
+                        V2_PHASES,
+                        b"{\"ts_ns\":10,\"phase\":\"measure\"}\n{\"ts_ns\":100,\"phase\":\"teardown\"}\n"
+                            .to_vec(),
+                    ),
+                    (
+                        "logs/checks/near.jsonl.zst",
+                        // The first is before the measure phase, so it is not the trial's value.
+                        log(
+                            "near",
+                            &[
+                                (5, pct("50", 1)),
+                                (20, "Global Summary:".into()),
+                                (20, pct("50", near)),
+                                (20, pct("99", 90)),
+                            ],
+                        ),
+                    ),
+                    ("logs/checks/far.jsonl.zst", log("far", &[(30, pct("50", far))])),
+                ],
+            );
+            let who = Identity {
+                id: format!("r{n}-defaults"),
+                repetition: n,
+                ..Identity::default()
+            };
+            trials.push(trial(&path, "x".into(), Some(who), &intent).unwrap());
+        }
+        assert_eq!(trials[0].values["near_p50"].value, Some(58.0));
+        assert!(trials[0].values["near_p50"].complete);
+        assert_eq!(trials[2].values["far_p50"].value, Some(65.0));
+        let v = verdict(&intent, trials);
+        assert_eq!(v.outcome, Outcome::Pass, "{:?}", v.criteria);
+        assert_eq!(v.criteria[0].lhs, Some(66.0));
+        assert_eq!(v.criteria[0].rhs, Some(58.0));
     }
 
     /// A check step's output is read from its entity's log member, line by line in the order the
