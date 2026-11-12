@@ -6,6 +6,12 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- A run's `entities.json` lists only the traffic log streams a profile actually starts: `send` and
+  `reflect` for a round-trip probe (`pps`), `load` for a load (`bandwidth_mbps`). It listed all
+  three for every profile, so an archive named log files that never existed.
+
 ## [0.21.0] - 2026-11-12
 
 A probe into a guest. A VM can be a measurement's `to` when its part declares the reflector its guest
