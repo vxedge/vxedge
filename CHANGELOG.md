@@ -6,6 +6,13 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-11-12
+
+A probe into a guest. A VM can be a measurement's `to` when its part declares the reflector its guest
+runs, a measurement can send from the host, every measurement waits for its reflector before it
+probes, and an experiment can bring one device up alone, which lets exp-002's packaging arms run
+one at a time as a campaign. vxAPI stays `vxedge.v1`, and every change is additive.
+
 ### Added
 
 - **A guest as a measurement's `to` (X9.9).** A VM (`qemu-microvm`, `libvirt`,
