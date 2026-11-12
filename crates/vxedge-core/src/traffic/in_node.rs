@@ -69,7 +69,7 @@ pub fn plan(
     let source = end_on(model, nodes, from, &slice, &what)?;
     let target = match &profile.target {
         TrafficEndpoint::Device(to) => Reflector::Node(end_on(model, nodes, to, &slice, &what)?),
-        _ => far_side_of(model, gateway, from, &slice, &what)?,
+        _ => Reflector::FarSide(far_side_of(model, gateway, from, &slice, &what)?),
     };
     if profile.pps.is_none() && profile.bandwidth_mbps.is_none() {
         return Err(format!(
@@ -143,13 +143,19 @@ pub async fn up(
             }
             (to.addr.clone(), None)
         }
-        Reflector::FarSide {
+        // In-node profiles are planned to a node or the far side only.
+        Reflector::Guest { node, .. } => {
+            return Err(err(format!(
+                "`{node}` runs a guest, which an in-node profile does not reach"
+            )));
+        }
+        Reflector::FarSide(crate::measurements::run::FarSide {
             parent,
             vlan,
             iface,
             cidr,
             addr,
-        } => {
+        }) => {
             // A load needs the far-side address too: the source resolves it on its own subnet.
             let reflect = p.pps.is_some() && !running(runtime_dir, &p.id, "reflect");
             let (sh, parent, iface_c, cidr, vlan, addr_c) = (
@@ -298,9 +304,9 @@ traffic_profiles:
             ("load1", "10.103.0.2")
         );
         assert_eq!((p.bandwidth_mbps, p.payload_bytes), (Some(400), 1200));
-        let Reflector::FarSide {
+        let Reflector::FarSide(crate::measurements::run::FarSide {
             vlan, addr, cidr, ..
-        } = &p.target
+        }) = &p.target
         else {
             panic!("{:?}", p.target)
         };

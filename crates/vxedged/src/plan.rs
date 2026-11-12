@@ -230,7 +230,17 @@ pub(crate) async fn preflight(
     // Typed intent and measurements, checked before any host question: a bad criterion fails
     // here, in a second, not after an hour of trials. Every problem is listed, each under its own
     // reason. Measurements are checked against the model, which knows each end's backend.
-    let measured = vxedge_core::measurements::problems(model);
+    let mut measured = vxedge_core::measurements::problems(model);
+    if measured.is_empty() {
+        // Where each measurement runs, and what each guest it reaches declares, read from the
+        // bundles already on this host.
+        let (m, n, c) = (model.clone(), nodes.to_vec(), cache_dir.to_path_buf());
+        measured = tokio::task::spawn_blocking(move || {
+            vxedge_core::measurements::run::placement_problems(&m, &n, &c)
+        })
+        .await
+        .unwrap_or_default();
+    }
     let intent = dir.and_then(|d| vxedge_core::Workspace::load(d).ok());
     if intent.is_some() || !measured.is_empty() {
         let mut problems = intent.map(|ws| ws.intent_problems()).unwrap_or_default();

@@ -5,7 +5,7 @@
 //! measurements:
 //!   ctl-rtt:
 //!     kind: rtt-probe        # the one kind so far
-//!     from: ecu1             # a device id: the node the probe sends from
+//!     from: ecu1             # a device id, or `host`: the node the probe sends from
 //!     to: internet           # a device id, or `internet`: the far side of the shared uplink
 //!     slice: adas            # the slice the probe's packets travel on
 //!     rate_pps: 500          # default 100
@@ -15,7 +15,19 @@
 //! [`parse`] reads the block's shape when the model is built. [`problems`] checks it against the
 //! model and returns each problem typed as a measurement problem, so `Plan` lists them all and
 //! `up` refuses on the first, before anything runs. A probe runs inside its node's network
-//! namespace, so a node that has none on the host (a VM, an attached platform) cannot be an end.
+//! namespace, so a node that has none on the host (a VM, an attached platform) cannot send one.
+//!
+//! A VM can be the `to` end when its guest runs a reflector of its own and its part says so:
+//! `org.vxedge.reflector: udp/<port>` in the bundle's `meta.json`. The part is read where its
+//! bundle is on disk ([`run::declared_reflector`]): at `Plan` for a local or already fetched
+//! bundle, else when the measurement starts, after `up` has fetched it.
+//!
+//! `from: host` sends from the host's own namespace over the slice's VLAN, from the first address
+//! of the `to` node's subnet: the far side a `to: internet` probe answers on, used the other way
+//! round. That is how a probe reaches a VM, whose namespace is the guest's.
+//!
+//! An experiment that `isolate`s a device brings that device up alone, so each of its
+//! measurements' device ends must be that device.
 //!
 //! On a `mode: s-nssai` slice the node's link pins no address: its end is the slice's UE, whose
 //! PDU-session address the 5G core assigns at `up`. Such a measurement runs between the UE and
@@ -34,6 +46,8 @@ pub mod run;
 
 /// The far side of the shared uplink, as a measurement's `to`.
 pub const INTERNET: &str = "internet";
+/// The host's own namespace, as a measurement's `from`.
+pub const HOST: &str = "host";
 /// The smallest probe: `vxprobe`'s own header.
 pub const MIN_PAYLOAD_BYTES: u32 = 8;
 /// The largest probe that fits one UDP datagram in a 1500-byte MTU.
@@ -125,6 +139,23 @@ pub fn problems(model: &Experiment) -> Vec<Problem> {
                 "from",
                 "a probe sends from a node: `internet` can only be the `to` end".into(),
             );
+        } else if m.from == HOST {
+            if on_ue {
+                push(
+                    "from",
+                    format!(
+                        "slice `{}` is `mode: s-nssai`: a probe on it runs from the slice's UE, \
+                         and `host` sends over a VLAN slice",
+                        m.slice
+                    ),
+                );
+            } else if m.to == INTERNET {
+                push(
+                    "to",
+                    "a probe from `host` reaches a node over the slice: its `to` is a device id"
+                        .into(),
+                );
+            }
         } else if on_ue {
             ue_end_problems(model, &m.from, &m.slice, &mut push);
         } else {
@@ -132,6 +163,8 @@ pub fn problems(model: &Experiment) -> Vec<Problem> {
         }
         if m.to == m.from {
             push("to", format!("`{}` is also the `from` end", m.to));
+        } else if m.to == HOST {
+            push("to", "`host` can only be the `from` end".into());
         } else if on_ue && m.to != INTERNET {
             push(
                 "to",
@@ -143,6 +176,19 @@ pub fn problems(model: &Experiment) -> Vec<Problem> {
             );
         } else if m.to != INTERNET {
             end_problems(model, &m.to, &m.slice, "to", &mut push);
+        }
+        if let Some(only) = &model.isolate {
+            for (field, end) in [("from", &m.from), ("to", &m.to)] {
+                if end != only && end != HOST && end != INTERNET {
+                    push(
+                        field,
+                        format!(
+                            "the experiment isolates `{only}`, so `{end}` stays down: a \
+                             measurement's device ends must be the isolated device"
+                        ),
+                    );
+                }
+            }
         }
         if !(1..=MAX_RATE_PPS).contains(&m.rate_pps) {
             push(
@@ -179,11 +225,21 @@ fn shared_far_sides(model: &Experiment, out: &mut Vec<Problem>) {
             .clone()?;
         run::first_host(&cidr)
     };
+    // A probe to `internet` answers on the far side of its sender's subnet, and a probe from
+    // `host` sends from the far side of its target's.
     let measured: Vec<(&Measurement, String)> = model
         .measurements
         .iter()
-        .filter(|m| m.to == INTERNET)
-        .filter_map(|m| Some((m, far_of(&m.from, &m.slice)?)))
+        .filter_map(|m| {
+            let near = if m.to == INTERNET {
+                &m.from
+            } else if m.from == HOST {
+                &m.to
+            } else {
+                return None;
+            };
+            Some((m, far_of(near, &m.slice)?))
+        })
         .collect();
     let loads: Vec<(String, String, String)> = model
         .traffic
@@ -261,8 +317,9 @@ fn ue_end_problems(
     }
 }
 
-/// A node end: a device of one of the vehicles, with a namespace on the host a probe can enter,
-/// and a link on the measurement's slice.
+/// A node end: a device of one of the vehicles, with a link on the measurement's slice that pins
+/// its address. A sender needs a namespace on the host a probe can enter. A reflector may also be
+/// a guest whose part declares the reflector it runs, which [`run::declared_reflector`] reads.
 fn end_problems(
     model: &Experiment,
     node: &str,
@@ -282,22 +339,24 @@ fn end_problems(
         );
         return;
     };
-    if let Some(
-        b @ (Backend::QemuMicrovm
-        | Backend::Libvirt
-        | Backend::CloudHypervisor
-        | Backend::Attach
-        | Backend::QemuMcu),
-    ) = device.backend
-    {
-        push(
+    match device.backend {
+        Some(b @ Backend::Attach) => push(
             field,
             format!(
-                "`{node}` runs on {}, and a probe cannot run inside a VM or an attached \
-                 platform yet: measure from a container, capsule or bare node",
+                "`{node}` runs on {}, an attached platform, whose software vxedge does not \
+                 place: a probe can neither send from it nor reach a reflector in it",
                 b.as_str()
             ),
-        );
+        ),
+        Some(b) if field == "from" && is_guest(b) => push(
+            field,
+            format!(
+                "`{node}` runs on {}, and a probe cannot run inside a VM: send from a \
+                 container, capsule or bare node, or from `host`",
+                b.as_str()
+            ),
+        ),
+        _ => {}
     }
     match endpoint_on(vehicle, node, slice) {
         None => push("slice", format!("`{node}` has no link on slice `{slice}`")),
@@ -310,6 +369,15 @@ fn end_problems(
         ),
         Some(_) => {}
     }
+}
+
+/// Whether a backend boots a guest from a bundle, whose namespace is its own: a probe reaches it
+/// only through a reflector its guest runs.
+pub fn is_guest(backend: Backend) -> bool {
+    matches!(
+        backend,
+        Backend::QemuMicrovm | Backend::Libvirt | Backend::CloudHypervisor | Backend::QemuMcu
+    )
 }
 
 /// `node`'s link endpoint on `slice`, in `vehicle`.
@@ -466,6 +534,80 @@ measurements:
             ]
         );
         assert!(p[0].detail.contains("qemu-microvm"), "{}", p[0].detail);
+    }
+
+    #[test]
+    fn a_guest_can_be_probed_from_the_host_or_a_node_but_not_probe_itself() {
+        let m = model(
+            "  host-vm: { kind: rtt-probe, from: host, to: vm1, slice: adas }\n  \
+             node-vm: { kind: rtt-probe, from: ecu1, to: vm1, slice: adas }\n  \
+             vm-node: { kind: rtt-probe, from: vm1, to: ecu1, slice: adas }\n",
+        );
+        let p = problems(&m);
+        assert_eq!(fields(&m), ["measurements.vm-node.from"], "{p:?}");
+        assert!(p[0].detail.contains("from `host`"), "{}", p[0].detail);
+    }
+
+    #[test]
+    fn host_is_only_a_sender_and_only_to_a_device_on_a_vlan_slice() {
+        let m = model(
+            "  a: { kind: rtt-probe, from: host, to: internet, slice: adas }\n  \
+             b: { kind: rtt-probe, from: ecu1, to: host, slice: adas }\n  \
+             c: { kind: rtt-probe, from: host, to: ecu2, slice: adas }\n",
+        );
+        assert_eq!(
+            fields(&m),
+            [
+                "measurements.a.to",
+                "measurements.b.to",
+                "measurements.c.slice"
+            ]
+        );
+        let ue = crate::model::load_yaml(&format!(
+            "{UE_WS}  a: {{ kind: rtt-probe, from: host, to: ue1, slice: adas }}\n"
+        ))
+        .unwrap();
+        let p = problems(&ue);
+        assert!(
+            p.iter()
+                .any(|p| p.field == "measurements.a.from" && p.detail.contains("s-nssai")),
+            "{p:?}"
+        );
+    }
+
+    #[test]
+    fn an_attached_platform_is_never_an_end() {
+        let m = crate::model::load_yaml(
+            &format!(
+                "{VEHICLE}measurements:\n  a: {{ kind: rtt-probe, from: host, to: vm1, slice: adas }}\n"
+            )
+            .replace("backend: qemu-microvm", "backend: attach"),
+        )
+        .unwrap();
+        let p = problems(&m);
+        assert!(
+            p.iter()
+                .any(|p| p.field == "measurements.a.to" && p.detail.contains("attached")),
+            "{p:?}"
+        );
+    }
+
+    #[test]
+    fn an_isolated_experiment_measures_only_its_isolated_device() {
+        let doc = format!(
+            "{VEHICLE}isolate: vm1\nmeasurements:\n  a: {{ kind: rtt-probe, from: host, to: vm1, slice: adas }}\n  \
+             b: {{ kind: rtt-probe, from: ecu1, to: internet, slice: adas }}\n"
+        );
+        let m = crate::model::load_yaml(&doc).unwrap();
+        assert_eq!(m.isolate.as_deref(), Some("vm1"));
+        let p = problems(&m);
+        assert_eq!(fields(&m), ["measurements.b.from"], "{p:?}");
+        assert!(p[0].detail.contains("isolates `vm1`"), "{}", p[0].detail);
+        let unknown = crate::model::load_yaml(&doc.replace("isolate: vm1", "isolate: nope"));
+        assert!(
+            unknown.unwrap_err().to_string().contains("isolates `nope`"),
+            "an unknown isolated device is refused when the model is built"
+        );
     }
 
     #[test]

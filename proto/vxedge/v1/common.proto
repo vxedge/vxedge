@@ -143,9 +143,11 @@ enum ErrorReason {
   // metric kind does not have. Refused before any trial runs.
   ERROR_REASON_CRITERION_INVALID = 29;
   // An experiment's measurement cannot run: an end that is not a device of its vehicles (or
-  // `internet`, for `to`), an end that is a VM or an attached platform, a slice that is not
-  // declared or that an end has no link on, or a rate, payload or window out of bounds. Refused
-  // before anything runs.
+  // `host`, for `from`, or `internet`, for `to`), a VM sending, a VM `to` whose part declares
+  // no `org.vxedge.reflector`, an attached platform, a device end other than the one the
+  // experiment `isolate`s, a slice that is not declared or that an end has no link on, or a
+  // rate, payload or window out of bounds. Refused before anything runs; a published guest
+  // bundle not yet on the host is read when the measurement starts.
   ERROR_REASON_MEASUREMENT_INVALID = 30;
   // A package digest this host's cache does not hold: pull or import it first.
   ERROR_REASON_PACKAGE_UNKNOWN = 31;

@@ -28,6 +28,8 @@ pub struct MeasurementSvc {
     pub runtime_dir: PathBuf,
     pub vxprobe_bin: String,
     pub containers: LazyClient,
+    /// The part cache, where a published guest bundle's `meta.json` declares its reflector.
+    pub cache_dir: PathBuf,
 }
 
 /// A workspace's measurements, placed: what `Start` runs and `Stop` and `Status` name.
@@ -50,7 +52,7 @@ impl MeasurementSvc {
         let workspace = dir.unwrap_or_else(|| PathBuf::from("."));
         let nodes = vxedge_core::zones::plan_nodes_from_model(&model, &gateway, &workspace)
             .map_err(|e| invalid(format!("node plan: {e}")))?;
-        let placements = run::plan(&model, &gateway, &nodes)
+        let placements = run::plan(&model, &gateway, &nodes, &self.cache_dir)
             .map_err(|e| errors::invalid(R::MeasurementInvalid, e))?;
         Ok(Resolved {
             model,

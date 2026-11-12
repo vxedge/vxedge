@@ -2158,6 +2158,80 @@ async fn a_measurement_from_a_ue_plans_without_a_pinned_address() {
     );
 }
 
+/// A guest is a measurement's `to` only when its part declares the reflector it runs: `Plan` reads
+/// `org.vxedge.reflector` from a bundle on disk and types its absence as a measurement problem.
+/// `from: host` sends from the host, and an experiment that `isolate`s a device measures only it.
+#[tokio::test]
+async fn a_guest_is_probed_from_the_host_only_when_its_part_declares_a_reflector() {
+    let daemon = Daemon::start();
+    let channel = daemon.channel().await;
+    let dir = scratch();
+    let bundle = dir.join("guest");
+    std::fs::create_dir_all(&bundle).unwrap();
+    for f in ["vmlinuz", "initrd.img"] {
+        std::fs::write(bundle.join(f), b"x").unwrap();
+    }
+    let ws = |isolate: &str| {
+        format!(
+            "kind: vehicle\nid: car\nzones: {{ front: {{}} }}\ndevices:\n  \
+             cont: {{ role: ecu, zone: front, backend: container }}\n  \
+             vm: {{ role: ecu, zone: front, backend: qemu-microvm }}\n\
+             functions:\n  f-cont: {{ deployed_on: cont }}\n  f-vm: {{ deployed_on: vm }}\nlinks:\n  \
+             - {{ id: a1, endpoints: [{{ node: cont, port: eth0, ip: 10.101.0.11/24 }}], slice: adas }}\n  \
+             - {{ id: a2, endpoints: [{{ node: vm, port: eth0, ip: 10.101.0.12/24 }}], slice: adas }}\n---\n\
+             kind: baseline\nid: bl\nparts:\n  - {{ ref: 'local/vxprobe:host-process', target_ids: f-cont }}\n  \
+             - {{ ref: ./guest, kind: bundle, target_ids: f-vm }}\n---\n\
+             kind: experiment\nid: h3\nvehicles: [car]\nbaseline: bl\n{isolate}network:\n  slices:\n    \
+             - {{ id: adas, mode: vlan, vlan: 101 }}\n\
+             measurements:\n  rtt: {{ kind: rtt-probe, from: host, to: vm, slice: adas }}\n"
+        )
+    };
+    let measurement_problems = |plan: &vxedge_api::v1::WorkspacePlan| {
+        plan.problems
+            .iter()
+            .filter(|p| p.reason == vxedge_api::v1::ErrorReason::MeasurementInvalid as i32)
+            .map(|p| p.detail.clone())
+            .collect::<Vec<_>>()
+    };
+    std::fs::write(dir.join("main.yaml"), ws("")).unwrap();
+
+    std::fs::write(bundle.join("meta.json"), r#"{"org.vxedge.arch": "x86_64"}"#).unwrap();
+    let plan = plan_of(&channel, &dir).await;
+    let problems = measurement_problems(&plan);
+    assert_eq!(problems.len(), 1, "{:?}", plan.problems);
+    assert!(
+        problems[0].contains("measurements.rtt.to") && problems[0].contains("org.vxedge.reflector"),
+        "{}",
+        problems[0]
+    );
+
+    std::fs::write(
+        bundle.join("meta.json"),
+        r#"{"org.vxedge.arch": "x86_64", "org.vxedge.reflector": "udp/9800"}"#,
+    )
+    .unwrap();
+    let plan = plan_of(&channel, &dir).await;
+    assert!(
+        measurement_problems(&plan).is_empty(),
+        "{:?}",
+        plan.problems
+    );
+
+    std::fs::write(dir.join("main.yaml"), ws("isolate: cont\n")).unwrap();
+    let plan = plan_of(&channel, &dir).await;
+    let problems = measurement_problems(&plan);
+    assert_eq!(problems.len(), 1, "{:?}", plan.problems);
+    assert!(problems[0].contains("isolates `cont`"), "{}", problems[0]);
+
+    std::fs::write(dir.join("main.yaml"), ws("isolate: vm\n")).unwrap();
+    let plan = plan_of(&channel, &dir).await;
+    assert!(
+        measurement_problems(&plan).is_empty(),
+        "{:?}",
+        plan.problems
+    );
+}
+
 /// `MeasurementService` names each declared measurement with its entity, and a start whose
 /// sender's node is not up fails its job naming the node, before any process runs.
 #[tokio::test]

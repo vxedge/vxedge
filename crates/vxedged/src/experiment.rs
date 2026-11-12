@@ -257,8 +257,14 @@ impl Handles {
     /// no node plan, and asking for it by name would fail the stage on a device that was never
     /// meant to be provisioned. Addressing devices individually rather than by region also
     /// keeps `up` from starting several guests concurrently in one call — the concurrency that
-    /// invalidated exp-002b's first campaign.
-    pub(crate) async fn stage_zones(&self, up: bool, p: &Progress) -> Result<String, JobFailure> {
+    /// invalidated exp-002b's first campaign. `only` is the device an experiment `isolate`s: `up`
+    /// then starts it alone and leaves every other device down.
+    pub(crate) async fn stage_zones(
+        &self,
+        up: bool,
+        only: Option<&str>,
+        p: &Progress,
+    ) -> Result<String, JobFailure> {
         let listed = match self
             .zones
             .list(Request::new(ZoneListRequest::default()))
@@ -293,12 +299,25 @@ impl Handles {
         if listed.is_empty() {
             return Ok("no zones declared".into());
         }
-        let ids: Vec<String> = listed.into_iter().map(|n| n.vxid).collect();
+        let ids: Vec<String> = listed
+            .into_iter()
+            .map(|n| n.vxid)
+            .filter(|id| only.is_none_or(|o| o == id.as_str()))
+            .collect();
+        if ids.is_empty() {
+            return Ok("no zones in the isolated device".into());
+        }
         self.stage_nodes(NodeStage::Zones, &ids, up, p).await
     }
 
-    /// Bring every compute device up or down, listed the way [`Self::stage_zones`] lists zones.
-    pub(crate) async fn stage_compute(&self, up: bool, p: &Progress) -> Result<String, JobFailure> {
+    /// Bring every compute device up or down, listed the way [`Self::stage_zones`] lists zones,
+    /// and limited to `only` the same way.
+    pub(crate) async fn stage_compute(
+        &self,
+        up: bool,
+        only: Option<&str>,
+        p: &Progress,
+    ) -> Result<String, JobFailure> {
         let request = Request::new(ComputeListRequest::default());
         let listed = match self.compute.list(request).await {
             Ok(r) => r.into_inner().nodes,
@@ -310,7 +329,14 @@ impl Handles {
         if listed.is_empty() {
             return Ok("no compute declared".into());
         }
-        let ids: Vec<String> = listed.into_iter().map(|n| n.vxid).collect();
+        let ids: Vec<String> = listed
+            .into_iter()
+            .map(|n| n.vxid)
+            .filter(|id| only.is_none_or(|o| o == id.as_str()))
+            .collect();
+        if ids.is_empty() {
+            return Ok("no compute in the isolated device".into());
+        }
         self.stage_nodes(NodeStage::Compute, &ids, up, p).await
     }
 
@@ -699,6 +725,8 @@ impl ExperimentService for ExperimentSvc {
         let svc = self.handles.clone();
         let stages = req.get_ref().stages.clone();
         let unlocked = req.get_ref().unlocked;
+        // An isolated experiment brings its one device up; `down` stops whatever is up.
+        let isolate = model.isolate.clone();
         let job = self
             .handles
             .engine
@@ -715,11 +743,11 @@ impl ExperimentService for ExperimentSvc {
                     }
                     p.checkpoint()?;
                     if wants(&stages, ExperimentStage::Zones) {
-                        done.push(svc.stage_zones(true, &p).await?);
+                        done.push(svc.stage_zones(true, isolate.as_deref(), &p).await?);
                     }
                     p.checkpoint()?;
                     if wants(&stages, ExperimentStage::Compute) {
-                        done.push(svc.stage_compute(true, &p).await?);
+                        done.push(svc.stage_compute(true, isolate.as_deref(), &p).await?);
                     }
                     p.checkpoint()?;
                     if wants(&stages, ExperimentStage::SignalPlane) {
@@ -813,12 +841,12 @@ impl ExperimentService for ExperimentSvc {
                         failures.push(e);
                     }
                     if wants(&stages, ExperimentStage::Compute)
-                        && let Err(e) = svc.stage_compute(false, &p).await
+                        && let Err(e) = svc.stage_compute(false, None, &p).await
                     {
                         failures.push(e);
                     }
                     if wants(&stages, ExperimentStage::Zones)
-                        && let Err(e) = svc.stage_zones(false, &p).await
+                        && let Err(e) = svc.stage_zones(false, None, &p).await
                     {
                         failures.push(e);
                     }

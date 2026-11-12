@@ -53,6 +53,8 @@ pub enum ModelError {
         "experiment `{experiment}` references vehicle `{entity}`, which is not in this workspace"
     )]
     UnknownEntity { experiment: String, entity: String },
+    #[error("experiment `{experiment}` isolates `{device}`, which is not a device of its vehicles")]
+    UnknownIsolate { experiment: String, device: String },
     #[error(
         "component `{component}` has {count} parts. A device runs one loadable; publish them as \
          a single `stack`-layer composite and reference that."
@@ -1196,6 +1198,15 @@ pub fn build(ws: &Workspace) -> Result<Experiment, ModelError> {
         }
     }
 
+    if let Some(device) = &exp.isolate
+        && !device_ids.contains(device.as_str())
+    {
+        return Err(ModelError::UnknownIsolate {
+            experiment: exp.id.clone(),
+            device: device.clone(),
+        });
+    }
+
     let method = raw
         .get("method")
         .map(|m| Method {
@@ -1301,6 +1312,7 @@ pub fn build(ws: &Workspace) -> Result<Experiment, ModelError> {
                 detail,
             }
         })?,
+        isolate: exp.isolate.clone(),
         method,
         services,
         signal_plane,

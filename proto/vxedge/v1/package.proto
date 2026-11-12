@@ -159,7 +159,9 @@ message PackageMeasurement {
   string id = 1;
   // `rtt-probe`.
   string kind = 2;
+  // A device id, or `host`.
   string from = 3;
+  // A device id, or `internet`.
   string to = 4;
   string slice = 5;
   uint32 rate_pps = 6;
