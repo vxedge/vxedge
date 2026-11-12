@@ -6,6 +6,13 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-11-12
+
+Measure windows. A campaign can split each trial's measure phase into named windows that run one
+after another, each with measurement values of its own, and a metric reads the window it names:
+the protocol exp-005 needs for a cold burst and a steady window in one trial. vxAPI stays
+`vxedge.v1`, and the change is additive: `CampaignTrial.windows` and `PhaseRecord.window`.
+
 ### Added
 
 - **Measure windows (X9.7).** `campaign.windows` splits each trial's measure phase into named
