@@ -8,6 +8,25 @@ All notable changes to this repo are documented here. Format follows
 
 ### Added
 
+- **Cross-campaign criteria (X9.8).** An experiment can declare `references`, the other campaigns
+  its criteria read (`<name>: { campaign: <id> }`), and a metric operand can read a reference's
+  trials with `reference: <name>`, for exp-010's H2: its p99 growth within 1.10x of exp-001's.
+  - **Reading:** a reference's trials are read with this experiment's metrics, as `Compare`
+    reads a reference, and its arms are its own campaign's.
+  - **Finding:** `ResultService.Verdict` takes `reference_workspace`, whose
+    `results/<campaign>/campaign.json` records each reference, with its archives hash-checked.
+    Without it, a reference is a campaign this host ran, or a record in the judged campaign's own
+    workspace. `Compare` reads references the same way, on both sides.
+  - **Missing:** a criterion that reads a reference that cannot be found is `inconclusive`, and
+    its reason names the reference. The verdict recorded when a campaign finishes has no
+    `reference_workspace`.
+  - **Refused at plan time** (`ERROR_REASON_CRITERION_INVALID`): an operand naming an undeclared
+    reference, and a reference whose `campaign` is not one folder name.
+  - **CLI:** `vxedge campaign verdict <id> --reference-workspace <path>`.
+  - **vxAPI:** additive. `ResultVerdictRequest.reference_workspace` and `VerdictRead.reference`.
+
+### Added
+
 - **Measure windows (X9.7).** `campaign.windows` splits each trial's measure phase into named
   windows that run one after another, for a protocol that measures twice in one trial, such as
   exp-005's cold burst the moment the zone is up followed by a steady window.

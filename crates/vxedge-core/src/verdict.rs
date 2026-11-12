@@ -517,44 +517,68 @@ fn same(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// The trials of each reference campaign an experiment declares, by reference name, or why that
+/// campaign could not be read.
+pub type References = BTreeMap<String, Result<Vec<Trial>, String>>;
+
 /// Trials, as [`intent::SampleSource`]: a metric's values under a selection are the values of
-/// the trials it selects, in order.
-pub struct Trials<'a>(pub &'a [Trial]);
+/// the trials it selects, in order; a reference's are those of its campaign's trials.
+pub struct Trials<'a>(pub &'a [Trial], pub &'a References);
+
+fn select_samples(
+    trials: &[Trial],
+    metric: &str,
+    select: &BTreeMap<String, Value>,
+) -> Option<Samples> {
+    let chosen: Vec<&Trial> = trials
+        .iter()
+        .filter(|t| {
+            select.iter().all(|(k, v)| match k.as_str() {
+                "arm" => t.arm.as_deref().is_some_and(|a| Some(a) == v.as_str()),
+                _ => t.parameters.get(k).is_some_and(|p| same(p, v)),
+            })
+        })
+        .collect();
+    if chosen.is_empty() {
+        return None;
+    }
+    let mut s = Samples {
+        complete: true,
+        ..Samples::default()
+    };
+    for t in chosen {
+        match t.values.get(metric) {
+            Some(TrialValue {
+                value: Some(v),
+                complete,
+                ..
+            }) => {
+                s.values.push(*v);
+                s.trials.push(t.id.clone());
+                s.complete &= complete;
+            }
+            _ => s.complete = false,
+        }
+    }
+    Some(s)
+}
 
 impl SampleSource for Trials<'_> {
     fn samples(&self, metric: &str, select: &BTreeMap<String, Value>) -> Option<Samples> {
-        let chosen: Vec<&Trial> = self
-            .0
-            .iter()
-            .filter(|t| {
-                select.iter().all(|(k, v)| match k.as_str() {
-                    "arm" => t.arm.as_deref().is_some_and(|a| Some(a) == v.as_str()),
-                    _ => t.parameters.get(k).is_some_and(|p| same(p, v)),
-                })
-            })
-            .collect();
-        if chosen.is_empty() {
-            return None;
+        select_samples(self.0, metric, select)
+    }
+
+    fn reference_samples(
+        &self,
+        reference: &str,
+        metric: &str,
+        select: &BTreeMap<String, Value>,
+    ) -> Result<Option<Samples>, String> {
+        match self.1.get(reference) {
+            None => Err(format!("reference `{reference}` was not given")),
+            Some(Err(why)) => Err(format!("reference `{reference}`: {why}")),
+            Some(Ok(trials)) => Ok(select_samples(trials, metric, select)),
         }
-        let mut s = Samples {
-            complete: true,
-            ..Samples::default()
-        };
-        for t in chosen {
-            match t.values.get(metric) {
-                Some(TrialValue {
-                    value: Some(v),
-                    complete,
-                    ..
-                }) => {
-                    s.values.push(*v);
-                    s.trials.push(t.id.clone());
-                    s.complete &= complete;
-                }
-                _ => s.complete = false,
-            }
-        }
-        Some(s)
     }
 }
 
@@ -570,9 +594,15 @@ pub struct Verdict {
     pub trials: Vec<Trial>,
 }
 
-/// Judge `intent`'s criteria over `trials`.
+/// Judge `intent`'s criteria over `trials`, with no reference campaign.
 pub fn verdict(intent: &Intent, trials: Vec<Trial>) -> Verdict {
-    let src = Trials(&trials);
+    verdict_with(intent, trials, &References::new())
+}
+
+/// Judge `intent`'s criteria over `trials`, reading each declared reference from `references`.
+/// A criterion that reads a reference missing from it is `inconclusive`.
+pub fn verdict_with(intent: &Intent, trials: Vec<Trial>, references: &References) -> Verdict {
+    let src = Trials(&trials, references);
     let criteria: Vec<Judgement> = intent
         .criteria
         .iter()
@@ -659,6 +689,16 @@ fn by_point<'a>(trials: &'a [Trial], metric: &str) -> Vec<(&'a str, Vec<f64>)> {
 /// Compare `trials` with `reference`, both judged by `intent`: every metric at every point both
 /// ran, in the reference's order, and every criterion's outcome on each side.
 pub fn compare(intent: &Intent, trials: Vec<Trial>, reference: Vec<Trial>) -> Comparison {
+    compare_with(intent, trials, reference, &References::new())
+}
+
+/// [`compare`], with each side's criteria reading the declared references from `references`.
+pub fn compare_with(
+    intent: &Intent,
+    trials: Vec<Trial>,
+    reference: Vec<Trial>,
+    references: &References,
+) -> Comparison {
     let mut metrics = Vec::new();
     for m in &intent.metrics {
         let ours = by_point(&trials, &m.id);
@@ -684,8 +724,8 @@ pub fn compare(intent: &Intent, trials: Vec<Trial>, reference: Vec<Trial>) -> Co
             });
         }
     }
-    let ours = verdict(intent, trials);
-    let theirs = verdict(intent, reference);
+    let ours = verdict_with(intent, trials, references);
+    let theirs = verdict_with(intent, reference, references);
     let criteria = ours
         .criteria
         .iter()
@@ -1009,6 +1049,89 @@ campaign:
         let v = verdict(&intent, trials);
         assert_eq!(v.outcome, Outcome::Inconclusive);
         assert!(v.criteria[0].why.as_deref().unwrap().contains("incomplete"));
+    }
+
+    /// exp-010's H2: this campaign's p99 growth from 0 to 600 Mbit/s within 1.10x of the growth
+    /// of a reference campaign (exp-001). A reference not given, or unreadable, is inconclusive.
+    #[test]
+    fn a_criterion_reads_a_declared_reference_campaign() {
+        let doc: Value = serde_yaml_ng::from_str(
+            r#"
+kind: experiment
+id: exp-010
+hypothesis: { id: H2, statement: s }
+references:
+  vlan: { campaign: exp-001, statement: "the VLAN baseline, frozen" }
+parameters:
+  load_mbps: { type: integer, unit: Mbit/s, default: 0, min: 0, max: 1000 }
+metrics:
+  - { id: p99, kind: gauge, unit: s, entity: measurements/ctl, series: vxprobe_rtt_seconds,
+      labels: { quantile: "0.99" } }
+criteria:
+  - id: h2
+    op: le
+    lhs: { ratio: [{ metric: p99, aggregate: median, select: { load_mbps: 600 } },
+                   { metric: p99, aggregate: median, select: { load_mbps: 0 } }] }
+    rhs: { ratio: [{ metric: p99, aggregate: median, select: { load_mbps: 600 }, reference: vlan },
+                   { metric: p99, aggregate: median, select: { load_mbps: 0 }, reference: vlan }],
+           factor: 1.10 }
+campaign:
+  sweep: { load_mbps: [0, 600] }
+"#,
+        )
+        .unwrap();
+        let (intent, problems) = intent::read(&doc);
+        assert_eq!(problems, vec![]);
+        let ours = vec![
+            t("r1-defaults", "", 0, 1.0),
+            t("r1-load_mbps=600", "", 600, 1.5),
+        ];
+        let theirs = vec![
+            t("r1-idle", "idle", 0, 1.0),
+            t("r1-saturated", "saturated", 600, 1.4),
+        ];
+        let refs = References::from([("vlan".to_string(), Ok(theirs.clone()))]);
+        let v = verdict_with(&intent, ours.clone(), &refs);
+        assert_eq!(v.outcome, Outcome::Pass, "{v:?}");
+        assert_eq!(v.criteria[0].lhs, Some(1.5));
+        assert!((v.criteria[0].rhs.unwrap() - 1.54).abs() < 1e-9);
+        let from_ref: Vec<Option<&str>> = v.criteria[0]
+            .reads
+            .iter()
+            .map(|r| r.reference.as_deref())
+            .collect();
+        assert_eq!(from_ref, [None, None, Some("vlan"), Some("vlan")]);
+        assert_eq!(v.criteria[0].reads[2].trials, ["r1-saturated"]);
+
+        // Growth beyond the tolerance fails.
+        let worse = vec![
+            t("r1-defaults", "", 0, 1.0),
+            t("r1-load_mbps=600", "", 600, 1.6),
+        ];
+        assert_eq!(verdict_with(&intent, worse, &refs).outcome, Outcome::Fail);
+
+        // Not given, or unreadable: inconclusive, never a pass, and the reason says which.
+        let v = verdict(&intent, ours.clone());
+        assert_eq!(v.outcome, Outcome::Inconclusive);
+        assert!(
+            v.criteria[0]
+                .why
+                .as_deref()
+                .unwrap()
+                .contains("reference `vlan` was not given")
+        );
+        let broken = References::from([("vlan".to_string(), Err("no record".to_string()))]);
+        let v = verdict_with(&intent, ours, &broken);
+        assert_eq!(v.outcome, Outcome::Inconclusive);
+        assert!(
+            v.criteria[0]
+                .why
+                .as_deref()
+                .unwrap()
+                .contains("reference `vlan`: no record"),
+            "{:?}",
+            v.criteria[0].why
+        );
     }
 
     /// Repetitions of one point compare by median against the reference's median and IQR, as

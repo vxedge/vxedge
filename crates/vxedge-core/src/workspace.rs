@@ -349,6 +349,8 @@ pub struct ExperimentDoc {
     #[serde(default)]
     pub hypothesis: Option<serde_yaml_ng::Value>,
     #[serde(default)]
+    pub references: Option<serde_yaml_ng::Value>,
+    #[serde(default)]
     pub parameters: Option<serde_yaml_ng::Value>,
     #[serde(default)]
     pub metrics: Option<serde_yaml_ng::Value>,

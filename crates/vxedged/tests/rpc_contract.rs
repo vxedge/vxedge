@@ -2951,6 +2951,7 @@ criteria:\n  - { id: h1, op: le, lhs: { metric: p99, aggregate: median, select: 
     let v = ResultServiceClient::new(channel.clone())
         .verdict(ResultVerdictRequest {
             campaign_id: "c-1".into(),
+            reference_workspace: None,
         })
         .await
         .unwrap()
@@ -3075,9 +3076,66 @@ criteria:\n  - { id: h1, op: le, lhs: { metric: p99, aggregate: median, select: 
         );
     }
 
+    // A criterion that reads a declared reference campaign: one this host ran, one recorded in
+    // another workspace, or one that cannot be found, which leaves it inconclusive.
+    std::fs::write(folder.join("campaign.json"), record.to_string()).unwrap();
+    let with_reference = |campaign: &str| {
+        let intent = intent.replace(
+            "criteria:\n",
+            &format!(
+                "references:\n  base: {{ campaign: {campaign} }}\ncriteria:\n  - {{ id: h2, op: le, \
+                 lhs: {{ metric: p99, aggregate: median, select: {{ arm: busy }} }}, \
+                 rhs: {{ metric: p99, aggregate: median, select: {{ arm: busy }}, reference: base }} }}\n"
+            ),
+        );
+        std::fs::write(dir.join("main.yaml"), format!("{main}{intent}")).unwrap();
+    };
+    let judge = |workspace: Option<vxedge_api::v1::ManifestRef>| {
+        let channel = channel.clone();
+        async move {
+            ResultServiceClient::new(channel)
+                .verdict(ResultVerdictRequest {
+                    campaign_id: "c-1".into(),
+                    reference_workspace: workspace,
+                })
+                .await
+                .unwrap()
+                .into_inner()
+        }
+    };
+    with_reference("ref");
+    let v = judge(None).await;
+    let h2 = &v.criteria[0];
+    assert_eq!(
+        (h2.id.as_str(), h2.outcome),
+        ("h2", VerdictOutcome::Pass as i32),
+        "{v:?}"
+    );
+    assert_eq!(h2.lhs, Some(0.002));
+    assert!((h2.rhs.unwrap() - 0.0045).abs() < 1e-12, "{:?}", h2.rhs);
+    assert_eq!(h2.reads[1].reference, "base");
+    assert_eq!(h2.reads[1].trials, ["r1-busy", "r2-busy"]);
+
+    with_reference("exp-ref");
+    let v = judge(Some(workspace.clone())).await;
+    assert_eq!(v.criteria[0].outcome, VerdictOutcome::Pass as i32, "{v:?}");
+    assert!((v.criteria[0].rhs.unwrap() - 0.0045).abs() < 1e-12);
+
+    with_reference("exp-gone");
+    let v = judge(None).await;
+    assert_eq!(v.criteria[0].outcome, VerdictOutcome::Inconclusive as i32);
+    assert_eq!(v.outcome, VerdictOutcome::Inconclusive as i32);
+    assert!(
+        v.criteria[0].why.contains("reference `base`") && v.criteria[0].why.contains("exp-gone"),
+        "{}",
+        v.criteria[0].why
+    );
+    std::fs::write(dir.join("main.yaml"), format!("{main}{intent}")).unwrap();
+
     let unknown = ResultServiceClient::new(channel)
         .verdict(ResultVerdictRequest {
             campaign_id: "nope".into(),
+            reference_workspace: None,
         })
         .await
         .unwrap_err();

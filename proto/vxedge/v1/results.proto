@@ -70,6 +70,11 @@ message ResultChunk {
 message ResultVerdictRequest {
   // The campaign whose trials are judged.
   string campaign_id = 1;
+  // The workspace whose `results/<campaign>/campaign.json` records each reference campaign the
+  // experiment declares (`references`), such as a frozen one. Its archives must hash to the record.
+  // Unset: a reference is a campaign this host ran, or one recorded in the judged campaign's own
+  // workspace. A reference that cannot be read leaves the criteria that read it inconclusive.
+  ManifestRef reference_workspace = 2;
 }
 
 // What a criterion, or a whole verdict, found. `inconclusive` is never a pass.
@@ -92,6 +97,9 @@ message VerdictRead {
   bool complete = 6;
   // The aggregate, before the operand's factor and offset; unset when there is none.
   optional double value = 7;
+  // The reference campaign it was read from (its name in `references`), when not the campaign
+  // judged.
+  string reference = 8;
 }
 
 // How one criterion was judged.
