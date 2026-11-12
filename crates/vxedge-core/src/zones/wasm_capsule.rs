@@ -287,6 +287,7 @@ mod tests {
             image: None,
             module: Some("/parts/sensor.wasm".into()),
             pinned_cpus,
+            qemu: Default::default(),
         }
     }
 

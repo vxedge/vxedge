@@ -8,8 +8,8 @@
 //! already depends on both.
 
 use vxedge_api::v1::{
-    NodeBackend, NodePayload, NodeSpec, NodeStatus, PayloadKind, ResourceKind, ResourceState,
-    ResourceStatus,
+    NodeBackend, NodePayload, NodeSpec, NodeStatus, PayloadKind, QemuOptions, ResourceKind,
+    ResourceState, ResourceStatus,
 };
 use vxedge_core::model::{Backend, DeviceRole};
 use vxedge_core::status::{Observable, ObservedState};
@@ -121,6 +121,11 @@ pub fn node_spec(np: &NodePlan) -> NodeSpec {
         vlan: u32::from(np.vlan),
         slice: np.slice.clone().unwrap_or_default(),
         payload: Some(node_payload(np)),
+        qemu: (np.backend == Backend::QemuMicrovm).then(|| QemuOptions {
+            machine: np.qemu.machine.as_str().to_string(),
+            transport: np.qemu.transport.as_str().to_string(),
+            vhost: np.qemu.vhost,
+        }),
     }
 }
 

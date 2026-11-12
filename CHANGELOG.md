@@ -28,6 +28,21 @@ All notable changes to this repo are documented here. Format follows
   processes in the node's namespace, such as the reflector a measurement starts there, under the
   same series names and units as a VM node's VMM, with `source="netns"`. An empty namespace has no
   series.
+- **QEMU options per `qemu-microvm` device (X-32).** A device's `qemu:` block sets the machine
+  (`microvm` or `q35`), the NIC's virtio transport (`mmio` or `pci`) and `vhost`, so an arm can
+  decompose a VM's cost one factor at a time, as exp-002b does. Without the block the command line
+  is unchanged.
+  - Refused when the manifest loads: `qemu:` on another backend, an unknown key or value, and
+    `q35` without `transport: pci`.
+  - Refused at boot, before QEMU starts: an aarch64 guest, `pci` for a bundle that does not
+    declare `org.vxedge.virtio-pci: true` (its guest would boot with no NIC), and `vhost` when
+    `/dev/vhost-net` cannot be opened.
+  - `microvm` with `pci` runs `microvm,pcie=on,acpi=on`; `q35` runs QEMU's `q35`.
+  - `NodeSpec.qemu` reports the machine, transport and vhost of every `qemu-microvm` node. vxAPI
+    stays `vxedge.v1`; the field is additive.
+  - `zones_qemu_microvm.rs` takes the arm from `VXEDGE_TEST_QEMU`. All five arms (default,
+    `microvm,pci`, `q35,pci`, `q35,pci,vhost`, `microvm,mmio,vhost`) boot the linux probe guest
+    under KVM, and its reflector answers at the pinned address.
 
 ## [0.24.0] - 2026-11-12
 

@@ -236,6 +236,7 @@ mod tests {
             remote_bundle: None,
             image: None,
             pinned_cpus: Vec::new(),
+            qemu: Default::default(),
         }
     }
 

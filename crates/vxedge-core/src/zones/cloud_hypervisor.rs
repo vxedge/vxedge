@@ -396,6 +396,7 @@ mod tests {
             image: None,
             module: None,
             pinned_cpus,
+            qemu: Default::default(),
         }
     }
 
