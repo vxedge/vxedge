@@ -6,6 +6,10 @@
 //! - The reflector runs in the `to` node's namespace, or for `to: internet` on the far side of
 //!   the shared uplink: a VLAN subinterface of the uplink's peer for the slice, addressed in the
 //!   sender's subnet. That is the far side exp-001 builds by hand.
+//! - On a `mode: s-nssai` slice, the reflector runs in the slice's UE, bound to its PDU-session
+//!   address, and the sender runs on the host, which reaches the UE through the 5G core's uplink:
+//!   the path the core routes, as `TrafficService` probes a UE. The figures are round trips, so
+//!   they read the same either way round.
 //! - The sender serves its metrics on `127.0.0.1` inside its own namespace. The daemon's exporter
 //!   enters the namespace to read them and serves them as `measurements/<id>`
 //!   ([`collect_metrics`]), so a scrape never crosses the slice it measures.
@@ -47,10 +51,33 @@ pub struct End {
     pub addr: String,
 }
 
+/// Where the sender runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Sender {
+    Node(End),
+    /// The host, on the data-network side of the 5G core, for a measurement from a UE.
+    DataNetwork {
+        /// The device whose UE it measures.
+        node: String,
+    },
+}
+
+impl Sender {
+    /// The device the measurement is from.
+    pub fn node(&self) -> &str {
+        match self {
+            Self::Node(end) => &end.node,
+            Self::DataNetwork { node } => node,
+        }
+    }
+}
+
 /// Where the reflector runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reflector {
     Node(End),
+    /// The slice's UE, bound to its PDU-session address, which is learned when it starts.
+    Ue(Box<crate::fiveg::SliceSession>),
     /// A VLAN subinterface of the uplink's peer, in the host's namespace.
     FarSide {
         parent: String,
@@ -63,10 +90,12 @@ pub enum Reflector {
 }
 
 impl Reflector {
-    pub fn addr(&self) -> &str {
+    /// Its address, when the plan knows it: a UE's is learned when the measurement starts.
+    pub fn addr(&self) -> Option<&str> {
         match self {
-            Self::Node(end) => &end.addr,
-            Self::FarSide { addr, .. } => addr,
+            Self::Node(end) => Some(&end.addr),
+            Self::FarSide { addr, .. } => Some(addr),
+            Self::Ue(_) => None,
         }
     }
 }
@@ -76,7 +105,7 @@ impl Reflector {
 pub struct Placement {
     pub id: String,
     pub entity: String,
-    pub sender: End,
+    pub sender: Sender,
     pub reflector: Reflector,
     pub reflect_port: u16,
     pub metrics_port: u16,
@@ -98,11 +127,21 @@ pub fn plan(
         .map(|(i, m)| {
             let i = u16::try_from(i).map_err(|_| "too many measurements".to_string())?;
             let what = format!("measurement `{}`", m.id);
-            let sender = end_on(model, nodes, &m.from, &m.slice, &what)?;
-            let reflector = if m.to == INTERNET {
-                far_side_of(model, gateway, &m.from, &m.slice, &what)?
+            let (sender, reflector) = if super::is_snssai(model, &m.slice) {
+                (
+                    Sender::DataNetwork {
+                        node: m.from.clone(),
+                    },
+                    Reflector::Ue(Box::new(ue_session(model, &m.slice, &what)?)),
+                )
             } else {
-                Reflector::Node(end_on(model, nodes, &m.to, &m.slice, &what)?)
+                let sender = Sender::Node(end_on(model, nodes, &m.from, &m.slice, &what)?);
+                let reflector = if m.to == INTERNET {
+                    far_side_of(model, gateway, &m.from, &m.slice, &what)?
+                } else {
+                    Reflector::Node(end_on(model, nodes, &m.to, &m.slice, &what)?)
+                };
+                (sender, reflector)
             };
             Ok(Placement {
                 id: m.id.clone(),
@@ -116,6 +155,19 @@ pub fn plan(
             })
         })
         .collect()
+}
+
+/// The 5G session of the `s-nssai` slice `slice`.
+fn ue_session(
+    model: &Experiment,
+    slice: &str,
+    what: &str,
+) -> Result<crate::fiveg::SliceSession, String> {
+    let plan = crate::fiveg::FiveGPlan::from_model(model).map_err(|e| format!("{what}: {e}"))?;
+    plan.sessions
+        .into_iter()
+        .find(|s| s.slice_id == slice)
+        .ok_or_else(|| format!("{what}: slice `{slice}` has no 5G session"))
 }
 
 /// `node` as an end on `slice`: its namespace and its pinned address there. `what` names the
@@ -214,7 +266,8 @@ pub(crate) fn first_host(cidr: &str) -> Option<String> {
 pub struct Started {
     pub id: String,
     pub entity: String,
-    /// The sender's namespace: a name under `/run/netns`, or a `/proc/<pid>/ns/net` path.
+    /// The sender's namespace: a name under `/run/netns`, a `/proc/<pid>/ns/net` path, or empty
+    /// for the host's own.
     pub netns: String,
     pub metrics_port: u16,
     /// The far-side interface this measurement's reflector listens on, if any.
@@ -467,7 +520,11 @@ pub async fn start(
         return Ok(format!("measurement `{}` already running", p.id));
     }
     let err = |e: String| format!("measurement `{}`: {e}", p.id);
-    let sender_ns = netns_of(&p.sender, containers).await.map_err(err)?;
+    // The host's own namespace is the empty name: a spawn there enters none.
+    let sender_ns = match &p.sender {
+        Sender::Node(end) => netns_of(end, containers).await.map_err(err)?,
+        Sender::DataNetwork { .. } => String::new(),
+    };
     let listen = |addr: &str| {
         vec![
             "reflect".into(),
@@ -478,7 +535,26 @@ pub async fn start(
     // A reflector outlives its sender: a measurement started again after its sender finished
     // keeps the one already listening, which still holds the port.
     let reflecting = read_pid(runtime_dir, &p.id, "reflect").is_some_and(alive);
+    let mut target = p.reflector.addr().map(str::to_string);
     let far_side = match &p.reflector {
+        Reflector::Ue(session) => {
+            // The UE's reflector is a member of its pod, named after the measurement, and stays
+            // until the 5G core comes down; starting it again finds it and learns the address.
+            let client = containers.get().await.map_err(|e| err(e.to_string()))?;
+            let cfg = crate::fiveg::FiveGLifecycleConfig::default();
+            let (addr, _) = crate::fiveg::ue_reflector_up(
+                client,
+                &cfg,
+                &runtime_dir.join("fiveg-config"),
+                session,
+                p.reflect_port,
+                &format!("measure-{}", p.id),
+            )
+            .await
+            .map_err(|e| err(format!("the UE of slice `{}`: {e}", session.slice_id)))?;
+            target = Some(addr);
+            None
+        }
         Reflector::Node(_) if reflecting => None,
         Reflector::FarSide { iface, .. } if reflecting => Some(iface.clone()),
         Reflector::Node(to) => {
@@ -529,10 +605,11 @@ pub async fn start(
     };
     // The reflector binds before the first probe is sent.
     tokio::time::sleep(Duration::from_millis(300)).await;
+    let target = target.ok_or_else(|| err("no reflector address".into()))?;
     let args = vec![
         "send".to_string(),
         "--target".into(),
-        format!("{}:{}", p.reflector.addr(), p.reflect_port),
+        format!("{target}:{}", p.reflect_port),
         "--pps".into(),
         p.rate_pps.to_string(),
         "--payload-bytes".into(),
@@ -550,7 +627,8 @@ pub async fn start(
     );
     let summary = summary_file(runtime_dir, &p.id);
     tokio::task::spawn_blocking(move || {
-        spawn(&rt, &id, "send", Some(&ns), &bin, args, Some(summary))
+        let ns = (!ns.is_empty()).then_some(ns.as_str());
+        spawn(&rt, &id, "send", ns, &bin, args, Some(summary))
     })
     .await
     .map_err(|e| err(e.to_string()))?
@@ -568,11 +646,10 @@ pub async fn start(
     )
     .map_err(|e| err(format!("cannot write its record: {e}")))?;
     Ok(format!(
-        "measurement `{}` started: {} pps from `{}` to {}:{} for {duration_s} s",
+        "measurement `{}` started: {} pps from `{}` to {target}:{} for {duration_s} s",
         p.id,
         p.rate_pps,
-        p.sender.node,
-        p.reflector.addr(),
+        p.sender.node(),
         p.reflect_port
     ))
 }
@@ -624,7 +701,14 @@ pub fn collect_metrics(runtime_dir: &Path) -> String {
             continue;
         }
         let port = s.metrics_port;
-        let Ok(Some(text)) = netlink::in_netns(&s.netns, move || fetch(port)) else {
+        let text = if s.netns.is_empty() {
+            fetch(port)
+        } else {
+            netlink::in_netns(&s.netns, move || fetch(port))
+                .ok()
+                .flatten()
+        };
+        let Some(text) = text else {
             continue;
         };
         out.push_str(&relabel(&text, &s.entity));
@@ -729,8 +813,11 @@ network:
         .unwrap();
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].entity, "measurements/ctl-rtt");
-        assert_eq!(p[0].sender.addr, "10.101.0.2");
-        assert!(!p[0].sender.image);
+        let Sender::Node(sender) = &p[0].sender else {
+            panic!("{:?}", p[0].sender)
+        };
+        assert_eq!(sender.addr, "10.101.0.2");
+        assert!(!sender.image);
         let Reflector::FarSide {
             parent,
             vlan,
@@ -786,6 +873,49 @@ network:
         let e = end_on(&model, &nodes, "ecu2", "info", "measurement `a`").unwrap();
         assert!(e.image);
         assert_eq!(e.runtime_name, crate::zones::runtime_name_of("ecu2"));
+    }
+
+    #[test]
+    fn a_probe_from_a_ue_reflects_in_the_ue_and_sends_from_the_host() {
+        let ws = r#"
+kind: vehicle
+id: car
+zones: { front: {} }
+devices:
+  ue1: { role: zone-controller, zone: front, backend: container }
+functions:
+  f1: { deployed_on: ue1 }
+links:
+  - { id: l1, endpoints: [ue1:eth0], slice: adas }
+---
+kind: baseline
+id: bl
+parts:
+  - { ref: 'local/vxprobe:host-process', target_ids: f1 }
+---
+kind: experiment
+id: exp
+vehicles: [car]
+baseline: bl
+network:
+  slices:
+    - { id: adas, mode: s-nssai, s_nssai: { sst: 1, sd: '000001' } }
+measurements:
+  ctl: { kind: rtt-probe, from: ue1, to: internet, slice: adas, rate_pps: 1000 }
+"#;
+        let model = crate::model::load_yaml(ws).unwrap();
+        assert!(super::super::problems(&model).is_empty());
+        let gateway = GatewayPlan::from_model(&model).unwrap();
+        let nodes =
+            crate::zones::plan_nodes_from_model(&model, &gateway, Path::new("/nonexistent"))
+                .unwrap();
+        let p = plan(&model, &gateway, &nodes).unwrap();
+        assert_eq!(p[0].sender, Sender::DataNetwork { node: "ue1".into() });
+        let Reflector::Ue(session) = &p[0].reflector else {
+            panic!("{:?}", p[0].reflector)
+        };
+        assert_eq!(session.slice_id, "adas");
+        assert_eq!(p[0].reflector.addr(), None);
     }
 
     #[test]

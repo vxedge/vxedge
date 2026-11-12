@@ -253,6 +253,10 @@ pub struct Profile {
     pub warmup_s: Option<f64>,
     #[serde(default)]
     pub duration_s: Option<f64>,
+    /// A shorter or longer `duration_s` for each window it names, by window id. The windows and
+    /// what each sets stay the campaign's.
+    #[serde(default)]
+    pub windows: BTreeMap<String, f64>,
 }
 
 /// One measure window of a trial (`campaign.windows`): the measurements run for `duration_s`
@@ -667,6 +671,15 @@ fn check_campaign(c: &mut Checker<'_>, intent: &Intent) {
         );
     }
     if campaign.windows.is_empty() {
+        for (name, p) in &campaign.profiles {
+            if !p.windows.is_empty() {
+                c.push(
+                    ProblemKind::Parameter,
+                    format!("campaign.profiles.{name}.windows"),
+                    "the campaign declares no `windows` for a profile to change",
+                );
+            }
+        }
         return;
     }
     if campaign.duration_s.is_some() {
@@ -681,8 +694,25 @@ fn check_campaign(c: &mut Checker<'_>, intent: &Intent) {
             c.push(
                 ProblemKind::Parameter,
                 format!("campaign.profiles.{name}.duration_s"),
-                "a campaign with `windows` measures for their sum, which a profile does not change",
+                "a campaign with `windows` measures for their sum: change a window's length with \
+                 the profile's `windows`",
             );
+        }
+        for (id, d) in &p.windows {
+            let field = format!("campaign.profiles.{name}.windows.{id}");
+            if !campaign.windows.iter().any(|w| &w.id == id) {
+                c.push(
+                    ProblemKind::Parameter,
+                    field,
+                    format!("`{id}` is not one of the campaign's `windows`"),
+                );
+            } else if d.is_nan() || *d <= 0.0 {
+                c.push(
+                    ProblemKind::Parameter,
+                    field,
+                    "a window needs a duration above 0",
+                );
+            }
         }
     }
     let mut ids = BTreeSet::new();
@@ -1914,6 +1944,16 @@ campaign:
                 "    quick: { repetitions: 2 }",
                 "    quick: { repetitions: 2, duration_s: 5 }",
                 "campaign.profiles.quick.duration_s",
+            ),
+            (
+                "    quick: { repetitions: 2 }",
+                "    quick: { repetitions: 2, windows: { warm: 5 } }",
+                "campaign.profiles.quick.windows.warm",
+            ),
+            (
+                "    quick: { repetitions: 2 }",
+                "    quick: { repetitions: 2, windows: { steady: 0 } }",
+                "campaign.profiles.quick.windows.steady",
             ),
             (
                 "{ id: steady, duration_s: 60 }",

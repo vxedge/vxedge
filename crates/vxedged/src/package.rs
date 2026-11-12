@@ -382,6 +382,7 @@ fn campaign(c: &intent::Campaign, params: &BTreeMap<String, intent::Parameter>) 
                 repetitions: p.repetitions,
                 warmup_s: p.warmup_s,
                 duration_s: p.duration_s,
+                windows: p.windows.clone().into_iter().collect(),
             })
             .collect(),
     }

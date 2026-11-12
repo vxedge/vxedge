@@ -670,6 +670,10 @@ enum CampaignCmd {
         /// Skip each trial's `vxp.lock` check while authoring. Recorded with the campaign.
         #[arg(long)]
         unlocked: bool,
+        /// A workspace whose `results/` records the reference campaigns the experiment's
+        /// `references` name, such as a frozen one. Recorded with the campaign.
+        #[arg(long)]
+        reference_workspace: Option<String>,
     },
     /// One campaign by id, or every campaign on the daemon.
     Status { campaign_id: Option<String> },
@@ -706,6 +710,10 @@ enum ResultsCmd {
         /// their trials: `rep{repetition}-load{load_mbps}`, `rep{repetition}-{arm}`.
         #[arg(long)]
         name: Option<String>,
+        /// A workspace whose `results/<campaign>/campaign.json` records the reference campaigns
+        /// the experiment's `references` name, such as a frozen one.
+        #[arg(long)]
+        reference_workspace: Option<std::path::PathBuf>,
     },
     /// Set these archives against reference archives, per metric at each point and per
     /// criterion, as `ResultService.Compare` does.
@@ -718,6 +726,9 @@ enum ResultsCmd {
         reference: Vec<std::path::PathBuf>,
         #[arg(long)]
         name: Option<String>,
+        /// As for `results verdict`: where the experiment's own `references` are recorded.
+        #[arg(long)]
+        reference_workspace: Option<std::path::PathBuf>,
     },
 }
 
@@ -995,16 +1006,39 @@ fn print_judgement(j: &vxedge_core::intent::Judgement, depth: usize) {
     }
 }
 
+/// The experiment's references, read from `root`'s `results/` when given. Without it, each is
+/// unread, so a criterion that reads one is inconclusive and says why.
+fn recorded_references(
+    root: Option<&std::path::Path>,
+    intent: &vxedge_core::intent::Intent,
+) -> vxedge_core::verdict::References {
+    match root {
+        Some(root) => vxedge_core::verdict::recorded_references(root, intent),
+        None => intent
+            .references
+            .keys()
+            .map(|name| {
+                (
+                    name.clone(),
+                    Err("offline, a reference needs `--reference-workspace`".to_string()),
+                )
+            })
+            .collect(),
+    }
+}
+
 fn results(cmd: &ResultsCmd, json: bool) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         ResultsCmd::Verdict {
             experiment,
             archives,
             name,
+            reference_workspace,
         } => {
             let intent = experiment_intent(experiment)?;
             let trials = local_trials(archives, name.as_deref(), &intent.metrics)?;
-            let v = vxedge_core::verdict::verdict(&intent, trials);
+            let refs = recorded_references(reference_workspace.as_deref(), &intent);
+            let v = vxedge_core::verdict::verdict_with(&intent, trials, &refs);
             if json {
                 println!("{}", serde_json::to_string_pretty(&v)?);
             } else {
@@ -1028,11 +1062,13 @@ fn results(cmd: &ResultsCmd, json: bool) -> Result<(), Box<dyn std::error::Error
             archives,
             reference,
             name,
+            reference_workspace,
         } => {
             let intent = experiment_intent(experiment)?;
             let ours = local_trials(archives, name.as_deref(), &intent.metrics)?;
             let theirs = local_trials(reference, name.as_deref(), &intent.metrics)?;
-            let c = vxedge_core::verdict::compare(&intent, ours, theirs);
+            let refs = recorded_references(reference_workspace.as_deref(), &intent);
+            let c = vxedge_core::verdict::compare_with(&intent, ours, theirs, &refs);
             if json {
                 println!("{}", serde_json::to_string_pretty(&c)?);
             } else {
@@ -2185,6 +2221,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     profile,
                     request_id,
                     unlocked,
+                    reference_workspace,
                 } => {
                     let job = campaigns
                         .start(CampaignStartRequest {
@@ -2193,6 +2230,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             request_id: request_id.clone(),
                             caller: "vxedge-cli".into(),
                             unlocked: *unlocked,
+                            reference_workspace: manifest_ref(reference_workspace),
                             ..Default::default()
                         })
                         .await?

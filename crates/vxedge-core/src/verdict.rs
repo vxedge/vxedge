@@ -521,6 +521,103 @@ fn same(a: &Value, b: &Value) -> bool {
 /// campaign could not be read.
 pub type References = BTreeMap<String, Result<Vec<Trial>, String>>;
 
+/// The archived trials of the campaign `id` that `root`'s `results/<id>/campaign.json` records,
+/// read with `metrics`, as `ResultService` reads a reference outside the host. Each archive is
+/// read from the record's folder (a relative path below it, or an absolute one by its file name)
+/// and must hash to the record's `sha256`.
+pub fn recorded_trials(
+    root: &std::path::Path,
+    id: &str,
+    metrics: &[Metric],
+) -> Result<Vec<Trial>, String> {
+    use std::path::{Component, Path};
+    let one_name = matches!(
+        Path::new(id).components().collect::<Vec<_>>().as_slice(),
+        [Component::Normal(_)]
+    );
+    if !one_name {
+        return Err(format!("`{id}` is not one folder name under `results/`"));
+    }
+    let folder = root.join("results").join(id);
+    let file = folder.join("campaign.json");
+    let text = std::fs::read(&file)
+        .map_err(|e| format!("no campaign record `{}`: {e}", file.display()))?;
+    let rec: serde_json::Value = serde_json::from_slice(&text)
+        .map_err(|e| format!("`{}` is not a campaign record: {e}", file.display()))?;
+    if rec["campaign_id"].as_str() != Some(id) {
+        return Err(format!(
+            "`{}` does not record campaign `{id}`",
+            file.display()
+        ));
+    }
+    let mut out = Vec::new();
+    for t in rec["trials"].as_array().into_iter().flatten() {
+        let (Some(tid), Some(archive)) = (t["id"].as_str(), t["archive"].as_str()) else {
+            continue;
+        };
+        if t["state"].as_str() != Some("succeeded") || archive.is_empty() {
+            continue;
+        }
+        let named = Path::new(archive);
+        let below = named
+            .components()
+            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
+        let path = if named.is_relative() && below {
+            folder.join(named)
+        } else if let Some(name) = named.is_absolute().then(|| named.file_name()).flatten() {
+            folder.join(name)
+        } else {
+            return Err(format!(
+                "trial `{tid}`: archive `{archive}` is outside the record's folder"
+            ));
+        };
+        let want = t["sha256"].as_str().unwrap_or_default();
+        let want = want.strip_prefix("sha256:").unwrap_or(want);
+        let bytes = std::fs::read(&path)
+            .map_err(|e| format!("trial `{tid}`: no archive `{}`: {e}", path.display()))?;
+        let got = crate::pkg::sha256(&bytes);
+        if want.is_empty() || got.strip_prefix("sha256:") != Some(want) {
+            return Err(format!(
+                "trial `{tid}`: `{}` is {got}, the record says `{want}`",
+                path.display()
+            ));
+        }
+        let parameters = t["parameters"]
+            .as_object()
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| Some((k.clone(), serde_yaml_ng::to_value(v).ok()?)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let who = Identity {
+            id: tid.to_string(),
+            arm: t["arm"]
+                .as_str()
+                .filter(|a| !a.is_empty())
+                .map(String::from),
+            repetition: t["repetition"].as_u64().unwrap_or(0) as u32,
+            parameters,
+        };
+        out.push(trial(&path, got, Some(who), metrics)?);
+    }
+    Ok(out)
+}
+
+/// The references `intent` declares, each read from `root`'s `results/` with [`recorded_trials`].
+pub fn recorded_references(root: &std::path::Path, intent: &Intent) -> References {
+    intent
+        .references
+        .iter()
+        .map(|(name, r)| {
+            (
+                name.clone(),
+                recorded_trials(root, &r.campaign, &intent.metrics),
+            )
+        })
+        .collect()
+}
+
 /// Trials, as [`intent::SampleSource`]: a metric's values under a selection are the values of
 /// the trials it selects, in order; a reference's are those of its campaign's trials.
 pub struct Trials<'a>(pub &'a [Trial], pub &'a References);

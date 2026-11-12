@@ -113,6 +113,14 @@ pub async fn up(
     }
     let source_ns = netns_of(&p.source, containers).await.map_err(err)?;
     let (target_addr, far_side) = match &p.target {
+        // In-node profiles run on VLAN slices; an s-nssai profile goes through the UE path in
+        // `traffic::lifecycle`.
+        Reflector::Ue(session) => {
+            return Err(err(format!(
+                "slice `{}` is s-nssai, which an in-node profile does not run on",
+                session.slice_id
+            )));
+        }
         Reflector::Node(to) => {
             if p.pps.is_some() && !running(runtime_dir, &p.id, "reflect") {
                 let ns = netns_of(to, containers).await.map_err(err)?;
@@ -306,7 +314,7 @@ traffic_profiles:
     fn a_probe_profile_plans_a_far_side_reflector() {
         let p = plan_of("rtt").unwrap();
         assert_eq!(p.pps, Some(500));
-        assert_eq!(p.target.addr(), "10.101.0.1");
+        assert_eq!(p.target.addr(), Some("10.101.0.1"));
     }
 
     #[test]

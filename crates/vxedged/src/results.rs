@@ -172,7 +172,14 @@ fn find(runtime_dir: &Path, seen: Option<PathBuf>, digest: &str) -> Result<Resul
 /// The folder of a workspace named by `m`: a directory, a file's directory, or a cached package.
 /// Only the folder matters here, not its documents: a results folder is read as it is. `None` when
 /// `m` names no folder.
-fn folder_of(m: Option<&vxedge_api::v1::ManifestRef>) -> Result<Option<PathBuf>, Status> {
+/// The reference workspace a campaign was started with, if any.
+fn recorded_reference(rec: &crate::campaign_run::CampaignRecord) -> Option<PathBuf> {
+    (!rec.reference_workspace.is_empty()).then(|| PathBuf::from(&rec.reference_workspace))
+}
+
+pub(crate) fn folder_of(
+    m: Option<&vxedge_api::v1::ManifestRef>,
+) -> Result<Option<PathBuf>, Status> {
     use vxedge_api::v1::manifest_ref::Source;
     Ok(match m.and_then(|m| m.source.as_ref()) {
         Some(Source::Path(p)) => {
@@ -338,6 +345,7 @@ impl ResultService for ResultSvc {
                 "`reference_workspace` names a folder: a path or a package digest, not inline YAML",
             ));
         }
+        let root = root.or_else(|| recorded_reference(&rec));
         let runtime_dir = self.runtime_dir.clone();
         let judged = tokio::task::spawn_blocking(move || {
             let lookup = crate::verdict::Lookup {
@@ -375,9 +383,12 @@ impl ResultService for ResultSvc {
                 None => crate::campaign_run::read(&runtime_dir, id)
                     .ok_or_else(|| crate::campaign::unknown(id))?,
             };
+            // The criteria's own references: in the workspace named here, else the one the
+            // campaign was started with.
+            let recorded = recorded_reference(&rec);
             let lookup = crate::verdict::Lookup {
                 runtime_dir: &runtime_dir,
-                workspace: root.as_deref(),
+                workspace: root.as_deref().or(recorded.as_deref()),
             };
             crate::verdict::compare(&rec, &reference, &lookup)
                 .map(|c| crate::verdict::comparison_to_proto(&rec, &reference, &c))

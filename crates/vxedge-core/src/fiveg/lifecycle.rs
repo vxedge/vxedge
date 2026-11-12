@@ -663,22 +663,41 @@ pub async fn ue_probe_up(
     port: u16,
 ) -> Result<String, FiveGLifecycleError> {
     let pod = ue_pod_name(&cfg.ran_pod_name, &session.slice_id);
+    let (ue_addr, started) = ue_reflector_up(client, cfg, cfg_dir, session, port, "probe").await?;
+    Ok(if started {
+        format!("vxprobe reflector up in UE pod `{pod}` on {ue_addr}:{port}")
+    } else {
+        format!("vxprobe reflector already up in UE pod `{pod}` (idempotent)")
+    })
+}
+
+/// A `vxprobe reflect` member named `member` in the slice's UE pod, bound to the UE's
+/// PDU-session address on `port` (see [`ue_probe_up`] for why it binds that address). Returns
+/// that address, and whether this call started the member: an existing one is left running.
+/// Torn down with the pod.
+pub async fn ue_reflector_up(
+    client: &ContainerClient,
+    cfg: &FiveGLifecycleConfig,
+    cfg_dir: &Path,
+    session: &SliceSession,
+    port: u16,
+    member: &str,
+) -> Result<(String, bool), FiveGLifecycleError> {
+    let pod = ue_pod_name(&cfg.ran_pod_name, &session.slice_id);
     let status = client
         .group_status(&pod)
         .await
         .map_err(containers(format!("observe UE pod `{pod}`")))?;
-    let probe_name = format!("{pod}-probe");
-    if status.member(&probe_name).is_some() {
-        return Ok(format!(
-            "vxprobe reflector already up in UE pod `{pod}` (idempotent)"
-        ));
-    }
     let handle = client.handle(&pod).await.map_err(containers(format!(
         "find UE pod `{pod}`'s network namespace"
     )))?;
     let ue_addr = wait_for_ue_pdu_addr(handle.infra_pid).await?;
+    let probe_name = format!("{pod}-{member}");
+    if status.member(&probe_name).is_some() {
+        return Ok((ue_addr, false));
+    }
     let probe = ContainerSpec {
-        name: "probe".to_string(),
+        name: member.to_string(),
         image: cfg.ran_image.clone(),
         cmd: vec![
             "vxprobe".to_string(),
@@ -693,9 +712,7 @@ pub async fn ue_probe_up(
         .ensure_member(&pod_group(cfg, &pod)?, &handle, &probe)
         .await
         .map_err(containers(format!("start `{probe_name}`")))?;
-    Ok(format!(
-        "vxprobe reflector up in UE pod `{pod}` on {ue_addr}:{port}"
-    ))
+    Ok((ue_addr, true))
 }
 
 /// Address for the CN pod's side of [`bridge_up`]'s attachment — distinct

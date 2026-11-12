@@ -6,6 +6,27 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **A measurement from a 5G UE (X9.10).** On a `mode: s-nssai` slice, an `rtt-probe` from a
+  device to `internet` no longer needs an `ip` pinned on the device's link: its end is the slice's
+  UE, whose PDU-session address the core assigns at `up`. `MeasurementService.Start` learns that
+  address, runs the reflector in the UE bound to it, and sends from the host through the core's
+  uplink, as `TrafficService` probes a UE. A `to` other than `internet` on such a slice is
+  `ERROR_REASON_MEASUREMENT_INVALID` at `Plan`. The UE's reflector stays until the core comes down.
+- **`CampaignStartRequest.reference_workspace`.** It names the workspace that records the
+  experiment's reference campaigns (X9.8's `references`), such as a frozen one, and is recorded
+  with the campaign. The verdict judged when the campaign finishes reads the references there, as
+  do a later `ResultService.Verdict` and `Compare`'s criteria that name none.
+  `vxedge campaign start --reference-workspace <path>`.
+- **Profile window lengths.** A profile's `windows` gives the measure windows it names another
+  length (`quick: { repetitions: 1, windows: { steady: 12 } }`). `PackageInfo`'s
+  `CampaignProfile.windows` carries it. An unknown window id, or a length of 0 or less, is
+  `ERROR_REASON_PARAMETER_INVALID`.
+- **Offline references.** `vxedge results verdict` and `results compare` take
+  `--reference-workspace`, and read the experiment's references from its `results/`, hash-checked,
+  as the daemon does. Without it, a criterion on a reference is `inconclusive` and says why.
+
 ## [0.19.0] - 2026-11-12
 
 Cross-campaign criteria. An experiment can declare the reference campaigns its criteria read, such

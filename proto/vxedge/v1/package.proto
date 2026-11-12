@@ -142,6 +142,8 @@ message CampaignProfile {
   optional uint32 repetitions = 2;
   optional double warmup_s = 3;
   optional double duration_s = 4;
+  // The length, in seconds, this profile gives each measure window it names, by window id.
+  map<string, double> windows = 5;
 }
 
 message PackageCampaign {

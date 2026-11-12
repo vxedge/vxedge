@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 
 use serde_yaml_ng::Value;
 
-use crate::intent::{Intent, ParamType, Parameter};
+use crate::intent::{self, Intent, ParamType, Parameter};
 
 /// One trial: a parameter assignment, run once.
 #[derive(Debug, Clone, PartialEq)]
@@ -139,6 +139,7 @@ pub fn plan(
         .map(|(k, p)| (k.clone(), p.default.clone()))
         .collect();
     let (mut repetitions, mut warmup_s, mut duration_s) = method;
+    let mut window_lengths: BTreeMap<String, f64> = BTreeMap::new();
     let mut points: Vec<(BTreeMap<String, Value>, Option<String>)> = Vec::new();
     match &intent.campaign {
         None => points.push((defaults.clone(), None)),
@@ -176,6 +177,7 @@ pub fn plan(
                 repetitions = p.repetitions.or(repetitions);
                 warmup_s = p.warmup_s.or(warmup_s);
                 duration_s = p.duration_s.or(duration_s);
+                window_lengths = p.windows.clone();
             }
         }
     }
@@ -187,11 +189,18 @@ pub fn plan(
         ));
     }
     let repetitions = repetitions.unwrap_or(1).max(1);
-    let windows = intent
+    // Each window at its length under the profile.
+    let windows: Vec<intent::Window> = intent
         .campaign
         .as_ref()
         .map(|c| c.windows.as_slice())
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .iter()
+        .map(|w| intent::Window {
+            duration_s: window_lengths.get(&w.id).copied().unwrap_or(w.duration_s),
+            ..w.clone()
+        })
+        .collect();
     let (warmup_s, duration_s) = (
         warmup_s.unwrap_or(0.0),
         if windows.is_empty() {
@@ -442,5 +451,28 @@ campaign:
         assert_eq!(t.windows[0].parameters["probe_pps"], Value::from(20));
         assert_eq!(t.windows[1].parameters["probe_pps"], Value::from(1000));
         assert_eq!(p.estimate_s(), 2.0 * (63.0 + OVERHEAD_S));
+    }
+
+    #[test]
+    fn a_profile_changes_the_length_of_the_windows_it_names() {
+        let i = intent(
+            r#"
+kind: experiment
+id: e
+campaign:
+  windows:
+    - { id: cold, duration_s: 3 }
+    - { id: steady, duration_s: 60 }
+  profiles:
+    quick: { repetitions: 1, windows: { steady: 12 } }
+"#,
+        );
+        let p = plan(&i, (None, None, None), Some("quick")).unwrap();
+        let t = &p.trials[0];
+        let lengths: Vec<f64> = t.windows.iter().map(|w| w.duration_s).collect();
+        assert_eq!(lengths, [3.0, 12.0]);
+        assert_eq!(t.duration_s, 15.0);
+        let full = plan(&i, (None, None, None), None).unwrap();
+        assert_eq!(full.trials[0].duration_s, 63.0);
     }
 }
