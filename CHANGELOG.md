@@ -6,6 +6,12 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-11-12
+
+Tool provenance in results. A result now names the build of every tool the daemon runs, so an
+archive says whether its probe was a debug or a release build. The signal-plane lifecycle checks
+exp-015's script made are a privileged vxedged test. vxAPI stays `vxedge.v1`, with no wire change.
+
 ### Added
 
 - **The tool binaries behind a result (X9.14).** `TelemetryService.Collect` writes `tools.json` to
