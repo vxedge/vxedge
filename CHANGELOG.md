@@ -6,6 +6,22 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **The tool binaries behind a result (X9.14).** `TelemetryService.Collect` writes `tools.json` to
+  the ingest folder, which vxtelemetry (from its next release) records as `tools` in the archive's
+  `metadata.json`: vxedged itself, then every tool flag (`--vxprobe-bin`, `--vxtraffic-bin`,
+  `--vxota-bin`, `--vxota-probe-bin`, `--vxtelemetry-bin`), whether or not the run used it. Each
+  entry has `name`, the `path` that runs (found on `PATH` the way the daemon spawns it, symlinks
+  resolved), the `version` its `--version` reports, the `sha256` of the file and `profile`.
+  - `profile` is `debug` or `release` when the tool says so: vxedged knows its own build, and
+    another tool's `--version` line may end in `(debug)` or `(release)`. Otherwise it is
+    `unknown`, and never guessed from the path.
+  - Each file is hashed and asked for its version once, and again only when it changes on disk,
+    so a tool rebuilt while the daemon runs is recorded as rebuilt.
+  - A tool that is not found, cannot be read or fails `--version` is still listed, with what is
+    known and an `error`.
+
 ## [0.23.0] - 2026-11-12
 
 OTA arm setup. A host-process `ota` service can sign its own store at every start and run clients
