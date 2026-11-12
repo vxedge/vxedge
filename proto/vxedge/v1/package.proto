@@ -49,9 +49,9 @@ message PackageParameter {
   string binds = 8;
 }
 
-// A metric gives each trial one value: the last sample of `series` (the line `labels` pick) on
-// `entity` inside the trial's measure phase, or the `ratio` of two metrics in the same trial,
-// times `factor`.
+// A metric gives each trial one value: the samples of `series` (the line `labels` pick) on
+// `entity` inside the trial's measure phase (or its `window`), reduced as `reduce` says, or the
+// `ratio` of two metrics in the same trial, times `factor`.
 message PackageMetric {
   string id = 1;
   // `counter`, `gauge` or `histogram`.
@@ -63,6 +63,12 @@ message PackageMetric {
   // The two metric ids divided, for a ratio.
   repeated string ratio = 7;
   optional double factor = 8;
+  // The measure window a series metric reads, when the campaign declares windows; else empty.
+  string window = 9;
+  // How a series metric reduces its samples to the trial's value: `last` (the last sample),
+  // `delta` (the last less the first), `rate` (that delta per second between them), `mean`,
+  // `min` or `max`. Empty for a ratio.
+  string reduce = 10;
 }
 
 // One side of a comparison: an aggregate of a metric's values over the trials it selects, a

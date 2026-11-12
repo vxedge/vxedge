@@ -91,10 +91,21 @@ pub const AGGREGATES: &[&str] = &[
     "mean", "median", "min", "max", "sum", "count", "iqr", "stddev", "p50", "p90", "p95", "p99",
 ];
 
+/// How a series metric reduces its samples inside the measure phase (or its `window`) to the
+/// trial's one value. `last` (the default) is the last sample. `delta` is the last sample less
+/// the first, so it spans the first to the last sample, not the phase's edges; `rate` is that
+/// delta over the seconds between those two samples, such as the share of one CPU a node used
+/// from its CPU-seconds counter. `mean`, `min` and `max` take the samples' mean, least or
+/// greatest, such as a node's mean resident memory. `delta` and `rate` need two samples;
+/// `rate` reads a counter or a histogram's cumulative series, and `mean`, `min` and `max` a
+/// gauge.
+pub const REDUCTIONS: &[&str] = &["last", "delta", "rate", "mean", "min", "max"];
+
 /// A metric: one value per trial, read from its records. A metric names a `series` (and the
-/// `labels` that pick one of its lines), whose value in a trial is its last sample on `entity`
-/// inside the trial's measure phase, or inside the measure `window` it names when the campaign
-/// declares `windows`; or it is the `ratio` of two such metrics in the same trial, times `factor`.
+/// `labels` that pick one of its lines), whose value in a trial is its samples on `entity` inside
+/// the trial's measure phase, or inside the measure `window` it names when the campaign declares
+/// `windows`, reduced as `reduce` says ([`REDUCTIONS`]; the last sample by default); or it is the
+/// `ratio` of two such metrics in the same trial, times `factor`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Metric {
@@ -112,6 +123,16 @@ pub struct Metric {
     pub factor: Option<f64>,
     #[serde(default)]
     pub window: Option<String>,
+    /// One of [`REDUCTIONS`]; `last` when not given.
+    #[serde(default)]
+    pub reduce: Option<String>,
+}
+
+impl Metric {
+    /// How the metric reduces its samples: `reduce`, or `last`.
+    pub fn reduction(&self) -> &str {
+        self.reduce.as_deref().unwrap_or("last")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -877,6 +898,41 @@ fn check_metrics(c: &mut Checker<'_>, intent: &Intent) {
                 "only a `ratio` takes a `factor`",
             );
         }
+        if let Some(r) = &m.reduce {
+            let field = format!("metrics[{i}].reduce");
+            if !REDUCTIONS.contains(&r.as_str()) {
+                c.push(
+                    ProblemKind::Criterion,
+                    field,
+                    format!(
+                        "`{r}` is not a reduction; there are {}",
+                        REDUCTIONS.join(", ")
+                    ),
+                );
+            } else if m.series.is_none() {
+                c.push(
+                    ProblemKind::Criterion,
+                    field,
+                    "a ratio divides its members' values and reduces nothing itself",
+                );
+            } else if r == "rate" && m.kind == MetricKind::Gauge {
+                c.push(
+                    ProblemKind::Criterion,
+                    field,
+                    "`rate` reads a counter, or a histogram's cumulative series: a gauge's \
+                     change over the window is `delta`",
+                );
+            } else if matches!(r.as_str(), "mean" | "min" | "max") && m.kind != MetricKind::Gauge {
+                c.push(
+                    ProblemKind::Criterion,
+                    field,
+                    format!(
+                        "`{r}` reads a gauge: a counter only grows, so what it counted in the \
+                         window is `delta`, and how fast is `rate`"
+                    ),
+                );
+            }
+        }
         let windows: Vec<&str> = intent
             .campaign
             .iter()
@@ -1635,6 +1691,59 @@ campaign:
 
     fn fields(problems: &[Problem]) -> Vec<(ProblemKind, String)> {
         problems.iter().map(|p| (p.kind, p.field.clone())).collect()
+    }
+
+    /// `reduce` takes one of the reductions, on a series metric, and the one that fits its
+    /// kind: `rate` a counter's, `mean`, `min` and `max` a gauge's.
+    #[test]
+    fn a_metric_reduces_its_samples_in_a_way_that_fits_its_kind() {
+        let from = "series: vxprobe_rtt_seconds, labels: { quantile: \"0.99\" } }";
+        let with = |reduce: &str, kind: &str| {
+            let d = edited(
+                from,
+                &format!("series: vxprobe_rtt_seconds, reduce: {reduce} }}"),
+            );
+            let text = serde_yaml_ng::to_string(&d)
+                .unwrap()
+                .replace("kind: gauge", kind);
+            read(&doc(&text)).1
+        };
+        for (reduce, kind) in [
+            ("last", "kind: gauge"),
+            ("mean", "kind: gauge"),
+            ("max", "kind: gauge"),
+            ("delta", "kind: gauge"),
+            ("delta", "kind: counter"),
+            ("rate", "kind: counter"),
+            ("rate", "kind: histogram"),
+        ] {
+            assert_eq!(with(reduce, kind), Vec::new(), "{reduce} on {kind}");
+        }
+        for (reduce, kind, says) in [
+            ("sum", "kind: gauge", "not a reduction"),
+            ("rate", "kind: gauge", "`rate` reads a counter"),
+            ("mean", "kind: counter", "`mean` reads a gauge"),
+            ("min", "kind: histogram", "`min` reads a gauge"),
+        ] {
+            let p = with(reduce, kind);
+            assert_eq!(
+                fields(&p),
+                [(ProblemKind::Criterion, "metrics[0].reduce".to_string())],
+                "{reduce} on {kind}"
+            );
+            assert!(p[0].detail.contains(says), "{}", p[0].detail);
+        }
+        let ratio = read(&edited(
+            "criteria:",
+            "  - { id: a, kind: counter, unit: \"1\", entity: e, series: x }\n  \
+             - { id: r, kind: gauge, unit: \"1\", entity: e, ratio: [a, a], reduce: mean }\n\
+             criteria:",
+        ))
+        .1;
+        assert_eq!(
+            fields(&ratio),
+            [(ProblemKind::Criterion, "metrics[2].reduce".to_string())]
+        );
     }
 
     #[test]
