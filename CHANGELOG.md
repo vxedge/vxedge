@@ -6,6 +6,31 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **An OTA store made per run, and an update in progress (X9.12).** A host-process `ota` service
+  can now set up exp-003's arms itself, with no store built on the host first:
+  - `config.publish: { <name>: { size_bytes } }` replaces `artifacts`. When the service starts,
+    vxedged makes a fresh root key and store in the runtime folder (the key outside the store),
+    and signs that many random bytes into it under each name. No key is ever in a package.
+  - `config.fetch: { target, clients, interval_s, metrics }` runs `clients` OTA clients
+    (`vxota-probe fetch`) beside the service, each downloading and verifying `target` back to
+    back, pinned to the store's root key, from the moment the service answers until it stops.
+    Their exporters (`metrics`, default `127.0.0.1:9902`, one port per client) are scrape targets
+    of the service's entity, and their output is its `fetch-<n>` log streams.
+  - A parameter that binds `services.<key>.config.fetch.clients` turns the burst on per arm.
+  - `vxedged --vxota-probe-bin` (`VXEDGE_VXOTA_PROBE_BIN`) names the client binary.
+  - `Plan`, and `CampaignService.Plan` for every point, refuse a store given twice or not at all,
+    a bad name, size or address, a `fetch.target` that `publish` does not make, more than 16
+    clients, and `publish` or `fetch` on a placed service (`ERROR_REASON_WORKSPACE_INVALID`).
+
+### Fixed
+
+- A campaign trial's archive lists the entities of the trial's own bound document. `entities.json`
+  was rebuilt from the package's defaults when the trial was collected, so whatever a parameter
+  bound, such as a measurement's `to` per arm or an arm's OTA clients, was missing or wrong there,
+  while the samples themselves were right.
+
 ## [0.22.0] - 2026-11-12
 
 Functional checks. An experiment can be a suite, not a measurement: tools run in the nodes'

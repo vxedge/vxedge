@@ -372,6 +372,15 @@ pub(crate) async fn preflight(
         }),
     );
 
+    let config = model
+        .services
+        .values()
+        .find_map(|def| vxedge_core::services::check_config(def).err());
+    pf.check(
+        "service configs",
+        config.map(|e| (R::WorkspaceInvalid, model.id.clone(), e.to_string())),
+    );
+
     let placed = model
         .services
         .values()

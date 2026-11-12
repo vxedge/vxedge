@@ -210,6 +210,12 @@ pub fn entities_with(model: &Experiment, host_targets: &[String]) -> Vec<EntityR
         if def.on.is_none() {
             let mut r = record(format!("{HOST}/services/{id}"), Kind::Service);
             r.role = Some(def.service_type.as_str().to_string());
+            // Its fetch clients' exporters: the deliveries an OTA burst made.
+            for t in crate::services::fetch_targets(def) {
+                if !r.scrape_targets.contains(&t) {
+                    r.scrape_targets.push(t);
+                }
+            }
             out.push(r);
         }
     }
@@ -331,6 +337,13 @@ pub fn add_logs(records: &mut [EntityRecord], model: &Experiment, runtime_dir: &
                 "stdout".into(),
                 file(format!("svc-{t}.log")),
             );
+            for n in 0..crate::services::fetch_targets(def).len() {
+                add(
+                    &format!("{HOST}/services/{id}"),
+                    format!("fetch-{n}"),
+                    crate::services::companion_log(runtime_dir, t, n),
+                );
+            }
         }
     }
     let node_of = |e: &crate::model::TrafficEndpoint| match e {
@@ -437,6 +450,25 @@ telemetry:
         let json = serde_json::to_value(ecu).unwrap();
         assert_eq!(json["kind"], "node");
         assert_eq!(json["payloads"][0]["ref"], "ghcr.io/vxedge/parts/vxprobe");
+    }
+
+    #[test]
+    fn an_ota_services_fetch_clients_bind_to_it() {
+        let mut m = model();
+        let def: crate::services::ServiceDef = serde_yaml_ng::from_str(
+            "id: ota-01\ntype: ota\nimage: { url: local/vxota, kind: container }\nconfig: \
+             { publish: { a: { size_bytes: 1 } }, fetch: { target: a, clients: 2 } }",
+        )
+        .unwrap();
+        m.services.insert("ota".into(), def);
+        let rt = std::path::Path::new("/run/vx");
+        let mut all = entities_of(&m);
+        add_logs(&mut all, &m, rt);
+        let ota = all.iter().find(|e| e.path == "host/services/ota").unwrap();
+        assert_eq!(ota.scrape_targets, ["127.0.0.1:9902", "127.0.0.1:9903"]);
+        let streams: Vec<&str> = ota.logs.iter().map(|l| l.stream.as_str()).collect();
+        assert_eq!(streams, ["stdout", "fetch-0", "fetch-1"]);
+        assert_eq!(ota.logs[2].path, rt.join("svc-ota-1.log"));
     }
 
     #[test]

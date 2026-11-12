@@ -2905,6 +2905,86 @@ async fn a_campaign_records_each_trial_and_keeps_going_past_a_failure() {
     assert_eq!(reason(&unknown), "ERROR_REASON_CAMPAIGN_UNKNOWN");
 }
 
+/// An OTA service that makes its own store and runs a fetch client per arm plans clean; a client
+/// count `fetch` refuses is a problem of that point, and a store given twice fails `Plan`.
+#[tokio::test]
+async fn an_ota_burst_per_arm_plans_and_a_bad_config_is_refused() {
+    use vxedge_api::v1::CampaignPlanRequest;
+    use vxedge_api::v1::campaign_service_client::CampaignServiceClient;
+    let daemon = Daemon::start();
+    let channel = daemon.channel().await;
+    // The vehicle without its placed OTA service: one service type has one owner.
+    let placed = "services:\n  ota:\n    id: ota-01\n    type: ota\n    image: { url: localhost/vxedge/ota:1, kind: container }\n    on: hpc1\n    config: { artifacts: artifacts, listen: \"0.0.0.0:8080\" }\n";
+    assert!(VEHICLE.contains(placed));
+    let dir = scratch();
+    let main =
+        vxedge_core::model::synthesize_vehicle_workspace(&VEHICLE.replace(placed, "")).unwrap();
+    let write = |config: &str, arms: &str| {
+        std::fs::write(
+            dir.join("main.yaml"),
+            format!(
+                "{main}\n{TELEMETRY_SERVICE}  ota:\n    id: ota-02\n    type: ota\n    \
+                 image: {{ url: local/vxota:host-process, kind: container }}\n    config: {config}\n\
+                 parameters:\n  ota_clients: {{ type: integer, unit: \"1\", default: 0, min: 0, max: 64, \
+                 binds: services.ota.config.fetch.clients }}\n\
+                 campaign:\n  arms: {arms}\n  duration_s: 10\n"
+            ),
+        )
+        .unwrap()
+    };
+    let config = "{ listen: 127.0.0.1:9900, publish: { burst: { size_bytes: 1024 } }, \
+                  fetch: { target: burst, clients: 0 } }";
+    write(
+        config,
+        "{ baseline: { ota_clients: 0 }, burst: { ota_clients: 1 } }",
+    );
+    let mut client = CampaignServiceClient::new(channel.clone());
+    let plan = |c: &mut CampaignServiceClient<Channel>| {
+        let req = CampaignPlanRequest {
+            manifest: path_ref(&dir),
+            ..Default::default()
+        };
+        let mut c = c.clone();
+        async move { c.plan(req).await.unwrap().into_inner() }
+    };
+    let ok = plan(&mut client).await;
+    assert!(ok.problems.is_empty(), "{:?}", ok.problems);
+    assert_eq!(ok.trials.len(), 2);
+
+    write(
+        config,
+        "{ baseline: { ota_clients: 0 }, burst: { ota_clients: 40 } }",
+    );
+    let many = plan(&mut client).await;
+    assert_eq!(many.problems.len(), 1, "{:?}", many.problems);
+    assert_eq!(
+        many.problems[0].reason,
+        vxedge_api::v1::ErrorReason::WorkspaceInvalid as i32
+    );
+    assert!(
+        many.problems[0].detail.contains("point `burst`")
+            && many.problems[0].detail.contains("at most 16"),
+        "{}",
+        many.problems[0].detail
+    );
+
+    write(
+        "{ artifacts: ./store, publish: { burst: { size_bytes: 1 } }, fetch: { target: burst, clients: 0 } }",
+        "{ baseline: { ota_clients: 0 } }",
+    );
+    let twice = plan_of(&channel, &dir).await;
+    assert!(!twice.valid);
+    let p = twice
+        .problems
+        .iter()
+        .find(|p| p.detail.contains("two stores"))
+        .unwrap_or_else(|| panic!("{:?}", twice.problems));
+    assert_eq!(
+        p.reason,
+        vxedge_api::v1::ErrorReason::WorkspaceInvalid as i32
+    );
+}
+
 /// `CampaignService.Plan` expands arms and sweep into trials, labelling a sweep point that equals
 /// an arm, applies a profile, and checks each point's bound document.
 #[tokio::test]
