@@ -14,12 +14,12 @@ use tonic::{Request, Response, Status, Streaming};
 use vxedge_api::v1::manifest_ref::Source;
 use vxedge_api::v1::package_service_server::PackageService;
 use vxedge_api::v1::{
-    CachedPackage, CampaignArm, CampaignProfile, CampaignSweep, CriterionComparison,
-    CriterionGroup, CriterionOperand, Job, ManifestRef, PackageCampaign, PackageCriterion,
-    PackageHypothesis, PackageImportChunk, PackageInfo, PackageInspectRequest, PackageList,
-    PackageListRequest, PackageMeasurement, PackageMetric, PackageParameter, PackagePullRequest,
-    PackageRequirements, ParamValue, PlanProblem, criterion_operand, package_criterion,
-    param_value,
+    CachedPackage, CampaignArm, CampaignProfile, CampaignSweep, CriterionCases,
+    CriterionComparison, CriterionGroup, CriterionOperand, Job, ManifestRef, PackageCampaign,
+    PackageCriterion, PackageHypothesis, PackageImportChunk, PackageInfo, PackageInspectRequest,
+    PackageList, PackageListRequest, PackageMeasurement, PackageMetric, PackageParameter,
+    PackagePullRequest, PackageRequirements, ParamValue, PlanProblem, criterion_operand,
+    package_criterion, param_value,
 };
 use vxedge_core::intent;
 
@@ -321,6 +321,14 @@ fn criterion(c: &intent::Criterion) -> PackageCriterion {
                 },
             )),
         },
+        intent::Criterion::Cases(k) => PackageCriterion {
+            id: k.id.clone(),
+            text: format!("cases({})", k.cases.join(", ")),
+            criterion: Some(package_criterion::Criterion::Cases(CriterionCases {
+                cases: k.cases.clone(),
+            })),
+            guards: Vec::new(),
+        },
         intent::Criterion::Group(g) => {
             let (rule, members) = match (&g.all, &g.any) {
                 (Some(all), _) => ("all", all.as_slice()),
@@ -394,6 +402,7 @@ fn intent_reason(kind: intent::ProblemKind) -> R {
         intent::ProblemKind::Criterion => R::CriterionInvalid,
         intent::ProblemKind::Measurement => R::MeasurementInvalid,
         intent::ProblemKind::Scenario => R::ScenarioInvalid,
+        intent::ProblemKind::Check => R::CheckInvalid,
     }
 }
 
@@ -525,7 +534,7 @@ pub(crate) fn inspect(
                 vxedge_core::measurements::problems(&model)
                     .into_iter()
                     .map(|p| PlanProblem {
-                        reason: R::MeasurementInvalid as i32,
+                        reason: intent_reason(p.kind) as i32,
                         subject: subject.clone(),
                         detail: p.to_string(),
                     }),

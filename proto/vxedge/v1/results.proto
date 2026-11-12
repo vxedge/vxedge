@@ -117,6 +117,20 @@ message CriterionVerdict {
   repeated CriterionVerdict guards = 9;
   // Why it is inconclusive, for people.
   string why = 10;
+  // For a `cases` criterion: what each case found in each trial.
+  repeated VerdictCase cases = 11;
+}
+
+// What one functional check case found in one trial.
+message VerdictCase {
+  string case_id = 1;
+  string trial_id = 2;
+  // Unset for an `observe` case, which records and is never judged.
+  VerdictOutcome outcome = 3;
+  // What it read, as JSON: a field's value, a count, or a list of values.
+  string value_json = 4;
+  // Why it did not pass, for people.
+  string why = 5;
 }
 
 // One metric's value in one trial.
@@ -134,6 +148,8 @@ message VerdictTrial {
   // `sha256:<hex>` of the trial's archive.
   string archive_digest = 5;
   map<string, TrialMetricValue> values = 6;
+  // What each functional check case found in this trial, by case id.
+  map<string, VerdictCase> cases = 7;
 }
 
 // An experiment's criteria judged over a campaign's archives.
@@ -146,6 +162,8 @@ message ResultVerdict {
   repeated CriterionVerdict criteria = 5;
   // The archived trials judged. A trial that failed or was not archived is not among them.
   repeated VerdictTrial trials = 6;
+  // What each `observe` check case recorded, trial by trial. Never judged.
+  repeated VerdictCase observations = 7;
 }
 
 message ResultCompareRequest {

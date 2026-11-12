@@ -163,6 +163,11 @@ enum ErrorReason {
   // The package's `requires.simulator` names a simulator this host does not have: none of its
   // executables is on vxedged's `PATH`. `HostService.Capabilities` lists the ones it has.
   ERROR_REASON_SIMULATOR_UNAVAILABLE = 35;
+  // An experiment's `checks` cannot run: a tool image neither pinned by digest nor `localhost/`,
+  // a step that does not do exactly one thing, runs on a node that is not a container node, or
+  // names a background step that is not running, a mounted file the package does not hold, or a
+  // case that reads a step recording nothing. Refused before anything runs.
+  ERROR_REASON_CHECK_INVALID = 36;
 }
 
 // Names one run. See `RunService`.

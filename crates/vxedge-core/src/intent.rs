@@ -24,6 +24,9 @@ pub enum ProblemKind {
     Criterion,
     Measurement,
     Scenario,
+    /// A `checks` block that cannot run: a tool not pinned, a step out of order or on a node that
+    /// is not a container node, a case reading a step that records nothing.
+    Check,
 }
 
 /// One problem with an experiment's typed intent: the field it is in, as a path from the
@@ -234,13 +237,24 @@ pub struct Group {
     pub guards: Vec<Criterion>,
 }
 
-/// A criterion: a comparison of two operands, or an `all`/`any` group of criteria.
+/// The `checks` cases a criterion holds to (`crate::checks`): it passes when every one passes in
+/// every trial.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Cases {
+    pub id: String,
+    pub cases: Vec<String>,
+}
+
+/// A criterion: a comparison of two operands, an `all`/`any` group of criteria, or a set of
+/// functional check cases.
 // A document holds a handful of criteria; boxing would only cost readability.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(untagged)]
 pub enum Criterion {
     Comparison(Comparison),
+    Cases(Cases),
     Group(Group),
 }
 
@@ -314,6 +328,8 @@ pub struct Intent {
     pub metrics: Vec<Metric>,
     pub criteria: Vec<Criterion>,
     pub campaign: Option<Campaign>,
+    /// The functional checks a trial runs, and the cases that judge them (`crate::checks`).
+    pub checks: Option<crate::checks::Checks>,
 }
 
 struct Checker<'a> {
@@ -376,7 +392,12 @@ pub fn read(doc: &Value) -> (Intent, Vec<Problem>) {
             .section("criteria", ProblemKind::Criterion)
             .unwrap_or_default(),
         campaign: c.section("campaign", ProblemKind::Parameter),
+        checks: c.section("checks", ProblemKind::Check),
     };
+    if let Some(k) = &intent.checks {
+        c.problems.extend(crate::checks::problems(&c.experiment, k));
+        check_checks_campaign(&mut c, &intent);
+    }
     check_parameters(&mut c, &intent);
     check_campaign(&mut c, &intent);
     campaign_and_method(&mut c);
@@ -424,6 +445,40 @@ fn campaign_and_method(c: &mut Checker<'_>) {
             ProblemKind::Parameter,
             "campaign",
             "an experiment declares `campaign` or `method`, not both: `campaign` replaces `method`",
+        );
+    }
+}
+
+/// A trial runs its checks in the measure phase, within the measure duration: one phase, so no
+/// windows, and a duration to bound them.
+fn check_checks_campaign(c: &mut Checker<'_>, intent: &Intent) {
+    let windows = intent
+        .campaign
+        .as_ref()
+        .is_some_and(|k| !k.windows.is_empty());
+    if windows {
+        c.push(
+            ProblemKind::Check,
+            "checks",
+            "a trial runs its checks in one measure phase, so a campaign with `checks` has no \
+             `windows`",
+        );
+    }
+    let duration = intent
+        .campaign
+        .as_ref()
+        .and_then(|k| k.duration_s)
+        .is_some()
+        || c.doc
+            .get("method")
+            .and_then(|m| m.get("duration_s"))
+            .is_some();
+    if !windows && !duration {
+        c.push(
+            ProblemKind::Check,
+            "checks",
+            "the checks run within the measure duration: give `campaign.duration_s` (or \
+             `method.duration_s`), the longest they may take",
         );
     }
 }
@@ -1020,8 +1075,36 @@ fn check_criterion(
     let guards = match criterion {
         Criterion::Group(g) => &g.guards,
         Criterion::Comparison(k) => &k.guards,
+        Criterion::Cases(_) => &Vec::new(),
     };
     match criterion {
+        Criterion::Cases(k) => {
+            unique(c, &k.id);
+            if k.cases.is_empty() {
+                c.push(
+                    ProblemKind::Criterion,
+                    format!("{field}.cases"),
+                    "names no case",
+                );
+            }
+            for name in &k.cases {
+                let detail = match intent.checks.as_ref().map(|ch| ch.case(name)) {
+                    None => Some(format!(
+                        "names case `{name}`, and the experiment declares no `checks`"
+                    )),
+                    Some(None) => {
+                        Some(format!("no case `{name}` is declared under `checks.cases`"))
+                    }
+                    Some(Some(case)) if case.observe => Some(format!(
+                        "case `{name}` is an `observe` case: it records, and is never judged"
+                    )),
+                    Some(Some(_)) => None,
+                };
+                if let Some(detail) = detail {
+                    c.push(ProblemKind::Criterion, format!("{field}.cases"), detail);
+                }
+            }
+        }
         Criterion::Group(g) => {
             if let Some(id) = &g.id {
                 unique(c, id);
@@ -1104,7 +1187,7 @@ fn check_criterion(
 }
 
 /// What a criterion found.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Outcome {
     Pass,
@@ -1146,6 +1229,20 @@ pub trait SampleSource {
     ) -> Result<Option<Samples>, String> {
         Err(format!("reference `{reference}` was not given"))
     }
+
+    /// What `case` found in each trial, in trial order, or `None` when no trial is selected.
+    fn case_results(&self, _case: &str) -> Option<Vec<CaseRead>> {
+        None
+    }
+}
+
+/// What one functional check case found in one trial.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CaseRead {
+    pub case: String,
+    pub trial: String,
+    #[serde(flatten)]
+    pub result: crate::checks::CaseResult,
 }
 
 /// `aggregate` of `values`, which are not empty. Percentiles are nearest-rank; `median` and
@@ -1233,6 +1330,9 @@ pub struct Judgement {
     pub members: Vec<Judgement>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub guards: Vec<Judgement>,
+    /// For a `cases` criterion: each case in each trial.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cases: Vec<CaseRead>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub why: Option<String>,
 }
@@ -1328,6 +1428,7 @@ pub fn judge(criterion: &Criterion, src: &dyn SampleSource) -> Judgement {
     let (guards, mut j) = match criterion {
         Criterion::Comparison(k) => (&k.guards, judge_comparison(k, src)),
         Criterion::Group(g) => (&g.guards, judge_group(g, src)),
+        Criterion::Cases(k) => (&Vec::new(), judge_cases(k, src)),
     };
     j.guards = guards.iter().map(|g| judge(g, src)).collect();
     if let Some(g) = j.guards.iter().find(|g| g.outcome != Outcome::Pass) {
@@ -1361,6 +1462,7 @@ fn judge_comparison(k: &Comparison, src: &dyn SampleSource) -> Judgement {
         reads,
         members: Vec::new(),
         guards: Vec::new(),
+        cases: Vec::new(),
         why: None,
     };
     match (l, r, t) {
@@ -1378,6 +1480,67 @@ fn judge_comparison(k: &Comparison, src: &dyn SampleSource) -> Judgement {
         (Err(why), _, _) | (_, Err(why), _) | (_, _, Err(why)) => j.why = Some(why),
     }
     j
+}
+
+/// A `cases` criterion fails when a case fails in any trial, and is `inconclusive` when none
+/// fails but one could not be judged, or no trial ran.
+fn judge_cases(k: &Cases, src: &dyn SampleSource) -> Judgement {
+    let mut cases = Vec::new();
+    let mut why = None;
+    for name in &k.cases {
+        match src.case_results(name) {
+            Some(reads) if !reads.is_empty() => cases.extend(reads),
+            _ => {
+                why.get_or_insert_with(|| format!("no trial records case `{name}`"));
+            }
+        }
+    }
+    let has = |o| cases.iter().any(|r| r.result.outcome == Some(o));
+    let outcome = if has(Outcome::Fail) {
+        Outcome::Fail
+    } else if why.is_some() || has(Outcome::Inconclusive) || cases.is_empty() {
+        Outcome::Inconclusive
+    } else {
+        Outcome::Pass
+    };
+    if outcome == Outcome::Fail {
+        why = cases
+            .iter()
+            .find(|r| r.result.outcome == Some(Outcome::Fail))
+            .map(|r| {
+                format!(
+                    "case `{}` in trial `{}`: {}",
+                    r.case,
+                    r.trial,
+                    r.result.why.as_deref().unwrap_or("failed")
+                )
+            });
+    } else if outcome == Outcome::Inconclusive && why.is_none() {
+        why = cases
+            .iter()
+            .find(|r| r.result.outcome == Some(Outcome::Inconclusive))
+            .map(|r| {
+                format!(
+                    "case `{}` in trial `{}`: {}",
+                    r.case,
+                    r.trial,
+                    r.result.why.as_deref().unwrap_or("inconclusive")
+                )
+            });
+    }
+    Judgement {
+        id: Some(k.id.clone()),
+        outcome,
+        rule: "cases".into(),
+        lhs: None,
+        rhs: None,
+        tolerance: None,
+        reads: Vec::new(),
+        members: Vec::new(),
+        guards: Vec::new(),
+        cases,
+        why,
+    }
 }
 
 fn judge_group(g: &Group, src: &dyn SampleSource) -> Judgement {
@@ -1410,6 +1573,7 @@ fn judge_group(g: &Group, src: &dyn SampleSource) -> Judgement {
             .then(|| "an inconclusive member decides it".to_string()),
         members,
         guards: Vec::new(),
+        cases: Vec::new(),
     }
 }
 

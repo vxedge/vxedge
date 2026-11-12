@@ -78,6 +78,9 @@ pub(crate) fn plan_of(
         .map_err(|e| errors::invalid(R::WorkspaceInvalid, e.to_string()))?;
     let (intent, mut intent_problems) = vxedge_core::intent::read(&doc);
     intent_problems.extend(ws.scenario_problems());
+    if let Some(k) = &intent.checks {
+        intent_problems.extend(vxedge_core::checks::file_problems(&subject, k, root));
+    }
     let mut problems: Vec<PlanProblem> = intent_problems
         .iter()
         .map(|p| {
@@ -86,6 +89,7 @@ pub(crate) fn plan_of(
                 vxedge_core::intent::ProblemKind::Criterion => R::CriterionInvalid,
                 vxedge_core::intent::ProblemKind::Measurement => R::MeasurementInvalid,
                 vxedge_core::intent::ProblemKind::Scenario => R::ScenarioInvalid,
+                vxedge_core::intent::ProblemKind::Check => R::CheckInvalid,
             };
             problem(reason, &subject, p.to_string())
         })
@@ -158,7 +162,13 @@ pub(crate) fn plan_of(
                     )),
                     Ok(m) => {
                         problems.extend(vxedge_core::measurements::problems(&m).into_iter().map(
-                            |p| problem(R::MeasurementInvalid, &subject, format!("{what}: {p}")),
+                            |p| {
+                                let reason = match p.kind {
+                                    vxedge_core::intent::ProblemKind::Check => R::CheckInvalid,
+                                    _ => R::MeasurementInvalid,
+                                };
+                                problem(reason, &subject, format!("{what}: {p}"))
+                            },
                         ))
                     }
                 }
@@ -295,6 +305,8 @@ impl CampaignService for CampaignSvc {
                     telemetry_key,
                     has_traffic: !model.traffic.is_empty(),
                     has_measurements: !model.measurements.is_empty(),
+                    checks: model.checks.clone(),
+                    checks_out: runtime_dir.join(vxedge_core::checks::DIR),
                     unlocked: false,
                 },
                 model.id,

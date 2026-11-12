@@ -11,6 +11,7 @@
 //! host/services/<service>      a service run as a host process
 //! host                         the testbed host, including the observer's own cost
 //! measurements/<measurement>   a declared measurement
+//! checks/<step>                a functional check step's output
 //! ```
 //!
 //! Paths come from ids, never from addresses. A scrape target is bound to the node whose link
@@ -32,6 +33,7 @@ pub enum Kind {
     Service,
     Host,
     Measurement,
+    Check,
 }
 
 impl Kind {
@@ -44,6 +46,7 @@ impl Kind {
             Self::Service => "service",
             Self::Host => "host",
             Self::Measurement => "measurement",
+            Self::Check => "check",
         }
     }
 }
@@ -192,6 +195,17 @@ pub fn entities_with(model: &Experiment, host_targets: &[String]) -> Vec<EntityR
     }
     out.push(host);
     out.extend(measurements);
+    if let Some(k) = &model.checks {
+        out.extend(k.recorded().map(|id| {
+            let mut r = record(crate::checks::entity(id), Kind::Check);
+            r.role = k
+                .steps
+                .iter()
+                .find(|s| s.id.as_deref() == Some(id))
+                .map(|s| s.action().to_string());
+            r
+        }));
+    }
     for (id, def) in &model.services {
         if def.on.is_none() {
             let mut r = record(format!("{HOST}/services/{id}"), Kind::Service);
@@ -271,6 +285,16 @@ pub fn add_logs(records: &mut [EntityRecord], model: &Experiment, runtime_dir: &
             r.logs.push(LogSource { stream, path: at });
         }
     };
+    if let Some(k) = &model.checks {
+        let dir = runtime_dir.join(crate::checks::DIR);
+        for id in k.recorded() {
+            add(
+                &crate::checks::entity(id),
+                crate::checks::STREAM.to_string(),
+                crate::checks::run::output_file(&dir, id),
+            );
+        }
+    }
     for vehicle in &model.entities {
         for device in vehicle.devices.values() {
             let Some(path) = node_path(model, &device.id) else {

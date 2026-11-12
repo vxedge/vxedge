@@ -50,6 +50,8 @@ pub struct Steps {
     pub measure: Arc<MeasurementSvc>,
     pub telemetry: Arc<TelemetrySvc>,
     pub svcs: Arc<SvcSvc>,
+    /// The Podman API a trial's functional checks run their tools through.
+    pub containers: vxedge_core::containers::LazyClient,
 }
 
 /// One trial in `campaign.json`.
@@ -219,6 +221,9 @@ pub struct Campaign {
     pub telemetry_key: String,
     pub has_traffic: bool,
     pub has_measurements: bool,
+    /// The functional checks each trial runs in its measure phase, and where their output goes.
+    pub checks: Option<vxedge_core::checks::Checks>,
+    pub checks_out: PathBuf,
     pub unlocked: bool,
 }
 
@@ -315,7 +320,11 @@ async fn measure(
         .into_inner();
         await_job(&steps.engine, job, p, 30, &format!("{label} measure")).await?;
     }
-    sleep_s(duration_s).await;
+    match &c.checks {
+        // The checks are the measure phase: it lasts as long as they take, within its duration.
+        Some(k) => run_checks(steps, c, k, duration_s).await?,
+        None => sleep_s(duration_s).await,
+    }
     if c.has_measurements {
         for _ in 0..20 {
             let st = MeasurementService::status(
@@ -340,6 +349,59 @@ async fn measure(
         }
     }
     Ok(())
+}
+
+/// Run the trial's functional checks within `budget_s`, then wait for the ingest to have read
+/// every line they wrote, so the archive holds all of it.
+async fn run_checks(
+    steps: &Steps,
+    c: &Campaign,
+    checks: &vxedge_core::checks::Checks,
+    budget_s: f64,
+) -> Result<(), JobFailure> {
+    let client = steps
+        .containers
+        .get()
+        .await
+        .map_err(|e| JobFailure::from(format!("checks: {e}")))?;
+    let ctx = vxedge_core::checks::run::Context {
+        client,
+        root: &c.root,
+        out: &c.checks_out,
+        budget: Duration::from_secs_f64(budget_s.max(0.0)),
+    };
+    vxedge_core::checks::run::run(checks, &ctx)
+        .await
+        .map_err(|e| JobFailure::from(format!("checks: {e}")))?;
+    wait_ingested(&c.ingest_dir, &c.checks_out, checks).await;
+    Ok(())
+}
+
+/// Wait, 20 s at most, until the ingest has read each check step's output to its end. The ingest
+/// reads log files once a round and stops without a last one, so a line written just before the
+/// measure phase ends would otherwise be missing from the archive.
+async fn wait_ingested(ingest_dir: &Path, out: &Path, checks: &vxedge_core::checks::Checks) {
+    let files: Vec<PathBuf> = checks
+        .recorded()
+        .map(|id| vxedge_core::checks::run::output_file(out, id))
+        .filter(|f| f.exists())
+        .collect();
+    for _ in 0..80 {
+        let offsets: std::collections::BTreeMap<String, u64> =
+            std::fs::read(ingest_dir.join("logs.offsets.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or_default();
+        let done = files.iter().all(|f| {
+            let len = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
+            let key = f.to_string_lossy();
+            offsets.get(key.as_ref()).is_some_and(|o| *o >= len)
+        });
+        if done {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 async fn stop_measurements(
@@ -389,6 +451,11 @@ pub async fn run_trial(
         ..Default::default()
     });
     prepare_ingest(&c.ingest_dir, campaign_id, t).map_err(JobFailure::from)?;
+    // A step's output from the trial before is gone before this trial's ingest starts, or the
+    // ingest would read it as this trial's.
+    if c.checks.is_some() {
+        let _ = std::fs::remove_dir_all(&c.checks_out);
+    }
     let mark = |phase: &str| phase_marker(&c.ingest_dir, &t.id, phase, None);
 
     set_phase("provision");
@@ -521,6 +588,13 @@ pub async fn run_trial(
         Ok::<_, JobFailure>((archive.display().to_string(), sha))
     }
     .await;
+    // A trial cut short leaves its check containers; none may outlive it, or hold a node's
+    // namespace while `down` removes the node.
+    if c.checks.is_some()
+        && let Ok(client) = steps.containers.get().await
+    {
+        vxedge_core::checks::run::remove_leftovers(client).await;
+    }
     // Down after every trial that got this far, whatever happened.
     let down = ExperimentService::down(
         &*steps.experiments,

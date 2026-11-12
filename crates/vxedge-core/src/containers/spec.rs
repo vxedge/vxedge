@@ -140,6 +140,10 @@ pub struct ContainerSpec {
     pub image: String,
     /// Command + args. Empty means the image's own default command.
     pub cmd: Vec<String>,
+    /// Replaces the image's entrypoint when not empty: a check step running another program the
+    /// image holds. Left out of the spec hash when empty, so no existing container's hash moves.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub entrypoint: Vec<String>,
     /// Ordered, so the spec hash is deterministic for a given manifest.
     pub env: BTreeMap<String, String>,
     pub binds: Vec<Bind>,

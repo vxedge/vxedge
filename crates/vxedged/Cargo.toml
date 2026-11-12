@@ -30,3 +30,4 @@ zip = { workspace = true }
 tonic-types = { workspace = true }
 tower = { workspace = true }
 hyper-util = { workspace = true }
+zstd = { workspace = true }

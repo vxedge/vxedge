@@ -49,6 +49,8 @@ pub struct Records {
     pub gaps: Vec<Gap>,
     /// The trial's phases, in order.
     pub phases: Vec<Phase>,
+    /// Each check step's output, by step id, line by line as recorded (`crate::checks`).
+    pub checks: BTreeMap<String, Vec<serde_json::Value>>,
 }
 
 /// A trial entering a phase; a `measure` phase of a campaign with windows names its window.
@@ -62,6 +64,8 @@ pub struct Phase {
 const V1_SAMPLES: &str = "ingest/samples.jsonl";
 const V2_SAMPLES: &str = "metrics/samples.jsonl.zst";
 const V2_PHASES: &str = "phases.jsonl";
+/// Where a check step's output is archived: the log member of its entity `checks/<step>`.
+const CHECK_LOGS: &str = "logs/checks/";
 
 fn member(zip: &mut zip::ZipArchive<std::fs::File>, name: &str) -> Result<Option<Vec<u8>>, String> {
     let mut file = match zip.by_name(name) {
@@ -220,6 +224,30 @@ pub fn read_archive(path: &Path) -> Result<Records, String> {
         }
         records.phases.sort_by_key(|p| p.ts_ns);
     }
+    let check_members: Vec<String> = zip
+        .file_names()
+        .filter_map(|n| n.ok().map(|n| n.into_owned()))
+        .filter(|n| n.starts_with(CHECK_LOGS) && n.ends_with(".jsonl.zst"))
+        .collect();
+    for name in check_members {
+        let Some(compressed) = member(&mut zip, &name)? else {
+            continue;
+        };
+        let bytes = zstd::decode_all(compressed.as_slice())
+            .map_err(|e| format!("cannot decompress `{name}`: {e}"))?;
+        for v in lines(&bytes) {
+            let (Some(entity), Some(text)) = (v["entity"].as_str(), v["line"].as_str()) else {
+                continue;
+            };
+            if let Some(step) = entity.strip_prefix("checks/") {
+                records
+                    .checks
+                    .entry(step.to_string())
+                    .or_default()
+                    .push(crate::checks::line(text));
+            }
+        }
+    }
     Ok(records)
 }
 
@@ -377,6 +405,9 @@ pub struct Trial {
     /// The archive's digest, or its path when the digest is not known.
     pub archive: String,
     pub values: BTreeMap<String, TrialValue>,
+    /// What each functional check case found in this trial, by case id.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub cases: BTreeMap<String, crate::checks::CaseResult>,
 }
 
 /// Who a trial is, as its archive's `metadata.trial` says, or as a caller says for an archive
@@ -484,12 +515,23 @@ pub fn identity_from_name(pattern: &str, stem: &str) -> Option<Identity> {
     Some(who)
 }
 
-/// The trial in the archive at `path`: `identity` when given, else its `metadata.trial`.
+/// What each of `intent`'s check cases found in the trial `records` hold.
+pub fn cases(records: &Records, intent: &Intent) -> BTreeMap<String, crate::checks::CaseResult> {
+    intent
+        .checks
+        .iter()
+        .flat_map(|k| &k.cases)
+        .map(|c| (c.id.clone(), crate::checks::judge(c, &records.checks)))
+        .collect()
+}
+
+/// The trial in the archive at `path`, read with `intent`'s metrics and check cases: `identity`
+/// when given, else its `metadata.trial`.
 pub fn trial(
     path: &Path,
     archive: String,
     identity: Option<Identity>,
-    metrics: &[Metric],
+    intent: &Intent,
 ) -> Result<Trial, String> {
     let records = read_archive(path)?;
     let who = identity
@@ -506,7 +548,8 @@ pub fn trial(
         repetition: who.repetition,
         parameters: who.parameters,
         archive,
-        values: values(&records, metrics),
+        values: values(&records, &intent.metrics),
+        cases: cases(&records, intent),
     })
 }
 
@@ -522,13 +565,13 @@ fn same(a: &Value, b: &Value) -> bool {
 pub type References = BTreeMap<String, Result<Vec<Trial>, String>>;
 
 /// The archived trials of the campaign `id` that `root`'s `results/<id>/campaign.json` records,
-/// read with `metrics`, as `ResultService` reads a reference outside the host. Each archive is
+/// read with `intent`, as `ResultService` reads a reference outside the host. Each archive is
 /// read from the record's folder (a relative path below it, or an absolute one by its file name)
 /// and must hash to the record's `sha256`.
 pub fn recorded_trials(
     root: &std::path::Path,
     id: &str,
-    metrics: &[Metric],
+    intent: &Intent,
 ) -> Result<Vec<Trial>, String> {
     use std::path::{Component, Path};
     let one_name = matches!(
@@ -599,7 +642,7 @@ pub fn recorded_trials(
             repetition: t["repetition"].as_u64().unwrap_or(0) as u32,
             parameters,
         };
-        out.push(trial(&path, got, Some(who), metrics)?);
+        out.push(trial(&path, got, Some(who), intent)?);
     }
     Ok(out)
 }
@@ -609,12 +652,7 @@ pub fn recorded_references(root: &std::path::Path, intent: &Intent) -> Reference
     intent
         .references
         .iter()
-        .map(|(name, r)| {
-            (
-                name.clone(),
-                recorded_trials(root, &r.campaign, &intent.metrics),
-            )
-        })
+        .map(|(name, r)| (name.clone(), recorded_trials(root, &r.campaign, intent)))
         .collect()
 }
 
@@ -677,6 +715,21 @@ impl SampleSource for Trials<'_> {
             Some(Ok(trials)) => Ok(select_samples(trials, metric, select)),
         }
     }
+
+    fn case_results(&self, case: &str) -> Option<Vec<intent::CaseRead>> {
+        let reads: Vec<intent::CaseRead> = self
+            .0
+            .iter()
+            .filter_map(|t| {
+                Some(intent::CaseRead {
+                    case: case.to_string(),
+                    trial: t.id.clone(),
+                    result: t.cases.get(case)?.clone(),
+                })
+            })
+            .collect();
+        (!reads.is_empty()).then_some(reads)
+    }
 }
 
 /// An experiment's verdict: every criterion judged, and the trials they were judged over.
@@ -688,6 +741,9 @@ pub struct Verdict {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hypothesis: Option<String>,
     pub criteria: Vec<Judgement>,
+    /// What each `observe` check case recorded, trial by trial: never judged.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub observations: Vec<intent::CaseRead>,
     pub trials: Vec<Trial>,
 }
 
@@ -713,10 +769,18 @@ pub fn verdict_with(intent: &Intent, trials: Vec<Trial>, references: &References
     } else {
         Outcome::Pass
     };
+    let observations = intent
+        .checks
+        .iter()
+        .flat_map(|k| &k.cases)
+        .filter(|c| c.observe)
+        .flat_map(|c| src.case_results(&c.id).unwrap_or_default())
+        .collect();
     Verdict {
         outcome,
         hypothesis: intent.hypothesis.as_ref().map(|h| h.id.clone()),
         criteria,
+        observations,
         trials,
     }
 }
@@ -862,6 +926,149 @@ mod tests {
         serde_yaml_ng::from_str(yaml).unwrap()
     }
 
+    /// A check step's output is read from its entity's log member, line by line in the order the
+    /// ingest recorded it; a `cases` criterion holds when every case passes in every trial, an
+    /// `observe` case is reported and never judged, and a step missing from a trial makes the
+    /// criterion inconclusive.
+    #[test]
+    fn check_cases_are_judged_from_the_archived_step_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let doc: Value = serde_yaml_ng::from_str(
+            r#"
+id: e
+campaign: { repetitions: 2, duration_s: 60 }
+checks:
+  tools: { kv2: { image: "localhost/kv2:1" } }
+  steps:
+    - { id: info, tool: kv2, on: cabin1, args: [info] }
+    - { id: act, tool: kv2, on: hpc1, args: [actuate, X, "true"] }
+  cases:
+    - { id: version, step: info, where: { op: info, result: ok }, field: version, equals: "0.7.1" }
+    - { id: code, step: act, where: { op: actuate }, field: code, observe: true }
+criteria:
+  - { id: v2, cases: [version] }
+"#,
+        )
+        .unwrap();
+        let (intent, problems) = intent::read(&doc);
+        assert_eq!(problems, vec![]);
+        let log = |step: &str, lines: &[&str]| {
+            let records: String = lines
+                .iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    serde_json::json!({
+                        "record": "log", "ts_ns": i, "entity": format!("checks/{step}"),
+                        "stream": "output", "line": l,
+                    })
+                    .to_string()
+                        + "\n"
+                })
+                .collect();
+            zstd::encode_all(records.as_bytes(), 3).unwrap()
+        };
+        let archive = |name: &str, version: &str, with_act: bool| {
+            let path = dir.path().join(name);
+            let info = format!(r#"{{"op":"info","result":"ok","version":"{version}"}}"#);
+            let mut members = vec![
+                ("metadata.json", br#"{"archive":"vxarchive/2"}"#.to_vec()),
+                (
+                    "logs/checks/info.jsonl.zst",
+                    log("info", &[&info, r#"{"op":"vx.step","exit":0}"#]),
+                ),
+            ];
+            if with_act {
+                members.push((
+                    "logs/checks/act.jsonl.zst",
+                    log(
+                        "act",
+                        &[r#"{"op":"actuate","result":"error","code":"UNAVAILABLE"}"#],
+                    ),
+                ));
+            }
+            zip_with(&path, &members);
+            path
+        };
+        let who = |n: u32| Identity {
+            id: format!("r{n}-defaults"),
+            repetition: n,
+            ..Identity::default()
+        };
+        let one = trial(
+            &archive("1.zip", "0.7.1", true),
+            "a".into(),
+            Some(who(1)),
+            &intent,
+        )
+        .unwrap();
+        let two = trial(
+            &archive("2.zip", "0.7.1", false),
+            "b".into(),
+            Some(who(2)),
+            &intent,
+        )
+        .unwrap();
+        assert_eq!(one.cases["version"].outcome, Some(Outcome::Pass));
+        assert_eq!(
+            two.cases["code"].outcome, None,
+            "an observe case is never judged"
+        );
+        assert_eq!(
+            two.cases["code"].why.as_deref(),
+            Some("step `act` did not run in this trial")
+        );
+        let v = verdict(&intent, vec![one.clone(), two]);
+        assert_eq!(v.outcome, Outcome::Pass);
+        assert_eq!(v.criteria[0].rule, "cases");
+        assert_eq!(v.criteria[0].cases.len(), 2);
+        assert_eq!(v.observations.len(), 2);
+        assert_eq!(v.observations[0].result.outcome, None);
+        assert_eq!(
+            v.observations[0].result.value,
+            Some(serde_json::json!("UNAVAILABLE"))
+        );
+
+        let bad = trial(
+            &archive("3.zip", "0.6.0", true),
+            "c".into(),
+            Some(who(3)),
+            &intent,
+        )
+        .unwrap();
+        let v = verdict(&intent, vec![one.clone(), bad]);
+        assert_eq!(v.outcome, Outcome::Fail);
+        assert_eq!(
+            v.criteria[0].why.as_deref(),
+            Some("case `version` in trial `r3-defaults`: `version` is `0.6.0`, not `0.7.1`")
+        );
+
+        let missing = trial(
+            &{
+                let path = dir.path().join("4.zip");
+                zip_with(
+                    &path,
+                    &[("metadata.json", br#"{"archive":"vxarchive/2"}"#.to_vec())],
+                );
+                path
+            },
+            "d".into(),
+            Some(who(4)),
+            &intent,
+        )
+        .unwrap();
+        let v = verdict(&intent, vec![one, missing]);
+        assert_eq!(v.outcome, Outcome::Inconclusive);
+        assert!(
+            v.criteria[0]
+                .why
+                .as_deref()
+                .unwrap()
+                .contains("did not run"),
+            "{:?}",
+            v.criteria[0].why
+        );
+    }
+
     #[test]
     fn v1_labels_parse_as_the_exporter_writes_them() {
         assert_eq!(
@@ -989,7 +1196,16 @@ mod tests {
         .iter()
         .map(|y| metric(y))
         .collect();
-        let t = trial(&path, "sha256:x".into(), None, &metrics).unwrap();
+        let t = trial(
+            &path,
+            "sha256:x".into(),
+            None,
+            &Intent {
+                metrics: metrics.clone(),
+                ..Intent::default()
+            },
+        )
+        .unwrap();
         assert_eq!(
             (t.id.as_str(), t.arm.as_deref()),
             ("r1-saturated", Some("saturated"))
@@ -1003,7 +1219,16 @@ mod tests {
             "{\"record\":\"gap\",\"entity\":\"measurements/ctl\",\"from_ns\":12,\"to_ns\":13,\"reason\":\"x\"}\n",
         );
         write(&path, &lines);
-        let t = trial(&path, "sha256:x".into(), None, &metrics).unwrap();
+        let t = trial(
+            &path,
+            "sha256:x".into(),
+            None,
+            &Intent {
+                metrics: metrics.clone(),
+                ..Intent::default()
+            },
+        )
+        .unwrap();
         assert!(!t.values["lost"].complete);
         assert!(!t.values["loss_pct"].complete);
     }
@@ -1062,7 +1287,16 @@ mod tests {
         .iter()
         .map(|y| metric(y))
         .collect();
-        let t = trial(&path, "sha256:x".into(), None, &metrics).unwrap();
+        let t = trial(
+            &path,
+            "sha256:x".into(),
+            None,
+            &Intent {
+                metrics: metrics.clone(),
+                ..Intent::default()
+            },
+        )
+        .unwrap();
         assert_eq!(t.values["cold_max"].value, Some(0.010));
         assert_eq!(t.values["steady_max"].value, Some(0.002));
         assert_eq!(t.values["steady_mean"].value, Some(0.001));
@@ -1094,6 +1328,7 @@ mod tests {
                     why: None,
                 },
             )]),
+            cases: BTreeMap::new(),
         }
     }
 
@@ -1292,7 +1527,8 @@ campaign:
                 repetition: 2,
                 parameters: BTreeMap::new(),
                 archive: String::new(),
-                values: BTreeMap::new()
+                values: BTreeMap::new(),
+                cases: BTreeMap::new(),
             }),
             "microvm-mmio"
         );
