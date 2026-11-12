@@ -613,6 +613,9 @@ pub struct Experiment {
     pub traffic: Vec<TrafficProfile>,
     /// What the experiment measures, by node id (`crate::measurements`).
     pub measurements: Vec<crate::measurements::Measurement>,
+    /// The one device `up` brings up, when the experiment isolates one: the zone and compute
+    /// stages start it alone and leave every other device down.
+    pub isolate: Option<String>,
     pub method: Method,
     /// Services the experiment runs alongside the vehicle (OTA, telemetry). Typed and validated
     /// at build time rather than re-parsed per use: `ServiceDef::find` used to deserialize the

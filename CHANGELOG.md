@@ -6,6 +6,30 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **A guest as a measurement's `to` (X9.9).** A VM (`qemu-microvm`, `libvirt`,
+  `cloud-hypervisor`, `qemu-mcu`) can be the `to` end of an `rtt-probe` when its part declares
+  the reflector its guest runs: `org.vxedge.reflector: udp/<port>` in the bundle's `meta.json`, as
+  the vxparts probe parts do from 0.1.1. Nothing is started in the guest: the probe is aimed at
+  that port. `Plan` reads the declaration from a local bundle or one already in the part cache, and
+  types its absence as `ERROR_REASON_MEASUREMENT_INVALID`. A published bundle not yet fetched is
+  read when the measurement starts, after `up` has fetched it. A VM still cannot send a probe, and
+  an attached platform is no end at all.
+- **`from: host`.** A measurement sends from the host's own namespace, over the slice's VLAN, from
+  the first address of the `to` node's subnet: the far side a `to: internet` probe answers on,
+  used the other way round. It is how a probe reaches a guest, and how exp-002 measured each
+  packaging of one ECU.
+- **A reflector wait.** Every measurement waits for its reflector to echo a datagram from where
+  its sender will run, for up to 90 s, before the first probe goes out, so a guest still booting is
+  waited for. One that never answers fails the measurement and names the address and port, rather
+  than recording a window of pure loss.
+- **`isolate`.** An experiment's `isolate: <device>` brings that device up alone at `up`, the others
+  staying down, so a campaign whose arms are packagings of one ECU runs one arm at a time. A
+  string parameter can bind it per arm, beside one that binds the measurement's `to`. An unknown
+  device is a workspace error, and a measurement whose device end is another device is
+  `ERROR_REASON_MEASUREMENT_INVALID`.
+
 ## [0.20.0] - 2026-11-12
 
 A measurement from a 5G UE. On an `s-nssai` slice, an `rtt-probe` runs between the slice's UE and

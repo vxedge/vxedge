@@ -344,6 +344,10 @@ pub struct ExperimentDoc {
     /// Read by [`crate::measurements`] when the model is built.
     #[serde(default)]
     pub measurements: Option<serde_yaml_ng::Value>,
+    /// The one device `up` brings up, the others staying down: a campaign whose arms are
+    /// packagings of one ECU runs one arm at a time. A device id of the experiment's vehicles.
+    #[serde(default)]
+    pub isolate: Option<String>,
     /// Typed intent (`ARCHITECTURE.md` §6.0.3), carried opaque here and read by
     /// [`crate::intent`], which types and checks it against the document itself.
     #[serde(default)]

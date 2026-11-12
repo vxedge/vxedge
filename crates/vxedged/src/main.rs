@@ -289,6 +289,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         runtime_dir: args.runtime_dir.clone(),
         vxprobe_bin: args.vxprobe_bin.clone(),
         containers: containers.clone(),
+        cache_dir: cache_dir.clone(),
     });
     let traffic = Arc::new(services::TrafficSvc {
         engine: engine.clone(),
