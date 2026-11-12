@@ -2145,8 +2145,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         .await?
                         .into_inner();
                     for t in &plan.trials {
+                        let windows = t
+                            .windows
+                            .iter()
+                            .map(|w| format!("{} {:.0}s", w.id, w.duration_s))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let windows = if windows.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  ({windows})")
+                        };
                         println!(
-                            "{:<24} {:>6.0}s warmup {:>6.0}s",
+                            "{:<24} {:>6.0}s warmup {:>6.0}s{windows}",
                             t.id, t.duration_s, t.warmup_s
                         );
                     }

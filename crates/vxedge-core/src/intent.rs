@@ -90,8 +90,8 @@ pub const AGGREGATES: &[&str] = &[
 
 /// A metric: one value per trial, read from its records. A metric names a `series` (and the
 /// `labels` that pick one of its lines), whose value in a trial is its last sample on `entity`
-/// inside the trial's measure phase; or it is the `ratio` of two such metrics in the same trial,
-/// times `factor`.
+/// inside the trial's measure phase, or inside the measure `window` it names when the campaign
+/// declares `windows`; or it is the `ratio` of two such metrics in the same trial, times `factor`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Metric {
@@ -107,6 +107,8 @@ pub struct Metric {
     pub ratio: Option<Vec<String>>,
     #[serde(default)]
     pub factor: Option<f64>,
+    #[serde(default)]
+    pub window: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -250,6 +252,21 @@ pub struct Profile {
     pub duration_s: Option<f64>,
 }
 
+/// One measure window of a trial (`campaign.windows`): the measurements run for `duration_s`
+/// with the parameters `set` changes for this window only, then stop, before the next window
+/// starts them afresh. Only a parameter that binds a measurement's field may be set.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Window {
+    pub id: String,
+    pub duration_s: f64,
+    #[serde(default)]
+    pub set: BTreeMap<String, Value>,
+}
+
+/// The binding path prefix a window's `set` may change: a measurement's field.
+pub const MEASUREMENT_BIND: &str = "measurements[";
+
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Campaign {
@@ -263,6 +280,8 @@ pub struct Campaign {
     pub warmup_s: Option<f64>,
     #[serde(default)]
     pub duration_s: Option<f64>,
+    #[serde(default)]
+    pub windows: Vec<Window>,
     #[serde(default)]
     pub profiles: BTreeMap<String, Profile>,
 }
@@ -611,6 +630,66 @@ fn check_campaign(c: &mut Checker<'_>, intent: &Intent) {
             "needs at least 1",
         );
     }
+    if campaign.windows.is_empty() {
+        return;
+    }
+    if campaign.duration_s.is_some() {
+        c.push(
+            ProblemKind::Parameter,
+            "campaign.duration_s",
+            "a campaign with `windows` measures for their sum: give each window its `duration_s`",
+        );
+    }
+    for (name, p) in &campaign.profiles {
+        if p.duration_s.is_some() {
+            c.push(
+                ProblemKind::Parameter,
+                format!("campaign.profiles.{name}.duration_s"),
+                "a campaign with `windows` measures for their sum, which a profile does not change",
+            );
+        }
+    }
+    let mut ids = BTreeSet::new();
+    for (i, w) in campaign.windows.iter().enumerate() {
+        let field = |f: &str| format!("campaign.windows[{i}].{f}");
+        if w.id.is_empty() || !ids.insert(w.id.as_str()) {
+            c.push(
+                ProblemKind::Parameter,
+                field("id"),
+                format!(
+                    "`{}` must be a non-empty id, unique among the windows",
+                    w.id
+                ),
+            );
+        }
+        if w.duration_s.is_nan() || w.duration_s <= 0.0 {
+            c.push(
+                ProblemKind::Parameter,
+                field("duration_s"),
+                "a window needs a duration above 0",
+            );
+        }
+        for (param, value) in &w.set {
+            let f = format!("campaign.windows[{i}].set.{param}");
+            set(c, f.clone(), param, value);
+            let binds = intent
+                .parameters
+                .get(param)
+                .and_then(|p| p.binds.as_deref());
+            if intent.parameters.contains_key(param)
+                && !binds.is_some_and(|b| b.starts_with(MEASUREMENT_BIND))
+            {
+                c.push(
+                    ProblemKind::Parameter,
+                    f,
+                    format!(
+                        "`{param}` binds no measurement field: a window may set only what its \
+                         measurements read, since the rest of the trial is already up"
+                    ),
+                );
+            }
+        }
+    }
 }
 
 fn check_metrics(c: &mut Checker<'_>, intent: &Intent) {
@@ -671,6 +750,40 @@ fn check_metrics(c: &mut Checker<'_>, intent: &Intent) {
                 format!("metrics[{i}].factor"),
                 "only a `ratio` takes a `factor`",
             );
+        }
+        let windows: Vec<&str> = intent
+            .campaign
+            .iter()
+            .flat_map(|c| c.windows.iter().map(|w| w.id.as_str()))
+            .collect();
+        match (&m.window, m.series.is_some(), windows.is_empty()) {
+            (Some(_), false, _) => c.push(
+                ProblemKind::Criterion,
+                format!("metrics[{i}].window"),
+                "a ratio reads its members' windows and names none itself",
+            ),
+            (Some(w), true, true) => c.push(
+                ProblemKind::Criterion,
+                format!("metrics[{i}].window"),
+                format!("`{w}` is not a window: the campaign declares no `windows`"),
+            ),
+            (Some(w), true, false) if !windows.contains(&w.as_str()) => c.push(
+                ProblemKind::Criterion,
+                format!("metrics[{i}].window"),
+                format!(
+                    "`{w}` is not a window of the campaign; there are {}",
+                    windows.join(", ")
+                ),
+            ),
+            (None, true, false) => c.push(
+                ProblemKind::Criterion,
+                format!("metrics[{i}].window"),
+                format!(
+                    "the campaign measures in windows ({}): name the one this metric reads",
+                    windows.join(", ")
+                ),
+            ),
+            _ => {}
         }
     }
 }
@@ -1678,5 +1791,112 @@ campaign:
         assert_eq!(aggregate(&v, "p50"), Some(50.0));
         assert_eq!(aggregate(&v, "max"), Some(100.0));
         assert_eq!(aggregate(&[], "mean"), None);
+    }
+
+    const WINDOWS: &str = r#"
+kind: experiment
+id: exp-005
+measurements:
+  probe: { kind: rtt-probe, from: zfl, to: internet, slice: adas, rate_pps: 1000 }
+traffic_profiles:
+  - { id: bg, source: zfl, target: internet, bandwidth_mbps: 0 }
+parameters:
+  probe_pps: { type: integer, unit: 1/s, default: 1000, min: 10, max: 5000,
+               binds: "measurements[probe].rate_pps" }
+  load_mbps: { type: integer, unit: Mbit/s, default: 0, min: 0, max: 1000,
+               binds: "traffic_profiles[bg].bandwidth_mbps" }
+metrics:
+  - { id: cold_max, kind: gauge, unit: s, entity: measurements/probe,
+      series: vxprobe_rtt_seconds_max, window: cold }
+  - { id: steady_p50, kind: gauge, unit: s, entity: measurements/probe,
+      series: vxprobe_rtt_seconds, labels: { quantile: "0.5" }, window: steady }
+  - { id: cold_ratio, kind: gauge, unit: "1", entity: measurements/probe,
+      ratio: [cold_max, steady_p50] }
+campaign:
+  repetitions: 20
+  windows:
+    - { id: cold, duration_s: 3, set: { probe_pps: 20 } }
+    - { id: steady, duration_s: 60 }
+  profiles:
+    quick: { repetitions: 2 }
+"#;
+
+    #[test]
+    fn measure_windows_name_their_metrics_and_set_only_measurement_parameters() {
+        let (intent, problems) = read(&doc(WINDOWS));
+        assert_eq!(problems, Vec::new());
+        let windows = &intent.campaign.unwrap().windows;
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].set.get("probe_pps"), Some(&Value::from(20)));
+
+        let cases = [
+            (
+                "    - { id: steady, duration_s: 60 }",
+                "    - { id: steady, duration_s: 60 }\n  duration_s: 63",
+                "campaign.duration_s",
+            ),
+            (
+                "    quick: { repetitions: 2 }",
+                "    quick: { repetitions: 2, duration_s: 5 }",
+                "campaign.profiles.quick.duration_s",
+            ),
+            (
+                "{ id: steady, duration_s: 60 }",
+                "{ id: cold, duration_s: 60 }",
+                "campaign.windows[1].id",
+            ),
+            (
+                "{ id: steady, duration_s: 60 }",
+                "{ id: steady, duration_s: 0 }",
+                "campaign.windows[1].duration_s",
+            ),
+            (
+                "set: { probe_pps: 20 }",
+                "set: { load_mbps: 20 }",
+                "campaign.windows[0].set.load_mbps",
+            ),
+            (
+                "set: { probe_pps: 20 }",
+                "set: { probe_pps: 1 }",
+                "campaign.windows[0].set.probe_pps",
+            ),
+            (
+                "set: { probe_pps: 20 }",
+                "set: { nope: 1 }",
+                "campaign.windows[0].set.nope",
+            ),
+            (
+                "series: vxprobe_rtt_seconds_max, window: cold",
+                "series: vxprobe_rtt_seconds_max",
+                "metrics[0].window",
+            ),
+            (
+                "series: vxprobe_rtt_seconds_max, window: cold",
+                "series: vxprobe_rtt_seconds_max, window: warm",
+                "metrics[0].window",
+            ),
+            (
+                "ratio: [cold_max, steady_p50] }",
+                "ratio: [cold_max, steady_p50], window: cold }",
+                "metrics[2].window",
+            ),
+        ];
+        for (from, to, field) in cases {
+            assert!(WINDOWS.contains(from), "{from}");
+            let (_, problems) = read(&doc(&WINDOWS.replacen(from, to, 1)));
+            assert!(
+                problems.iter().any(|p| p.field == field),
+                "{to}: {problems:?}"
+            );
+        }
+        // Without windows, a metric names none.
+        let (_, problems) = read(&edited(
+            "labels: { quantile: \"0.99\" } }",
+            "labels: { quantile: \"0.99\" }, window: cold }",
+        ));
+        assert_eq!(
+            fields(&problems),
+            [(ProblemKind::Criterion, "metrics[0].window".into())]
+        );
     }
 }

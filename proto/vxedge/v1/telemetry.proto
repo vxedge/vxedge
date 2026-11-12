@@ -52,6 +52,8 @@ message GapRecord {
 message PhaseRecord {
   string trial = 1;
   string phase = 2;
+  // The window a `measure` phase is, for a campaign that declares `windows`; else empty.
+  string window = 3;
 }
 
 // Log lines of the experiment's entities: a node's serial console, a hypervisor's log, a host

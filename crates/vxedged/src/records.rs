@@ -134,6 +134,7 @@ pub fn parse(seq: i64, line: &str) -> Option<Record> {
             record::Record::Phase(PhaseRecord {
                 trial: s("trial"),
                 phase: s("phase"),
+                window: s("window"),
             }),
         ),
         _ => return None,
@@ -212,6 +213,15 @@ mod tests {
         assert_eq!(entity(&g), Some("host"));
         let p = parse(5, r#"{"record":"phase","ts_ns":9,"phase":"measure"}"#).unwrap();
         assert_eq!(entity(&p), None);
+        let w = parse(
+            5,
+            r#"{"record":"phase","ts_ns":9,"phase":"measure","window":"cold"}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(w.record, Some(record::Record::Phase(ref ph)) if ph.window == "cold"),
+            "{w:?}"
+        );
         assert!(parse(6, r#"{"record":"story","ts_ns":1}"#).is_none());
         assert!(parse(7, "{torn").is_none());
         let l = parse_log(

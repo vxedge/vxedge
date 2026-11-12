@@ -47,8 +47,16 @@ pub struct Records {
     pub metadata: serde_json::Value,
     pub samples: Vec<Sample>,
     pub gaps: Vec<Gap>,
-    /// `(ts_ns, phase)`, in order.
-    pub phases: Vec<(i64, String)>,
+    /// The trial's phases, in order.
+    pub phases: Vec<Phase>,
+}
+
+/// A trial entering a phase; a `measure` phase of a campaign with windows names its window.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Phase {
+    pub ts_ns: i64,
+    pub phase: String,
+    pub window: Option<String>,
 }
 
 const V1_SAMPLES: &str = "ingest/samples.jsonl";
@@ -203,10 +211,14 @@ pub fn read_archive(path: &Path) -> Result<Records, String> {
     if let Some(bytes) = member(&mut zip, V2_PHASES)? {
         for v in lines(&bytes) {
             if let (Some(ts), Some(phase)) = (v["ts_ns"].as_i64(), v["phase"].as_str()) {
-                records.phases.push((ts, phase.to_string()));
+                records.phases.push(Phase {
+                    ts_ns: ts,
+                    phase: phase.to_string(),
+                    window: v["window"].as_str().map(String::from),
+                });
             }
         }
-        records.phases.sort_by_key(|(ts, _)| *ts);
+        records.phases.sort_by_key(|p| p.ts_ns);
     }
     Ok(records)
 }
@@ -231,21 +243,24 @@ impl TrialValue {
     }
 }
 
-/// The span the trial measured: from its `measure` phase to the phase after it, or the whole
-/// archive when it records no phases.
-fn measure_window(records: &Records) -> Result<(i64, i64), String> {
+/// The span the trial measured: from its `measure` phase (the one of `window`, when the metric
+/// names one) to the phase after it, or the whole archive when it records no phases.
+fn measure_window(records: &Records, window: Option<&str>) -> Result<(i64, i64), String> {
     if records.phases.is_empty() {
         return Ok((i64::MIN, i64::MAX));
     }
     let start = records
         .phases
         .iter()
-        .position(|(_, p)| p == "measure")
-        .ok_or("the trial records no measure phase")?;
-    let from = records.phases[start].0;
+        .position(|p| p.phase == "measure" && p.window.as_deref() == window)
+        .ok_or_else(|| match window {
+            Some(w) => format!("the trial records no measure window `{w}`"),
+            None => "the trial records no measure phase".to_string(),
+        })?;
+    let from = records.phases[start].ts_ns;
     let to = records.phases[start + 1..]
         .first()
-        .map_or(i64::MAX, |(ts, _)| *ts);
+        .map_or(i64::MAX, |p| p.ts_ns);
     Ok((from, to))
 }
 
@@ -314,13 +329,14 @@ fn series_value(records: &Records, m: &Metric, series: &str, window: (i64, i64))
 
 /// Every metric's value in the trial `records` hold.
 pub fn values(records: &Records, metrics: &[Metric]) -> BTreeMap<String, TrialValue> {
-    let window = measure_window(records);
     let mut out: BTreeMap<String, TrialValue> = BTreeMap::new();
     for m in metrics {
-        let v = match (&window, &m.series) {
-            (Err(why), _) => TrialValue::none(why.clone()),
-            (Ok(w), Some(series)) => series_value(records, m, series, *w),
-            (Ok(_), None) => continue,
+        let Some(series) = &m.series else {
+            continue;
+        };
+        let v = match measure_window(records, m.window.as_deref()) {
+            Err(why) => TrialValue::none(why),
+            Ok(w) => series_value(records, m, series, w),
         };
         out.insert(m.id.clone(), v);
     }
@@ -853,6 +869,77 @@ mod tests {
         let t = trial(&path, "sha256:x".into(), None, &metrics).unwrap();
         assert!(!t.values["lost"].complete);
         assert!(!t.values["loss_pct"].complete);
+    }
+
+    /// A campaign with windows: each windowed metric is the last sample inside its own window, and
+    /// a ratio divides values from two windows of one trial.
+    #[test]
+    fn a_windowed_metric_reads_its_own_measure_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = |ts: i64, metric: &str, v: f64| {
+            format!(
+                "{{\"record\":\"sample\",\"ts_ns\":{ts},\"entity\":\"measurements/probe\",\"metric\":\"{metric}\",\"value\":{v}}}\n"
+            )
+        };
+        let lines = [
+            s(11, "vxprobe_rtt_seconds_max", 0.009),
+            s(12, "vxprobe_rtt_seconds_max", 0.010),
+            s(25, "vxprobe_rtt_seconds_max", 0.002),
+            s(26, "vxprobe_rtt_seconds_p50", 0.001),
+        ]
+        .concat()
+        .replace("vxprobe_rtt_seconds_p50", "vxprobe_rtt_seconds_mean");
+        let phase = |ts: i64, p: &str, w: Option<&str>| match w {
+            Some(w) => format!(
+                "{{\"record\":\"phase\",\"ts_ns\":{ts},\"phase\":\"{p}\",\"window\":\"{w}\"}}\n"
+            ),
+            None => format!("{{\"record\":\"phase\",\"ts_ns\":{ts},\"phase\":\"{p}\"}}\n"),
+        };
+        let phases = [
+            phase(0, "warmup", None),
+            phase(10, "measure", Some("cold")),
+            phase(20, "measure", Some("steady")),
+            phase(30, "cooldown", None),
+        ]
+        .concat();
+        let metadata = serde_json::json!({
+            "archive": "vxarchive/2",
+            "trial": { "trial_id": "r1-defaults", "repetition": 1, "parameters": {} },
+        });
+        let path = dir.path().join("t.zip");
+        zip_with(
+            &path,
+            &[
+                ("metadata.json", serde_json::to_vec(&metadata).unwrap()),
+                (V2_SAMPLES, zstd::encode_all(lines.as_bytes(), 3).unwrap()),
+                (V2_PHASES, phases.into_bytes()),
+            ],
+        );
+        let metrics: Vec<Metric> = [
+            "{ id: cold_max, kind: gauge, unit: s, entity: measurements/probe, series: vxprobe_rtt_seconds_max, window: cold }",
+            "{ id: steady_max, kind: gauge, unit: s, entity: measurements/probe, series: vxprobe_rtt_seconds_max, window: steady }",
+            "{ id: steady_mean, kind: gauge, unit: s, entity: measurements/probe, series: vxprobe_rtt_seconds_mean, window: steady }",
+            "{ id: ratio, kind: gauge, unit: '1', entity: measurements/probe, ratio: [cold_max, steady_mean] }",
+            "{ id: warm_max, kind: gauge, unit: s, entity: measurements/probe, series: vxprobe_rtt_seconds_max, window: warm }",
+        ]
+        .iter()
+        .map(|y| metric(y))
+        .collect();
+        let t = trial(&path, "sha256:x".into(), None, &metrics).unwrap();
+        assert_eq!(t.values["cold_max"].value, Some(0.010));
+        assert_eq!(t.values["steady_max"].value, Some(0.002));
+        assert_eq!(t.values["steady_mean"].value, Some(0.001));
+        assert_eq!(t.values["ratio"].value, Some(10.0));
+        assert_eq!(t.values["warm_max"].value, None);
+        assert!(
+            t.values["warm_max"]
+                .why
+                .as_deref()
+                .unwrap()
+                .contains("no measure window `warm`"),
+            "{:?}",
+            t.values["warm_max"]
+        );
     }
 
     fn t(id: &str, arm: &str, load: u64, p99: f64) -> Trial {

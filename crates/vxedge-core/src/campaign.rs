@@ -6,7 +6,8 @@
 //! carries that arm's name instead of running twice. A parameter neither sets takes its default.
 //! Each point runs `repetitions` times, all points of one repetition before the next, and every
 //! trial is provisioned and torn down on its own (decision X-23). A `profile` overrides the
-//! repetitions, warmup and duration. An experiment without a `campaign` is one point at its
+//! repetitions, warmup and duration. A campaign may split each trial's measure phase into named
+//! `windows`, run one after another, each of which may set measurement parameters of its own. An experiment without a `campaign` is one point at its
 //! defaults, with its `method`'s repetitions and windows.
 //!
 //! [`bind`] gives a trial's document: the experiment document with each parameter's value written
@@ -31,7 +32,19 @@ pub struct Trial {
     /// From 1.
     pub repetition: u32,
     pub warmup_s: f64,
+    /// The measure phase's length: the campaign's `duration_s`, or its windows' sum.
     pub duration_s: f64,
+    /// The measure windows, in order, when the campaign declares `windows`; else empty.
+    pub windows: Vec<TrialWindow>,
+}
+
+/// One measure window of one trial: how long, and every parameter's value while it runs (the
+/// trial's, with the window's `set` applied).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrialWindow {
+    pub id: String,
+    pub duration_s: f64,
+    pub parameters: BTreeMap<String, Value>,
 }
 
 /// The trials of a campaign, and what they add up to.
@@ -174,9 +187,18 @@ pub fn plan(
         ));
     }
     let repetitions = repetitions.unwrap_or(1).max(1);
+    let windows = intent
+        .campaign
+        .as_ref()
+        .map(|c| c.windows.as_slice())
+        .unwrap_or_default();
     let (warmup_s, duration_s) = (
         warmup_s.unwrap_or(0.0),
-        duration_s.unwrap_or(DEFAULT_DURATION_S),
+        if windows.is_empty() {
+            duration_s.unwrap_or(DEFAULT_DURATION_S)
+        } else {
+            windows.iter().map(|w| w.duration_s).sum()
+        },
     );
     let mut trials = Vec::new();
     for rep in 1..=repetitions {
@@ -189,6 +211,20 @@ pub fn plan(
                 repetition: rep,
                 warmup_s,
                 duration_s,
+                windows: windows
+                    .iter()
+                    .map(|w| {
+                        let mut parameters = point.clone();
+                        for (k, v) in &w.set {
+                            parameters.insert(k.clone(), v.clone());
+                        }
+                        TrialWindow {
+                            id: w.id.clone(),
+                            duration_s: w.duration_s,
+                            parameters,
+                        }
+                    })
+                    .collect(),
             });
         }
     }
@@ -371,5 +407,40 @@ campaign:
                 && out.contains("duration_s: 9")
                 && !out.contains("duration_s: 1")
         );
+    }
+
+    #[test]
+    fn windows_split_the_measure_phase_and_carry_their_own_values() {
+        let i = intent(
+            r#"
+kind: experiment
+id: e
+measurements:
+  probe: { kind: rtt-probe, from: zfl, to: internet, slice: adas, rate_pps: 1000 }
+parameters:
+  probe_pps: { type: integer, unit: 1/s, default: 1000, min: 10, max: 5000,
+               binds: "measurements[probe].rate_pps" }
+metrics:
+  - { id: cold_max, kind: gauge, unit: s, entity: measurements/probe,
+      series: vxprobe_rtt_seconds_max, window: cold }
+campaign:
+  repetitions: 2
+  windows:
+    - { id: cold, duration_s: 3, set: { probe_pps: 20 } }
+    - { id: steady, duration_s: 60 }
+"#,
+        );
+        let p = plan(&i, (None, None, None), None).unwrap();
+        assert_eq!(p.trials.len(), 2);
+        let t = &p.trials[0];
+        assert_eq!(
+            (t.id.as_str(), t.warmup_s, t.duration_s),
+            ("r1-defaults", 0.0, 63.0)
+        );
+        let ids: Vec<&str> = t.windows.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, ["cold", "steady"]);
+        assert_eq!(t.windows[0].parameters["probe_pps"], Value::from(20));
+        assert_eq!(t.windows[1].parameters["probe_pps"], Value::from(1000));
+        assert_eq!(p.estimate_s(), 2.0 * (63.0 + OVERHEAD_S));
     }
 }
