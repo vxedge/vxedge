@@ -6,6 +6,14 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-11-12
+
+A measurement from a 5G UE. On an `s-nssai` slice, an `rtt-probe` runs between the slice's UE and
+the data network, its address learned when it starts, which lets exp-010's H2 run as a campaign.
+A campaign can also name where its reference campaigns are recorded, a profile can shorten measure
+windows, and the offline `results` commands read references. vxAPI stays `vxedge.v1`, and every
+change is additive.
+
 ### Added
 
 - **A measurement from a 5G UE (X9.10).** On a `mode: s-nssai` slice, an `rtt-probe` from a
