@@ -2095,6 +2095,69 @@ async fn plan_types_measurement_problems_and_lists_measurements() {
     assert_eq!(reason(&refused), "ERROR_REASON_MEASUREMENT_INVALID");
 }
 
+/// On a `mode: s-nssai` slice a measurement's node end is the slice's UE, whose address the 5G
+/// core assigns at `up`: `Plan` takes one from a UE to `internet` with no pinned address, and
+/// types one between two UEs as a measurement problem naming `to`.
+#[tokio::test]
+async fn a_measurement_from_a_ue_plans_without_a_pinned_address() {
+    let daemon = Daemon::start();
+    let channel = daemon.channel().await;
+    let dir = scratch();
+    let ws = |measurements: &str| {
+        format!(
+            "kind: vehicle\nid: car\nzones: {{ front: {{}}, rear: {{}} }}\ndevices:\n  \
+             ue1: {{ role: zone-controller, zone: front, backend: container }}\n  \
+             ue2: {{ role: zone-controller, zone: rear, backend: container }}\n\
+             functions:\n  f1: {{ deployed_on: ue1 }}\nlinks:\n  \
+             - {{ id: l1, endpoints: [ue1:eth0], slice: adas }}\n  \
+             - {{ id: l2, endpoints: [ue2:eth0], slice: info }}\n---\n\
+             kind: baseline\nid: bl\nparts:\n  - {{ ref: 'local/vxprobe:host-process', target_ids: f1 }}\n---\n\
+             kind: experiment\nid: h2\nvehicles: [car]\nbaseline: bl\nnetwork:\n  slices:\n    \
+             - {{ id: adas, mode: s-nssai, s_nssai: {{ sst: 1, sd: '000001' }} }}\n    \
+             - {{ id: info, mode: s-nssai, s_nssai: {{ sst: 2, sd: '000002' }} }}\n\
+             measurements:\n{measurements}"
+        )
+    };
+    let measurement_problems = |plan: &vxedge_api::v1::WorkspacePlan| {
+        plan.problems
+            .iter()
+            .filter(|p| p.reason == vxedge_api::v1::ErrorReason::MeasurementInvalid as i32)
+            .map(|p| p.detail.clone())
+            .collect::<Vec<_>>()
+    };
+
+    std::fs::write(
+        dir.join("main.yaml"),
+        ws("  ctl: { kind: rtt-probe, from: ue1, to: internet, slice: adas }\n"),
+    )
+    .unwrap();
+    let plan = plan_of(&channel, &dir).await;
+    assert!(
+        measurement_problems(&plan).is_empty(),
+        "{:?}",
+        plan.problems
+    );
+    assert!(
+        plan.entities.iter().any(|e| e.path == "measurements/ctl"),
+        "{:?}",
+        plan.entities
+    );
+
+    std::fs::write(
+        dir.join("main.yaml"),
+        ws("  ctl: { kind: rtt-probe, from: ue1, to: ue2, slice: adas }\n"),
+    )
+    .unwrap();
+    let plan = plan_of(&channel, &dir).await;
+    let problems = measurement_problems(&plan);
+    assert_eq!(problems.len(), 1, "{:?}", plan.problems);
+    assert!(
+        problems[0].contains("measurements.ctl.to") && problems[0].contains("s-nssai"),
+        "{}",
+        problems[0]
+    );
+}
+
 /// `MeasurementService` names each declared measurement with its entity, and a start whose
 /// sender's node is not up fails its job naming the node, before any process runs.
 #[tokio::test]
@@ -3120,6 +3183,16 @@ criteria:\n  - { id: h1, op: le, lhs: { metric: p99, aggregate: median, select: 
     let v = judge(Some(workspace.clone())).await;
     assert_eq!(v.criteria[0].outcome, VerdictOutcome::Pass as i32, "{v:?}");
     assert!((v.criteria[0].rhs.unwrap() - 0.0045).abs() < 1e-12);
+
+    // A campaign started with `reference_workspace` records it, and a verdict that names none
+    // reads the references from there.
+    let recorded_at = daemon.root.join("run/campaigns/c-1.json");
+    let mut started_with = c1.clone();
+    started_with["reference_workspace"] = frozen.path().display().to_string().into();
+    std::fs::write(&recorded_at, started_with.to_string()).unwrap();
+    let v = judge(None).await;
+    assert_eq!(v.criteria[0].outcome, VerdictOutcome::Pass as i32, "{v:?}");
+    std::fs::write(&recorded_at, c1.to_string()).unwrap();
 
     with_reference("exp-gone");
     let v = judge(None).await;

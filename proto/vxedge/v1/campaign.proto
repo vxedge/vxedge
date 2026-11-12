@@ -77,6 +77,12 @@ message CampaignStartRequest {
   // Where the trial archives and `campaign.json` go. Empty: `results/<campaign id>/` in the
   // workspace, or under the daemon's runtime folder for a cached package.
   string results_dir = 6;
+  // The workspace that records the reference campaigns the experiment's `references` name, such
+  // as a frozen one: its `results/<campaign id>/campaign.json`, as `ResultVerdictRequest`'s
+  // `reference_workspace`. Recorded with the campaign, so the verdict judged when it finishes, and
+  // a later `Verdict` or `Compare` that names none, read the references from it. Unset: this
+  // host's campaigns, then the campaign's own workspace's `results/`.
+  ManifestRef reference_workspace = 7;
 }
 
 enum CampaignState {

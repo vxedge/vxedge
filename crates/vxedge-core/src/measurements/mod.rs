@@ -16,6 +16,11 @@
 //! model and returns each problem typed as a measurement problem, so `Plan` lists them all and
 //! `up` refuses on the first, before anything runs. A probe runs inside its node's network
 //! namespace, so a node that has none on the host (a VM, an attached platform) cannot be an end.
+//!
+//! On a `mode: s-nssai` slice the node's link pins no address: its end is the slice's UE, whose
+//! PDU-session address the 5G core assigns at `up`. Such a measurement runs between the UE and
+//! the data network, so its `to` is `internet`; the address is learned when it starts
+//! ([`run::start`]).
 
 use std::collections::BTreeMap;
 
@@ -114,16 +119,28 @@ pub fn problems(model: &Experiment) -> Vec<Problem> {
                 format!("`{}` is not a slice in `network.slices`", m.slice),
             );
         }
+        let on_ue = is_snssai(model, &m.slice);
         if m.from == INTERNET {
             push(
                 "from",
                 "a probe sends from a node: `internet` can only be the `to` end".into(),
             );
+        } else if on_ue {
+            ue_end_problems(model, &m.from, &m.slice, &mut push);
         } else {
             end_problems(model, &m.from, &m.slice, "from", &mut push);
         }
         if m.to == m.from {
             push("to", format!("`{}` is also the `from` end", m.to));
+        } else if on_ue && m.to != INTERNET {
+            push(
+                "to",
+                format!(
+                    "slice `{}` is `mode: s-nssai`: a probe on it runs between the slice's UE and \
+                     the data network, so its `to` is `internet`",
+                    m.slice
+                ),
+            );
         } else if m.to != INTERNET {
             end_problems(model, &m.to, &m.slice, "to", &mut push);
         }
@@ -212,6 +229,35 @@ fn shared_far_sides(model: &Experiment, out: &mut Vec<Problem>) {
                 ),
             });
         }
+    }
+}
+
+/// Whether `slice` is a `mode: s-nssai` slice of the experiment.
+pub(crate) fn is_snssai(model: &Experiment, slice: &str) -> bool {
+    model
+        .slices
+        .iter()
+        .any(|s| s.id == slice && s.mode == crate::model::SliceMode::SNssai)
+}
+
+/// A UE end: a device of one of the vehicles with a link on the `s-nssai` slice. Its address is
+/// the UE's PDU session, so the link pins none, and the probe runs in the slice's UE, not in the
+/// device's own namespace.
+fn ue_end_problems(
+    model: &Experiment,
+    node: &str,
+    slice: &str,
+    push: &mut impl FnMut(&str, String),
+) {
+    let Some(vehicle) = model.entities.iter().find(|v| v.devices.contains_key(node)) else {
+        push(
+            "from",
+            format!("`{node}` is not a device of the experiment's vehicles"),
+        );
+        return;
+    };
+    if endpoint_on(vehicle, node, slice).is_none() {
+        push("slice", format!("`{node}` has no link on slice `{slice}`"));
     }
 }
 
@@ -321,6 +367,65 @@ network:
 
     fn fields(model: &Experiment) -> Vec<String> {
         problems(model).into_iter().map(|p| p.field).collect()
+    }
+
+    /// exp-010's shape: two UEs on two `s-nssai` slices, links pinning no address.
+    const UE_WS: &str = r#"
+kind: vehicle
+id: car
+zones: { front: {}, rear: {} }
+devices:
+  ue1: { role: zone-controller, zone: front, backend: container }
+  ue2: { role: zone-controller, zone: rear, backend: container }
+functions:
+  f1: { deployed_on: ue1 }
+links:
+  - { id: l1, endpoints: [ue1:eth0], slice: adas }
+  - { id: l2, endpoints: [ue2:eth0], slice: info }
+---
+kind: baseline
+id: bl
+parts:
+  - { ref: 'local/vxprobe:host-process', target_ids: f1 }
+---
+kind: experiment
+id: exp
+vehicles: [car]
+baseline: bl
+network:
+  slices:
+    - { id: adas, mode: s-nssai, s_nssai: { sst: 1, sd: '000001' } }
+    - { id: info, mode: s-nssai, s_nssai: { sst: 2, sd: '000002' } }
+measurements:
+"#;
+
+    #[test]
+    fn a_probe_from_a_ue_to_the_data_network_needs_no_pinned_address() {
+        let m = crate::model::load_yaml(&format!(
+            "{UE_WS}  ctl: {{ kind: rtt-probe, from: ue1, to: internet, slice: adas }}\n"
+        ))
+        .unwrap();
+        assert!(fields(&m).is_empty(), "{:?}", problems(&m));
+    }
+
+    #[test]
+    fn a_probe_on_an_snssai_slice_must_reach_the_data_network() {
+        let m = crate::model::load_yaml(&format!(
+            "{UE_WS}  a: {{ kind: rtt-probe, from: ue1, to: ue2, slice: adas }}\n  \
+             b: {{ kind: rtt-probe, from: ue2, to: internet, slice: adas }}\n"
+        ))
+        .unwrap();
+        let p = problems(&m);
+        assert!(
+            p.iter()
+                .any(|p| p.field == "measurements.a.to" && p.detail.contains("s-nssai")),
+            "{p:?}"
+        );
+        assert!(
+            p.iter()
+                .any(|p| p.field == "measurements.b.slice" && p.detail.contains("no link")),
+            "{p:?}"
+        );
     }
 
     #[test]

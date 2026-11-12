@@ -405,6 +405,18 @@ impl CampaignService for CampaignSvc {
                 "caller": req.caller, "unlocked": req.unlocked, "trials": trials.len(),
             }),
         );
+        let reference_workspace = match crate::results::folder_of(req.reference_workspace.as_ref())?
+        {
+            Some(dir) => dir.display().to_string(),
+            None if req.reference_workspace.is_some() => {
+                return Err(errors::invalid(
+                    R::WorkspaceInvalid,
+                    "`reference_workspace` names a folder: a path or a package digest, not inline \
+                     YAML",
+                ));
+            }
+            None => String::new(),
+        };
         let record = Arc::new(Mutex::new(CampaignRecord {
             campaign_id: id.clone(),
             state: "running".into(),
@@ -416,6 +428,7 @@ impl CampaignService for CampaignSvc {
             unlocked: req.unlocked,
             workspace: root.display().to_string(),
             results_dir: results_dir.display().to_string(),
+            reference_workspace,
             trials,
             started_unix_ms: now_ms(),
             finished_unix_ms: 0,
@@ -485,9 +498,11 @@ impl CampaignService for CampaignSvc {
                     let snapshot = rec.lock().expect("campaign record").clone();
                     let runtime_dir = runtime_dir.clone();
                     let judged = tokio::task::spawn_blocking(move || {
+                        let recorded = (!snapshot.reference_workspace.is_empty())
+                            .then(|| PathBuf::from(&snapshot.reference_workspace));
                         let lookup = crate::verdict::Lookup {
                             runtime_dir: &runtime_dir,
-                            workspace: None,
+                            workspace: recorded.as_deref(),
                         };
                         crate::verdict::of_campaign(&snapshot, &lookup)
                     })

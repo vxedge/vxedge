@@ -95,6 +95,10 @@ pub struct CampaignRecord {
     pub workspace: String,
     #[serde(default)]
     pub results_dir: String,
+    /// The workspace whose `results/` records the experiment's reference campaigns, when the
+    /// start named one (`reference_workspace`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reference_workspace: String,
     pub trials: Vec<TrialRecord>,
     #[serde(default)]
     pub started_unix_ms: i64,
