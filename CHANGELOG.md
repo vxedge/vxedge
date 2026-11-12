@@ -6,6 +6,25 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Samples from a check step's output (X9.15).** A tool step can declare that its lines carry
+  numbers a metric reads, such as kuksa-perf's latency percentiles, so exp-016 runs as a package:
+  ```yaml
+  samples:
+    - { series: kuksa_perf_latency_us, where: { op: latency }, value: us, unit: us, labels: [quantile] }
+  ```
+  - Each line `where` selects that holds a number at `value` is one sample of `series` on the
+    step's entity `checks/<step>`, at the time the line was recorded, labelled with the values
+    of its `labels` fields. A metric reads it as it reads a probe's series: its last sample in the
+    measure phase is the trial's value, and criteria aggregate it across trials.
+  - The samples are read from the step's archived output when a trial is judged, so
+    `results verdict` gives the same values offline as the daemon does.
+  - `Plan` refuses `samples` on a step that is not a tool step, a bad series or label name, a
+    series declared twice on one step, an empty `value` path or `unit`, and a metric on
+    `checks/<step>` whose step is not a tool step, does not declare its series, declares it in
+    another unit, or lacks a label the metric picks (`ERROR_REASON_CHECK_INVALID`).
+
 ## [0.24.0] - 2026-11-12
 
 Tool provenance in results. A result now names the build of every tool the daemon runs, so an
