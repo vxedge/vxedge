@@ -2045,6 +2045,143 @@ async fn plan_and_up_refuse_typed_intent_that_cannot_hold() {
     assert_eq!(reason(&refused), "ERROR_REASON_PARAMETER_INVALID");
 }
 
+/// A `checks` block that cannot run is a typed problem in `Plan` (`CHECK_INVALID`) naming its
+/// field: a tool not pinned, a node that does not exist, a file the package lacks, a criterion
+/// naming no declared case. A recorded step is an entity of its own, `checks/<step>`.
+#[tokio::test]
+async fn plan_types_check_problems_and_lists_check_steps() {
+    let daemon = Daemon::start();
+    let channel = daemon.channel().await;
+    let (dir, _) = experiment_workspace();
+    let main = std::fs::read_to_string(dir.join("main.yaml")).unwrap();
+    let checks = "\nmethod: { duration_s: 60 }\nchecks:\n  tools:\n    \
+                  kv2: { image: \"localhost/vxperiments/kv2:1\" }\n    \
+                  moving: { image: \"ghcr.io/x/y:latest\" }\n  steps:\n    \
+                  - { id: info, tool: kv2, on: ecu1, args: [info] }\n    \
+                  - { id: lost, tool: kv2, on: nope }\n    \
+                  - { id: vss, tool: kv2, on: alone, files: { /vss.json: assets/vss.json } }\n  \
+                  cases:\n    - { id: version, step: info, field: version, equals: \"0.7.1\" }\n\
+                  criteria:\n  - { id: v2, cases: [version, missing] }\n";
+    std::fs::write(dir.join("main.yaml"), format!("{main}{checks}")).unwrap();
+
+    let plan = plan_of(&channel, &dir).await;
+    assert!(!plan.valid);
+    let of = |r: vxedge_api::v1::ErrorReason| -> Vec<String> {
+        plan.problems
+            .iter()
+            .filter(|p| p.reason == r as i32)
+            .map(|p| p.detail.clone())
+            .collect()
+    };
+    let checks = of(vxedge_api::v1::ErrorReason::CheckInvalid);
+    for want in [
+        "checks.tools.moving.image",
+        "checks.steps[1].on",
+        "checks.steps[2].files./vss.json",
+    ] {
+        assert!(
+            checks.iter().any(|d| d.contains(want)),
+            "{want}: {:?}",
+            plan.problems
+        );
+    }
+    let criteria = of(vxedge_api::v1::ErrorReason::CriterionInvalid);
+    assert!(
+        criteria.iter().any(|d| d.contains("no case `missing`")),
+        "{:?}",
+        plan.problems
+    );
+    let entity = plan
+        .entities
+        .iter()
+        .find(|e| e.path == "checks/info")
+        .unwrap_or_else(|| panic!("{:?}", plan.entities));
+    assert_eq!(entity.kind, "check");
+}
+
+/// `ResultService.Verdict` judges a `cases` criterion from each trial's archived step output and
+/// reports each case per trial; an `observe` case is reported apart and never judged.
+#[tokio::test]
+async fn a_verdict_judges_check_cases_from_the_archives() {
+    use std::io::Write;
+    use vxedge_api::v1::result_service_client::ResultServiceClient;
+    use vxedge_api::v1::{ResultVerdictRequest, VerdictOutcome};
+    let (dir, _) = experiment_workspace();
+    let main = std::fs::read_to_string(dir.join("main.yaml")).unwrap();
+    let checks = "\ncampaign: { repetitions: 1, duration_s: 60 }\nchecks:\n  \
+                  tools: { kv2: { image: \"localhost/vxperiments/kv2:1\" } }\n  steps:\n    \
+                  - { id: info, tool: kv2, on: ecu1, args: [info] }\n  cases:\n    \
+                  - { id: version, step: info, where: { op: info }, field: version, equals: \"0.7.1\" }\n    \
+                  - { id: took, step: info, where: { op: vx.step }, field: exit, observe: true }\n\
+                  criteria:\n  - { id: v2, cases: [version] }\n";
+    std::fs::write(dir.join("main.yaml"), format!("{main}{checks}")).unwrap();
+    let results = dir.join("results/c-k");
+    std::fs::create_dir_all(&results).unwrap();
+    let archive = results.join("r1-defaults.zip");
+    {
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        let opts = zip::write::SimpleFileOptions::default();
+        zip.start_file("metadata.json", opts).unwrap();
+        zip.write_all(br#"{"archive":"vxarchive/2"}"#).unwrap();
+        let lines: String = [
+            r#"{"op":"info","result":"ok","version":"0.7.1"}"#,
+            r#"{"op":"vx.step","exit":0,"timed_out":false}"#,
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            serde_json::json!({ "record": "log", "ts_ns": i, "entity": "checks/info",
+                "stream": "output", "line": l })
+            .to_string()
+                + "\n"
+        })
+        .collect();
+        zip.start_file("logs/checks/info.jsonl.zst", opts).unwrap();
+        zip.write_all(&zstd::encode_all(lines.as_bytes(), 3).unwrap())
+            .unwrap();
+        zip.finish().unwrap();
+    }
+    let record = serde_json::json!({
+        "campaign_id": "c-k", "state": "succeeded", "job_id": "j", "experiment_id": "e1",
+        "workspace": dir.display().to_string(), "results_dir": results.display().to_string(),
+        "trials": [{ "id": "r1-defaults", "repetition": 1, "parameters": {},
+            "state": "succeeded", "archive": archive.display().to_string(), "sha256": "ab" }],
+        "started_unix_ms": 1, "finished_unix_ms": 2,
+    });
+    let daemon = Daemon::start_with(|rt| {
+        std::fs::create_dir_all(rt.join("campaigns")).unwrap();
+        std::fs::write(rt.join("campaigns/c-k.json"), record.to_string()).unwrap();
+    });
+    let channel = daemon.channel().await;
+    let v = ResultServiceClient::new(channel)
+        .verdict(ResultVerdictRequest {
+            campaign_id: "c-k".into(),
+            reference_workspace: None,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(v.outcome, VerdictOutcome::Pass as i32, "{v:?}");
+    let c = &v.criteria[0];
+    assert_eq!((c.id.as_str(), c.rule.as_str()), ("v2", "cases"));
+    assert_eq!(c.cases.len(), 1);
+    assert_eq!(
+        (c.cases[0].case_id.as_str(), c.cases[0].trial_id.as_str()),
+        ("version", "r1-defaults")
+    );
+    assert_eq!(c.cases[0].value_json, "\"0.7.1\"");
+    assert_eq!(
+        v.trials[0].cases["version"].outcome,
+        VerdictOutcome::Pass as i32
+    );
+    assert_eq!(v.observations.len(), 1);
+    assert_eq!(
+        v.observations[0].outcome,
+        VerdictOutcome::Unspecified as i32
+    );
+    assert_eq!(v.observations[0].value_json, "0");
+}
+
 /// A measurement that cannot run is a typed problem in `Plan` naming its field, and `up` refuses
 /// before anything runs. One that can is listed as an entity of its own.
 #[tokio::test]

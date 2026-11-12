@@ -397,6 +397,122 @@ impl ContainerClient {
             })
     }
 
+    /// Make `image` present: pulled when absent, unless it is a `localhost/` image, which has no
+    /// registry to come from.
+    pub async fn ensure_image(&self, image: &str) -> Result<(), ContainerError> {
+        if self.image_present(image).await? {
+            return Ok(());
+        }
+        if image.starts_with("localhost/") {
+            return Err(ContainerError::ImageUnavailable {
+                image: image.to_string(),
+                detail: "a `localhost/` image is built on this host, and this host has none".into(),
+            });
+        }
+        self.pull(image).await
+    }
+
+    /// Create and start a container outside any group, such as a check step's tool, in
+    /// `network_mode` (`container:<id>`, `none`). An existing container of the same name is
+    /// removed first. Returns its id.
+    pub async fn start_standalone(
+        &self,
+        name: &str,
+        spec: &ContainerSpec,
+        network_mode: &str,
+        labels: BTreeMap<String, String>,
+    ) -> Result<String, ContainerError> {
+        self.remove(name).await?;
+        let body = create_body(spec, labels, Some(network_mode.to_string()));
+        let id = self
+            .create(name, body)
+            .await
+            .map_err(|e| match status_code(&e) {
+                Some(409) => ContainerError::NameTaken {
+                    name: name.to_string(),
+                },
+                Some(404) => ContainerError::ImageUnavailable {
+                    image: spec.image.clone(),
+                    detail: e.to_string(),
+                },
+                _ => api(format!("create `{name}`"))(e),
+            })?;
+        self.docker
+            .start_container(&id, None)
+            .await
+            .map_err(api(format!("start `{name}`")))?;
+        Ok(id)
+    }
+
+    /// A container's output as it is written, stdout and stderr together, until it exits.
+    pub fn follow_output(
+        &self,
+        container: &str,
+    ) -> std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<Vec<u8>, ContainerError>> + Send>>
+    {
+        let opts = LogsOptionsBuilder::new()
+            .stdout(true)
+            .stderr(true)
+            .follow(true)
+            .build();
+        let name = container.to_string();
+        Box::pin(
+            self.docker
+                .logs(container, Some(opts))
+                .map_ok(|chunk| chunk.into_bytes().to_vec())
+                .map_err(move |e| api(format!("follow the output of `{name}`"))(e)),
+        )
+    }
+
+    /// Wait for a container to exit and return its exit code.
+    pub async fn wait_exit(&self, container: &str) -> Result<i64, ContainerError> {
+        match self
+            .docker
+            .wait_container(container, None)
+            .try_collect::<Vec<_>>()
+            .await
+        {
+            Ok(responses) => Ok(responses.last().map_or(0, |r| r.status_code)),
+            Err(bollard::errors::Error::DockerContainerWaitError { code, .. }) => Ok(code),
+            Err(e) => Err(api(format!("wait for `{container}`"))(e)),
+        }
+    }
+
+    /// Force-remove a container by name or id; already gone is success.
+    pub async fn remove_container(&self, container: &str) -> Result<(), ContainerError> {
+        self.remove(container).await
+    }
+
+    /// The ids of every container, running or not, that carries the label `key`.
+    pub async fn labelled(&self, key: &str) -> Result<Vec<String>, ContainerError> {
+        let opts = ListContainersOptionsBuilder::new()
+            .all(true)
+            .filters(&HashMap::from([("label", vec![key])]))
+            .build();
+        let list = self
+            .docker
+            .list_containers(Some(opts))
+            .await
+            .map_err(api("list containers".to_string()))?;
+        Ok(list.into_iter().filter_map(|c| c.id).collect())
+    }
+
+    /// Whether a container is running, how often it restarted, and when it last started; `None`
+    /// when there is no such container.
+    pub async fn state(&self, container: &str) -> Result<Option<ContainerRun>, ContainerError> {
+        let inspected = match self.docker.inspect_container(container, None).await {
+            Ok(i) => i,
+            Err(e) if status_code(&e) == Some(404) => return Ok(None),
+            Err(e) => return Err(api(format!("inspect `{container}`"))(e)),
+        };
+        let state = inspected.state.unwrap_or_default();
+        Ok(Some(ContainerRun {
+            running: state.running.unwrap_or(false),
+            restarts: inspected.restart_count.unwrap_or(0),
+            started_at: state.started_at.unwrap_or_default(),
+        }))
+    }
+
     async fn output(&self, container: &str) -> Result<String, ContainerError> {
         let opts = LogsOptionsBuilder::new().stdout(true).stderr(true).build();
         let chunks: Vec<_> = self
@@ -407,6 +523,14 @@ impl ContainerClient {
             .map_err(api(format!("read output of `{container}`")))?;
         Ok(chunks.iter().map(ToString::to_string).collect())
     }
+}
+
+/// What [`ContainerClient::state`] reads of a container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerRun {
+    pub running: bool,
+    pub restarts: i64,
+    pub started_at: String,
 }
 
 /// One [`ContainerClient`] per process, connected on first use. A daemon that holds this starts
@@ -467,6 +591,7 @@ pub(crate) fn create_body(
     ContainerCreateBody {
         image: Some(spec.image.clone()),
         cmd: non_empty(spec.cmd.clone()),
+        entrypoint: non_empty(spec.entrypoint.clone()),
         env: non_empty(spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect()),
         labels: Some(labels.into_iter().collect()),
         host_config: Some(HostConfig {

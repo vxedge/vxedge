@@ -6,6 +6,29 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Functional checks (X9.11).** A `kind: experiment` can declare a suite, not a measurement, in
+  `checks`: the `tools` it runs (OCI images pinned by digest, or `localhost/`), the `steps` a
+  trial runs in order, and the `cases` that judge each step's output, as exp-015 and exp-017 judge
+  a Kuksa databroker with a `kuksa.val.v2` client.
+  - A step runs a tool in a container node's namespace (`on`), in one of its own (`on: alone`), or
+    in a background step's (`with`); repeats it `until` a line matches; starts it in the
+    `background` and later `wait`s for or `stop`s it; or `observe`s a node's group member or bridge
+    port from the host. `files` mounts package files read-only.
+  - Each step's output is a log stream of the entity `checks/<step>`, so it is archived with the
+    trial. The daemon adds a `vx.step` line after each step: its exit code, whether it timed out,
+    its attempts.
+  - A campaign trial runs its steps in its measure phase, within the measure duration.
+  - A case expects one thing of the lines its `where` selects: a field `equals`, `one_of`,
+    `contains` or is `present`; a `count`; a `sequence`, `ends_with` or `includes`; or a `compare`
+    of two steps. A criterion `{ id, cases: [...] }` passes when every case passes in every trial,
+    and a case whose step did not run is `inconclusive`. An `observe` case is recorded and never
+    judged.
+  - vxAPI: `ERROR_REASON_CHECK_INVALID`; `CriterionVerdict.cases`, `VerdictTrial.cases` and
+    `ResultVerdict.observations`; `CriterionCases` in `PackageCriterion`. `vxedge results verdict`
+    prints each case. Additive.
+
 ### Fixed
 
 - A run's `entities.json` lists only the traffic log streams a profile actually starts: `send` and

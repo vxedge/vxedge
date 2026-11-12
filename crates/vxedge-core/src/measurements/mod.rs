@@ -115,9 +115,13 @@ pub fn parse(block: Option<&Value>) -> Result<Vec<Measurement>, String> {
         .collect())
 }
 
-/// Every problem with the experiment's measurements, checked against its model.
+/// Every problem with the experiment's measurements, and with the nodes its functional checks
+/// name, checked against its model.
 pub fn problems(model: &Experiment) -> Vec<Problem> {
     let mut out = Vec::new();
+    if let Some(k) = &model.checks {
+        out.extend(crate::checks::model_problems(model, k));
+    }
     for m in &model.measurements {
         let mut push = |field: &str, detail: String| {
             out.push(Problem {

@@ -298,7 +298,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         runtime_dir: args.runtime_dir.clone(),
         vxprobe_bin: args.vxprobe_bin.clone(),
         vxtraffic_bin: args.vxtraffic_bin.clone(),
-        containers,
+        containers: containers.clone(),
     });
     let telemetry = Arc::new(telemetry::TelemetrySvc {
         engine: telemetry_engine,
@@ -335,6 +335,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 measure: measure.clone(),
                 telemetry: telemetry.clone(),
                 svcs: svcs.clone(),
+                containers: containers.clone(),
             },
             audit: audit.clone(),
             runtime_dir: args.runtime_dir.clone(),

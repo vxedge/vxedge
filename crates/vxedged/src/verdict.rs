@@ -6,7 +6,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use vxedge_api::v1::{
-    CriterionVerdict, ResultVerdict, TrialMetricValue, VerdictOutcome, VerdictRead, VerdictTrial,
+    CriterionVerdict, ResultVerdict, TrialMetricValue, VerdictCase, VerdictOutcome, VerdictRead,
+    VerdictTrial,
 };
 use vxedge_core::intent::{self, Judgement, Outcome};
 use vxedge_core::verdict::{self, Identity, Verdict};
@@ -57,13 +58,8 @@ fn trials_of(rec: &CampaignRecord, intent: &intent::Intent) -> Result<Vec<verdic
                 repetition: t.repetition,
                 parameters,
             };
-            verdict::trial(
-                Path::new(&t.archive),
-                digest(&t.sha256),
-                Some(who),
-                &intent.metrics,
-            )
-            .map_err(|e| format!("campaign `{}`, trial `{}`: {e}", rec.campaign_id, t.id))
+            verdict::trial(Path::new(&t.archive), digest(&t.sha256), Some(who), intent)
+                .map_err(|e| format!("campaign `{}`, trial `{}`: {e}", rec.campaign_id, t.id))
         })
         .collect()
 }
@@ -202,6 +198,20 @@ fn params(
         .collect()
 }
 
+fn case(case: &str, trial: &str, r: &vxedge_core::checks::CaseResult) -> VerdictCase {
+    VerdictCase {
+        case_id: case.to_string(),
+        trial_id: trial.to_string(),
+        outcome: r.outcome.map_or(VerdictOutcome::Unspecified, outcome) as i32,
+        value_json: r.value.as_ref().map(|v| v.to_string()).unwrap_or_default(),
+        why: r.why.clone().unwrap_or_default(),
+    }
+}
+
+fn case_read(r: &intent::CaseRead) -> VerdictCase {
+    case(&r.case, &r.trial, &r.result)
+}
+
 fn criterion(j: &Judgement) -> CriterionVerdict {
     CriterionVerdict {
         id: j.id.clone().unwrap_or_default(),
@@ -227,6 +237,7 @@ fn criterion(j: &Judgement) -> CriterionVerdict {
         members: j.members.iter().map(criterion).collect(),
         guards: j.guards.iter().map(criterion).collect(),
         why: j.why.clone().unwrap_or_default(),
+        cases: j.cases.iter().map(case_read).collect(),
     }
 }
 
@@ -238,6 +249,7 @@ pub(crate) fn to_proto(rec: &CampaignRecord, v: &Verdict) -> ResultVerdict {
         hypothesis: v.hypothesis.clone().unwrap_or_default(),
         outcome: outcome(v.outcome) as i32,
         criteria: v.criteria.iter().map(criterion).collect(),
+        observations: v.observations.iter().map(case_read).collect(),
         trials: v
             .trials
             .iter()
@@ -260,6 +272,11 @@ pub(crate) fn to_proto(rec: &CampaignRecord, v: &Verdict) -> ResultVerdict {
                             },
                         )
                     })
+                    .collect(),
+                cases: t
+                    .cases
+                    .iter()
+                    .map(|(k, r)| (k.clone(), case(k, &t.id, r)))
                     .collect(),
             })
             .collect(),

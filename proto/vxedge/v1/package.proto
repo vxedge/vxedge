@@ -120,11 +120,18 @@ message PackageCriterion {
   oneof criterion {
     CriterionComparison comparison = 2;
     CriterionGroup group = 3;
+    CriterionCases cases = 6;
   }
   // A one-line rendering for people. Nothing parses it.
   string text = 4;
   // Criteria that must pass for this one to be conclusive.
   repeated PackageCriterion guards = 5;
+}
+
+// A criterion over functional check cases: it passes when every case passes in every trial.
+message CriterionCases {
+  // Case ids, as `checks.cases` declares them.
+  repeated string cases = 1;
 }
 
 message CampaignArm {

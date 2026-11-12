@@ -362,6 +362,9 @@ pub struct ExperimentDoc {
     pub criteria: Option<serde_yaml_ng::Value>,
     #[serde(default)]
     pub campaign: Option<serde_yaml_ng::Value>,
+    /// Functional checks: tools, steps and cases, read by [`crate::checks`].
+    #[serde(default)]
+    pub checks: Option<serde_yaml_ng::Value>,
 }
 
 impl ExperimentDoc {
@@ -1354,6 +1357,15 @@ impl Workspace {
             .flat_map(crate::intent::check)
             .collect();
         problems.extend(self.scenario_problems());
+        for doc in &self.experiments_raw {
+            if let Ok(Some(k)) = crate::checks::parse(doc.get("checks")) {
+                let id = doc
+                    .get("id")
+                    .and_then(serde_yaml_ng::Value::as_str)
+                    .unwrap_or("?");
+                problems.extend(crate::checks::file_problems(id, &k, &self.root));
+            }
+        }
         problems
     }
 

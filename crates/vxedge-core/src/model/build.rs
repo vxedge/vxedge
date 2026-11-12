@@ -1312,6 +1312,12 @@ pub fn build(ws: &Workspace) -> Result<Experiment, ModelError> {
                 detail,
             }
         })?,
+        checks: crate::checks::parse(raw.get("checks")).map_err(|detail| {
+            ModelError::MalformedBlock {
+                block: "checks",
+                detail,
+            }
+        })?,
         isolate: exp.isolate.clone(),
         method,
         services,

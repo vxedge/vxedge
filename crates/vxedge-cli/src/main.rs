@@ -941,7 +941,7 @@ fn experiment_intent(
 fn local_trials(
     paths: &[std::path::PathBuf],
     name: Option<&str>,
-    metrics: &[vxedge_core::intent::Metric],
+    intent: &vxedge_core::intent::Intent,
 ) -> Result<Vec<vxedge_core::verdict::Trial>, Box<dyn std::error::Error>> {
     let mut files = Vec::new();
     for p in paths {
@@ -970,7 +970,7 @@ fn local_trials(
                 None => None,
             };
             let digest = vxedge_core::pkg::sha256(&std::fs::read(f)?);
-            Ok(vxedge_core::verdict::trial(f, digest, who, metrics)?)
+            Ok(vxedge_core::verdict::trial(f, digest, who, intent)?)
         })
         .collect()
 }
@@ -1004,6 +1004,27 @@ fn print_judgement(j: &vxedge_core::intent::Judgement, depth: usize) {
         println!("{pad}  guard:");
         print_judgement(g, depth + 2);
     }
+    for c in &j.cases {
+        print_case(c, depth + 1);
+    }
+}
+
+fn print_case(c: &vxedge_core::intent::CaseRead, depth: usize) {
+    let pad = "  ".repeat(depth);
+    let outcome = c.result.outcome.map_or("observed", |o| o.as_str());
+    let value = c
+        .result
+        .value
+        .as_ref()
+        .map(|v| format!(" {v}"))
+        .unwrap_or_default();
+    let why = c
+        .result
+        .why
+        .as_deref()
+        .map(|w| format!(" ({w})"))
+        .unwrap_or_default();
+    println!("{pad}{:<32} {:<9} {}{value}{why}", c.case, outcome, c.trial);
 }
 
 /// The experiment's references, read from `root`'s `results/` when given. Without it, each is
@@ -1036,7 +1057,7 @@ fn results(cmd: &ResultsCmd, json: bool) -> Result<(), Box<dyn std::error::Error
             reference_workspace,
         } => {
             let intent = experiment_intent(experiment)?;
-            let trials = local_trials(archives, name.as_deref(), &intent.metrics)?;
+            let trials = local_trials(archives, name.as_deref(), &intent)?;
             let refs = recorded_references(reference_workspace.as_deref(), &intent);
             let v = vxedge_core::verdict::verdict_with(&intent, trials, &refs);
             if json {
@@ -1055,6 +1076,12 @@ fn results(cmd: &ResultsCmd, json: bool) -> Result<(), Box<dyn std::error::Error
                 for c in &v.criteria {
                     print_judgement(c, 1);
                 }
+                if !v.observations.is_empty() {
+                    println!("  observed, not judged:");
+                    for o in &v.observations {
+                        print_case(o, 2);
+                    }
+                }
             }
         }
         ResultsCmd::Compare {
@@ -1065,8 +1092,8 @@ fn results(cmd: &ResultsCmd, json: bool) -> Result<(), Box<dyn std::error::Error
             reference_workspace,
         } => {
             let intent = experiment_intent(experiment)?;
-            let ours = local_trials(archives, name.as_deref(), &intent.metrics)?;
-            let theirs = local_trials(reference, name.as_deref(), &intent.metrics)?;
+            let ours = local_trials(archives, name.as_deref(), &intent)?;
+            let theirs = local_trials(reference, name.as_deref(), &intent)?;
             let refs = recorded_references(reference_workspace.as_deref(), &intent);
             let c = vxedge_core::verdict::compare_with(&intent, ours, theirs, &refs);
             if json {

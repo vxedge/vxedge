@@ -178,6 +178,7 @@ fn intent_reason(kind: vxedge_core::intent::ProblemKind) -> R {
         vxedge_core::intent::ProblemKind::Criterion => R::CriterionInvalid,
         vxedge_core::intent::ProblemKind::Measurement => R::MeasurementInvalid,
         vxedge_core::intent::ProblemKind::Scenario => R::ScenarioInvalid,
+        vxedge_core::intent::ProblemKind::Check => R::CheckInvalid,
     }
 }
 

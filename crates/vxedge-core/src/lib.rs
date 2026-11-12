@@ -6,6 +6,7 @@
 //! Open5GS, traffic) as they land.
 
 pub mod campaign;
+pub mod checks;
 pub mod containers;
 pub mod distribution;
 pub mod entities;

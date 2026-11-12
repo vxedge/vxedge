@@ -613,6 +613,8 @@ pub struct Experiment {
     pub traffic: Vec<TrafficProfile>,
     /// What the experiment measures, by node id (`crate::measurements`).
     pub measurements: Vec<crate::measurements::Measurement>,
+    /// The functional checks a trial runs (`crate::checks`).
+    pub checks: Option<crate::checks::Checks>,
     /// The one device `up` brings up, when the experiment isolates one: the zone and compute
     /// stages start it alone and leave every other device down.
     pub isolate: Option<String>,
