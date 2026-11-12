@@ -776,7 +776,7 @@ pub fn bridge_vlan_list(netns: Option<&str>, dev: &str) -> Result<Vec<u16>, Netl
 /// is an absolute path. The second form is how a namespace outside `ip netns`'s registry is
 /// addressed, such as a container group's (`/proc/<infra pid>/ns/net`, the zone `container`
 /// backend's OCI payload), so every `netns: Option<&str>` here accepts either.
-fn netns_path(name: &str) -> std::path::PathBuf {
+pub fn netns_path(name: &str) -> std::path::PathBuf {
     let p = std::path::Path::new(name);
     if p.is_absolute() {
         p.to_path_buf()

@@ -494,6 +494,12 @@ pub(crate) fn inspect(
                 labels: m.labels.clone().into_iter().collect(),
                 ratio: m.ratio.clone().unwrap_or_default(),
                 factor: m.factor,
+                window: m.window.clone().unwrap_or_default(),
+                reduce: if m.series.is_some() {
+                    m.reduction().to_string()
+                } else {
+                    String::new()
+                },
             })
             .collect();
         info.criteria = typed.criteria.iter().map(criterion).collect();
