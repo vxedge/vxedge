@@ -6,6 +6,13 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-11-12
+
+Cross-campaign criteria. An experiment can declare the reference campaigns its criteria read, such
+as exp-010's H2 against exp-001's frozen campaign, and `ResultService.Verdict` finds them in a
+workspace's `results/` or on the host. vxAPI stays `vxedge.v1`, and the change is additive:
+`ResultVerdictRequest.reference_workspace` and `VerdictRead.reference`.
+
 ## [0.18.0] - 2026-11-12
 
 Measure windows. A campaign can split each trial's measure phase into named windows that run one
