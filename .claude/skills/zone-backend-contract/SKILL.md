@@ -26,6 +26,14 @@ isolation mechanism differs — that is exactly the H3 variable." Concretely:
   (`vmlinuz`+`initrd.img`), virtio-net on a tap. An aarch64 bundle (`meta.json` `"arch": "aarch64"`)
   boots `qemu-system-aarch64 -M virt` instead: virtio-mmio too, console `ttyAMA0`. KVM only on a
   host of the same instruction set, else TCG; `NodeStatus.acceleration` says which.
+  A device's `qemu: { machine: microvm | q35, transport: mmio | pci, vhost: bool }` (x86 guests
+  only) changes the machine, the NIC's virtio transport and its data path, for an arm that
+  decomposes the VM's cost; absent, the command line is the microVM's, byte for byte.
+  `microvm` with `pci` is `microvm,pcie=on,acpi=on` (without ACPI the NIC behind the root port
+  stays in D3cold). The manifest refuses what it can judge at load: `qemu:` on another backend,
+  an unknown key or value, `q35` without `pci`. Boot refuses the rest before QEMU starts: an
+  aarch64 guest, `pci` for a bundle without `org.vxedge.virtio-pci: true`, `vhost` without
+  `/dev/vhost-net`. `NodeSpec.qemu` reports the options a node runs with.
 - `libvirt`: full QEMU machine via `virsh` (`qemu:///system`), same bundle/cmdline
   contract, precreated tap (`managed='no'`).
 - `cloud-hypervisor`: the same guest bundle under Cloud Hypervisor, driven over its REST API on a
@@ -73,6 +81,8 @@ must follow, not just imitate loosely:
 - Document, in the recipe's own README, exactly which `backend:` values the image
   supports — a recipe for a guest that production runs under a Type-1 hypervisor must state
   the RTOS-as-guest inversion fidelity caveat (ARCHITECTURE §9) inline, not leave it implicit.
+- A guest whose kernel drives a virtio-net on a PCI bus declares `org.vxedge.virtio-pci: true`;
+  without it, `qemu.transport: pci` is refused, since the guest would boot with no NIC.
 - A guest that answers a measurement echoes UDP on :9800 at its `vx.ip` address and declares it as
   `org.vxedge.reflector: udp/9800`. Each VM backend's privileged test (`zones_qemu_microvm.rs`,
   `zones_cloud_hypervisor.rs`, `zones_qemu_mcu.rs`) checks the reflector answers at the pinned address.

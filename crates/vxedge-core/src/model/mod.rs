@@ -123,6 +123,56 @@ pub struct Device {
     /// CPUs this device's runtime is pinned to. A determinism control, not an allocation —
     /// which is why it sits here rather than in [`Resources`].
     pub pinned_cpus: Vec<u32>,
+    /// The `qemu:` block of a `qemu-microvm` device: the machine, the NIC's virtio transport and
+    /// vhost. Absent, it is the default microVM.
+    pub qemu: QemuOptions,
+}
+
+/// How a `qemu-microvm` device's QEMU is built, for an arm that decomposes the VM's cost one
+/// factor at a time. The default is the microVM: `microvm` without ACPI, a virtio-mmio NIC, no
+/// vhost.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QemuOptions {
+    pub machine: QemuMachine,
+    pub transport: VirtioTransport,
+    /// The NIC's data path runs in the host kernel (`vhost-net`) rather than in QEMU.
+    pub vhost: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum QemuMachine {
+    /// QEMU's `microvm`: no PCI bus unless the transport asks for one.
+    #[default]
+    Microvm,
+    /// QEMU's `q35`: a PC with ACPI and a PCIe bus.
+    Q35,
+}
+
+impl QemuMachine {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            QemuMachine::Microvm => "microvm",
+            QemuMachine::Q35 => "q35",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum VirtioTransport {
+    /// `virtio-net-device` on a virtio-mmio slot.
+    #[default]
+    Mmio,
+    /// `virtio-net-pci` on the machine's PCI bus.
+    Pci,
+}
+
+impl VirtioTransport {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VirtioTransport::Mmio => "mmio",
+            VirtioTransport::Pci => "pci",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

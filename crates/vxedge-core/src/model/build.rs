@@ -130,6 +130,20 @@ pub enum ModelError {
          a non-negative integer that fits a CPU index — every entry must be, not just some"
     )]
     MalformedPinnedCpu { device: String, value: String },
+    #[error("device `{device}` declares `qemu:`, which only a `qemu-microvm` device takes")]
+    QemuOptionsOnOtherBackend { device: String },
+    #[error("device `{device}` declares `qemu.{key}: {value}`; expected {expected}")]
+    MalformedQemuOption {
+        device: String,
+        key: String,
+        value: String,
+        expected: &'static str,
+    },
+    #[error(
+        "device `{device}` declares `qemu.machine: q35` without `transport: pci`; q35 has no \
+         virtio-mmio slots, so its NIC is on the PCI bus"
+    )]
+    Q35WithoutPci { device: String },
     #[error("slice `{slice}` declares `mode: {mode}` — expected `vlan` or `s-nssai`")]
     UnknownSliceMode { slice: String, mode: String },
     #[error("vxlan tunnel `{tunnel}` declares `remote: {remote}`, which is not a valid IP address")]
@@ -573,6 +587,79 @@ fn pinned_cpus_of(device: &str, realtime: Option<&Value>) -> Result<Vec<u32>, Mo
         .collect()
 }
 
+/// A `qemu-microvm` device's `qemu:` block. Every check that the manifest alone settles is made
+/// here; what depends on the guest bundle (its instruction set, whether its kernel drives a PCI
+/// NIC) or on the host (`/dev/vhost-net`) is refused when the node boots.
+fn qemu_options_of(
+    device: &str,
+    backend: Option<Backend>,
+    raw: Option<&Value>,
+) -> Result<QemuOptions, ModelError> {
+    let Some(raw) = raw else {
+        return Ok(QemuOptions::default());
+    };
+    if backend != Some(Backend::QemuMicrovm) {
+        return Err(ModelError::QemuOptionsOnOtherBackend {
+            device: device.to_string(),
+        });
+    }
+    let malformed =
+        |key: &str, value: &Value, expected: &'static str| ModelError::MalformedQemuOption {
+            device: device.to_string(),
+            key: key.to_string(),
+            value: serde_yaml_ng::to_string(value)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            expected,
+        };
+    let Some(map) = raw.as_mapping() else {
+        return Err(malformed(
+            "",
+            raw,
+            "a mapping of machine, transport and vhost",
+        ));
+    };
+    let mut options = QemuOptions::default();
+    for (key, value) in map {
+        let key = key.as_str().unwrap_or_default();
+        match key {
+            "machine" => {
+                options.machine = match value.as_str() {
+                    Some("microvm") => QemuMachine::Microvm,
+                    Some("q35") => QemuMachine::Q35,
+                    _ => return Err(malformed(key, value, "`microvm` or `q35`")),
+                }
+            }
+            "transport" => {
+                options.transport = match value.as_str() {
+                    Some("mmio") => VirtioTransport::Mmio,
+                    Some("pci") => VirtioTransport::Pci,
+                    _ => return Err(malformed(key, value, "`mmio` or `pci`")),
+                }
+            }
+            "vhost" => {
+                options.vhost = value
+                    .as_bool()
+                    .ok_or_else(|| malformed(key, value, "true or false"))?
+            }
+            _ => {
+                return Err(malformed(
+                    key,
+                    value,
+                    "only `machine`, `transport` and `vhost` keys",
+                ));
+            }
+        }
+    }
+    if options.machine == QemuMachine::Q35 && options.transport != VirtioTransport::Pci {
+        return Err(ModelError::Q35WithoutPci {
+            device: device.to_string(),
+        });
+    }
+    Ok(options)
+}
+
 /// §6.0 → entity. Nothing is synthesized: the schema declares zones, devices and functions as
 /// separate things, so this reads them. The earlier builder had to invent a function per device
 /// because §6.0 could not say what a function was — that was the gap this schema closed.
@@ -616,6 +703,7 @@ fn build_entity(ws: &Workspace, doc: &VehicleDoc) -> Result<Entity, ModelError> 
                     }],
                 },
                 pinned_cpus: pinned_cpus_of(id, d.realtime.as_ref())?,
+                qemu: qemu_options_of(id, backend_of(id, &spec)?, d.qemu.as_ref())?,
             },
         );
     }
@@ -2227,6 +2315,86 @@ devices:
                 assert_eq!(device, "zonefl");
             }
             other => panic!("expected MalformedPinnedCpu, got {other:?}"),
+        }
+    }
+
+    fn qemu_workspace(device: &str) -> String {
+        format!(
+            r#"
+kind: experiment
+id: e
+vehicles: [veh]
+network: {{ slices: [] }}
+---
+kind: vehicle
+id: veh
+devices:
+  ecu: {device}
+"#
+        )
+    }
+
+    fn qemu_of_device(device: &str) -> Result<QemuOptions, crate::model::LoadError> {
+        load_yaml(&qemu_workspace(device)).map(|m| m.entities[0].devices["ecu"].qemu)
+    }
+
+    #[test]
+    fn a_qemu_block_reaches_the_model_and_its_absence_is_the_microvm() {
+        assert_eq!(
+            qemu_of_device("{ role: ecu, backend: qemu-microvm }").unwrap(),
+            QemuOptions::default()
+        );
+        assert_eq!(
+            qemu_of_device(
+                "{ role: ecu, backend: qemu-microvm, qemu: { machine: q35, transport: pci, vhost: true } }"
+            )
+            .unwrap(),
+            QemuOptions {
+                machine: QemuMachine::Q35,
+                transport: VirtioTransport::Pci,
+                vhost: true,
+            }
+        );
+        assert_eq!(
+            qemu_of_device("{ role: ecu, backend: qemu-microvm, qemu: { transport: pci } }")
+                .unwrap(),
+            QemuOptions {
+                transport: VirtioTransport::Pci,
+                ..QemuOptions::default()
+            }
+        );
+    }
+
+    #[test]
+    fn a_qemu_block_the_manifest_can_judge_is_refused_at_plan_time() {
+        use crate::model::LoadError::Model;
+        match qemu_of_device("{ role: ecu, backend: cloud-hypervisor, qemu: { vhost: true } }") {
+            Err(Model(ModelError::QemuOptionsOnOtherBackend { device })) => {
+                assert_eq!(device, "ecu")
+            }
+            other => panic!("expected QemuOptionsOnOtherBackend, got {other:?}"),
+        }
+        for (block, key) in [
+            ("{ machine: pc }", "machine"),
+            ("{ transport: ccw }", "transport"),
+            ("{ vhost: yes-please }", "vhost"),
+            ("{ acpi: on }", "acpi"),
+        ] {
+            let device = format!("{{ role: ecu, backend: qemu-microvm, qemu: {block} }}");
+            match qemu_of_device(&device) {
+                Err(Model(ModelError::MalformedQemuOption { key: k, .. })) => assert_eq!(k, key),
+                other => panic!("{block}: expected MalformedQemuOption, got {other:?}"),
+            }
+        }
+        for block in ["{ machine: q35 }", "{ machine: q35, transport: mmio }"] {
+            let device = format!("{{ role: ecu, backend: qemu-microvm, qemu: {block} }}");
+            assert!(
+                matches!(
+                    qemu_of_device(&device),
+                    Err(Model(ModelError::Q35WithoutPci { .. }))
+                ),
+                "{block}"
+            );
         }
     }
 

@@ -137,6 +137,10 @@ struct BundleBoot {
     /// `"virtualization": true`: the guest is itself a hypervisor and needs the CPU's
     /// virtualization extensions. aarch64 only: EL2 on `virt`, with GICv3.
     virtualization: bool,
+    /// `"org.vxedge.virtio-pci": "true"`: the guest's kernel drives a virtio-net on a PCI bus, so
+    /// a device may ask for `qemu.transport: pci`. Default false: the FreeRTOS and Zephyr probe
+    /// guests drive virtio-mmio only, and on PCI they would boot with no NIC.
+    virtio_pci: bool,
 }
 
 /// The ranges `cpus` and `memory_mb` may take: a zone ECU guest, not a server.
@@ -150,6 +154,7 @@ fn bundle_boot(np: &NodePlan) -> Result<BundleBoot, ZoneBackendError> {
         cpus: 1,
         memory_mb: None,
         virtualization: false,
+        virtio_pci: false,
     };
     let Some(dir) = np.bundle.as_deref() else {
         return Ok(default);
@@ -232,12 +237,23 @@ fn bundle_boot(np: &NodePlan) -> Result<BundleBoot, ZoneBackendError> {
                 .into(),
         ));
     }
+    let virtio_pci = match meta.get("org.vxedge.virtio-pci") {
+        None => false,
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(serde_json::Value::String(s)) if s == "true" || s == "false" => s == "true",
+        Some(v) => {
+            return Err(refuse(format!(
+                "the bundle's meta.json `org.vxedge.virtio-pci` is not true or false: {v}"
+            )));
+        }
+    };
     Ok(BundleBoot {
         arch,
         legacy_mmio,
         cpus,
         memory_mb,
         virtualization,
+        virtio_pci,
     })
 }
 
@@ -252,6 +268,7 @@ use crate::gateway::netlink;
 use crate::gateway::netops::children_are_privileged;
 use crate::gateway::netops::{NetOpsError, Shell};
 use crate::model::Backend;
+use crate::model::{QemuMachine, QemuOptions, VirtioTransport};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ZoneBackendError {
@@ -643,6 +660,7 @@ fn microvm_up(sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneB
     }
     let (kernel, initrd) = bundle_paths(np)?;
     let boot = bundle_boot(np)?;
+    check_qemu_options(np, boot, vhost_net_usable)?;
     let arch = boot.arch;
     let accel = Acceleration::for_guest(arch, Path::new("/dev/kvm").exists());
     if !on_path(arch.qemu_bin()) {
@@ -675,6 +693,53 @@ fn microvm_up(sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneB
     Ok(())
 }
 
+/// Whether this process can open `/dev/vhost-net` for reading and writing, as QEMU's
+/// `vhost=on` does.
+fn vhost_net_usable() -> bool {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/vhost-net")
+        .is_ok()
+}
+
+/// The checks on a device's `qemu:` block that depend on its bundle or on this host, so the
+/// manifest alone cannot settle them (`model::build` refuses the rest at plan time).
+fn check_qemu_options(
+    np: &NodePlan,
+    boot: BundleBoot,
+    vhost_usable: fn() -> bool,
+) -> Result<(), ZoneBackendError> {
+    let refuse = |detail: String| {
+        Err(ZoneBackendError::Runtime {
+            node: np.node_id.clone(),
+            detail,
+        })
+    };
+    let q = np.qemu;
+    if q != QemuOptions::default() && boot.arch != GuestArch::X86_64 {
+        return refuse(format!(
+            "`qemu:` options are for an x86 guest; this bundle is {}",
+            boot.arch.as_str()
+        ));
+    }
+    if q.transport == VirtioTransport::Pci && !boot.virtio_pci {
+        return refuse(
+            "`qemu.transport: pci` needs a bundle that declares `org.vxedge.virtio-pci: true`; \
+             this one does not, and its guest would boot with no NIC"
+                .into(),
+        );
+    }
+    if q.vhost && !vhost_usable() {
+        return refuse(
+            "`qemu.vhost: true` needs `/dev/vhost-net` open for reading and writing (the `kvm` \
+             group on most hosts)"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// The QEMU command line of a `qemu-microvm` node: a minimal virtio-mmio machine with direct
 /// kernel boot, `microvm` on x86_64 and `virt` on aarch64. Pure, so both are tested.
 fn microvm_argv(
@@ -686,6 +751,8 @@ fn microvm_argv(
     accel: Acceleration,
 ) -> Vec<String> {
     let arch = boot.arch;
+    let q = np.qemu;
+    let pci = q.transport == VirtioTransport::Pci;
     let transport = format!("virtio-mmio.force-legacy={}", boot.legacy_mmio);
     let name = np.runtime_name();
     let pidfile = runtime_dir.join(format!("{name}.pid"));
@@ -693,12 +760,31 @@ fn microvm_argv(
         "file:{}",
         runtime_dir.join(format!("{name}.serial.log")).display()
     );
-    let netdev = format!("tap,id=n0,ifname={},script=no,downscript=no", np.endpoint);
-    let nic = format!("virtio-net-device,netdev=n0,mac={}", np.guest_mac());
+    let vhost = if q.vhost { ",vhost=on" } else { "" };
+    let netdev = format!(
+        "tap,id=n0,ifname={},script=no,downscript=no{vhost}",
+        np.endpoint
+    );
+    let nic_model = if pci {
+        "virtio-net-pci"
+    } else {
+        "virtio-net-device"
+    };
+    let nic = format!("{nic_model},netdev=n0,mac={}", np.guest_mac());
     let append = kernel_cmdline_for(np, arch);
     let kvm = accel == Acceleration::Kvm;
     let (machine, cpu, default_mb) = match arch {
-        GuestArch::X86_64 => ("microvm,acpi=off", if kvm { "host" } else { "max" }, 128),
+        // A PCIe bus on `microvm` needs ACPI: without it the NIC behind the root port stays in
+        // D3cold. `q35` always has both.
+        GuestArch::X86_64 => (
+            match (q.machine, pci) {
+                (QemuMachine::Q35, _) => "q35",
+                (QemuMachine::Microvm, true) => "microvm,pcie=on,acpi=on",
+                (QemuMachine::Microvm, false) => "microvm,acpi=off",
+            },
+            if kvm { "host" } else { "max" },
+            128,
+        ),
         // A guest that is itself a hypervisor runs at EL2, and its own guests need the GICv3
         // virtualization interface.
         GuestArch::Aarch64 if boot.virtualization => (
@@ -738,11 +824,6 @@ fn microvm_argv(
             "-smp",
             &smp,
             "-nodefaults",
-            // QEMU's virtio-mmio is the legacy (version 1) transport unless told otherwise.
-            // Linux speaks both; Zephyr's driver refuses version 1, and some drivers speak only
-            // it, so the bundle chooses ([`BundleBoot::legacy_mmio`]).
-            "-global",
-            &transport,
             "-no-user-config",
             "-nographic",
             "-monitor",
@@ -764,6 +845,16 @@ fn microvm_argv(
         .iter()
         .map(|s| s.to_string()),
     );
+    // QEMU's virtio-mmio is the legacy (version 1) transport unless told otherwise. Linux speaks
+    // both; Zephyr's driver refuses version 1, and some drivers speak only it, so the bundle
+    // chooses ([`BundleBoot::legacy_mmio`]). A PCI NIC has no virtio-mmio transport to set.
+    if !pci {
+        let at = args
+            .iter()
+            .position(|a| a == "-nodefaults")
+            .map_or(args.len(), |i| i + 1);
+        args.splice(at..at, ["-global".to_string(), transport]);
+    }
     // An empty `initrd.img` is a bundle whose kernel needs none: its image carries the whole
     // system. QEMU's arm loader refuses an empty file, so it is not passed at all.
     if std::fs::metadata(initrd).is_ok_and(|m| m.len() > 0) {
@@ -1380,6 +1471,7 @@ mod tests {
             image: Some(PAUSE_IMAGE.into()),
             module: None,
             pinned_cpus: Vec::new(),
+            qemu: Default::default(),
         }
     }
 
@@ -1402,12 +1494,193 @@ mod tests {
             cpus: 1,
             memory_mb: None,
             virtualization: false,
+            virtio_pci: false,
         }
     }
 
     fn arg_after<'a>(argv: &'a [String], flag: &str) -> &'a str {
         let i = argv.iter().position(|a| a == flag).expect(flag);
         &argv[i + 1]
+    }
+
+    fn qemu(machine: QemuMachine, transport: VirtioTransport, vhost: bool) -> QemuOptions {
+        QemuOptions {
+            machine,
+            transport,
+            vhost,
+        }
+    }
+
+    /// With no `qemu:` block an x86 guest gets exactly the microVM command line it had before the
+    /// block existed, so no existing experiment changes.
+    #[test]
+    fn no_qemu_block_keeps_the_microvm_command_line() {
+        let np = microvm_node(None);
+        let rt = Path::new("/run/vx");
+        let name = np.runtime_name();
+        let argv = microvm_argv(
+            &np,
+            rt,
+            "k",
+            "i",
+            boot(GuestArch::X86_64),
+            Acceleration::Kvm,
+        );
+        let expected: Vec<String> = [
+            "qemu-system-x86_64",
+            "-M",
+            "microvm,acpi=off",
+            "-cpu",
+            "host",
+            "-m",
+            "128m",
+            "-smp",
+            "1",
+            "-nodefaults",
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-no-user-config",
+            "-nographic",
+            "-monitor",
+            "none",
+            "-serial",
+            &format!("file:/run/vx/{name}.serial.log"),
+            "-kernel",
+            "k",
+            "-append",
+            &kernel_cmdline_for(&np, GuestArch::X86_64),
+            "-netdev",
+            "tap,id=n0,ifname=vz-arm,script=no,downscript=no",
+            "-device",
+            &format!("virtio-net-device,netdev=n0,mac={}", np.guest_mac()),
+            "-pidfile",
+            &format!("/run/vx/{name}.pid"),
+            "-daemonize",
+            "-enable-kvm",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(argv, expected);
+    }
+
+    /// Each `qemu:` arm builds its machine, NIC and data path, and only an MMIO NIC sets the
+    /// virtio-mmio transport.
+    #[test]
+    fn each_qemu_arm_builds_its_machine_nic_and_data_path() {
+        use QemuMachine::{Microvm, Q35};
+        use VirtioTransport::{Mmio, Pci};
+        let rt = Path::new("/run/vx");
+        for (options, machine, nic, vhost) in [
+            (
+                qemu(Microvm, Mmio, false),
+                "microvm,acpi=off",
+                "virtio-net-device",
+                false,
+            ),
+            (
+                qemu(Microvm, Mmio, true),
+                "microvm,acpi=off",
+                "virtio-net-device",
+                true,
+            ),
+            (
+                qemu(Microvm, Pci, false),
+                "microvm,pcie=on,acpi=on",
+                "virtio-net-pci",
+                false,
+            ),
+            (qemu(Q35, Pci, false), "q35", "virtio-net-pci", false),
+            (qemu(Q35, Pci, true), "q35", "virtio-net-pci", true),
+        ] {
+            let mut np = microvm_node(None);
+            np.qemu = options;
+            let argv = microvm_argv(
+                &np,
+                rt,
+                "k",
+                "i",
+                boot(GuestArch::X86_64),
+                Acceleration::Kvm,
+            );
+            assert_eq!(arg_after(&argv, "-M"), machine, "{options:?}");
+            assert!(arg_after(&argv, "-device").starts_with(&format!("{nic},netdev=n0,mac=")));
+            assert_eq!(
+                arg_after(&argv, "-netdev").ends_with(",vhost=on"),
+                vhost,
+                "{options:?}"
+            );
+            assert_eq!(
+                argv.iter().any(|a| a == "-global"),
+                options.transport == Mmio,
+                "{options:?}"
+            );
+            assert_eq!(arg_after(&argv, "-cpu"), "host");
+            assert_eq!(arg_after(&argv, "-m"), "128m");
+        }
+    }
+
+    /// What the manifest cannot settle is refused at boot: options on a non-x86 guest, a PCI NIC
+    /// for a guest that drives none, vhost without `/dev/vhost-net`.
+    #[test]
+    fn qemu_options_the_bundle_or_host_cannot_honour_are_refused_at_boot() {
+        use QemuMachine::{Microvm, Q35};
+        use VirtioTransport::{Mmio, Pci};
+        let yes: fn() -> bool = || true;
+        let no: fn() -> bool = || false;
+        let pci_bundle = BundleBoot {
+            virtio_pci: true,
+            ..boot(GuestArch::X86_64)
+        };
+        let mut np = microvm_node(None);
+
+        // The default needs nothing, on any guest and any host.
+        for arch in [GuestArch::X86_64, GuestArch::Aarch64] {
+            check_qemu_options(&np, boot(arch), no).unwrap();
+        }
+
+        np.qemu = qemu(Q35, Pci, false);
+        check_qemu_options(&np, pci_bundle, no).unwrap();
+        let e = check_qemu_options(&np, boot(GuestArch::X86_64), yes).unwrap_err();
+        assert!(e.to_string().contains("org.vxedge.virtio-pci"), "{e}");
+        let arm = BundleBoot {
+            arch: GuestArch::Aarch64,
+            ..pci_bundle
+        };
+        let e = check_qemu_options(&np, arm, yes).unwrap_err();
+        assert!(e.to_string().contains("aarch64"), "{e}");
+
+        np.qemu = qemu(Microvm, Mmio, true);
+        check_qemu_options(&np, boot(GuestArch::X86_64), yes).unwrap();
+        let e = check_qemu_options(&np, boot(GuestArch::X86_64), no).unwrap_err();
+        assert!(e.to_string().contains("/dev/vhost-net"), "{e}");
+    }
+
+    /// A bundle declares a PCI-capable guest with the published annotation.
+    #[test]
+    fn a_bundle_declares_a_pci_capable_guest() {
+        let dir = tempfile::tempdir().unwrap();
+        let np = microvm_node(Some(dir.path().to_path_buf()));
+        for (meta, pci) in [
+            (r#"{}"#, false),
+            (r#"{"org.vxedge.virtio-pci":"true"}"#, true),
+            (r#"{"org.vxedge.virtio-pci":true}"#, true),
+            (r#"{"org.vxedge.virtio-pci":"false"}"#, false),
+        ] {
+            std::fs::write(dir.path().join("meta.json"), meta).unwrap();
+            assert_eq!(bundle_boot(&np).unwrap().virtio_pci, pci, "{meta}");
+        }
+        std::fs::write(
+            dir.path().join("meta.json"),
+            r#"{"org.vxedge.virtio-pci":"yes"}"#,
+        )
+        .unwrap();
+        assert!(
+            bundle_boot(&np)
+                .unwrap_err()
+                .to_string()
+                .contains("not true or false")
+        );
     }
 
     /// An aarch64 bundle boots QEMU's `virt` machine with the PL011 console. Without KVM for its

@@ -62,6 +62,7 @@ fn remote_plan() -> NodePlan {
         image: None,
         module: None,
         pinned_cpus: Vec::new(),
+        qemu: Default::default(),
     }
 }
 
