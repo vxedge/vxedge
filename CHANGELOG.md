@@ -43,15 +43,18 @@ All notable changes to this repo are documented here. Format follows
     (`sha256:cc81350e76480ee37237abcc78f42871d97c71ed1cd35e431a02924a521cc94b`).
   - A package that uses `time_sync` requires the first vxedge release that reads it.
 
+## [0.29.1] - 2026-11-14
+
+Two fixes: archives record a digest-pulled payload image's digest, and a tool rebuilt in place is not
+recorded as failed. No vxAPI change. Released from the `release/0.29` branch, cut from v0.29.0;
+`network.time_sync`, above, is not in it.
+
 ### Fixed
 
 - `TelemetryService.Collect` names a published container payload by its pinned reference
   (`<ref>@<digest>`) when it asks vxtelemetry to record image digests. With the bare reference, an
   image pulled by digest has no tag in the Podman store, so the archive's `image_digests` read
   "unresolved" for it. Found in exp-018's first live run.
-
-### Fixed
-
 - A tool rebuilt in place is no longer recorded as failed when its `--version` run meets ETXTBSY
   ("text file busy"), which another process forked while the file was open for writing can cause
   for a moment. The daemon retries briefly. This also made a `vxedged` unit test flaky in CI.
