@@ -8,6 +8,13 @@ All notable changes to this repo are documented here. Format follows
 
 ### Fixed
 
+- `TelemetryService.Collect` names a published container payload by its pinned reference
+  (`<ref>@<digest>`) when it asks vxtelemetry to record image digests. With the bare reference, an
+  image pulled by digest has no tag in the Podman store, so the archive's `image_digests` read
+  "unresolved" for it. Found in exp-018's first live run.
+
+### Fixed
+
 - A tool rebuilt in place is no longer recorded as failed when its `--version` run meets ETXTBSY
   ("text file busy"), which another process forked while the file was open for writing can cause
   for a moment. The daemon retries briefly. This also made a `vxedged` unit test flaky in CI.

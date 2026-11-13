@@ -246,7 +246,9 @@ impl TelemetryService for TelemetrySvc {
                 .values()
                 .filter_map(|f| f.part.as_ref())
                 .filter(|p| p.kind == vxedge_core::model::PartKind::Container)
-                .map(|p| p.reference.clone())
+                // Digest-pinned, as the payload was started: a part pulled by digest has no tag
+                // in the store, so its bare reference would not resolve.
+                .map(|p| p.image_ref())
         }));
         images.extend(
             vxedge_core::fiveg::fiveg_images(&model)
