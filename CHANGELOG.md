@@ -6,6 +6,12 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- A tool rebuilt in place is no longer recorded as failed when its `--version` run meets ETXTBSY
+  ("text file busy"), which another process forked while the file was open for writing can cause
+  for a moment. The daemon retries briefly. This also made a `vxedged` unit test flaky in CI.
+
 ## [0.29.0] - 2026-11-13
 
 A container payload can be started with its own arguments, environment and `NET_ADMIN`: a
