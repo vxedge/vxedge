@@ -136,6 +136,15 @@ pub enum WorkspaceValidationError {
     )]
     PublishedRefWithoutDigest { baseline: String, part: String },
     #[error(
+        "baseline `{baseline}`: part `{part}` sets `run.cap_add: {capability}`. `run.cap_add` \
+         accepts NET_ADMIN only."
+    )]
+    RunCapabilityRefused {
+        baseline: String,
+        part: String,
+        capability: String,
+    },
+    #[error(
         "the package `{package}` has name `{name}`, but the experiment id is `{experiment}` — \
          under `vxp/1` the part after the `/` is the experiment id, so they must be the same"
     )]
@@ -821,7 +830,33 @@ pub struct PartEntry {
     /// needs most, since it runs one function on three backends from three parts.
     #[serde(default)]
     pub kind: Option<String>,
+    /// How a container payload starts (`ARCHITECTURE.md` §6.0.2): its command arguments,
+    /// environment and added capabilities. Valid only on a part a `container` device runs as its
+    /// payload; every target of the entry starts the same way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<RunDoc>,
 }
+
+/// `run` on a baseline `parts` entry, as written.
+///
+/// `args` replaces the image's `CMD` and keeps its `ENTRYPOINT`, as `podman run <image> <args>`
+/// does. `env` values are strings: a YAML number or boolean is refused rather than read as its
+/// spelling, so `"1"` and `1.0` cannot become two names for one input. `cap_add` accepts
+/// [`RUN_CAPABILITIES`] only, checked by [`Workspace::validate`] so every bad entry is named.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunDoc {
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub cap_add: Vec<String>,
+}
+
+/// The capabilities `run.cap_add` accepts: `NET_ADMIN`, which a load part needs to install its
+/// own routes (a multicast route for SOME/IP service discovery). Anything else is refused.
+pub const RUN_CAPABILITIES: &[&str] = &["NET_ADMIN"];
 
 impl PartEntry {
     /// A ref is local when it names something on this machine rather than in a registry.
@@ -1341,6 +1376,14 @@ impl Workspace {
                         digest: d.clone(),
                     }),
                     _ => {}
+                }
+                let caps = p.run.iter().flat_map(|r| &r.cap_add);
+                for cap in caps.filter(|c| !RUN_CAPABILITIES.contains(&c.as_str())) {
+                    errors.push(E::RunCapabilityRefused {
+                        baseline: b.id.clone(),
+                        part: p.reference.clone(),
+                        capability: cap.clone(),
+                    });
                 }
             }
         }
@@ -2076,6 +2119,87 @@ parts:
         let msg = err.to_string();
         assert!(msg.contains("adress"), "{msg}");
         assert!(msg.contains("node"), "{msg}");
+    }
+
+    /// A baseline with one `run` entry, for the `run` shape tests: what `validate` refuses is
+    /// named against the entry, and what serde refuses never becomes a workspace.
+    fn run_baseline(run: &str) -> String {
+        format!(
+            "kind: baseline\nid: bl\nparts:\n  - ref: localhost/vxedge/probe:1\n    \
+             target_ids: fn-a\n    run: {run}\n"
+        )
+    }
+
+    #[test]
+    fn run_cap_add_accepts_net_admin_only() {
+        let ok = Workspace::from_yaml(&run_baseline("{ cap_add: [NET_ADMIN] }")).unwrap();
+        assert_eq!(
+            ok.baselines[0].parts[0].run.as_ref().unwrap().cap_add,
+            ["NET_ADMIN"]
+        );
+        assert!(
+            !ok.validate()
+                .iter()
+                .any(|e| matches!(e, WorkspaceValidationError::RunCapabilityRefused { .. }))
+        );
+        let ws = Workspace::from_yaml(&run_baseline(
+            "{ cap_add: [NET_ADMIN, SYS_ADMIN, net_raw] }",
+        ))
+        .unwrap();
+        let refused: Vec<String> = ws
+            .validate()
+            .into_iter()
+            .filter_map(|e| match e {
+                WorkspaceValidationError::RunCapabilityRefused {
+                    baseline,
+                    part,
+                    capability,
+                } => {
+                    assert_eq!(
+                        (baseline.as_str(), part.as_str()),
+                        ("bl", "localhost/vxedge/probe:1")
+                    );
+                    Some(capability)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(refused, ["SYS_ADMIN", "net_raw"]);
+    }
+
+    /// `env` values are strings. A YAML number or boolean is refused rather than read as its
+    /// spelling, and so is a list or a map.
+    #[test]
+    fn run_env_takes_strings_only() {
+        let ws = Workspace::from_yaml(&run_baseline("{ env: { A: '1', B: x } }")).unwrap();
+        let env = &ws.baselines[0].parts[0].run.as_ref().unwrap().env;
+        assert_eq!((env["A"].as_str(), env["B"].as_str()), ("1", "x"));
+        for bad in ["1", "true", "1.5", "[a]", "{ k: v }"] {
+            let err = Workspace::from_yaml(&run_baseline(&format!("{{ env: {{ A: {bad} }} }}")))
+                .map(|_| ())
+                .unwrap_err();
+            assert!(matches!(err, WorkspaceError::Parse { .. }), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn run_args_are_strings_and_unknown_run_keys_are_refused() {
+        let ws = Workspace::from_yaml(&run_baseline("{ args: [pub, 1000Hz, '1'] }")).unwrap();
+        assert_eq!(
+            ws.baselines[0].parts[0].run.as_ref().unwrap().args,
+            ["pub", "1000Hz", "1"]
+        );
+        for bad in [
+            "{ args: [1] }",
+            "{ command: [x] }",
+            "{ entrypoint: [x] }",
+            "[x]",
+        ] {
+            let err = Workspace::from_yaml(&run_baseline(bad))
+                .map(|_| ())
+                .unwrap_err();
+            assert!(matches!(err, WorkspaceError::Parse { .. }), "{bad}: {err}");
+        }
     }
 
     #[test]

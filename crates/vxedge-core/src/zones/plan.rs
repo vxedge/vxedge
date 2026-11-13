@@ -105,6 +105,9 @@ pub struct NodePlan {
     /// store. `None` keeps the node a bare network namespace whose payload the experiment runner execs in by name — what every
     /// `local/…:host-process` part means, so no existing workspace changes behaviour.
     pub image: Option<String>,
+    /// How `image` starts: the baseline entry's `run` (`ARCHITECTURE.md` §6.0.2). Empty for a
+    /// node with no image, and for a payload started on its image's own defaults.
+    pub run: crate::model::PartRun,
     pub pinned_cpus: Vec<u32>,
     /// `qemu-microvm` only: the machine, NIC transport and vhost the device's `qemu:` block names.
     pub qemu: QemuOptions,
@@ -283,7 +286,7 @@ pub fn plan_nodes_from_model(
                 // image is deployed on it. A `local/…` part names a host process, which the
                 // runner starts itself inside the named netns — the contract every shipped
                 // workspace relies on, so it stays the default.
-                let image = match backend {
+                let (image, run) = match backend {
                     Backend::Container => {
                         let images: Vec<&crate::model::Part> = entity
                             .functions_on(&device.id)
@@ -296,14 +299,17 @@ pub fn plan_nodes_from_model(
                                 count: images.len(),
                             });
                         }
-                        images.first().map(|part| part.image_ref())
+                        match images.first() {
+                            Some(part) => (Some(part.image_ref()), part.run.clone()),
+                            None => (None, crate::model::PartRun::default()),
+                        }
                     }
                     Backend::Libvirt
                     | Backend::QemuMicrovm
                     | Backend::CloudHypervisor
                     | Backend::WasmCapsule
                     | Backend::Attach
-                    | Backend::QemuMcu => None,
+                    | Backend::QemuMcu => (None, crate::model::PartRun::default()),
                 };
                 // A capsule's module is a local file, or a published part `zones::node_up`
                 // fetches, the same split a VM bundle has.
@@ -362,6 +368,7 @@ pub fn plan_nodes_from_model(
                     remote_bundle,
                     module,
                     image,
+                    run,
                     pinned_cpus: device.pinned_cpus.clone(),
                     qemu: device.qemu,
                 });

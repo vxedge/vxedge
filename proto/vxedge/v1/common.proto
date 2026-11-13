@@ -208,6 +208,18 @@ message NodePayload {
   string reference = 2;
   // `sha256:...` of a published part. Empty for a local one.
   string digest = 3;
+  // How a container payload starts: the baseline part's `run`. Unset when the part declares
+  // none, and for every payload that is not a container.
+  PayloadRun run = 4;
+}
+
+// `run` on a baseline part (`ARCHITECTURE.md` §6.0.2).
+message PayloadRun {
+  // Replaces the image's command (`CMD`). The image's entrypoint is kept.
+  repeated string args = 1;
+  map<string, string> env = 2;
+  // Linux capabilities added to the payload container: `NET_ADMIN` only.
+  repeated string cap_add = 3;
 }
 
 // One node as the workspace plans it. The typed form of what `ResourceStatus.detail` holds as text.

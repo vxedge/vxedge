@@ -805,6 +805,7 @@ parts:
   - ref: ghcr.io/vxedge/parts/probe:1
     digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     target_ids: fa
+    run: { args: [--listen, "0.0.0.0:9801"], env: { ROLE: reflector }, cap_add: [NET_ADMIN] }
   - { ref: ./bundle, kind: bundle, target_ids: [fb, fc, fd] }
   - { ref: ./firmware, kind: bundle, target_ids: fg }
   - { ref: ./capsule.wasm, kind: wasm, target_ids: fe }
@@ -1015,6 +1016,16 @@ async fn node_status_is_typed_on_every_backend() {
         payload.digest,
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     );
+    // The part's `run` is reported with the payload it starts, and only there.
+    let run = payload
+        .run
+        .expect("a container payload carries its part's run");
+    assert_eq!(run.args, ["--listen", "0.0.0.0:9801"]);
+    assert_eq!(run.env["ROLE"], "reflector");
+    assert_eq!(run.cap_add, ["NET_ADMIN"]);
+    for id in ["b", "c", "d", "e", "f", "g"] {
+        assert!(spec(id).payload.unwrap().run.is_none(), "{id}");
+    }
 }
 
 #[tokio::test]

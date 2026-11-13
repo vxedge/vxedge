@@ -60,6 +60,7 @@ fn remote_plan() -> NodePlan {
         bundle: None,
         remote_bundle: Some((REFERENCE.to_string(), DIGEST.to_string())),
         image: None,
+        run: Default::default(),
         module: None,
         pinned_cpus: Vec::new(),
         qemu: Default::default(),

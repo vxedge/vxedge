@@ -394,6 +394,7 @@ mod tests {
             bundle: None,
             remote_bundle: None,
             image: None,
+            run: Default::default(),
             module: None,
             pinned_cpus,
             qemu: Default::default(),

@@ -8,8 +8,8 @@
 //! already depends on both.
 
 use vxedge_api::v1::{
-    NodeBackend, NodePayload, NodeSpec, NodeStatus, PayloadKind, QemuOptions, ResourceKind,
-    ResourceState, ResourceStatus,
+    NodeBackend, NodePayload, NodeSpec, NodeStatus, PayloadKind, PayloadRun, QemuOptions,
+    ResourceKind, ResourceState, ResourceStatus,
 };
 use vxedge_core::model::{Backend, DeviceRole};
 use vxedge_core::status::{Observable, ObservedState};
@@ -65,11 +65,13 @@ fn node_payload(np: &NodePlan) -> NodePayload {
             kind: kind as i32,
             reference: reference.clone(),
             digest: digest.clone(),
+            run: None,
         },
         None => NodePayload {
             kind: kind as i32,
             reference: local.map(|p| p.display().to_string()).unwrap_or_default(),
             digest: String::new(),
+            run: None,
         },
     };
     match np.backend {
@@ -80,6 +82,11 @@ fn node_payload(np: &NodePlan) -> NodePayload {
                     kind: PayloadKind::Container as i32,
                     reference: reference.to_string(),
                     digest: digest.to_string(),
+                    run: (!np.run.is_empty()).then(|| PayloadRun {
+                        args: np.run.args.clone(),
+                        env: np.run.env.clone().into_iter().collect(),
+                        cap_add: np.run.cap_add.clone(),
+                    }),
                 }
             }
             None => NodePayload {

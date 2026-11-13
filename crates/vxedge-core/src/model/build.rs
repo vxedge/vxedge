@@ -63,6 +63,16 @@ pub enum ModelError {
     #[error("component `{component}` has no part — nothing to run on it")]
     NoPart { component: String },
     #[error(
+        "baseline `{baseline}`: part `{part}` sets `run`, but {why}. `run` is valid only on a \
+         part a `container` device runs as its payload: a published or `localhost/` container \
+         image."
+    )]
+    RunNotOnPayload {
+        baseline: String,
+        part: String,
+        why: String,
+    },
+    #[error(
         "`{component}`: part `{part}` is a {kind}, but the device it deploys onto runs the \
          `{backend}` backend. A container backend boots a container image; libvirt, \
          qemu-microvm and cloud-hypervisor boot a guest bundle; wasm-capsule runs a `kind: wasm` \
@@ -348,11 +358,14 @@ fn resources_of(device: &str, spec: &Value) -> Result<Option<Resources>, ModelEr
 
 /// The one part targeting `component`. A `stack`-layer part wins over its own members: a stack
 /// exists precisely to be the single pullable unit, so carrying both is not ambiguous.
-fn sole_part(
-    ws: &Workspace,
+///
+/// Returns the entry it chose beside the part, so [`check_run`] can tell a `run` on the entry a
+/// device actually runs from one on an entry that lost to a stack.
+fn sole_part<'w>(
+    ws: &'w Workspace,
     component: &str,
     backend: Option<Backend>,
-) -> Result<Part, ModelError> {
+) -> Result<(&'w PartEntry, Part), ModelError> {
     let candidates: Vec<&PartEntry> = ws
         .baselines
         .iter()
@@ -387,12 +400,77 @@ fn sole_part(
         }
     };
     let kind = part_kind(component, chosen, backend)?;
-    Ok(Part {
-        reference: chosen.reference.clone(),
-        kind,
-        digest: chosen.digest.clone(),
-        local: chosen.is_local(),
-    })
+    let run = chosen.run.clone().unwrap_or_default();
+    Ok((
+        chosen,
+        Part {
+            reference: chosen.reference.clone(),
+            kind,
+            digest: chosen.digest.clone(),
+            local: chosen.is_local(),
+            run: PartRun {
+                args: run.args,
+                env: run.env,
+                cap_add: run.cap_add,
+            },
+        },
+    ))
+}
+
+/// `run` is valid only on a part a `container` device runs as its payload (`ARCHITECTURE.md`
+/// §6.0.2). Checks every baseline entry that sets `run` and targets `component`, which runs on
+/// `device` under `backend` from `chosen`, and refuses the first that does not hold, naming it.
+fn check_run(
+    ws: &Workspace,
+    component: &str,
+    device: &str,
+    backend: Option<Backend>,
+    chosen: Option<(&PartEntry, &Part)>,
+) -> Result<(), ModelError> {
+    for b in &ws.baselines {
+        for entry in b.parts.iter().filter(|p| p.run.is_some()) {
+            if !entry
+                .target_ids
+                .as_ref()
+                .is_some_and(|t| t.as_slice().contains(&component))
+            {
+                continue;
+            }
+            let refuse = |why: String| ModelError::RunNotOnPayload {
+                baseline: b.id.clone(),
+                part: entry.reference.clone(),
+                why,
+            };
+            match chosen {
+                Some((c, _)) if !std::ptr::eq(c, entry) => {
+                    return Err(refuse(format!(
+                        "`{component}` runs `{}` instead, the stack part that wins over its \
+                         members",
+                        c.reference
+                    )));
+                }
+                None => {
+                    return Err(refuse(format!("`{component}` runs no part")));
+                }
+                Some(_) => {}
+            }
+            if backend != Some(Backend::Container) {
+                return Err(refuse(format!(
+                    "`{component}` is deployed on `{device}`, whose backend is `{}`",
+                    backend.map_or("none", Backend::as_str)
+                )));
+            }
+            if let Some((_, part)) = chosen
+                && !part.is_oci_payload()
+            {
+                return Err(refuse(format!(
+                    "on `{device}` it is not a published or `localhost/` container image (a \
+                     `local/` part is a host process, and a bare path names no image Podman runs)"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// What a part *is*, and whether the device can run it.
@@ -791,10 +869,15 @@ fn build_entity(ws: &Workspace, doc: &VehicleDoc) -> Result<Entity, ModelError> 
                 // against the file the author wrote (`ComponentWithoutPart`). Any *other*
                 // failure is a real defect in the part they did declare, and swallowing it
                 // turned a kind mismatch into a function that silently ran nothing.
-                part: match sole_part(ws, id, backend) {
-                    Ok(part) => Some(part),
-                    Err(ModelError::NoPart { .. }) => None,
-                    Err(e) => return Err(e),
+                part: {
+                    let chosen = match sole_part(ws, id, backend) {
+                        Ok(chosen) => Some(chosen),
+                        Err(ModelError::NoPart { .. }) => None,
+                        Err(e) => return Err(e),
+                    };
+                    let chosen_ref = chosen.as_ref().map(|(entry, part)| (*entry, part));
+                    check_run(ws, id, &f.deployed_on, backend, chosen_ref)?;
+                    chosen.map(|(_, part)| part)
                 },
                 asil: f.asil.as_deref().map(|a| asil_of(id, a)).transpose()?,
             },
@@ -1283,6 +1366,24 @@ fn checked(exp: Experiment) -> Result<Experiment, LoadError> {
 pub fn build(ws: &Workspace) -> Result<Experiment, ModelError> {
     let exp = ws.experiments.first().ok_or(ModelError::NoExperiment)?;
     let raw = ws.experiments_raw.first().cloned().unwrap_or(Value::Null);
+
+    // `check_run` sees an entry through the components it targets; one that targets none is
+    // run by no device.
+    for b in &ws.baselines {
+        let untargeted = b.parts.iter().find(|p| {
+            p.run.is_some()
+                && p.target_ids
+                    .as_ref()
+                    .is_none_or(|t| t.as_slice().is_empty())
+        });
+        if let Some(p) = untargeted {
+            return Err(ModelError::RunNotOnPayload {
+                baseline: b.id.clone(),
+                part: p.reference.clone(),
+                why: "it targets no component".to_string(),
+            });
+        }
+    }
 
     let mut entities = Vec::new();
     for id in &exp.vehicles {
@@ -3379,5 +3480,154 @@ devices: {}
         );
         let err = load_yaml(&ws).unwrap_err().to_string();
         assert!(err.contains("time_sync"), "{err}");
+    }
+
+    /// Two container devices and a VM, each with its own part, for the `run` tests. `{RUN_A}`
+    /// is replaced with the `run` line of the entry targeting `fn-a`.
+    const RUN_WS: &str = "
+kind: experiment
+id: e
+vehicles: [veh]
+baseline: bl
+network: { slices: [{ id: adas, mode: vlan, vlan: 101 }] }
+---
+kind: vehicle
+id: veh
+devices:
+  ct-a: { role: ecu, backend: container }
+  ct-b: { role: ecu, backend: container }
+  vm1: { role: ecu, backend: libvirt }
+functions:
+  fn-a: { deployed_on: ct-a }
+  fn-b: { deployed_on: ct-b }
+  fn-vm: { deployed_on: vm1 }
+links:
+  - { id: la, endpoints: [ct-a:eth0], slice: adas }
+  - { id: lb, endpoints: [ct-b:eth0], slice: adas }
+  - { id: lv, endpoints: [vm1:eth0], slice: adas }
+---
+kind: baseline
+id: bl
+parts:
+  - ref: ghcr.io/vxedge/parts/agent/probe/app/vxprobe:0.2.0
+    digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    target_ids: [fn-a, fn-b]
+{RUN_A}
+  - { ref: ./bundle, kind: bundle, target_ids: fn-vm }
+";
+
+    fn run_ws(run: &str) -> String {
+        RUN_WS.replace("{RUN_A}", run)
+    }
+
+    fn run_refusal(yaml: &str) -> (String, String, String) {
+        match load_yaml(yaml) {
+            Err(crate::model::LoadError::Model(ModelError::RunNotOnPayload {
+                baseline,
+                part,
+                why,
+            })) => (baseline, part, why),
+            other => panic!("expected RunNotOnPayload, got {other:?}"),
+        }
+    }
+
+    /// `run` reaches every target of its entry: two devices running one part start the same way.
+    #[test]
+    fn run_starts_every_target_of_its_entry_the_same_way() {
+        use crate::gateway::GatewayPlan;
+        use crate::zones::plan::plan_nodes_from_model;
+        let yaml = run_ws(
+            "    run: { args: [--listen, '0.0.0.0:9801'], env: { ROLE: reflector }, \
+             cap_add: [NET_ADMIN] }",
+        );
+        let model = load_yaml(&yaml).unwrap();
+        let gw = GatewayPlan::from_model(&model).unwrap();
+        let nodes = plan_nodes_from_model(&model, &gw, std::path::Path::new("/")).unwrap();
+        for id in ["ct-a", "ct-b"] {
+            let node = nodes.iter().find(|n| n.node_id == id).unwrap();
+            assert_eq!(node.run.args, ["--listen", "0.0.0.0:9801"], "{id}");
+            assert_eq!(node.run.env["ROLE"], "reflector", "{id}");
+            assert_eq!(node.run.cap_add, ["NET_ADMIN"], "{id}");
+        }
+        let vm = nodes.iter().find(|n| n.node_id == "vm1").unwrap();
+        assert!(vm.run.is_empty());
+
+        // No `run`, nothing set: the image starts on its own defaults.
+        let model = load_yaml(&run_ws("")).unwrap();
+        let nodes = plan_nodes_from_model(&model, &gw, std::path::Path::new("/")).unwrap();
+        assert!(nodes.iter().all(|n| n.run.is_empty()));
+    }
+
+    #[test]
+    fn run_on_a_part_a_vm_boots_is_refused_naming_the_entry() {
+        let yaml = run_ws("").replace(
+            "  - { ref: ./bundle, kind: bundle, target_ids: fn-vm }",
+            "  - { ref: ./bundle, kind: bundle, target_ids: fn-vm, run: { args: [x] } }",
+        );
+        let (baseline, part, why) = run_refusal(&yaml);
+        assert_eq!((baseline.as_str(), part.as_str()), ("bl", "./bundle"));
+        assert!(why.contains("vm1") && why.contains("libvirt"), "{why}");
+    }
+
+    /// A `local/` part is a host process the runner starts, not an image, so there is nothing for
+    /// `run` to start, even on a container device.
+    #[test]
+    fn run_on_a_host_process_part_is_refused() {
+        let yaml = RUN_WS
+            .replace(
+                "  - ref: ghcr.io/vxedge/parts/agent/probe/app/vxprobe:0.2.0\n    digest: \
+                 sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+                "  - ref: local/vxprobe:host-process\n",
+            )
+            .replace("{RUN_A}", "    run: { args: [x] }");
+        let (_, part, why) = run_refusal(&yaml);
+        assert_eq!(part, "local/vxprobe:host-process");
+        assert!(why.contains("localhost/"), "{why}");
+    }
+
+    /// A bare path is a container image only by `kind:`, and still not one Podman can run.
+    #[test]
+    fn run_on_a_bare_path_container_part_is_refused() {
+        let yaml = RUN_WS
+            .replace(
+                "  - ref: ghcr.io/vxedge/parts/agent/probe/app/vxprobe:0.2.0\n    digest: \
+                 sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+                "  - ref: ./images/probe\n    kind: container\n",
+            )
+            .replace("{RUN_A}", "    run: { args: [x] }");
+        let (_, part, _) = run_refusal(&yaml);
+        assert_eq!(part, "./images/probe");
+    }
+
+    /// A member that loses to its stack is not what the device runs, so its `run` would start
+    /// nothing.
+    #[test]
+    fn run_on_a_part_a_stack_overrides_is_refused() {
+        let yaml = run_ws("").replace(
+            "  - { ref: ./bundle, kind: bundle, target_ids: fn-vm }",
+            "  - { ref: ./bundle, kind: bundle, target_ids: fn-vm }\n  \
+             - ref: ghcr.io/vxedge/parts/zone/linux/stack/probe-bundle:0.1.0\n    \
+             digest: sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n    \
+             kind: container\n    target_ids: fn-a\n",
+        );
+        let yaml = yaml.replace(
+            "    target_ids: [fn-a, fn-b]\n",
+            "    target_ids: [fn-a, fn-b]\n    run: { args: [x] }\n",
+        );
+        let (_, part, why) = run_refusal(&yaml);
+        assert_eq!(part, "ghcr.io/vxedge/parts/agent/probe/app/vxprobe:0.2.0");
+        assert!(why.contains("stack/probe-bundle"), "{why}");
+    }
+
+    #[test]
+    fn run_on_an_entry_with_no_target_is_refused() {
+        let yaml = run_ws("").replace(
+            "  - { ref: ./bundle, kind: bundle, target_ids: fn-vm }",
+            "  - { ref: ./bundle, kind: bundle, target_ids: fn-vm }\n  \
+             - { ref: localhost/vxedge/spare:1, run: { args: [x] } }",
+        );
+        let (_, part, why) = run_refusal(&yaml);
+        assert_eq!(part, "localhost/vxedge/spare:1");
+        assert!(why.contains("no component"), "{why}");
     }
 }
