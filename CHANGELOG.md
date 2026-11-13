@@ -39,8 +39,9 @@ All notable changes to this repo are documented here. Format follows
   - `Plan`, `up` and `GatewayService.Up` refuse with `ERROR_REASON_HOST_REQUIREMENT_UNMET` when the
     host cannot start the grandmaster: sudo refuses `nsenter` without a password and vxedged is not
     root. `HostService.Capabilities` reports `gptp`.
-  - A package that uses `time_sync` requires the first vxedge release that reads it. The linuxptp
-    image's digest is a placeholder, the local build's, until the part is published.
+  - The image is `ghcr.io/vxedge/parts/agent/time/app/linuxptp:0.1.0`, pinned by digest
+    (`sha256:cc81350e76480ee37237abcc78f42871d97c71ed1cd35e431a02924a521cc94b`).
+  - A package that uses `time_sync` requires the first vxedge release that reads it.
 
 ### Fixed
 

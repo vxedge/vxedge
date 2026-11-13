@@ -53,13 +53,8 @@ use std::time::Duration;
 use crate::containers::{Bind, ContainerClient, ContainerSpec, GroupSpec, InfraNetwork};
 use crate::gateway::{GatewayPlan, Shell};
 
-/// The vxparts `linuxptp` part, 0.1.0.
-///
-/// PLACEHOLDER until the part is published: this digest is the local build's
-/// (`VXPARTS_NO_PUSH=1 scripts/publish/publish-container.sh parts/agent/time/app/linuxptp
-/// 0.1.0`), which Podman resolves on the host that built it. Publishing gives the image its
-/// registry digest, which replaces this one.
-pub const LINUXPTP_IMAGE: &str = "ghcr.io/vxedge/parts/agent/time/app/linuxptp:0.1.0@sha256:577c614c40c422e6c4362676944d2961bba117a3601ec8e895d06ca119974cfa";
+/// The vxparts `linuxptp` part, 0.1.0 (linuxptp 4.2), pinned by its registry digest.
+pub const LINUXPTP_IMAGE: &str = "ghcr.io/vxedge/parts/agent/time/app/linuxptp:0.1.0@sha256:cc81350e76480ee37237abcc78f42871d97c71ed1cd35e431a02924a521cc94b";
 
 /// A follower's `ptp4l` in its device's container group.
 pub const FOLLOWER_MEMBER: &str = "gptp";

@@ -11,8 +11,8 @@
 //! - the exporter's `vxedge_gptp_*` text serves both followers, and a follower that stops
 //!   answering leaves a gap.
 //!
-//! The linuxptp image is [`vxedge_core::gptp::LINUXPTP_IMAGE`], which must be on this host
-//! (`podman image exists`); until the part is published that is the local build's digest.
+//! The linuxptp image is [`vxedge_core::gptp::LINUXPTP_IMAGE`], pinned by digest. Pull it first:
+//!   podman pull ghcr.io/vxedge/parts/agent/time/app/linuxptp:0.1.0@sha256:cc81350e76480ee37237abcc78f42871d97c71ed1cd35e431a02924a521cc94b
 //!
 //! **Do not run under `sudo`**, for the reason `zones_podman.rs` gives: Podman must stay this
 //! user's. Privilege comes from file capabilities on the test binary, plus a sudo credential
@@ -179,7 +179,7 @@ fn followers_sync_to_the_gateway_grandmaster_and_the_exporter_serves_them() {
     assert!(
         rt.block_on(client.image_present(gptp::LINUXPTP_IMAGE))
             .unwrap(),
-        "{} is not on this host: build the vxparts linuxptp part first",
+        "{} is not on this host: pull it first (see module docs)",
         gptp::LINUXPTP_IMAGE
     );
 
