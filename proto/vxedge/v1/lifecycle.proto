@@ -17,7 +17,7 @@ message GatewayUpRequest {
   ManifestRef manifest = 1;
   // Skip the `vxp.lock` check while authoring (`up --unlocked`). The run records that it ran
   // unlocked (`Run.package_locked`), so its result is never mistaken for a locked one. Ignored
-  // for a legacy descriptor or an inline manifest, which are never lock-checked.
+  // for an inline manifest or a directory without a `vxp.yaml`, which are never lock-checked.
   bool unlocked = 2;
 }
 
@@ -275,7 +275,7 @@ message VehicleUpRequest {
   repeated ExperimentStage stages = 2;
   // Skip the `vxp.lock` check while authoring (`up --unlocked`). The run records that it ran
   // unlocked (`Run.package_locked`), so its result is never mistaken for a locked one. Ignored
-  // for a legacy descriptor or an inline manifest, which are never lock-checked.
+  // for an inline manifest or a directory without a `vxp.yaml`, which are never lock-checked.
   bool unlocked = 3;
 }
 
@@ -330,7 +330,7 @@ message ExperimentUpRequest {
   repeated ExperimentStage stages = 2;
   // Skip the `vxp.lock` check while authoring (`up --unlocked`). The run records that it ran
   // unlocked (`Run.package_locked`), so its result is never mistaken for a locked one. Ignored
-  // for a legacy descriptor or an inline manifest, which are never lock-checked.
+  // for an inline manifest or a directory without a `vxp.yaml`, which are never lock-checked.
   bool unlocked = 3;
 }
 

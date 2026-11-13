@@ -183,6 +183,7 @@ impl TelemetryService for TelemetrySvc {
     }
 
     async fn collect(&self, req: Request<CollectRequest>) -> Result<Response<Job>, Status> {
+        // `archive_version` is ignored: vxtelemetry writes `vxarchive/2`, the one format there is.
         let req = req.into_inner();
         let (yaml, sha256, dir) = crate::services::resolve_manifest(req.manifest.as_ref()).await?;
         let workspace = dir.ok_or_else(|| {
@@ -266,7 +267,6 @@ impl TelemetryService for TelemetrySvc {
         }
         self.audit.record("TelemetryService.Collect", audit);
         let package_locked = run_package.map(|p| p.locked);
-        let archive_version = req.archive_version;
         let bin = self.vxtelemetry_bin.clone();
         let log = self.runtime_dir.join("collect.log");
         let job = self
@@ -285,10 +285,6 @@ impl TelemetryService for TelemetrySvc {
                     .arg(&ingest)
                     .arg("--out")
                     .arg(&out);
-                if archive_version != 0 {
-                    cmd.arg("--archive-version")
-                        .arg(archive_version.to_string());
-                }
                 for image in &images {
                     cmd.arg("--record-image").arg(image);
                 }

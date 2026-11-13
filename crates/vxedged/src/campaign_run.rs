@@ -569,7 +569,7 @@ pub async fn run_trial(
                 CollectRequest {
                     manifest: manifest.clone(),
                     out_path: archive.display().to_string(),
-                    archive_version: 2,
+                    ..Default::default()
                 },
                 &parent,
             ),

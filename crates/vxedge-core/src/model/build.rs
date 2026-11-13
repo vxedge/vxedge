@@ -1516,7 +1516,11 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("vxmodelplan-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
-        std::fs::write(tmp.join("x.vxp"), "id: exp-x\n").unwrap();
+        std::fs::write(
+            tmp.join("vxp.yaml"),
+            "schema: vxp/1\nid: local/exp-x\nversion: 0.1.0\nentry: main.yaml\n",
+        )
+        .unwrap();
         std::fs::write(
             tmp.join("main.yaml"),
             r#"

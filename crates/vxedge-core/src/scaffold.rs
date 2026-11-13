@@ -124,7 +124,7 @@ impl WorkspacePlan {
     /// [`WorkspacePlan::plan`] keeps them so. They must be separable because a migration wants
     /// the folder distinguished from the frozen manifest beside it (`exp-003-ws/`) while the
     /// experiment id stays `exp-003`, so results and comparisons line up — found while migrating
-    /// exp-003, where the `.vxp` had to be hand-edited afterwards.
+    /// exp-003, where the descriptor had to be hand-edited afterwards.
     pub fn plan_with_id(dir: &str, id: &str, template: Template) -> Result<Self, ScaffoldError> {
         if !valid_id(dir) {
             return Err(ScaffoldError::InvalidId(dir.to_string()));

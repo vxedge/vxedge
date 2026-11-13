@@ -135,7 +135,8 @@ fn experiment_new_scaffolds_a_locked_vxp1_package() {
     }
 }
 
-/// A legacy descriptor still runs, but the package verbs say how to migrate it.
+/// A legacy `<name>.vxp` descriptor is no longer read: the package and experiment verbs refuse
+/// it and say how to migrate it.
 #[test]
 fn a_legacy_workspace_is_told_to_migrate() {
     let base = scratch("legacy");
@@ -145,9 +146,15 @@ fn a_legacy_workspace_is_told_to_migrate() {
     std::fs::remove_file(root.join("vxp.yaml")).unwrap();
     std::fs::remove_file(root.join("vxp.lock")).unwrap();
     std::fs::write(root.join("demo.vxp"), "id: demo\nversion: 0.1.0\n").unwrap();
-    let (ok, _, err) = vxedge(&root, &["pkg", "pack"]);
-    assert!(!ok);
-    assert!(err.contains("legacy descriptor"), "{err}");
+    for verb in [&["pkg", "pack"][..], &["experiment", "validate"]] {
+        let (ok, out, err) = vxedge(&root, verb);
+        assert!(!ok, "{verb:?}: {out}");
+        assert!(
+            err.contains("legacy `<name>.vxp` descriptor, which this vxedge no longer reads")
+                && err.contains("schema: vxp/1"),
+            "{verb:?}: {err}"
+        );
+    }
     std::fs::remove_dir_all(&base).ok();
 }
 

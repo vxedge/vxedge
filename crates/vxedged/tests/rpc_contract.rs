@@ -1338,14 +1338,14 @@ async fn plan_and_up_agree() {
     }
 }
 
-/// A `.vxp` whose id is not the experiment's is refused by `Plan` and by `experiment up`, with
-/// the same typed reason, before anything is provisioned.
+/// A `vxp.yaml` whose name is not the experiment's id is refused by `Plan` and by
+/// `experiment up`, with the same typed reason, before anything is provisioned.
 #[tokio::test]
 async fn plan_and_up_agree_on_a_mismatched_descriptor() {
     let daemon = Daemon::start();
     let channel = daemon.channel().await;
     let (dir, id) = experiment_workspace();
-    std::fs::write(dir.join("pkg.vxp"), "id: not-the-experiment\n").unwrap();
+    write_v1(&dir, "not-the-experiment", "vxp/1", "");
 
     let plan = plan_of(&channel, &dir).await;
     assert!(!plan.valid);
@@ -1757,6 +1757,8 @@ async fn collect_returns_the_archive_and_its_digest() {
         args.contains("--record-image localhost/vxedge/probe:1"),
         "{args}"
     );
+    // vxtelemetry writes only `vxarchive/2` and has no option to choose.
+    assert!(!args.contains("--archive-version"), "{args}");
     let locked = std::fs::read_to_string(bin.parent().unwrap().join("locked")).unwrap();
     assert_eq!(locked.trim(), "unset", "no run, so nothing to say");
     // The binaries the daemon runs, beside what vxtelemetry archives: every tool flag, the
@@ -1960,9 +1962,10 @@ async fn plan_and_up_refuse_a_package_that_does_not_match_its_lock() {
     assert!(problems[0].contains("no `vxp.lock`"), "{problems:?}");
 }
 
-/// A legacy descriptor is never lock-checked.
+/// A legacy `<name>.vxp` descriptor is no longer read: `Plan` refuses the workspace and says how
+/// to migrate it, and `experiment up` refuses it with the same reason.
 #[tokio::test]
-async fn a_legacy_package_is_not_lock_checked() {
+async fn a_legacy_descriptor_is_refused_with_how_to_migrate() {
     let daemon = Daemon::start();
     let channel = daemon.channel().await;
     let (dir, id) = experiment_workspace();
@@ -1971,10 +1974,27 @@ async fn a_legacy_package_is_not_lock_checked() {
         format!("id: {id}\nversion: 0.1.0\n"),
     )
     .unwrap();
+    let plan = plan_of(&channel, &dir).await;
+    assert!(!plan.valid);
+    let first = plan.problems.first().expect("refused");
     assert_eq!(
-        lock_problems(&plan_of(&channel, &dir).await),
-        Vec::<String>::new()
+        first.reason,
+        vxedge_api::v1::ErrorReason::WorkspaceInvalid as i32
     );
+    assert!(
+        first.detail.contains("legacy `<name>.vxp` descriptor")
+            && first.detail.contains("schema: vxp/1"),
+        "{}",
+        first.detail
+    );
+    let refused = ExperimentServiceClient::new(channel)
+        .up(ExperimentUpRequest {
+            manifest: path_ref(&dir),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&refused), "ERROR_REASON_WORKSPACE_INVALID");
 }
 
 /// A run's package and kernel are read back from its record, and a record from before they were
@@ -3271,25 +3291,28 @@ async fn results_are_listed_from_their_metadata_and_fetched_by_digest() {
     assert_eq!(reason(&unknown), "ERROR_REASON_RESULT_UNKNOWN");
 }
 
-/// A `vxarchive/1` archive whose probe served `p99` as its last 0.99 quantile.
-fn write_v1_archive(path: &Path, p99: f64) {
+/// A `vxarchive/2` archive whose probe, `measurements/rtt`, served `p99` as its last 0.99
+/// quantile.
+fn write_v2_archive(path: &Path, p99: f64) {
     use std::io::Write;
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
     let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default();
     zip.start_file("metadata.json", opts).unwrap();
-    zip.write_all(br#"{"experiment_id":"e1","ingest":{"scrapes_failed":0}}"#)
+    zip.write_all(br#"{"archive":"vxarchive/2","experiment_id":"e1"}"#)
         .unwrap();
-    zip.start_file("ingest/samples.jsonl", opts).unwrap();
-    for (ts, v) in [(1, p99 / 2.0), (2, p99)] {
-        writeln!(
-            zip,
-            "{}",
-            serde_json::json!({ "ts_unix_ms": ts, "target": "10.0.0.2:9801",
-                "metric": "vxprobe_rtt_seconds", "labels": "{quantile=\"0.99\"}", "value": v })
-        )
+    let samples: String = [(1, p99 / 2.0), (2, p99)]
+        .iter()
+        .map(|(ts, v)| {
+            serde_json::json!({ "record": "sample", "ts_ns": ts, "entity": "measurements/rtt",
+                "metric": "vxprobe_rtt_seconds", "labels": { "quantile": "0.99" }, "value": v })
+            .to_string()
+                + "\n"
+        })
+        .collect();
+    zip.start_file("metrics/samples.jsonl.zst", opts).unwrap();
+    zip.write_all(&zstd::encode_all(samples.as_bytes(), 3).unwrap())
         .unwrap();
-    }
     zip.finish().unwrap();
 }
 
@@ -3322,7 +3345,7 @@ criteria:\n  - { id: h1, op: le, lhs: { metric: p99, aggregate: median, select: 
     ] {
         let id = format!("r{rep}-{arm}");
         let archive = results.join(format!("{id}.zip"));
-        write_v1_archive(&archive, p99);
+        write_v2_archive(&archive, p99);
         trials.push(serde_json::json!({
             "id": id, "arm": arm, "repetition": rep, "parameters": { "load_mbps": load },
             "state": "succeeded", "archive": archive.display().to_string(), "sha256": "ab",
@@ -3341,7 +3364,7 @@ criteria:\n  - { id: h1, op: le, lhs: { metric: p99, aggregate: median, select: 
     for (rep, p99) in [(1, 0.004), (2, 0.005)] {
         let id = format!("r{rep}-busy");
         let archive = dir.join(format!("results/ref/{id}.zip"));
-        write_v1_archive(&archive, p99);
+        write_v2_archive(&archive, p99);
         reference.push(serde_json::json!({
             "id": id, "arm": "busy", "repetition": rep, "parameters": { "load_mbps": 600 },
             "state": "succeeded", "archive": archive.display().to_string(), "sha256": "cd",
@@ -3558,6 +3581,57 @@ criteria:\n  - { id: h1, op: le, lhs: { metric: p99, aggregate: median, select: 
     assert_eq!(reason(&unknown), "ERROR_REASON_CAMPAIGN_UNKNOWN");
 }
 
+/// A trial archived as `vxarchive/1` is no longer read: `Verdict` refuses the campaign and says
+/// where the current sets are.
+#[tokio::test]
+async fn a_vxarchive_1_trial_is_refused_by_verdict() {
+    use std::io::Write;
+    use vxedge_api::v1::ResultVerdictRequest;
+    use vxedge_api::v1::result_service_client::ResultServiceClient;
+    let (dir, _) = experiment_workspace();
+    let main = std::fs::read_to_string(dir.join("main.yaml")).unwrap();
+    let intent = "\nhypothesis: { id: H1, statement: p99 stays under 10 ms }\n\
+metrics:\n  - { id: p99, kind: gauge, unit: s, entity: measurements/rtt, series: vxprobe_rtt_seconds, labels: { quantile: \"0.99\" } }\n\
+criteria:\n  - { id: h1, op: le, lhs: { metric: p99, aggregate: median }, rhs: { value: 0.01, unit: s } }\n";
+    std::fs::write(dir.join("main.yaml"), format!("{main}{intent}")).unwrap();
+    let archive = dir.join("results/c-v1/r1.zip");
+    std::fs::create_dir_all(archive.parent().unwrap()).unwrap();
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+    let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default();
+    zip.start_file("metadata.json", opts).unwrap();
+    zip.write_all(br#"{"experiment_id":"e1","ingest":{"scrapes_failed":0}}"#)
+        .unwrap();
+    zip.start_file("ingest/samples.jsonl", opts).unwrap();
+    zip.write_all(br#"{"ts_unix_ms":1,"target":"10.0.0.2:9801","metric":"vxprobe_rtt_seconds","labels":"{quantile=\"0.99\"}","value":0.001}"#)
+        .unwrap();
+    zip.finish().unwrap();
+    let record = serde_json::json!({
+        "campaign_id": "c-v1", "state": "succeeded", "job_id": "j", "experiment_id": "e1",
+        "workspace": dir.display().to_string(), "results_dir": archive.parent().unwrap().display().to_string(),
+        "trials": [{ "id": "r1", "repetition": 1, "parameters": {}, "state": "succeeded",
+                     "archive": archive.display().to_string(), "sha256": "ab" }],
+        "started_unix_ms": 1, "finished_unix_ms": 2,
+    });
+    let daemon = Daemon::start_with(|rt| {
+        std::fs::create_dir_all(rt.join("campaigns")).unwrap();
+        std::fs::write(rt.join("campaigns/c-v1.json"), record.to_string()).unwrap();
+    });
+    let err = ResultServiceClient::new(daemon.channel().await)
+        .verdict(ResultVerdictRequest {
+            campaign_id: "c-v1".into(),
+            reference_workspace: None,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err:?}");
+    assert_eq!(reason(&err), "ERROR_REASON_RESULT_UNKNOWN", "{err:?}");
+    assert!(
+        err.message()
+            .contains("vxarchive/1 archive, which is no longer read; use the vxarchive/2 sets"),
+        "{err:?}"
+    );
+}
+
 /// Typed intent that holds adds no problem.
 #[tokio::test]
 async fn typed_intent_that_holds_plans_clean() {
@@ -3608,8 +3682,8 @@ fn write_verification(cache: &Path, digest: &str, fingerprint: &str) {
 }
 
 /// Under `require_signed`, `Plan` and `up` refuse a package nobody verified here, one verified
-/// as signed by a signer the policy does not name, and a legacy workspace, all before anything
-/// is provisioned, and accept one an allowed signer verified.
+/// as signed by a signer the policy does not name, and a directory without a `vxp.yaml`, all
+/// before anything is provisioned, and accept one an allowed signer verified.
 #[tokio::test]
 async fn a_host_that_requires_signatures_refuses_what_is_not_verified() {
     let policy_dir = scratch();
@@ -3685,14 +3759,12 @@ async fn a_host_that_requires_signatures_refuses_what_is_not_verified() {
         edited.problems
     );
 
-    let (legacy, id) = experiment_workspace();
-    std::fs::write(
-        legacy.join(format!("{id}.vxp")),
-        format!("id: {id}\nversion: 0.1.0\n"),
-    )
-    .unwrap();
-    let problems = signature_problems(&plan_of(&channel, &legacy).await);
-    assert!(problems[0].contains("legacy"), "{problems:?}");
+    let (bare, _) = experiment_workspace();
+    let problems = signature_problems(&plan_of(&channel, &bare).await);
+    assert!(
+        problems[0].contains("only a `vxp/1` package"),
+        "{problems:?}"
+    );
 }
 
 /// `Plan` names every entity telemetry records will use, derived from ids, with the scrape
