@@ -243,6 +243,13 @@ impl VehicleService for VehicleSvc {
                         );
                     }
                     p.checkpoint()?;
+                    if wants(&stages, ExperimentStage::TimeSync) {
+                        done.push(
+                            svc.stage_time_sync(&model, dir.as_deref(), true, &p)
+                                .await?,
+                        );
+                    }
+                    p.checkpoint()?;
                     if wants(&stages, ExperimentStage::SignalPlane) {
                         done.push(
                             svc.stage_signal_plane(&model, dir.as_deref(), true, &p)
@@ -322,6 +329,11 @@ impl VehicleService for VehicleSvc {
                     {
                         failures.push(e);
                     }
+                    if wants(&stages, ExperimentStage::TimeSync)
+                        && let Err(e) = svc.stage_time_sync(&model, dir.as_deref(), false, &p).await
+                    {
+                        failures.push(e);
+                    }
                     if wants(&stages, ExperimentStage::Compute)
                         && let Err(e) = svc
                             .stage_nodes(NodeStage::Compute, &compute, false, &p)
@@ -394,11 +406,12 @@ impl VehicleService for VehicleSvc {
             }
             Ok::<_, Status>(out)
         };
-        let (gw, typed, services, signal_plane) = tokio::join!(
+        let (gw, typed, services, signal_plane, time_sync) = tokio::join!(
             self.handles.gateway.observe(Some(gateway), None),
             crate::services::observed_nodes(shell, runtime_dir, nodes),
             services,
             self.handles.signal_plane_component(&model, dir.as_deref()),
+            self.handles.time_sync_components(&model, dir.as_deref()),
         );
         let (gw, typed) = (gw?, typed?);
         let gw_status = gw.status.clone().unwrap_or_default();
@@ -406,6 +419,7 @@ impl VehicleService for VehicleSvc {
             typed.iter().filter_map(|n| n.status.clone()).collect();
         components.extend(services?);
         components.extend(signal_plane?);
+        components.extend(time_sync?);
 
         let (status, mut components) =
             crate::status::composite_rollup(&id, ResourceKind::Vehicle, gw_status, components);

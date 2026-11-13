@@ -35,6 +35,10 @@ message Run {
   // `network.shaping`'s IEEE 802.1Qbv schedule, `htb` for the HTB tree. Empty for a run recorded
   // before shaping was.
   string shaping = 11;
+  // The gateway's time sync (`ARCHITECTURE.md` §6.0.3): `gptp` for `network.time_sync`'s IEEE
+  // 802.1AS domain, which runs on software timestamps with free-running followers; empty for a
+  // run without one, or recorded before time sync was.
+  string time_sync = 12;
 }
 
 // A `vxp/1` package as a result cites it.

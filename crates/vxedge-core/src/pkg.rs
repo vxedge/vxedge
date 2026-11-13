@@ -554,9 +554,11 @@ pub fn lock(root: &Path, locked_with: &str) -> Result<Lock, PkgError> {
                 digest: nos.digest.clone(),
             });
         }
-        // The 5G core and RAN are not placements: vxedged starts its own digest-pinned images.
+        // The 5G core and RAN are not placements, nor is `network.time_sync`'s linuxptp:
+        // vxedged starts its own digest-pinned images.
         let fiveg = crate::fiveg::fiveg_images(model)
             .into_iter()
+            .chain(crate::gptp::gptp_images(model))
             .map(str::to_string);
         for url in model.placements().map(|p| p.image.url.clone()).chain(fiveg) {
             let url = &url;
@@ -1553,6 +1555,30 @@ mod tests {
             assert!(fiveg.images.contains(&locked), "{:?}", fiveg.images);
             assert!(!plain.images.contains(&locked), "{:?}", plain.images);
         }
+        fs::remove_dir_all(root.parent().unwrap()).ok();
+    }
+
+    /// `network.time_sync` runs vxedged's own linuxptp image: the lock pins it by digest, as it
+    /// does the 5G images, and leaves it out of a workspace without the block.
+    #[test]
+    fn time_sync_locks_the_linuxptp_image() {
+        let root = locked_workspace("gptp");
+        let plain = lock(&root, "0.8.0").unwrap();
+        let main = fs::read_to_string(root.join("main.yaml")).unwrap();
+        assert!(main.contains("network:\n"), "{main}");
+        let main = main.replace(
+            "network:\n",
+            "network:\n  time_sync: { kind: gptp, followers: [ecu1] }\n",
+        );
+        fs::write(root.join("main.yaml"), main).unwrap();
+        let synced = lock(&root, "0.8.0").unwrap();
+        let (reference, digest) = crate::gptp::LINUXPTP_IMAGE.split_once('@').unwrap();
+        let locked = LockedRef {
+            reference: reference.into(),
+            digest: Some(digest.into()),
+        };
+        assert!(synced.images.contains(&locked), "{:?}", synced.images);
+        assert!(!plain.images.contains(&locked), "{:?}", plain.images);
         fs::remove_dir_all(root.parent().unwrap()).ok();
     }
 

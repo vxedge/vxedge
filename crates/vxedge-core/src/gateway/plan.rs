@@ -65,6 +65,11 @@ pub enum PlanError {
     )]
     ShapingWindowTooLong { window: String, duration_us: u32 },
     #[error(
+        "`network.time_sync`: follower `{device}` has {count} access port(s) on the bridge, and \
+         its `ptp4l` follows on exactly one"
+    )]
+    FollowerPorts { device: String, count: usize },
+    #[error(
         "vxlan tunnel `{tunnel}` extends slice `{slice}`, which is `mode: s-nssai` — an s-nssai \
          slice has no VLAN for a vxlan tunnel to carry (`model::build`'s own \
          `UndefinedVxlanSlice` check only confirms the slice exists, not that it's `mode: \
@@ -288,6 +293,60 @@ impl ShapingPlan {
     }
 }
 
+/// The gateway's IEEE 802.1AS domain (`network.time_sync`), resolved to bridge ports: the
+/// grandmaster has one master port per follower, that follower's access port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimeSyncPlan {
+    pub kind: crate::model::TimeSyncKind,
+    /// In manifest order.
+    pub followers: Vec<FollowerPort>,
+}
+
+/// One follower and the access port the grandmaster reaches it on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FollowerPort {
+    pub device: String,
+    pub access_port: String,
+}
+
+impl TimeSyncPlan {
+    /// The grandmaster's master ports, one per follower, in follower order.
+    pub fn master_ports(&self) -> Vec<String> {
+        self.followers
+            .iter()
+            .map(|f| f.access_port.clone())
+            .collect()
+    }
+
+    fn plan(
+        time_sync: &crate::model::TimeSync,
+        endpoints: &[EndpointPlan],
+    ) -> Result<Self, PlanError> {
+        let followers = time_sync
+            .followers
+            .iter()
+            .map(|device| {
+                let ports: Vec<&EndpointPlan> =
+                    endpoints.iter().filter(|e| &e.node == device).collect();
+                match ports.as_slice() {
+                    [one] => Ok(FollowerPort {
+                        device: device.clone(),
+                        access_port: one.name.clone(),
+                    }),
+                    _ => Err(PlanError::FollowerPorts {
+                        device: device.clone(),
+                        count: ports.len(),
+                    }),
+                }
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            kind: time_sync.kind,
+            followers,
+        })
+    }
+}
+
 /// The shortest window tested (`ARCHITECTURE.md` §6.0.3). A shorter one is accepted, and the plan
 /// says its result has software gates' timer jitter in it.
 pub const SHORTEST_TESTED_WINDOW_US: u32 = 10_000;
@@ -324,6 +383,9 @@ pub struct GatewayPlan {
     /// The gate schedule that replaces the HTB tree on the uplink, when the experiment declares
     /// `network.shaping`. `None` is the HTB tree.
     pub shaping: Option<ShapingPlan>,
+    /// The gPTP domain the gateway is grandmaster of, when the experiment declares
+    /// `network.time_sync`.
+    pub time_sync: Option<TimeSyncPlan>,
 }
 
 /// One half of a collision message: which attachment a name was derived from.
@@ -633,6 +695,12 @@ impl GatewayPlan {
             });
         }
 
+        let time_sync = exp
+            .time_sync
+            .as_ref()
+            .map(|ts| TimeSyncPlan::plan(ts, &endpoints))
+            .transpose()?;
+
         Ok(Self {
             bridge: "vxbr0".into(),
             uplink: "vxup0".into(),
@@ -647,6 +715,7 @@ impl GatewayPlan {
             snssai_slice_ids,
             data_plane: exp.data_plane,
             shaping,
+            time_sync,
         })
     }
 
@@ -700,16 +769,30 @@ impl GatewayPlan {
         } else {
             format!("; impaired link(s): [{}]", impaired.join(", "))
         };
-        if let Some(shaping) = &self.shaping {
-            return self.shaping_summary(shaping, &snssai, &harness);
+        let base = match &self.shaping {
+            Some(shaping) => self.shaping_summary(shaping, &snssai, &harness),
+            None => format!(
+                "bridge {} + uplink {} @ {} mbit; slices: [{slices}]{snssai}; {} endpoint(s){harness}",
+                self.bridge,
+                self.uplink,
+                self.root_rate_mbps,
+                self.endpoints.len()
+            ),
+        };
+        match &self.time_sync {
+            Some(ts) => format!(
+                "{base}; {} grandmaster on [{}] for follower(s) [{}], software timestamps, \
+                 followers free-running",
+                ts.kind.as_str(),
+                ts.master_ports().join(", "),
+                ts.followers
+                    .iter()
+                    .map(|f| f.device.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            None => base,
         }
-        format!(
-            "bridge {} + uplink {} @ {} mbit; slices: [{slices}]{snssai}; {} endpoint(s){harness}",
-            self.bridge,
-            self.uplink,
-            self.root_rate_mbps,
-            self.endpoints.len()
-        )
     }
 
     /// [`Self::summary`] under a gate schedule: the cycle and its windows in place of the rates.
@@ -1478,6 +1561,74 @@ links:
         assert!(matches!(
             GatewayPlan::from_model(&m),
             Err(PlanError::ShapingWindowTooLong { .. })
+        ));
+    }
+
+    /// BASE's two devices as containers with an image, both following the gateway's clock.
+    fn synced() -> String {
+        BASE.replace("backend: libvirt", "backend: container")
+            .replace(
+                "  - { ref: ./bundle, target_ids: [fn-ecu, fn-info] }",
+                "  - { ref: localhost/vxedge/probe:1, target_ids: [fn-ecu, fn-info] }",
+            )
+            .replace(
+                "priority: 5 } }\n",
+                "priority: 5 } }\n  time_sync: { kind: gptp, followers: [node-info-01, node-ecu-01] }\n",
+            )
+    }
+
+    #[test]
+    fn time_sync_plans_one_master_port_per_follower_access_port() {
+        let plan = GatewayPlan::from_model(&model(&synced())).unwrap();
+        let ts = plan.time_sync.as_ref().expect("planned");
+        let info = crate::gateway::ifnames::access_port("node-info-01", Some("eth0"));
+        let ecu = crate::gateway::ifnames::access_port("node-ecu-01", Some("eth0"));
+        assert_eq!(
+            ts.followers,
+            vec![
+                FollowerPort {
+                    device: "node-info-01".into(),
+                    access_port: info.clone()
+                },
+                FollowerPort {
+                    device: "node-ecu-01".into(),
+                    access_port: ecu.clone()
+                },
+            ]
+        );
+        // The bridge's own access ports, in follower order.
+        assert_eq!(ts.master_ports(), vec![info.clone(), ecu.clone()]);
+        assert!(
+            plan.endpoints.iter().any(|e| e.name == info)
+                && plan.endpoints.iter().any(|e| e.name == ecu)
+        );
+        assert!(
+            plan.summary().ends_with(&format!(
+                "; gptp grandmaster on [{info}, {ecu}] for follower(s) [node-info-01, node-ecu-01], \
+                 software timestamps, followers free-running"
+            )),
+            "{}",
+            plan.summary()
+        );
+        // Without the block the plan and its summary are what they were.
+        let plain = GatewayPlan::from_model(&model(&synced().replace(
+            "  time_sync: { kind: gptp, followers: [node-info-01, node-ecu-01] }\n",
+            "",
+        )))
+        .unwrap();
+        assert_eq!(plain.time_sync, None);
+        assert!(!plain.summary().contains("gptp"));
+    }
+
+    /// The planner refuses a follower it has no single port for, for a model that reached it by
+    /// another route than the model's own check.
+    #[test]
+    fn the_planner_refuses_a_follower_without_one_port() {
+        let mut m = model(&synced());
+        m.time_sync.as_mut().unwrap().followers.push("hpc9".into());
+        assert!(matches!(
+            GatewayPlan::from_model(&m),
+            Err(PlanError::FollowerPorts { device, count: 0 }) if device == "hpc9"
         ));
     }
 }

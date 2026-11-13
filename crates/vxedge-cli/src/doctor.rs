@@ -454,7 +454,8 @@ fn tier2() -> Vec<Check> {
     ));
 
     // The 5G transit link and bridge attachment run `sudo ip` and `sudo nsenter` (join a pod's
-    // network namespace by PID), and must not stop at a password prompt.
+    // network namespace by PID), and `network.time_sync`'s grandmaster starts with `sudo nsenter`
+    // (`vxedge_core::gptp`); none of them may stop at a password prompt.
     let missing: Vec<String> = ["ip", "nsenter"]
         .into_iter()
         .filter(|prog| !find_on_path(prog).is_some_and(|p| sudo_runs_without_password(&p)))
@@ -462,7 +463,7 @@ fn tier2() -> Vec<Check> {
         .collect();
     c.push(check(
         2,
-        "sudo without a password for ip and nsenter (5G pods)",
+        "sudo without a password for ip and nsenter (5G pods, gPTP grandmaster)",
         false,
         missing.is_empty(),
         if missing.is_empty() {

@@ -328,6 +328,16 @@ pub(crate) struct ActiveRecord {
     /// How the uplink shapes the slices, [`shaping_kind`]. `None` in a record written before
     /// shaping was recorded.
     pub shaping: Option<String>,
+    /// The gateway's time sync, [`time_sync_kind`]. `None` for a run without one, or a record
+    /// written before time sync was recorded.
+    pub time_sync: Option<String>,
+}
+
+/// What a run records as its time sync (`ARCHITECTURE.md` §6.0.3): `network.time_sync`'s kind,
+/// `gptp`, which this release runs on software timestamps with free-running followers; `None`
+/// without the block. `Compare` and a verdict read it to say which mode each run was in.
+pub(crate) fn time_sync_kind(model: &vxedge_core::model::Experiment) -> Option<&'static str> {
+    model.time_sync.as_ref().map(|t| t.kind.as_str())
 }
 
 /// What a run records as its uplink shaping (`ARCHITECTURE.md` §6.0.3): `network.shaping`'s kind,
@@ -480,6 +490,7 @@ fn read_active_record(runtime_dir: &Path) -> Option<ActiveRecord> {
         package,
         kernel,
         shaping: v["shaping"].as_str().map(str::to_string),
+        time_sync: v["time_sync"].as_str().map(str::to_string),
     })
 }
 
@@ -639,18 +650,21 @@ impl GatewaySvc {
                         format!("{detail} Nothing was provisioned."),
                     )
                 })?;
-                // The taprio check `Plan` and `experiment up` make, so a gate schedule on a host
-                // without it is refused here rather than failing at `tc`. A workspace that does
-                // not parse is left to the job, which reports it as before.
+                // The taprio and time-sync checks `Plan` and `experiment up` make, so a gate
+                // schedule or a grandmaster this host cannot run is refused here rather than
+                // failing halfway. A workspace that does not parse is left to the job, which
+                // reports it as before.
                 if let Ok(model) = parse_to_model(&yaml) {
+                    let sh = self.shell.clone();
                     let refusal = tokio::task::spawn_blocking(move || {
                         crate::plan::gateway_up_refusal(
                             &model,
                             vxedge_core::package::kernel_has_taprio,
+                            || vxedge_core::gptp::can_run_grandmaster(&sh),
                         )
                     })
                     .await
-                    .map_err(|e| Status::internal(format!("taprio check panicked: {e}")))?;
+                    .map_err(|e| Status::internal(format!("host check panicked: {e}")))?;
                     if let Some(refusal) = refusal {
                         return Err(refusal);
                     }
@@ -852,6 +866,21 @@ impl GatewaySvc {
                             Some(fp)
                         };
 
+                        // The grandmaster's master ports are the access ports, which exist now.
+                        if plan.time_sync.is_some() {
+                            p.update(99, "starting the gPTP grandmaster");
+                            let client = containers.get().await.map_err(|e| e.to_string())?;
+                            vxedge_core::gptp::grandmaster_up(
+                                client,
+                                &shell,
+                                &plan,
+                                &runtime_dir,
+                                vxedge_core::gptp::LINUXPTP_IMAGE,
+                            )
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        }
+
                         // Persist exactly what was provisioned. When the request named a §6.0
                         // workspace this is the *lowered* manifest, which exists nowhere on
                         // disk otherwise — so without this there is no artifact recording what
@@ -885,6 +914,7 @@ impl GatewaySvc {
                             "run_id": run_id,
                             "started_unix_ms": started,
                             "shaping": shaping_kind(&model),
+                            "time_sync": time_sync_kind(&model),
                         });
                         if let (Some(fields), Some(kernel)) = (record.as_object_mut(), &kernel) {
                             fields.extend(provenance(package.as_ref(), kernel));
@@ -955,6 +985,14 @@ impl GatewaySvc {
                             })
                             .await?;
                             fiveg::fiveg_down(client, &cfg)
+                                .await
+                                .map_err(|e| e.to_string())?;
+                        }
+                        // Before its ports go: removing its container ends the grandmaster.
+                        if plan.time_sync.is_some() {
+                            p.update(55, "stopping the gPTP grandmaster");
+                            let client = containers.get().await.map_err(|e| e.to_string())?;
+                            vxedge_core::gptp::grandmaster_down(client, &plan.bridge, &runtime_dir)
                                 .await
                                 .map_err(|e| e.to_string())?;
                         }
@@ -3161,6 +3199,22 @@ mod tests {
     }
 
     #[test]
+    fn a_run_records_its_time_sync_kind() {
+        let plain = "kind: experiment\nid: e\nvehicles: [veh]\nnetwork:\n  slices:\n    - { id: adas, mode: vlan, vlan: 101 }\n---\nkind: vehicle\nid: veh\ndevices: {}\n";
+        let model = vxedge_core::model::load_yaml(plain).unwrap();
+        assert_eq!(time_sync_kind(&model), None);
+        let synced = vxedge_core::model::build(
+            &vxedge_core::Workspace::from_yaml(&plain.replace(
+                "vlan: 101 }\n",
+                "vlan: 101 }\n  time_sync: { kind: gptp, followers: [ecu1] }\n",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(time_sync_kind(&synced), Some("gptp"));
+    }
+
+    #[test]
     fn the_active_record_reads_back_and_a_damaged_one_does_not() {
         let dir = std::env::temp_dir().join(format!("vxedged-active-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -3185,6 +3239,7 @@ mod tests {
                 package: None,
                 kernel: None,
                 shaping: None,
+                time_sync: None,
             })
         );
         std::fs::write(
@@ -3195,6 +3250,15 @@ mod tests {
         assert_eq!(
             read_active_record(&dir).unwrap().shaping.as_deref(),
             Some("gate-schedule")
+        );
+        std::fs::write(
+            active_record(&dir),
+            r#"{"id":"exp-gptp","dir":"/ws/t","bridge":"vxbr0","time_sync":"gptp"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_active_record(&dir).unwrap().time_sync.as_deref(),
+            Some("gptp")
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -6,6 +6,43 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- `network.time_sync` with `kind: gptp` (`ARCHITECTURE.md` §6.0.3): the gateway is the grandmaster of
+  an IEEE 802.1AS domain, one `ptp4l` with a master port on each follower's access port, and each
+  follower device runs a `ptp4l` that follows it. Every `ptp4l` runs the vxparts `linuxptp` part with
+  linuxptp's 802.1AS profile on software timestamps, with `neighborPropDelayThresh` at 100000 ns.
+  - A follower's `ptp4l` joins its device's container group, as a placed service does, and runs free
+    (`free_running 1`): containers share the host's clock, so it measures the time-sync path and does
+    not steer the clock.
+  - The grandmaster's ports are the bridge's, where a rootless container cannot open a raw socket.
+    The image runs rootless as a `hold` container, and `GatewayService.Up` starts `gptp gateway` from
+    its file system with `sudo -n nsenter --mount --pid` into it, in the bridge's network namespace:
+    the `sudo nsenter` the 5G pods already need. Removing the container ends the grandmaster, so
+    vxedged never signals a root process. `GatewayService.Down` does that before the ports go.
+  - The exporter serves `vxedge_gptp_offset_seconds` (`offsetFromMaster`) and
+    `vxedge_gptp_path_delay_seconds` (`peerMeanPathDelay`) for each follower, with the follower as
+    entity, read from its `ptp4l` over its management socket. A follower that does not answer, or
+    follows no grandmaster, leaves a gap.
+  - Every socket, log and pidfile is under the run's runtime directory, and the grandmaster's
+    container is named after the bridge, so nothing uses linuxptp's default `/var/run/ptp4l`.
+  - A new stage, `time-sync` (`EXPERIMENT_STAGE_TIME_SYNC`), starts the followers after compute and
+    before the signal plane; `experiment status` and `vehicle status` list each follower
+    (`RESOURCE_KIND_TIME_SYNC`), and the event bus carries `time-sync.up` and `time-sync.down`.
+  - The package lock pins the linuxptp image by digest, and `TelemetryService.Collect` passes it on for
+    the archive's `image_digests`. The run record carries `time_sync` (`Run.time_sync`, `gptp`).
+  - Validation refuses, with `ERROR_REASON_WORKSPACE_INVALID`: `time_sync` with
+    `network.data_plane: ovs`, no `followers`, a follower listed twice, a follower that is no device,
+    a VM follower (its guest runs its own follower, and vxedge has no way into it), a container
+    follower with no container payload or no access port on a vlan slice, a service named `gptp` on a
+    follower, an unknown `kind` and an unknown key.
+  - `Plan`, `up` and `GatewayService.Up` refuse with `ERROR_REASON_HOST_REQUIREMENT_UNMET` when the
+    host cannot start the grandmaster: sudo refuses `nsenter` without a password and vxedged is not
+    root. `HostService.Capabilities` reports `gptp`.
+  - The image is `ghcr.io/vxedge/parts/agent/time/app/linuxptp:0.1.0`, pinned by digest
+    (`sha256:cc81350e76480ee37237abcc78f42871d97c71ed1cd35e431a02924a521cc94b`).
+  - A package that uses `time_sync` requires the first vxedge release that reads it.
+
 ### Fixed
 
 - `TelemetryService.Collect` names a published container payload by its pinned reference

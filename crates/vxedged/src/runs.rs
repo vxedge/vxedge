@@ -144,6 +144,7 @@ impl RunSvc {
                 preempt_rt: k.preempt_rt,
             }),
             shaping: record.shaping.unwrap_or_default(),
+            time_sync: record.time_sync.unwrap_or_default(),
             workspace_sha256: record.sha256.unwrap_or_default(),
             state: run_state(gateway_state, workspace, busy),
             started_unix_ms: record.started_unix_ms.unwrap_or_default(),

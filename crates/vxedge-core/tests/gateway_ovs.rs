@@ -57,6 +57,7 @@ fn test_plan() -> GatewayPlan {
         snssai_slice_ids: vec![],
         data_plane: DataPlaneKind::Ovs,
         shaping: None,
+        time_sync: None,
     }
 }
 
