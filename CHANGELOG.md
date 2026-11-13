@@ -22,6 +22,12 @@ All notable changes to this repo are documented here. Format follows
   locked by an earlier version that has an `s-nssai` slice reports its lock as stale until it is
   locked again.
 
+### Removed
+
+- `containers/fiveg/` (the `vx5g-core` and `vx5g-ran` Containerfiles, `build-vx5g-ran.sh` and
+  `pod-up.sh`). The vxparts parts `gw/5gc/os/open5gs` and `gw/ran/os/ueransim` build those images,
+  and `fiveg::lifecycle` replaced the `pod-up.sh` sequence.
+
 ## [0.26.0] - 2026-11-13
 
 One archive format and one package descriptor (decision X-30). vxedge reads only `vxarchive/2`

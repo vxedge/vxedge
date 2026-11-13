@@ -8,14 +8,14 @@
 //!
 //! Config schema targets **Open5GS 2.8.x** and **UERANSIM 3.2.x**. The
 //! rendered config set has been proven **end to end** (2026-07-14) against
-//! the containerized stack (`containers/fiveg/`, hybrid policy §15): the
+//! the containerized stack (hybrid policy §15): the
 //! full core (NRF/AUSF/UDM/UDR/PCF/BSF/NSSF/AMF + per-slice SMF/UPF) comes
 //! up on rendered configs, the gNB completes **NG Setup**, and **both UEs
 //! register and establish PDU sessions on their own S-NSSAI**, each getting
 //! its slice's subnet (adas → 10.46.0.2 on uesimtun0, infotainment →
 //! 10.47.0.2 on uesimtun1).
 //!
-//! [`lifecycle`] (2026-07-17) ports that proven `pod-up.sh` sequence into a
+//! [`lifecycle`] (2026-07-17) ports that proven shell sequence into a
 //! tested Rust module — pod up/down/status, idempotent — and is now wired
 //! into `GatewayService` (`vxedged`): `vxedge up/down/status` provision the
 //! CN/RAN pods and attach the CN pod to the real `vxbr0` whenever a

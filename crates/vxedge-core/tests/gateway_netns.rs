@@ -1111,7 +1111,7 @@ fn vxlan_tunnel_carries_slice_traffic_between_two_simulated_hosts() {
 
 /// Regression/acceptance test for `docs/ROADMAP.md` #16's rtnetlink port slice 4
 /// (`apply_fiveg_uplink`/`apply_fiveg_ue_routes`). The real 5G CN pod attachment
-/// (`fiveg_podman.rs`) is gated on podman + real vx5g-core images this environment doesn't
+/// (`fiveg_podman.rs`) is gated on podman + the real 5G images this environment doesn't
 /// have — this test proves the netlink mechanics those functions now use (bridge-self VLAN
 /// membership, an 802.1q VLAN subinterface, route creation) against a real kernel, standing in
 /// for the CN pod with a throwaway veth pair rather than a real container.

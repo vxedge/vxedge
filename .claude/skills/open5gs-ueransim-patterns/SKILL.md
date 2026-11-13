@@ -95,7 +95,7 @@ netns to save pod overhead; it breaks at the second UE's registration, not at se
 
 ## Verification discipline
 
-- Containerized only (`vxedge/containers/fiveg/`, vx5g-core/vx5g-ran images) — no host
+- Containerized only (the vxparts `gw/5gc/os/open5gs` and `gw/ran/os/ueransim` images) — no host
   Open5GS/UERANSIM install, ever (Track C policy, `ARCHITECTURE.md` §15). If you find
   yourself apt-installing Open5GS to debug, stop and reproduce inside the pod instead.
 - "Daemons start and stay running" is not proof of anything — the actual gate is NG

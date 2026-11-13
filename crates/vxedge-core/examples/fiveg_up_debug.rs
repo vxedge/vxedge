@@ -1,7 +1,6 @@
 //! Dev tool: bring the fiveg lifecycle pod up from a manifest and leave it
 //! running (unlike the integration test, which tears down). Used to
-//! spot-check the Rust-driven pod against a live gNB/UE the same way the
-//! shell `pod-up.sh` reference was validated.
+//! spot-check the Rust-driven pod against a live gNB and UE.
 //!
 //! Usage: cargo run -p vxedge-core --example fiveg_up_debug -- <manifest.yaml> <runtime-dir> <pod-name>
 
