@@ -205,16 +205,36 @@ fn sha256_of(path: &Path) -> std::io::Result<String> {
 }
 
 /// The first line `path --version` prints.
+/// `ETXTBSY` on Linux: "text file busy".
+const ETXTBSY: i32 = 26;
+/// How often [`version_line`] retries a tool refused with [`ETXTBSY`].
+const ETXTBSY_RETRIES: u32 = 10;
+
 async fn version_line(path: &Path) -> Result<String, String> {
-    let run = tokio::process::Command::new(path)
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .output();
-    let output = tokio::time::timeout(VERSION_TIMEOUT, run)
-        .await
-        .map_err(|_| format!("`{} --version` did not answer", path.display()))?
-        .map_err(|e| format!("cannot run `{} --version`: {e}", path.display()))?;
+    // A tool rebuilt in place can be refused for a moment with ETXTBSY: another process forked
+    // while the file was still open for writing holds that descriptor until it execs. Brief
+    // retries ride it out instead of recording a working tool as failed until its file changes.
+    let mut attempt = 0;
+    let output = loop {
+        let run = tokio::process::Command::new(path)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output();
+        match tokio::time::timeout(VERSION_TIMEOUT, run)
+            .await
+            .map_err(|_| format!("`{} --version` did not answer", path.display()))?
+        {
+            Err(e) if e.raw_os_error() == Some(ETXTBSY) && attempt < ETXTBSY_RETRIES => {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            other => {
+                break other
+                    .map_err(|e| format!("cannot run `{} --version`: {e}", path.display()))?;
+            }
+        }
+    };
     if !output.status.success() {
         return Err(format!(
             "`{} --version` failed ({})",
