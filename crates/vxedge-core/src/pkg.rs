@@ -537,8 +537,12 @@ pub fn lock(root: &Path, locked_with: &str) -> Result<Lock, PkgError> {
             digest: nos.digest.clone(),
         });
     }
-    for p in model.placements() {
-        let url = &p.image.url;
+    // The 5G core and RAN are not placements: vxedged starts its own digest-pinned images.
+    let fiveg = crate::fiveg::fiveg_images(&model)
+        .into_iter()
+        .map(str::to_string);
+    for url in model.placements().map(|p| p.image.url.clone()).chain(fiveg) {
+        let url = &url;
         if url.starts_with("localhost/") || url.starts_with("local/") {
             continue;
         }
@@ -1476,6 +1480,34 @@ mod tests {
         fs::create_dir_all(root.join("parts")).unwrap();
         fs::write(root.join("parts/p.bin"), "p").unwrap();
         root
+    }
+
+    /// An `s-nssai` slice starts the 5G core and RAN, which are no placement: the lock pins their
+    /// images by digest all the same, and drops them when no slice is `s-nssai`.
+    #[test]
+    fn an_snssai_slice_locks_the_5g_images() {
+        let root = locked_workspace("fiveg");
+        let plain = lock(&root, "0.8.0").unwrap();
+        let main = fs::read_to_string(root.join("main.yaml")).unwrap().replace(
+            "mode: vlan, vlan: 101,",
+            "mode: s-nssai, s_nssai: { sst: 1, sd: '000001' },",
+        );
+        fs::write(root.join("main.yaml"), main).unwrap();
+        let fiveg = lock(&root, "0.8.0").unwrap();
+        for image in [
+            crate::fiveg::FIVEG_CORE_IMAGE,
+            crate::fiveg::FIVEG_RAN_IMAGE,
+            crate::fiveg::FIVEG_MONGO_IMAGE,
+        ] {
+            let (reference, digest) = image.split_once('@').unwrap();
+            let locked = LockedRef {
+                reference: reference.into(),
+                digest: Some(digest.into()),
+            };
+            assert!(fiveg.images.contains(&locked), "{:?}", fiveg.images);
+            assert!(!plain.images.contains(&locked), "{:?}", plain.images);
+        }
+        fs::remove_dir_all(root.parent().unwrap()).ok();
     }
 
     /// A published artifact store is a part like any other: the lock lists it by ref and digest,

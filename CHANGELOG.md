@@ -6,6 +6,22 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Changed
+
+- The 5G core and RAN run published images pinned by digest instead of the locally built
+  `vx5g-core` and `vx5g-ran`: `ghcr.io/vxedge/parts/gw/5gc/os/open5gs:0.1.0` (Open5GS 2.8.0) and
+  `ghcr.io/vxedge/parts/gw/ran/os/ueransim:0.1.0` (UERANSIM v3.2.7 with the vxprobe 0.2.3
+  release). The subscriber database is pinned too, to the `mongo:7` index digest (MongoDB
+  7.0.45). Each image is pulled on first use, so a 5G experiment no longer needs a local image
+  build, and two hosts run the same bytes. The constants are `fiveg::FIVEG_CORE_IMAGE`,
+  `FIVEG_RAN_IMAGE` and `FIVEG_MONGO_IMAGE`. Pods left by an earlier version are recreated on the
+  next `up`, because their image changed.
+- A package with an `s-nssai` slice locks those three images in `vxp.lock` `images`, and
+  `TelemetryService.Collect` records their digests in the archive's `image_digests`, as for a
+  zone's image. The 5G core and RAN are not placements, so neither listed them before. A package
+  locked by an earlier version that has an `s-nssai` slice reports its lock as stale until it is
+  locked again.
+
 ## [0.26.0] - 2026-11-13
 
 One archive format and one package descriptor (decision X-30). vxedge reads only `vxarchive/2`

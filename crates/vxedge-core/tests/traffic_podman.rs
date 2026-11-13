@@ -12,14 +12,13 @@
 //! port having VLAN membership without the *bridge itself* or the *host*
 //! having any way to reach it).
 //!
-//! Needs the `vx5g-core`/`vx5g-ran` images (`containers/fiveg/`, the latter
-//! built via `containers/fiveg/build-vx5g-ran.sh` so it bundles `vxprobe`)
-//! and release `vxprobe`/`vxtraffic` binaries from the sibling `vxagents`
-//! repo. Ignored by default.
+//! Runs the digest-pinned core and RAN images (`FIVEG_CORE_IMAGE`,
+//! `FIVEG_RAN_IMAGE`, the latter bundling `vxprobe`), pulled on first use, and
+//! release `vxprobe`/`vxtraffic` binaries from the sibling `vxagents` repo.
+//! Ignored by default.
 //!
 //! **Do not run under `sudo`** — same reason as `fiveg_podman.rs`: it would
-//! switch `podman` to root's own separate rootless identity, which never
-//! built these images. Privilege comes in two pieces instead, the same two
+//! switch `podman` to root's own separate rootless identity and image store. Privilege comes in two pieces instead, the same two
 //! `vxedged` needs (`docs/TESTBED-SETUP.md`): `CAP_NET_ADMIN` on the test
 //! binary itself, for the gateway's in-process netlink calls, and a cached
 //! sudo credential for the shell-outs `Shell` escalates (`tc`) and fiveg's
@@ -27,10 +26,7 @@
 //! (`systemctl --user enable --now podman.socket`).
 //!
 //! Run with:
-//!   cd vxedge/containers/fiveg
-//!   podman build -t vx5g-core -f Containerfile.open5gs .
-//!   ./build-vx5g-ran.sh
-//!   cd ../../../vxagents && cargo build --release -p vxprobe -p vxtraffic
+//!   cd vxagents && cargo build --release -p vxprobe -p vxtraffic
 //!   cd ../vxedge && sudo -v
 //!   BIN=$(cargo test -p vxedge-core --test traffic_podman --no-run --message-format=json \
 //!     | jq -r 'select(.target.name=="traffic_podman" and .executable) | .executable')
@@ -123,7 +119,7 @@ impl Drop for Guard {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs root + podman + vx5g-core/vx5g-ran images + built vxprobe/vxtraffic (see module docs)"]
+#[ignore = "needs root + podman + network for the 5G image pulls + built vxprobe/vxtraffic (see module docs)"]
 async fn traffic_service_runs_vlan_and_snssai_profiles_simultaneously_through_the_real_bridge() {
     let containers = LazyClient::user();
     let client = containers

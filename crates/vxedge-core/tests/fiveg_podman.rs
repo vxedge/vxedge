@@ -1,23 +1,20 @@
 //! Privileged integration test: the fiveg lifecycle module driving real
 //! podman (its rootless user API socket, `systemctl --user enable --now
-//! podman.socket`), across two pods (CN + RAN) joined by a transit veth. Needs the
-//! `vx5g-core` and `vx5g-ran` images built (`containers/fiveg/`) and
-//! network access for the first `mongo:7` pull. Ignored by default.
+//! podman.socket`), across two pods (CN + RAN) joined by a transit veth. Runs the
+//! digest-pinned core and RAN images (`FIVEG_CORE_IMAGE`, `FIVEG_RAN_IMAGE`), pulled on first
+//! use, so it needs network access for the first run. Ignored by default.
 //!
 //! **Do not run the test process itself under `sudo`** — `podman` must
 //! stay unprivileged (found live, 2026-07-17: `sudo cargo test` switches
 //! `podman` to root's own separate rootless-podman identity/storage, which
-//! never built these images and fails resolving them). Host networking
+//! has its own image store). Host networking
 //! (the transit veth, entering pod netns) needs CAP_NET_ADMIN regardless,
 //! so `lifecycle`'s `host_ip`/`nsenter_ip` shell out to `sudo ip`/
 //! `sudo nsenter` internally, scoped to just those calls — cache a sudo
 //! credential first so those inner calls don't block on a prompt:
 //!
 //! Run with:
-//!   cd vxedge/containers/fiveg
-//!   podman build -t vx5g-core -f Containerfile.open5gs .
-//!   ./build-vx5g-ran.sh   # bundles vxprobe from ../../../vxagents
-//!   cd ../.. && sudo -v && \
+//!   cd vxedge && sudo -v && \
 //!     cargo test -p vxedge-core --test fiveg_podman -- --ignored --nocapture
 
 use vxedge_core::containers::ContainerClient;
@@ -64,7 +61,7 @@ impl Drop for PodGuard {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs root + podman + the vx5g-core/vx5g-ran images (see module docs)"]
+#[ignore = "needs root + podman + network for the 5G image pulls (see module docs)"]
 async fn fiveg_up_brings_cn_and_ran_pods_up_idempotently_then_tears_down() {
     let client = ContainerClient::connect_user()
         .await
@@ -75,8 +72,6 @@ async fn fiveg_up_brings_cn_and_ran_pods_up_idempotently_then_tears_down() {
     let cfg = FiveGLifecycleConfig {
         pod_name: "vx5g-cargo-test".to_string(),
         ran_pod_name: "vx5g-cargo-test-ran".to_string(),
-        core_image: "vx5g-core".to_string(),
-        ran_image: "vx5g-ran".to_string(),
         ..FiveGLifecycleConfig::default()
     };
     let mut guard = PodGuard {

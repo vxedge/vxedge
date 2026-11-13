@@ -105,7 +105,38 @@ fn containers(op: impl Into<String>) -> impl FnOnce(ContainerError) -> FiveGLife
 
 pub use crate::containers::PAUSE_IMAGE;
 
-/// Which pods + images to drive. Defaults match `containers/fiveg/`.
+/// The 5G core image every CN container runs: the vxparts part `gw/5gc/os/open5gs` 0.1.0
+/// (Open5GS 2.8.0, `2.8.0~noble5`, with `open5gs-dbctl` and mongosh), pinned by its digest. A
+/// single linux/amd64 manifest. Pulled on first use when absent. Published in
+/// <https://github.com/vxedge/vxparts/pull/38>.
+pub const FIVEG_CORE_IMAGE: &str = "ghcr.io/vxedge/parts/gw/5gc/os/open5gs:0.1.0@sha256:dfad2271a85c7147669ed5a98cc4c61b113a915d95050ddbcfe25bdea55ac97d";
+
+/// The RAN image the gNB and every UE run: the vxparts part `gw/ran/os/ueransim` 0.1.0
+/// (UERANSIM v3.2.7 at `1d1e154f`, with the vxagents 0.2.3 release `vxprobe`), pinned by its
+/// digest. A single linux/amd64 manifest. Pulled on first use when absent.
+pub const FIVEG_RAN_IMAGE: &str = "ghcr.io/vxedge/parts/gw/ran/os/ueransim:0.1.0@sha256:39393bb1982f57f4c3b14ff743baea810868b089d7ceda633b85026817fe066a";
+
+/// The subscriber database the CN pod runs first: MongoDB 7.0.45, pinned by the multi-arch index
+/// digest of `mongo:7` (resolved 2026-11-13). Pulled on first use when absent.
+pub const FIVEG_MONGO_IMAGE: &str = "docker.io/library/mongo:7@sha256:8bb4442761a63a8dda452744082cdac9644b429807eb977b42324a63cef59ca4";
+
+/// The images a run of `exp` starts for its 5G core and RAN: [`FIVEG_CORE_IMAGE`],
+/// [`FIVEG_RAN_IMAGE`] and [`FIVEG_MONGO_IMAGE`] when any slice is `s-nssai`, none otherwise. The
+/// package lock pins them and an archive records their digests, as for a zone's image.
+pub fn fiveg_images(exp: &crate::model::Experiment) -> Vec<&'static str> {
+    if exp
+        .slices
+        .iter()
+        .any(|s| s.mode == crate::model::SliceMode::SNssai)
+    {
+        vec![FIVEG_CORE_IMAGE, FIVEG_RAN_IMAGE, FIVEG_MONGO_IMAGE]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Which pods + images to drive. The images default to [`FIVEG_CORE_IMAGE`] and
+/// [`FIVEG_RAN_IMAGE`], each pinned by digest.
 #[derive(Debug, Clone)]
 pub struct FiveGLifecycleConfig {
     /// CN pod name (mongo + 8-NF core + per-slice SMF/UPF).
@@ -127,8 +158,8 @@ impl Default for FiveGLifecycleConfig {
         Self {
             ran_pod_name: format!("{pod_name}-ran"),
             pod_name,
-            core_image: "vx5g-core".to_string(),
-            ran_image: "vx5g-ran".to_string(),
+            core_image: FIVEG_CORE_IMAGE.to_string(),
+            ran_image: FIVEG_RAN_IMAGE.to_string(),
             infra_image: PAUSE_IMAGE.to_string(),
         }
     }
@@ -346,7 +377,7 @@ pub fn core_run_specs(
     vec![
         vec![spec(
             "mongo".to_string(),
-            "docker.io/library/mongo:7",
+            FIVEG_MONGO_IMAGE,
             vec![
                 "mongod".to_string(),
                 "--bind_ip".to_string(),
@@ -1157,7 +1188,7 @@ devices: {}
         let cfg = FiveGLifecycleConfig::default();
         let cfg_dir = Path::new("/run/vx/fiveg-config");
         let gnb = gnb_spec(&cfg, cfg_dir);
-        assert_eq!(gnb.image, "vx5g-ran");
+        assert_eq!(gnb.image, FIVEG_RAN_IMAGE);
         assert_eq!(gnb.cmd, ["nr-gnb", "-c", "/etc/vx5g/ueransim/gnb.yaml"]);
         assert!(gnb.cap_add.is_empty() && gnb.devices.is_empty());
 
@@ -1200,17 +1231,25 @@ devices: {}
     // hardcoded sst=1, ignoring the slice's actual SST).
 
     #[test]
-    fn default_config_matches_the_containers_fiveg_images() {
+    fn default_config_runs_the_digest_pinned_parts() {
         let cfg = FiveGLifecycleConfig::default();
         assert_eq!(cfg.pod_name, "vx5g");
-        assert_eq!(cfg.core_image, "vx5g-core");
+        assert_eq!(cfg.core_image, FIVEG_CORE_IMAGE);
         assert_eq!(cfg.ran_pod_name, "vx5g-ran");
-        assert_eq!(cfg.ran_image, "vx5g-ran");
+        assert_eq!(cfg.ran_image, FIVEG_RAN_IMAGE);
         assert_eq!(cfg.infra_image, PAUSE_IMAGE);
-        assert!(
-            PAUSE_IMAGE.contains("@sha256:"),
-            "the infra image is digest-pinned"
-        );
+        for image in [
+            FIVEG_CORE_IMAGE,
+            FIVEG_RAN_IMAGE,
+            FIVEG_MONGO_IMAGE,
+            PAUSE_IMAGE,
+        ] {
+            let (_, digest) = image.split_once("@sha256:").expect("digest-pinned");
+            assert!(
+                digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()),
+                "{image}"
+            );
+        }
     }
 
     fn nrf_running() -> ContainerStatus {

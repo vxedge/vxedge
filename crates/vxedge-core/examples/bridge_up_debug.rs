@@ -28,8 +28,6 @@ async fn main() -> ExitCode {
     let cfg = FiveGLifecycleConfig {
         pod_name: pod_name.clone(),
         ran_pod_name: format!("{pod_name}-ran"),
-        core_image: "vx5g-core".to_string(),
-        ran_image: "vx5g-ran".to_string(),
         ..FiveGLifecycleConfig::default()
     };
     let client = match ContainerClient::connect_user().await {
