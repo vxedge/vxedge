@@ -531,7 +531,7 @@ mod tests {
         // ensure_endpoint), so this exercises purely the dispatch logic.
         let tmp = tempfile::tempdir().unwrap();
         let sh = Shell::default();
-        let fiveg_cfg = FiveGLifecycleConfig::default();
+        let fiveg_cfg = FiveGLifecycleConfig::for_instance(crate::instance::Instance::FIRST);
         let profile = snssai_profile("bad-probe", Some(1000), None);
         let err = profile_up(
             &LazyClient::user(),
@@ -557,7 +557,7 @@ mod tests {
     async fn snssai_ue_target_without_a_fiveg_plan_is_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         let sh = Shell::default();
-        let fiveg_cfg = FiveGLifecycleConfig::default();
+        let fiveg_cfg = FiveGLifecycleConfig::for_instance(crate::instance::Instance::FIRST);
         // Target the UE itself (not the far side) so the missing-plan check
         // in ensure_reflector, not ProbeTargetNotReflectable, is what fires.
         let mut profile = snssai_profile("adas-probe", Some(1000), None);
@@ -586,7 +586,7 @@ mod tests {
     async fn snssai_ue_target_with_a_plan_missing_the_session_is_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         let sh = Shell::default();
-        let fiveg_cfg = FiveGLifecycleConfig::default();
+        let fiveg_cfg = FiveGLifecycleConfig::for_instance(crate::instance::Instance::FIRST);
         let mut profile = snssai_profile("adas-probe", Some(1000), None);
         std::mem::swap(&mut profile.source, &mut profile.target);
 
@@ -635,7 +635,7 @@ devices: {}
     async fn load_profile_reports_spawn_failure_for_missing_binary() {
         let tmp = tempfile::tempdir().unwrap();
         let sh = Shell::default();
-        let fiveg_cfg = FiveGLifecycleConfig::default();
+        let fiveg_cfg = FiveGLifecycleConfig::for_instance(crate::instance::Instance::FIRST);
         let profile = snssai_profile("load", None, Some(400));
         let err = profile_up(
             &LazyClient::user(),

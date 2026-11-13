@@ -109,7 +109,7 @@ fn container_node_runs_an_oci_payload_in_its_own_group_namespace() {
     };
 
     let model = vxedge_core::model::load_yaml(&workspace()).expect("workspace loads");
-    let plan = GatewayPlan::from_model(&model).unwrap();
+    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST).unwrap();
     apply(&sh, &plan).unwrap();
     assert!(observe(&sh, &plan).unwrap().fully_up());
 

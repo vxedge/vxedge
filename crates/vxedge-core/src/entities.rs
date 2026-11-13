@@ -283,7 +283,12 @@ pub fn entities_with(model: &Experiment, host_targets: &[String]) -> Vec<EntityR
 /// node's by its backend, each host service's output, and each traffic generator's output to
 /// the node it runs from (a reflector to the node it answers on), or to `host` when that is no
 /// device. A container's output is Podman's and has no file here.
-pub fn add_logs(records: &mut [EntityRecord], model: &Experiment, runtime_dir: &std::path::Path) {
+pub fn add_logs(
+    records: &mut [EntityRecord],
+    model: &Experiment,
+    runtime_dir: &std::path::Path,
+    instance: crate::instance::Instance,
+) {
     use crate::model::Backend;
     let file = |name: String| runtime_dir.join(name);
     let mut add = |path: &str, stream: String, at: std::path::PathBuf| {
@@ -306,7 +311,7 @@ pub fn add_logs(records: &mut [EntityRecord], model: &Experiment, runtime_dir: &
             let Some(path) = node_path(model, &device.id) else {
                 continue;
             };
-            let name = crate::zones::runtime_name_of(&device.id);
+            let name = crate::zones::runtime_name_of(instance, &device.id);
             let streams: Vec<(&str, std::path::PathBuf)> = match device.backend {
                 Some(Backend::QemuMicrovm | Backend::QemuMcu) => {
                     vec![("serial", file(format!("{name}.serial.log")))]
@@ -463,7 +468,7 @@ telemetry:
         m.services.insert("ota".into(), def);
         let rt = std::path::Path::new("/run/vx");
         let mut all = entities_of(&m);
-        add_logs(&mut all, &m, rt);
+        add_logs(&mut all, &m, rt, crate::instance::Instance::FIRST);
         let ota = all.iter().find(|e| e.path == "host/services/ota").unwrap();
         assert_eq!(ota.scrape_targets, ["127.0.0.1:9902", "127.0.0.1:9903"]);
         let streams: Vec<&str> = ota.logs.iter().map(|l| l.stream.as_str()).collect();
@@ -492,7 +497,7 @@ telemetry:
         });
         let rt = std::path::Path::new("/run/vx");
         let mut all = entities_of(&m);
-        add_logs(&mut all, &m, rt);
+        add_logs(&mut all, &m, rt, crate::instance::Instance::FIRST);
         let logs = |path: &str| -> Vec<(String, std::path::PathBuf)> {
             all.iter()
                 .find(|e| e.path == path)
@@ -504,7 +509,7 @@ telemetry:
         };
         assert_eq!(
             logs("car/_/hpc1"),
-            [("serial".into(), rt.join("vx-hpc1.serial.log"))]
+            [("serial".into(), rt.join("vx0-hpc1.serial.log"))]
         );
         // A container's output is Podman's; only its traffic generator's is a file.
         assert_eq!(

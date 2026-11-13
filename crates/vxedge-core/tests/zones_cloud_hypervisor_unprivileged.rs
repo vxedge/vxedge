@@ -135,7 +135,7 @@ fn an_unprivileged_vmm_carries_traffic_on_a_tap_its_user_owns() {
         escalate: true,
     };
     let model = vxedge_core::model::load_yaml(&workspace(&bundle)).expect("workspace loads");
-    let plan = GatewayPlan::from_model(&model).unwrap();
+    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST).unwrap();
     let _guard = Guard {
         sh: sh.clone(),
         plan: plan.clone(),

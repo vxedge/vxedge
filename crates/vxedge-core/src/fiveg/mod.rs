@@ -18,7 +18,7 @@
 //! [`lifecycle`] (2026-07-17) ports that proven shell sequence into a
 //! tested Rust module — pod up/down/status, idempotent — and is now wired
 //! into `GatewayService` (`vxedged`): `vxedge up/down/status` provision the
-//! CN/RAN pods and attach the CN pod to the real `vxbr0` whenever a
+//! CN/RAN pods and attach the CN pod to the real `vxbr<s>` whenever a
 //! manifest declares `mode: s-nssai` slices.
 //!
 //! [`subscriber`] (2026-07-17) replaces `dbctl`-shelling with direct

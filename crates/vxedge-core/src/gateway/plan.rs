@@ -351,8 +351,16 @@ impl TimeSyncPlan {
 /// says its result has software gates' timer jitter in it.
 pub const SHORTEST_TESTED_WINDOW_US: u32 = 10_000;
 
+/// The bridge of the run in `instance`: `vxbr<s>`. Named on its own because a daemon that has
+/// lost its plan still has to find a run's bridge on the host.
+pub fn bridge_name(instance: crate::instance::Instance) -> String {
+    format!("vxbr{instance}")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayPlan {
+    /// The run's slot on its host. Every host name below carries it (`ARCHITECTURE.md` §6.0.5).
+    pub instance: crate::instance::Instance,
     pub bridge: String,
     /// Trunk uplink (bridge side); the HTB queue tree lives on its egress —
     /// the shared bottleneck where slice contention is measured.
@@ -448,8 +456,8 @@ fn plan_slices(slices: &[SliceInput]) -> Result<(Vec<SlicePlan>, Vec<String>), P
 ///
 /// A qdisc shapes what leaves an interface, so the obvious reading — impair every attachment of
 /// the link — impairs each traversal *twice* whenever both ends are devices on this bridge. A
-/// packet from `gw1` to `zonefl` leaves `gw1`, is impaired inbound at `vz-gw1`, crosses the
-/// bridge, and is impaired again outbound at `vz-zonefl`: 500 µs of delay on a 250 µs wire, with
+/// packet from `gw1` to `zonefl` leaves `gw1`, is impaired inbound at `vz0-gw1`, crosses the
+/// bridge, and is impaired again outbound at `vz0-zonefl`: 500 µs of delay on a 250 µs wire, with
 /// nothing anywhere reporting a problem. Halving the values to compensate would then be wrong
 /// for the single-attachment links every frozen experiment actually declares.
 ///
@@ -512,7 +520,10 @@ impl GatewayPlan {
     /// vector, never what anything is called. That is what let the retired §6.1 schema
     /// (declaration order) and a §6.0 workspace (map order) describe the same topology and
     /// plan the same interfaces, which is how every migration was signed off.
-    pub fn from_model(exp: &crate::model::Experiment) -> Result<Self, PlanError> {
+    pub fn from_model(
+        exp: &crate::model::Experiment,
+        instance: crate::instance::Instance,
+    ) -> Result<Self, PlanError> {
         let flat: Vec<SliceInput> = exp
             .slices
             .iter()
@@ -579,7 +590,7 @@ impl GatewayPlan {
                             .host_interface
                             .clone()
                             .ok_or_else(|| PlanError::AttachWithoutInterface(device.id.clone()))?,
-                        _ => super::ifnames::access_port(&device.id, port),
+                        _ => super::ifnames::access_port(instance, &device.id, port),
                     };
                     let origin = describe_attachment(&device.id, port);
                     if let Some(other) = claimed.insert(name.clone(), origin.clone()) {
@@ -591,7 +602,9 @@ impl GatewayPlan {
                     }
                     endpoints.push(EndpointPlan {
                         peer: match kind {
-                            EndpointKind::Veth => super::ifnames::veth_peer(&device.id, port),
+                            EndpointKind::Veth => {
+                                super::ifnames::veth_peer(instance, &device.id, port)
+                            }
                             EndpointKind::Tap | EndpointKind::Adopted => name.clone(),
                         },
                         name,
@@ -621,8 +634,10 @@ impl GatewayPlan {
             std::collections::BTreeMap::new();
         for t in &exp.tunnels {
             let name = match t.kind {
-                crate::model::TunnelKind::Wireguard => super::ifnames::wireguard_tunnel(&t.id),
-                crate::model::TunnelKind::Vxlan => super::ifnames::vxlan_tunnel(&t.id),
+                crate::model::TunnelKind::Wireguard => {
+                    super::ifnames::wireguard_tunnel(instance, &t.id)
+                }
+                crate::model::TunnelKind::Vxlan => super::ifnames::vxlan_tunnel(instance, &t.id),
             };
             if let Some(other) = claimed_tunnels.insert(name.clone(), t.id.clone()) {
                 return Err(PlanError::TunnelNameCollision {
@@ -702,9 +717,10 @@ impl GatewayPlan {
             .transpose()?;
 
         Ok(Self {
-            bridge: "vxbr0".into(),
-            uplink: "vxup0".into(),
-            uplink_peer: "vxup0p".into(),
+            instance,
+            bridge: bridge_name(instance),
+            uplink: format!("vxup{instance}"),
+            uplink_peer: format!("vxup{instance}p"),
             root_rate_mbps: exp
                 .uplink_bandwidth_bps
                 .map(|bps| (bps / 1_000_000).max(1))
@@ -921,7 +937,8 @@ parts:
     /// container device's second address is accepted at its port alongside the first.
     #[test]
     fn an_attach_device_adopts_its_platforms_interface() {
-        let plan = GatewayPlan::from_model(&model(ATTACH)).unwrap();
+        let plan =
+            GatewayPlan::from_model(&model(ATTACH), crate::instance::Instance::FIRST).unwrap();
         let ivi = plan
             .endpoints
             .iter()
@@ -941,14 +958,14 @@ parts:
     fn an_attach_device_without_a_host_interface_is_refused() {
         let ws = ATTACH.replace(", host_interface: cvd-etap-01", "");
         assert!(matches!(
-            GatewayPlan::from_model(&model(&ws)),
+            GatewayPlan::from_model(&model(&ws), crate::instance::Instance::FIRST),
             Err(PlanError::AttachWithoutInterface(d)) if d == "ivi-aaos"
         ));
     }
 
     #[test]
     fn builds_deterministic_plan() {
-        let plan = GatewayPlan::from_model(&model(BASE)).unwrap();
+        let plan = GatewayPlan::from_model(&model(BASE), crate::instance::Instance::FIRST).unwrap();
         assert_eq!(plan.bridge, "vxbr0");
         assert_eq!(plan.root_rate_mbps, 500);
         assert_eq!(plan.slices.len(), 2);
@@ -958,16 +975,19 @@ parts:
         // min rate 0 floors to 1 mbit (HTB needs non-zero rates).
         assert_eq!(plan.slices[1].min_rate_mbps, 1);
         assert_eq!(plan.endpoints.len(), 2);
-        assert_eq!(plan.endpoints[0].name, "vz-node-ecu-01");
+        assert_eq!(plan.endpoints[0].name, "vz0-node-ecu-01");
         assert_eq!(plan.endpoints[0].node, "node-ecu-01");
         assert_eq!(plan.endpoints[0].kind, EndpointKind::Tap);
         // A tap has no peer: the hypervisor opens the access port itself.
-        assert_eq!(plan.endpoints[0].peer, "vz-node-ecu-01");
+        assert_eq!(plan.endpoints[0].peer, "vz0-node-ecu-01");
         // No `network.data_plane` in BASE — every frozen experiment is in exactly this shape,
         // and this is what keeps them selecting the kernel bridge without ever naming it.
         assert_eq!(plan.data_plane, crate::model::DataPlaneKind::KernelBridge);
         // Determinism: same workspace, same plan.
-        assert_eq!(plan, GatewayPlan::from_model(&model(BASE)).unwrap());
+        assert_eq!(
+            plan,
+            GatewayPlan::from_model(&model(BASE), crate::instance::Instance::FIRST).unwrap()
+        );
     }
 
     #[test]
@@ -977,11 +997,12 @@ parts:
             "network:\n  data_plane: ovs\n  defaults: { bandwidth: 500000000 }",
             1,
         );
-        let plan = GatewayPlan::from_model(&model(&ws)).unwrap();
+        let plan = GatewayPlan::from_model(&model(&ws), crate::instance::Instance::FIRST).unwrap();
         assert_eq!(plan.data_plane, crate::model::DataPlaneKind::Ovs);
         // Selecting OVS changes nothing else about the plan — the same slices/endpoints/HTB
         // rates a campaign would compare across the two mechanisms.
-        let kernel_bridge_plan = GatewayPlan::from_model(&model(BASE)).unwrap();
+        let kernel_bridge_plan =
+            GatewayPlan::from_model(&model(BASE), crate::instance::Instance::FIRST).unwrap();
         assert_eq!(plan.slices, kernel_bridge_plan.slices);
         assert_eq!(plan.endpoints, kernel_bridge_plan.endpoints);
     }
@@ -991,7 +1012,7 @@ parts:
         // BASE's endpoints are bare `device:port` form — no IP pinned, so there is no
         // anti-spoof filter to install (docs/ROADMAP.md's nftables ingress filter). Confirmed
         // here rather than assumed, since a `None` is easy to get right by accident.
-        let plan = GatewayPlan::from_model(&model(BASE)).unwrap();
+        let plan = GatewayPlan::from_model(&model(BASE), crate::instance::Instance::FIRST).unwrap();
         assert!(plan.endpoints.iter().all(|e| e.expected_source.is_none()));
 
         let ws = BASE.replacen(
@@ -999,7 +1020,7 @@ parts:
             "{ id: l-infot, endpoints: [{ node: node-info-01, port: eth0, ip: 10.103.0.2/24 }], slice: infotainment }",
             1,
         );
-        let plan = GatewayPlan::from_model(&model(&ws)).unwrap();
+        let plan = GatewayPlan::from_model(&model(&ws), crate::instance::Instance::FIRST).unwrap();
         let pinned = plan
             .endpoints
             .iter()
@@ -1019,7 +1040,8 @@ parts:
     fn tunnels_are_planned_with_deterministic_interface_names() {
         // BASE itself declares none — absence must plan to an empty list, not error, the same
         // property `slices_of`/`data_plane_of` already have for their own absent blocks.
-        let base_plan = GatewayPlan::from_model(&model(BASE)).unwrap();
+        let base_plan =
+            GatewayPlan::from_model(&model(BASE), crate::instance::Instance::FIRST).unwrap();
         assert!(base_plan.tunnels.is_empty());
 
         let ws = BASE.replacen(
@@ -1030,11 +1052,11 @@ parts:
              allowed_ips: [10.200.0.0/24] }",
             1,
         );
-        let plan = GatewayPlan::from_model(&model(&ws)).unwrap();
+        let plan = GatewayPlan::from_model(&model(&ws), crate::instance::Instance::FIRST).unwrap();
         assert_eq!(plan.tunnels.len(), 1);
         let t = &plan.tunnels[0];
         assert_eq!(t.id, "ota-uplink");
-        assert_eq!(t.name, "vxwg-ota-uplink");
+        assert_eq!(t.name, "vxwg0-ota-3cb1");
         assert_eq!(t.kind, crate::model::TunnelKind::Wireguard);
         assert_eq!(t.listen_port, Some(51820));
         assert_eq!(t.address.as_deref(), Some("10.200.0.1/24"));
@@ -1062,9 +1084,10 @@ parts:
              'tun-a', listen_port: 51821, address: 10.200.1.1/24, peer: { public_key: k2 } }",
             1,
         );
-        let err = GatewayPlan::from_model(&model(&ws)).unwrap_err();
+        let err =
+            GatewayPlan::from_model(&model(&ws), crate::instance::Instance::FIRST).unwrap_err();
         assert!(
-            matches!(&err, PlanError::TunnelNameCollision { name, .. } if name == "vxwg-tun-a"),
+            matches!(&err, PlanError::TunnelNameCollision { name, .. } if name == "vxwg0-tun-a"),
             "{err}"
         );
     }
@@ -1077,11 +1100,11 @@ parts:
              kind: vxlan, vni: 100, remote: 198.51.100.7, slices: [adas] }",
             1,
         );
-        let plan = GatewayPlan::from_model(&model(&ws)).unwrap();
+        let plan = GatewayPlan::from_model(&model(&ws), crate::instance::Instance::FIRST).unwrap();
         assert_eq!(plan.tunnels.len(), 1);
         let t = &plan.tunnels[0];
         assert_eq!(t.id, "site-b");
-        assert_eq!(t.name, "vxln-site-b");
+        assert_eq!(t.name, "vxln0-site-b");
         assert_eq!(t.kind, crate::model::TunnelKind::Vxlan);
         assert_eq!(t.vni, Some(100));
         assert_eq!(t.remote, Some("198.51.100.7".parse().unwrap()));
@@ -1101,7 +1124,8 @@ parts:
              198.51.100.7, slices: [adas] }\n  slices:",
             1,
         );
-        let err = GatewayPlan::from_model(&model(&ws)).unwrap_err();
+        let err =
+            GatewayPlan::from_model(&model(&ws), crate::instance::Instance::FIRST).unwrap_err();
         assert!(
             matches!(
                 &err,
@@ -1115,7 +1139,8 @@ parts:
     #[test]
     fn rejects_vlan_colliding_with_the_reserved_fiveg_uplink_vlan() {
         let ws = slices_only("    - { id: adas, mode: vlan, vlan: 4000 }");
-        let err = GatewayPlan::from_model(&model(&ws)).unwrap_err();
+        let err =
+            GatewayPlan::from_model(&model(&ws), crate::instance::Instance::FIRST).unwrap_err();
         assert!(matches!(
             err,
             PlanError::VlanCollidesWithFiveGUplink(id, 4000) if id == "adas"
@@ -1126,7 +1151,7 @@ parts:
     fn vlan_only_manifest_has_no_snssai_ids_tracked() {
         // Regression guard: adding s-nssai tracking must not change the
         // vlan-only plan at all (zero risk to the frozen H1/H3/H4 numbers).
-        let plan = GatewayPlan::from_model(&model(BASE)).unwrap();
+        let plan = GatewayPlan::from_model(&model(BASE), crate::instance::Instance::FIRST).unwrap();
         assert!(plan.snssai_slice_ids.is_empty());
     }
 
@@ -1141,7 +1166,8 @@ parts:
             "    - { id: infotainment, mode: vlan, vlan: 103, qos: { min_rate_mbps: 0, max_rate_mbps: 400, priority: 5 } }\n    - { id: adas5g, mode: s-nssai, s_nssai: { sst: 1, sd: '000001' } }",
             1,
         ));
-        let plan = GatewayPlan::from_model(&m).expect("mixed workspace now succeeds");
+        let plan = GatewayPlan::from_model(&m, crate::instance::Instance::FIRST)
+            .expect("mixed workspace now succeeds");
         // vlan slices provisioned exactly as the vlan-only case (BASE).
         assert_eq!(plan.slices.len(), 2);
         assert_eq!(plan.slices[0].id, "adas");
@@ -1153,7 +1179,8 @@ parts:
     fn snssai_only_manifest_succeeds_with_no_vlan_slices() {
         let ws =
             slices_only("    - { id: adas5g, mode: s-nssai, s_nssai: { sst: 1, sd: '000001' } }");
-        let plan = GatewayPlan::from_model(&model(&ws)).expect("s-nssai-only workspace succeeds");
+        let plan = GatewayPlan::from_model(&model(&ws), crate::instance::Instance::FIRST)
+            .expect("s-nssai-only workspace succeeds");
         assert!(plan.slices.is_empty());
         assert_eq!(plan.snssai_slice_ids, vec!["adas5g".to_string()]);
         // Bridge/uplink are still planned — an s-nssai-only experiment still
@@ -1186,7 +1213,7 @@ links:
   - { id: b, endpoints: [node-microvm-01:eth0], slice: s }
   - { id: c, endpoints: [node-libvirt-01:eth0], slice: s }
 "#;
-        let plan = GatewayPlan::from_model(&model(ws)).unwrap();
+        let plan = GatewayPlan::from_model(&model(ws), crate::instance::Instance::FIRST).unwrap();
         let named: Vec<(&str, &str, &str)> = plan
             .endpoints
             .iter()
@@ -1195,9 +1222,9 @@ links:
         assert_eq!(
             named,
             vec![
-                ("node-cont-01", "vz-node-c-32cc", "vzp-node-c-32cc"),
-                ("node-libvirt-01", "vz-node-l-de44", "vz-node-l-de44"),
-                ("node-microvm-01", "vz-node-m-a34f", "vz-node-m-a34f"),
+                ("node-cont-01", "vz0-node-c-32cc", "vp0-node-c-32cc"),
+                ("node-libvirt-01", "vz0-node-l-de44", "vz0-node-l-de44"),
+                ("node-microvm-01", "vz0-node-m-a34f", "vz0-node-m-a34f"),
             ]
         );
     }
@@ -1221,9 +1248,10 @@ links:
   - { id: a, endpoints: [node.a:eth0], slice: s }
   - { id: b, endpoints: [node-a:eth0], slice: s }
 "#;
-        let err = GatewayPlan::from_model(&model(ws)).unwrap_err();
+        let err =
+            GatewayPlan::from_model(&model(ws), crate::instance::Instance::FIRST).unwrap_err();
         assert!(
-            matches!(&err, PlanError::EndpointNameCollision { name, .. } if name == "vz-node-a"),
+            matches!(&err, PlanError::EndpointNameCollision { name, .. } if name == "vz0-node-a"),
             "{err}"
         );
     }
@@ -1258,7 +1286,8 @@ links:
 
     #[test]
     fn an_impaired_link_lands_on_its_access_port_with_its_ifb() {
-        let plan = GatewayPlan::from_model(&model(IMPAIRED)).unwrap();
+        let plan =
+            GatewayPlan::from_model(&model(IMPAIRED), crate::instance::Instance::FIRST).unwrap();
         let sensor = plan
             .endpoints
             .iter()
@@ -1266,8 +1295,8 @@ links:
             .unwrap();
         let imp = sensor.impairment.as_ref().expect("seg-t1 is impaired");
         assert_eq!(imp.link, "seg-t1");
-        assert_eq!(imp.ifb, "vxi-node-s-c9ce");
-        assert_eq!(sensor.name, "vz-node-s-c9ce");
+        assert_eq!(imp.ifb, "vi0-node-s-c9ce");
+        assert_eq!(sensor.name, "vz0-node-s-c9ce");
         assert_eq!(imp.params.rate_mbps, Some(100));
         assert_eq!(imp.params.delay_us, Some(250));
         assert_eq!(imp.params.jitter_us, Some(40));
@@ -1283,7 +1312,10 @@ links:
         assert_eq!(imp.params.rate_mbps, Some(1000));
         assert_eq!(imp.params.delay_us, None);
 
-        assert_eq!(plan, GatewayPlan::from_model(&model(IMPAIRED)).unwrap());
+        assert_eq!(
+            plan,
+            GatewayPlan::from_model(&model(IMPAIRED), crate::instance::Instance::FIRST).unwrap()
+        );
     }
 
     /// The regression the one-port rule exists to prevent, and the reason it is not "impair every
@@ -1308,7 +1340,7 @@ links:
     slice: adas
     impairments: { delay_us: 250 }
 "#;
-        let plan = GatewayPlan::from_model(&model(ws)).unwrap();
+        let plan = GatewayPlan::from_model(&model(ws), crate::instance::Instance::FIRST).unwrap();
         assert_eq!(plan.endpoints.len(), 2, "both attachments still get a port");
         let impaired: Vec<&str> = plan
             .endpoints
@@ -1318,7 +1350,7 @@ links:
             .collect();
         assert_eq!(
             impaired,
-            vec!["vz-gw1"],
+            vec!["vz0-gw1"],
             "exactly one port carries the netem"
         );
     }
@@ -1342,15 +1374,19 @@ links:
   - { id: l, endpoints: [ENDPOINTS], slice: adas, impairments: { delay_us: 250 } }
 "#;
         let carrier = |eps: &str| {
-            let plan = GatewayPlan::from_model(&model(&one.replace("ENDPOINTS", eps))).unwrap();
+            let plan = GatewayPlan::from_model(
+                &model(&one.replace("ENDPOINTS", eps)),
+                crate::instance::Instance::FIRST,
+            )
+            .unwrap();
             plan.endpoints
                 .iter()
                 .find(|e| e.impairment.is_some())
                 .map(|e| e.name.clone())
                 .unwrap()
         };
-        assert_eq!(carrier("aaa:eth0, zzz:eth0"), "vz-aaa");
-        assert_eq!(carrier("zzz:eth0, aaa:eth0"), "vz-aaa");
+        assert_eq!(carrier("aaa:eth0, zzz:eth0"), "vz0-aaa");
+        assert_eq!(carrier("zzz:eth0, aaa:eth0"), "vz0-aaa");
     }
 
     /// Two links impairing one port would leave only one netem installed and the run would
@@ -1374,9 +1410,10 @@ links:
   - { id: l1, endpoints: [node-a:eth0], slice: adas, impairments: { delay_us: 250 } }
   - { id: l2, endpoints: [node-a:eth0], slice: adas, impairments: { delay_us: 900 } }
 "#;
-        let err = GatewayPlan::from_model(&model(ws)).unwrap_err();
+        let err =
+            GatewayPlan::from_model(&model(ws), crate::instance::Instance::FIRST).unwrap_err();
         assert!(
-            matches!(&err, PlanError::EndpointNameCollision { name, .. } if name == "vz-node-a"),
+            matches!(&err, PlanError::EndpointNameCollision { name, .. } if name == "vz0-node-a"),
             "{err}"
         );
     }
@@ -1408,7 +1445,8 @@ links:
   - { id: l1, endpoints: [node-a:eth0], slice: adas }
   - { id: l2, endpoints: [node-b:eth0], slice: adas5g, impairments: { delay_us: 250 } }
 "#;
-        let err = GatewayPlan::from_model(&model(ws)).unwrap_err();
+        let err =
+            GatewayPlan::from_model(&model(ws), crate::instance::Instance::FIRST).unwrap_err();
         assert!(
             matches!(&err, PlanError::ImpairmentNotRenderable { link } if link == "l2"),
             "{err}"
@@ -1419,7 +1457,7 @@ links:
     /// impairments, and adding the feature must leave their plans byte for byte unchanged.
     #[test]
     fn an_unimpaired_workspace_plans_no_impairments() {
-        let plan = GatewayPlan::from_model(&model(BASE)).unwrap();
+        let plan = GatewayPlan::from_model(&model(BASE), crate::instance::Instance::FIRST).unwrap();
         assert!(plan.endpoints.iter().all(|e| e.impairment.is_none()));
         assert!(!plan.summary().contains("impaired"));
     }
@@ -1429,7 +1467,7 @@ links:
         let ws =
             "kind: experiment\nid: e\nvehicles: [veh]\n---\nkind: vehicle\nid: veh\ndevices: {}\n";
         assert!(matches!(
-            GatewayPlan::from_model(&model(ws)),
+            GatewayPlan::from_model(&model(ws), crate::instance::Instance::FIRST),
             Err(PlanError::NoSlices)
         ));
     }
@@ -1449,7 +1487,8 @@ links:
 
     #[test]
     fn a_gate_schedule_plans_one_class_per_slice_and_default() {
-        let plan = GatewayPlan::from_model(&model(&shaped())).unwrap();
+        let plan =
+            GatewayPlan::from_model(&model(&shaped()), crate::instance::Instance::FIRST).unwrap();
         let s = plan.shaping.as_ref().expect("planned");
         assert_eq!(
             s.classes,
@@ -1502,14 +1541,17 @@ links:
              [adas 10000us, rest 90000us]; slices: [adas (vlan 101, class 1), infotainment \
              (vlan 103, class 2)]; 2 endpoint(s)"
         );
-        assert_eq!(plan, GatewayPlan::from_model(&model(&shaped())).unwrap());
+        assert_eq!(
+            plan,
+            GatewayPlan::from_model(&model(&shaped()), crate::instance::Instance::FIRST).unwrap()
+        );
     }
 
     /// Without `network.shaping` nothing about the plan changes: the HTB tree, a single-queue
     /// uplink and the summary every frozen experiment's plan has always printed.
     #[test]
     fn without_shaping_the_htb_plan_is_unchanged() {
-        let plan = GatewayPlan::from_model(&model(BASE)).unwrap();
+        let plan = GatewayPlan::from_model(&model(BASE), crate::instance::Instance::FIRST).unwrap();
         assert_eq!(plan.shaping, None);
         assert_eq!(plan.uplink_tx_queues(), None);
         assert_eq!(plan.slice_class_handle(&plan.slices[0]), "1:10");
@@ -1523,9 +1565,10 @@ links:
     /// A window shorter than the 10 ms tested is accepted, and the plan says what that costs.
     #[test]
     fn a_window_shorter_than_tested_is_named_in_the_summary() {
-        let plan = GatewayPlan::from_model(&model(
-            &shaped().replace("duration_us: 10000", "duration_us: 500"),
-        ))
+        let plan = GatewayPlan::from_model(
+            &model(&shaped().replace("duration_us: 10000", "duration_us: 500")),
+            crate::instance::Instance::FIRST,
+        )
         .unwrap();
         assert!(
             plan.summary().ends_with(
@@ -1536,7 +1579,7 @@ links:
             plan.summary()
         );
         assert!(
-            !GatewayPlan::from_model(&model(&shaped()))
+            !GatewayPlan::from_model(&model(&shaped()), crate::instance::Instance::FIRST)
                 .unwrap()
                 .summary()
                 .contains("jitter")
@@ -1552,14 +1595,14 @@ links:
             .open
             .push("telematics".into());
         assert!(matches!(
-            GatewayPlan::from_model(&m),
+            GatewayPlan::from_model(&m, crate::instance::Instance::FIRST),
             Err(PlanError::ShapingUnknownClass { window, class })
                 if window == "adas" && class == "telematics"
         ));
         let mut m = model(&shaped());
         m.shaping.as_mut().unwrap().windows[0].duration_us = u32::MAX;
         assert!(matches!(
-            GatewayPlan::from_model(&m),
+            GatewayPlan::from_model(&m, crate::instance::Instance::FIRST),
             Err(PlanError::ShapingWindowTooLong { .. })
         ));
     }
@@ -1579,10 +1622,19 @@ links:
 
     #[test]
     fn time_sync_plans_one_master_port_per_follower_access_port() {
-        let plan = GatewayPlan::from_model(&model(&synced())).unwrap();
+        let plan =
+            GatewayPlan::from_model(&model(&synced()), crate::instance::Instance::FIRST).unwrap();
         let ts = plan.time_sync.as_ref().expect("planned");
-        let info = crate::gateway::ifnames::access_port("node-info-01", Some("eth0"));
-        let ecu = crate::gateway::ifnames::access_port("node-ecu-01", Some("eth0"));
+        let info = crate::gateway::ifnames::access_port(
+            crate::instance::Instance::FIRST,
+            "node-info-01",
+            Some("eth0"),
+        );
+        let ecu = crate::gateway::ifnames::access_port(
+            crate::instance::Instance::FIRST,
+            "node-ecu-01",
+            Some("eth0"),
+        );
         assert_eq!(
             ts.followers,
             vec![
@@ -1611,10 +1663,13 @@ links:
             plan.summary()
         );
         // Without the block the plan and its summary are what they were.
-        let plain = GatewayPlan::from_model(&model(&synced().replace(
-            "  time_sync: { kind: gptp, followers: [node-info-01, node-ecu-01] }\n",
-            "",
-        )))
+        let plain = GatewayPlan::from_model(
+            &model(&synced().replace(
+                "  time_sync: { kind: gptp, followers: [node-info-01, node-ecu-01] }\n",
+                "",
+            )),
+            crate::instance::Instance::FIRST,
+        )
         .unwrap();
         assert_eq!(plain.time_sync, None);
         assert!(!plain.summary().contains("gptp"));
@@ -1627,7 +1682,7 @@ links:
         let mut m = model(&synced());
         m.time_sync.as_mut().unwrap().followers.push("hpc9".into());
         assert!(matches!(
-            GatewayPlan::from_model(&m),
+            GatewayPlan::from_model(&m, crate::instance::Instance::FIRST),
             Err(PlanError::FollowerPorts { device, count: 0 }) if device == "hpc9"
         ));
     }

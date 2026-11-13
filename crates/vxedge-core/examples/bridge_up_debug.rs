@@ -8,7 +8,7 @@
 //! The bridge must already exist (`sudo ip link add <bridge-name> type
 //! bridge && sudo ip link set <bridge-name> up`) — this tool does not
 //! create it, deliberately: whether to create a throwaway test bridge or
-//! attach to `vxedge up`'s real `vxbr0` is the caller's call, not this
+//! attach to `vxedge up`'s real `vxbr<s>` is the caller's call, not this
 //! tool's.
 
 use std::{env, process::ExitCode};
@@ -28,7 +28,7 @@ async fn main() -> ExitCode {
     let cfg = FiveGLifecycleConfig {
         pod_name: pod_name.clone(),
         ran_pod_name: format!("{pod_name}-ran"),
-        ..FiveGLifecycleConfig::default()
+        ..FiveGLifecycleConfig::for_instance(vxedge_core::instance::Instance::FIRST)
     };
     let client = match ContainerClient::connect_user().await {
         Ok(c) => c,

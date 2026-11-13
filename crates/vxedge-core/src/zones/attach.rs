@@ -220,6 +220,7 @@ mod tests {
 
     fn node(dir: &Path) -> NodePlan {
         NodePlan {
+            instance: crate::instance::Instance::FIRST,
             zone_id: "cockpit".into(),
             node_id: format!("ivi-test-{}", std::process::id()),
             role: crate::model::DeviceRole::Ecu,

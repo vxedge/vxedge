@@ -551,6 +551,7 @@ impl Handles {
                     if up {
                         vxedge_core::gptp::prepare_dir(&vxedge_core::gptp::follower_dir(
                             &runtime_dir,
+                            node.instance,
                             &node.node_id,
                         ))
                         .map_err(|e| e.to_string())?;
@@ -721,7 +722,8 @@ fn time_sync_members(
     let Some(time_sync) = &model.time_sync else {
         return Ok(Vec::new());
     };
-    let gateway = GatewayPlan::from_model(model).map_err(|e| e.to_string())?;
+    let gateway =
+        GatewayPlan::from_model(model, crate::services::RUN_SLOT).map_err(|e| e.to_string())?;
     let nodes = vxedge_core::zones::plan_nodes_from_model(
         model,
         &gateway,
@@ -740,6 +742,7 @@ fn time_sync_members(
             let spec = vxedge_core::gptp::follower_spec(
                 vxedge_core::gptp::LINUXPTP_IMAGE,
                 runtime_dir,
+                node.instance,
                 device,
             );
             Ok((node, spec))
@@ -756,7 +759,8 @@ fn signal_plane_member(
         return Ok(None);
     };
     let spec = vxedge_core::services::kuksa_spec(&plane.kuksa).map_err(|e| e.to_string())?;
-    let gateway = GatewayPlan::from_model(model).map_err(|e| e.to_string())?;
+    let gateway =
+        GatewayPlan::from_model(model, crate::services::RUN_SLOT).map_err(|e| e.to_string())?;
     let nodes = vxedge_core::zones::plan_nodes_from_model(
         model,
         &gateway,
@@ -834,7 +838,7 @@ impl ExperimentService for ExperimentSvc {
         })?;
         // Every check `up` makes before touching the host, shared with `vehicle up` and
         // `WorkspaceService.Plan`.
-        let nodes = GatewayPlan::from_model(&model)
+        let nodes = GatewayPlan::from_model(&model, crate::services::RUN_SLOT)
             .map_err(|e| e.to_string())
             .and_then(|gw| {
                 vxedge_core::zones::plan_nodes_from_model(

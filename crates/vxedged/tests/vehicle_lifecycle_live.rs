@@ -475,7 +475,11 @@ fn podman_id(container: &str) -> Option<String> {
 /// The Podman group name of a device of `yaml`'s vehicle.
 fn group_of(yaml: &str, dir: &Path, node: &str) -> String {
     let model = vxedge_core::model::load_vehicle_yaml(yaml).expect("vehicle loads");
-    let gateway = vxedge_core::gateway::GatewayPlan::from_model(&model).unwrap();
+    let gateway = vxedge_core::gateway::GatewayPlan::from_model(
+        &model,
+        vxedge_core::instance::Instance::FIRST,
+    )
+    .unwrap();
     vxedge_core::zones::plan_nodes_from_model(&model, &gateway, dir)
         .unwrap()
         .into_iter()

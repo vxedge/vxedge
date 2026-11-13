@@ -21,6 +21,7 @@ use vxedge_core::model::{DataPlaneKind, Impairment};
 /// `gateway_netns` test's own plan would use. All well under `IFNAMSIZ`.
 fn test_plan() -> GatewayPlan {
     GatewayPlan {
+        instance: vxedge_core::instance::Instance::FIRST,
         bridge: "vxovstest".into(),
         uplink: "vxovsup".into(),
         uplink_peer: "vxovsupp".into(),

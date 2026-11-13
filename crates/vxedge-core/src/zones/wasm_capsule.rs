@@ -44,8 +44,8 @@ fn log_path(np: &NodePlan, runtime_dir: &Path) -> PathBuf {
 /// The runner's pid, if one is running this node.
 fn running_pid(np: &NodePlan) -> Option<i32> {
     foreign::guests()
-        .find(|(_, node)| node == &np.node_id)
-        .map(|(pid, _)| pid)
+        .find(|g| g.node == np.node_id && g.instance == Some(np.instance))
+        .map(|g| g.pid)
 }
 
 /// The runner: `VXEDGE_CAPSULE_BIN`, else beside this executable, else on PATH. Absolute, since
@@ -106,6 +106,8 @@ fn launch_argv(runner: &Path, np: &NodePlan, module: &Path) -> Vec<String> {
         argv.extend(["taskset".to_string(), "-c".to_string(), cpus.join(",")]);
     }
     argv.push(runner.display().to_string());
+    argv.push("--slot".to_string());
+    argv.push(np.instance.to_string());
     argv.push("--node".to_string());
     argv.push(np.node_id.clone());
     argv.push(module.display().to_string());
@@ -271,6 +273,7 @@ mod tests {
 
     fn node(pinned_cpus: Vec<u32>) -> NodePlan {
         NodePlan {
+            instance: crate::instance::Instance::FIRST,
             zone_id: "z".into(),
             node_id: "sensor-01".into(),
             role: DeviceRole::Sensor,
@@ -304,6 +307,8 @@ mod tests {
                 "setsid",
                 "-f",
                 "/opt/vxcapsule",
+                "--slot",
+                "0",
                 "--node",
                 "sensor-01",
                 "/m.wasm"

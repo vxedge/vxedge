@@ -369,6 +369,7 @@ async fn run_checks(
         root: &c.root,
         out: &c.checks_out,
         budget: Duration::from_secs_f64(budget_s.max(0.0)),
+        instance: crate::services::RUN_SLOT,
     };
     vxedge_core::checks::run::run(checks, &ctx)
         .await

@@ -138,7 +138,7 @@ fn cmdline(pid: u32) -> Vec<String> {
 fn probes_answered(target: &str) -> u64 {
     let out = podman(&[
         "exec",
-        "vx-node-run-a-payload",
+        "vx0-node-run-a-payload",
         "/vxprobe",
         "send",
         "--target",
@@ -260,7 +260,7 @@ fn a_parts_run_starts_its_payload_and_multicast_crosses_the_slice() {
 
     let run_b = "{ args: [--listen, '0.0.0.0:9811'], env: { VX_ROLE: reflector } }";
     let model = vxedge_core::model::load_yaml(&workspace(run_b)).expect("workspace loads");
-    let plan = GatewayPlan::from_model(&model).unwrap();
+    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST).unwrap();
     apply(&sh, &plan).unwrap();
     let runtime = std::env::temp_dir().join(format!("vxzones-run-{}", std::process::id()));
     std::fs::create_dir_all(&runtime).unwrap();
@@ -281,10 +281,10 @@ fn a_parts_run_starts_its_payload_and_multicast_crosses_the_slice() {
     }
 
     // The entrypoint is kept and `run.args` replaces the command.
-    let pid_a = podman_pid("vx-node-run-a-payload").expect("payload A running");
-    let pid_b = podman_pid("vx-node-run-b-payload").expect("payload B running");
-    let infra_a = podman_pid("vx-node-run-a-infra").expect("infra A running");
-    let infra_b = podman_pid("vx-node-run-b-infra").expect("infra B running");
+    let pid_a = podman_pid("vx0-node-run-a-payload").expect("payload A running");
+    let pid_b = podman_pid("vx0-node-run-b-payload").expect("payload B running");
+    let infra_a = podman_pid("vx0-node-run-a-infra").expect("infra A running");
+    let infra_b = podman_pid("vx0-node-run-b-infra").expect("infra B running");
     assert_eq!(
         cmdline(pid_b),
         ["/vxprobe", "reflect", "--listen", "0.0.0.0:9811"]
@@ -297,7 +297,7 @@ fn a_parts_run_starts_its_payload_and_multicast_crosses_the_slice() {
         "inspect",
         "-f",
         "{{json .Config.Env}}",
-        "vx-node-run-b-payload",
+        "vx0-node-run-b-payload",
     ]);
     assert!(
         String::from_utf8_lossy(&env.stdout).contains("VX_ROLE=reflector"),
@@ -353,8 +353,8 @@ fn a_parts_run_starts_its_payload_and_multicast_crosses_the_slice() {
     ]);
     let plain = send(infra_a, "plain", "plain");
     let with_if = send(infra_a, "if", "if");
-    let routed_a = route("vx-node-run-a-payload");
-    let routed_b = route("vx-node-run-b-payload");
+    let routed_a = route("vx0-node-run-a-payload");
+    let routed_b = route("vx0-node-run-b-payload");
     let routed = send(infra_a, "plain", "routed");
     let mut received = String::new();
     stdout.read_to_string(&mut received).unwrap();
@@ -404,10 +404,10 @@ fn a_parts_run_starts_its_payload_and_multicast_crosses_the_slice() {
     let model2 = vxedge_core::model::load_yaml(&workspace(run_b2)).unwrap();
     let nodes2 = plan_nodes_from_model(&model2, &plan, Path::new("/")).unwrap();
     node_up(&sh, node(&nodes2, "node-run-b"), &runtime, &runtime).unwrap();
-    let pid_b2 = podman_pid("vx-node-run-b-payload").expect("payload B running again");
+    let pid_b2 = podman_pid("vx0-node-run-b-payload").expect("payload B running again");
     assert_ne!(pid_b2, pid_b, "a changed run recreates the payload");
     assert_eq!(
-        podman_pid("vx-node-run-b-infra"),
+        podman_pid("vx0-node-run-b-infra"),
         Some(infra_b),
         "same namespace"
     );
@@ -421,12 +421,12 @@ fn a_parts_run_starts_its_payload_and_multicast_crosses_the_slice() {
     );
     // The same `run` again is a no-op.
     node_up(&sh, node(&nodes2, "node-run-b"), &runtime, &runtime).unwrap();
-    assert_eq!(podman_pid("vx-node-run-b-payload"), Some(pid_b2));
+    assert_eq!(podman_pid("vx0-node-run-b-payload"), Some(pid_b2));
 
     drop(guard);
     for id in ["a", "b"] {
         for member in ["infra", "payload"] {
-            let name = format!("vx-node-run-{id}-{member}");
+            let name = format!("vx0-node-run-{id}-{member}");
             assert_eq!(podman_pid(&name), None, "{name} removed");
         }
     }

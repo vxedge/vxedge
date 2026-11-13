@@ -102,7 +102,7 @@ fn a_placed_service_joins_its_device_namespace_and_leaves_without_taking_the_nod
     let dir = std::env::temp_dir().join(format!("vxsvc-{}", std::process::id()));
     std::fs::create_dir_all(dir.join("store")).unwrap();
     let model = vxedge_core::model::load_vehicle_yaml(&workspace()).expect("workspace loads");
-    let plan = GatewayPlan::from_model(&model).unwrap();
+    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST).unwrap();
     apply(&sh, &plan).unwrap();
     let nodes = plan_nodes_from_model(&model, &plan, &dir).unwrap();
     let node = &nodes[0];

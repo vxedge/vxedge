@@ -47,8 +47,8 @@ impl MeasurementSvc {
         if let Some(p) = vxedge_core::measurements::problems(&model).first() {
             return Err(errors::invalid(R::MeasurementInvalid, p.to_string()));
         }
-        let gateway =
-            GatewayPlan::from_model(&model).map_err(|e| invalid(format!("gateway plan: {e}")))?;
+        let gateway = GatewayPlan::from_model(&model, crate::services::RUN_SLOT)
+            .map_err(|e| invalid(format!("gateway plan: {e}")))?;
         let workspace = dir.unwrap_or_else(|| PathBuf::from("."));
         let nodes = vxedge_core::zones::plan_nodes_from_model(&model, &gateway, &workspace)
             .map_err(|e| invalid(format!("node plan: {e}")))?;

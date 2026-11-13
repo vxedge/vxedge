@@ -35,6 +35,8 @@ use vxedge_core::gptp;
 use vxedge_core::zones::backend::NodeState;
 use vxedge_core::zones::{member_down, member_up, node_down, node_status, node_up};
 
+const I0: vxedge_core::instance::Instance = vxedge_core::instance::Instance::FIRST;
+
 const FOLLOWERS: [&str; 2] = ["tsecu1", "tshpc1"];
 
 fn workspace() -> String {
@@ -96,7 +98,7 @@ impl Drop for Cleanup {
             gptp::grandmaster_group_name(&self.bridge)
         )];
         for f in FOLLOWERS {
-            let group = vxedge_core::zones::runtime_name_of(f);
+            let group = vxedge_core::zones::runtime_name_of(I0, f);
             names.extend([
                 format!("{group}-{}", gptp::FOLLOWER_MEMBER),
                 format!("{group}-payload"),
@@ -166,7 +168,7 @@ fn followers_sync_to_the_gateway_grandmaster_and_the_exporter_serves_them() {
         escalate: true,
     };
     let model = vxedge_core::model::load_yaml(&workspace()).expect("workspace loads");
-    let plan = GatewayPlan::from_model(&model).unwrap();
+    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST).unwrap();
     let _cleanup = Cleanup {
         ns: ns.clone(),
         runtime: runtime.clone(),
@@ -237,8 +239,8 @@ fn followers_sync_to_the_gateway_grandmaster_and_the_exporter_serves_them() {
         let node = nodes.iter().find(|n| n.node_id == device).unwrap().clone();
         node_up(&sh, &node, &runtime, &runtime).unwrap();
         assert_eq!(node_status(&sh, &node, &runtime), NodeState::Up);
-        let spec = gptp::follower_spec(gptp::LINUXPTP_IMAGE, &runtime, device);
-        gptp::prepare_dir(&gptp::follower_dir(&runtime, device)).unwrap();
+        let spec = gptp::follower_spec(gptp::LINUXPTP_IMAGE, &runtime, I0, device);
+        gptp::prepare_dir(&gptp::follower_dir(&runtime, I0, device)).unwrap();
         member_up(&sh, &node, &runtime, &spec).unwrap();
         followers.push((node, spec));
     }
@@ -247,7 +249,7 @@ fn followers_sync_to_the_gateway_grandmaster_and_the_exporter_serves_them() {
     let deadline = Instant::now() + Duration::from_secs(60);
     while FOLLOWERS
         .iter()
-        .any(|d| gptp::read_follower(&gptp::follower_dir(&runtime, d)).is_none())
+        .any(|d| gptp::read_follower(&gptp::follower_dir(&runtime, I0, d)).is_none())
     {
         assert!(
             Instant::now() < deadline,
@@ -263,7 +265,7 @@ fn followers_sync_to_the_gateway_grandmaster_and_the_exporter_serves_them() {
     let mut delays: Vec<Vec<f64>> = vec![Vec::new(); FOLLOWERS.len()];
     for _ in 0..20 {
         for (i, d) in FOLLOWERS.iter().enumerate() {
-            let r = gptp::read_follower(&gptp::follower_dir(&runtime, d))
+            let r = gptp::read_follower(&gptp::follower_dir(&runtime, I0, d))
                 .unwrap_or_else(|| panic!("follower {d} stopped answering"));
             offsets[i].push(r.offset_s);
             delays[i].push(r.path_delay_s);
@@ -292,7 +294,7 @@ fn followers_sync_to_the_gateway_grandmaster_and_the_exporter_serves_them() {
     }
 
     // The exporter's text: both followers, entity = the follower.
-    let text = gptp::metrics(&model, &runtime);
+    let text = gptp::metrics(&model, &runtime, I0);
     println!("{text}");
     for d in FOLLOWERS {
         let entity = vxedge_core::entities::node_path(&model, d).unwrap();
@@ -307,7 +309,7 @@ fn followers_sync_to_the_gateway_grandmaster_and_the_exporter_serves_them() {
     // A follower that stops answering leaves a gap; the other is still served.
     let (node, spec) = &followers[0];
     member_down(node, spec).unwrap();
-    let text = gptp::metrics(&model, &runtime);
+    let text = gptp::metrics(&model, &runtime, I0);
     let gone = vxedge_core::entities::node_path(&model, FOLLOWERS[0]).unwrap();
     let kept = vxedge_core::entities::node_path(&model, FOLLOWERS[1]).unwrap();
     assert!(
@@ -338,7 +340,7 @@ fn followers_sync_to_the_gateway_grandmaster_and_the_exporter_serves_them() {
     // With no grandmaster, the remaining follower soon has none to follow: a gap too.
     let deadline = Instant::now() + Duration::from_secs(30);
     while sample(
-        &gptp::metrics(&model, &runtime),
+        &gptp::metrics(&model, &runtime, I0),
         "vxedge_gptp_offset_seconds",
         &kept,
     )

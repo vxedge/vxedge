@@ -291,7 +291,9 @@ fn render(
     families.extend(slice.into_iter().map(|(f, _)| f));
     families.extend([own_cpu, own_mem]);
     let gptp = match &active {
-        Some((model, _, Some(_))) => vxedge_core::gptp::metrics(model, runtime_dir),
+        Some((model, _, Some(_))) => {
+            vxedge_core::gptp::metrics(model, runtime_dir, crate::services::RUN_SLOT)
+        }
         _ => String::new(),
     };
     // Each running measurement's sender, read inside its own namespace (`measurements/<id>`).

@@ -134,6 +134,8 @@ impl Reflector {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Placement {
     pub id: String,
+    /// The slot of the run measured: a UE reflector lives in that run's 5G pods.
+    pub instance: crate::instance::Instance,
     pub entity: String,
     pub sender: Sender,
     pub reflector: Reflector,
@@ -183,6 +185,7 @@ pub fn plan(
             };
             Ok(Placement {
                 id: m.id.clone(),
+                instance: gateway.instance,
                 entity: m.entity(),
                 sender,
                 reflector,
@@ -261,7 +264,7 @@ pub fn placement_problems(
     if model.measurements.is_empty() {
         return Vec::new();
     }
-    let placements = GatewayPlan::from_model(model)
+    let placements = GatewayPlan::from_model(model, crate::instance::Instance::FIRST)
         .map_err(|e| e.to_string())
         .and_then(|gateway| plan(model, &gateway, nodes, cache_dir));
     match placements {
@@ -690,7 +693,7 @@ pub async fn start(
             // The UE's reflector is a member of its pod, named after the measurement, and stays
             // until the 5G core comes down; starting it again finds it and learns the address.
             let client = containers.get().await.map_err(|e| err(e.to_string()))?;
-            let cfg = crate::fiveg::FiveGLifecycleConfig::default();
+            let cfg = crate::fiveg::FiveGLifecycleConfig::for_instance(p.instance);
             let (addr, _) = crate::fiveg::ue_reflector_up(
                 client,
                 &cfg,
@@ -998,7 +1001,7 @@ network:
 
     fn placements(measurements: &str) -> Result<Vec<Placement>, String> {
         let model = crate::model::load_yaml(&format!("{WS}measurements:\n{measurements}")).unwrap();
-        let gateway = GatewayPlan::from_model(&model).unwrap();
+        let gateway = GatewayPlan::from_model(&model, crate::instance::Instance::FIRST).unwrap();
         let nodes =
             crate::zones::plan_nodes_from_model(&model, &gateway, Path::new("/nonexistent"))
                 .unwrap();
@@ -1066,13 +1069,16 @@ network:
             "{WS}measurements:\n  a: {{ kind: rtt-probe, from: ecu1, to: internet, slice: adas }}\n"
         ))
         .unwrap();
-        let gateway = GatewayPlan::from_model(&model).unwrap();
+        let gateway = GatewayPlan::from_model(&model, crate::instance::Instance::FIRST).unwrap();
         let nodes =
             crate::zones::plan_nodes_from_model(&model, &gateway, Path::new("/nonexistent"))
                 .unwrap();
         let e = end_on(&model, &nodes, "ecu2", "info", "measurement `a`").unwrap();
         assert!(e.image);
-        assert_eq!(e.runtime_name, crate::zones::runtime_name_of("ecu2"));
+        assert_eq!(
+            e.runtime_name,
+            crate::zones::runtime_name_of(crate::instance::Instance::FIRST, "ecu2")
+        );
     }
 
     #[test]
@@ -1105,7 +1111,7 @@ measurements:
 "#;
         let model = crate::model::load_yaml(ws).unwrap();
         assert!(super::super::problems(&model).is_empty());
-        let gateway = GatewayPlan::from_model(&model).unwrap();
+        let gateway = GatewayPlan::from_model(&model, crate::instance::Instance::FIRST).unwrap();
         let nodes =
             crate::zones::plan_nodes_from_model(&model, &gateway, Path::new("/nonexistent"))
                 .unwrap();
@@ -1156,7 +1162,7 @@ measurements:
         let dir = tempfile::tempdir().unwrap();
         let model = crate::model::load_yaml(ARMS).unwrap();
         assert!(super::super::problems(&model).is_empty());
-        let gateway = GatewayPlan::from_model(&model).unwrap();
+        let gateway = GatewayPlan::from_model(&model, crate::instance::Instance::FIRST).unwrap();
         let nodes = crate::zones::plan_nodes_from_model(&model, &gateway, dir.path()).unwrap();
         let p = plan(&model, &gateway, &nodes, Path::new("/nonexistent")).unwrap();
         let (cont, vm) = (&p[0], &p[1]);
@@ -1182,7 +1188,7 @@ measurements:
             "{ ref: ghcr.io/vxedge/parts/zone/linux/stack/probe-bundle, kind: bundle, digest: 'sha256:dce921197fa93f7a6bd306b1748b93785e329e443504bd2113a98ccfad52c5e6', target_ids: f-vm }",
         ))
         .unwrap();
-        let gateway = GatewayPlan::from_model(&model).unwrap();
+        let gateway = GatewayPlan::from_model(&model, crate::instance::Instance::FIRST).unwrap();
         let nodes =
             crate::zones::plan_nodes_from_model(&model, &gateway, Path::new("/ws")).unwrap();
         let p = plan(&model, &gateway, &nodes, Path::new("/cache")).unwrap();

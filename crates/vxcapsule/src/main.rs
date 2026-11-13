@@ -27,7 +27,7 @@ const MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 /// Written to stderr once the guest is instantiated. The backend waits for this line.
 const READY_LINE: &str = "vxcapsule: running";
 
-const USAGE: &str = "usage: vxcapsule --node <node-id> <module.wasm>";
+const USAGE: &str = "usage: vxcapsule --slot <slot> --node <node-id> <module.wasm>";
 
 #[derive(Debug, thiserror::Error)]
 enum CapsuleError {
@@ -56,15 +56,22 @@ struct Args {
 }
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, CapsuleError> {
-    let mut args = args.into_iter();
-    let (flag, node, module) = (args.next(), args.next(), args.next());
-    match (flag.as_deref(), node, module, args.next()) {
-        (Some("--node"), Some(node), Some(module), None) if !node.is_empty() => Ok(Args {
-            node,
+    // `--slot` is read by no one in here: it puts the run's slot on this process's command
+    // line, where vxedged finds which run a capsule belongs to.
+    let args: Vec<String> = args.into_iter().collect();
+    let strs: Vec<&str> = args.iter().map(String::as_str).collect();
+    match strs.as_slice() {
+        ["--slot", slot, "--node", node, module] if is_slot(slot) && !node.is_empty() => Ok(Args {
+            node: node.to_string(),
             module: PathBuf::from(module),
         }),
         _ => Err(CapsuleError::Usage),
     }
+}
+
+/// A slot is one character, 0-9 or a-z (`vxedge_core::instance`).
+fn is_slot(s: &str) -> bool {
+    matches!(s.as_bytes(), [b'0'..=b'9' | b'a'..=b'z'])
 }
 
 struct Capsule {
@@ -165,7 +172,7 @@ mod tests {
     #[test]
     fn a_node_and_a_module_are_the_whole_command_line() {
         assert_eq!(
-            args(&["--node", "sensor-01", "/parts/s.wasm"]).unwrap(),
+            args(&["--slot", "0", "--node", "sensor-01", "/parts/s.wasm"]).unwrap(),
             Args {
                 node: "sensor-01".into(),
                 module: "/parts/s.wasm".into()
@@ -178,9 +185,12 @@ mod tests {
         for bad in [
             &[][..],
             &["--node", "n"],
-            &["--node", "", "m.wasm"],
-            &["--module", "n", "m.wasm"],
-            &["--node", "n", "m.wasm", "extra"],
+            &["--node", "n", "m.wasm"],
+            &["--slot", "0", "--node", "", "m.wasm"],
+            &["--slot", "A", "--node", "n", "m.wasm"],
+            &["--slot", "00", "--node", "n", "m.wasm"],
+            &["--slot", "0", "--module", "n", "m.wasm"],
+            &["--slot", "0", "--node", "n", "m.wasm", "extra"],
         ] {
             assert!(matches!(args(bad), Err(CapsuleError::Usage)), "{bad:?}");
         }
