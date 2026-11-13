@@ -244,9 +244,15 @@ fn write_active_record(runtime: &Path, id: &str, dir: &Path, sha256: Option<&str
     std::fs::write(runtime.join("active.json"), record.to_string()).unwrap();
 }
 
+/// How long a test job may take. Generous because a loaded host (parallel test binaries, another
+/// session's build) slows the daemon's job workers, and a short fixed bound turned that into
+/// failures; a job that finishes returns at once whatever the bound.
+const JOB_DEADLINE: Duration = Duration::from_secs(60);
+
 async fn wait_for_job(channel: Channel, id: String) -> i32 {
     let mut jobs = JobServiceClient::new(channel);
-    for _ in 0..400 {
+    let deadline = tokio::time::Instant::now() + JOB_DEADLINE;
+    while tokio::time::Instant::now() < deadline {
         let job = jobs
             .get(GetJobRequest { id: id.clone() })
             .await
