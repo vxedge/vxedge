@@ -42,9 +42,11 @@ jobs:
       - uses: bufbuild/buf-action@v1
         with:
           lint: true
-          # vxAPI is the contract: PRs must not break it. Compared against main.
+          # vxAPI is the contract: PRs must not break it. Compared against the branch the PR
+          # merges into, so a patch on a maintenance branch (release/0.29) is not judged against
+          # main's newer fields.
           breaking: ${{ github.event_name == 'pull_request' }}
-          breaking_against: "https://github.com/${{ github.repository }}.git#branch=main"
+          breaking_against: "https://github.com/${{ github.repository }}.git#branch=${{ github.base_ref || 'main' }}"
           push: false
 
   deny:
