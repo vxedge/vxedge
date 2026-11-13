@@ -6,6 +6,12 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Changed
+
+- `vxedge doctor --tier 2` checks what the 5G pods need instead of host Open5GS and UERANSIM binaries, which
+  the published images replaced: the user's Podman API socket, `passt`, the `sctp` kernel module, and that
+  `sudo -n` runs `ip` and `nsenter`. All four are optional, as only `mode: s-nssai` slices need them.
+
 ## [0.27.0] - 2026-11-13
 
 The 5G core and RAN run published images pinned by digest. vxedged pulls the vxparts parts
