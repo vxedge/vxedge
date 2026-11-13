@@ -264,7 +264,11 @@ pub fn placement_problems(
     if model.measurements.is_empty() {
         return Vec::new();
     }
-    let placements = GatewayPlan::from_model(model, crate::instance::Instance::FIRST)
+    // The problems do not depend on the slot; the nodes' own keeps any name in an error theirs.
+    let instance = nodes
+        .first()
+        .map_or(crate::instance::Instance::FIRST, |n| n.instance);
+    let placements = GatewayPlan::from_model(model, instance)
         .map_err(|e| e.to_string())
         .and_then(|gateway| plan(model, &gateway, nodes, cache_dir));
     match placements {

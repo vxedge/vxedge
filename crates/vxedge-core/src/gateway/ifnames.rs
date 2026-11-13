@@ -191,10 +191,20 @@ pub fn veth_peer(instance: Instance, device: &str, port: Option<&str>) -> String
 /// did not come from [`access_port`] keeps its own text and would overrun `IFNAMSIZ`, which the
 /// kernel refuses loudly — but no such name reaches here: the plan carries only what
 /// [`access_port`] produced.
-/// The slot stays the access port's, so the IFB is in the same run as its port.
-pub fn ingress_ifb(access_port: &str) -> String {
-    let rest = access_port.strip_prefix(ACCESS_LEAD).unwrap_or(access_port);
-    format!("{IFB_LEAD}{rest}")
+/// An adopted interface (an `attach` device's platform-named tap) did not come from
+/// [`access_port`], so its IFB takes the run's slot and a stem shortened from the whole name.
+pub fn ingress_ifb(instance: Instance, access_port: &str) -> String {
+    match access_port_instance(access_port) {
+        Some(Some(_)) => {
+            let rest = access_port.strip_prefix(ACCESS_LEAD).unwrap_or(access_port);
+            format!("{IFB_LEAD}{rest}")
+        }
+        _ => format!(
+            "{}{}",
+            prefix(IFB_LEAD, instance),
+            shorten_to_budget(sanitize(access_port), STEM_MAX)
+        ),
+    }
 }
 
 /// The slot an access port name carries: `Some(Some(slot))` for `vz<s>-…`, `Some(None)` for a
@@ -254,7 +264,7 @@ mod tests {
         ] {
             let name = access_port(I0, id, Some("eth0"));
             let peer = veth_peer(I0, id, Some("eth0"));
-            let ifb = ingress_ifb(&name);
+            let ifb = ingress_ifb(I0, &name);
             assert!(name.len() <= IFNAME_MAX, "{name} is {} bytes", name.len());
             assert!(peer.len() <= IFNAME_MAX, "{peer} is {} bytes", peer.len());
             assert!(ifb.len() <= IFNAME_MAX, "{ifb} is {} bytes", ifb.len());
@@ -302,7 +312,7 @@ mod tests {
         for id in ["node-a", "node-adas-probe-01"] {
             let port = access_port(I0, id, Some("eth0"));
             let peer = veth_peer(I0, id, Some("eth0"));
-            let ifb = ingress_ifb(&port);
+            let ifb = ingress_ifb(I0, &port);
             assert_eq!(ifb, format!("vi0-{}", stem(id, Some("eth0"))));
             assert_ne!(ifb, port);
             assert_ne!(ifb, peer);
@@ -375,7 +385,7 @@ mod tests {
         );
         assert_eq!(veth_peer(i1, "node-adas-probe-01", None), "vp1-node-a-c06a");
         assert_eq!(
-            ingress_ifb(&access_port(i1, "node-adas-probe-01", None)),
+            ingress_ifb(i1, &access_port(i1, "node-adas-probe-01", None)),
             "vi1-node-a-c06a"
         );
         assert_ne!(wireguard_tunnel(I0, "t"), wireguard_tunnel(i1, "t"));
@@ -401,5 +411,18 @@ mod tests {
         ] {
             assert_eq!(access_port_instance(other), None, "{other}");
         }
+    }
+
+    /// An adopted interface keeps its platform's name, so its IFB is named from the whole name in
+    /// the run's slot.
+    #[test]
+    fn an_adopted_ports_ifb_carries_the_slot() {
+        let i1 = Instance::parse("1").unwrap();
+        assert_eq!(ingress_ifb(i1, "cvd-etap-01"), "vi1-cvd-etap-01");
+        let long = ingress_ifb(I0, "enp3s0f1np1-tap");
+        assert!(
+            long.starts_with("vi0-") && long.len() <= IFNAME_MAX,
+            "{long}"
+        );
     }
 }

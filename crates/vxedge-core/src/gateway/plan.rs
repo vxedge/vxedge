@@ -480,6 +480,7 @@ fn plan_slices(slices: &[SliceInput]) -> Result<(Vec<SlicePlan>, Vec<String>), P
 /// attachments derive one interface name.
 fn assign_impairments(
     exp: &crate::model::Experiment,
+    instance: crate::instance::Instance,
     endpoints: &mut [EndpointPlan],
     endpoint_link: &[String],
 ) -> Result<(), PlanError> {
@@ -505,7 +506,7 @@ fn assign_impairments(
         let ep = &mut endpoints[carrier];
         ep.impairment = Some(EndpointImpairment {
             link: link.id.clone(),
-            ifb: super::ifnames::ingress_ifb(&ep.name),
+            ifb: super::ifnames::ingress_ifb(instance, &ep.name),
             params,
         });
     }
@@ -623,7 +624,7 @@ impl GatewayPlan {
             }
         }
 
-        assign_impairments(exp, &mut endpoints, &endpoint_link)?;
+        assign_impairments(exp, instance, &mut endpoints, &endpoint_link)?;
 
         let mut tunnels: Vec<TunnelPlan> = Vec::new();
         // One map for both kinds, deliberately: a name is a name to the kernel regardless of

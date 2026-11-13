@@ -142,8 +142,8 @@ pub struct FiveGLifecycleConfig {
     pub pod_name: String,
     pub core_image: String,
     /// RAN pod name (gNB + UEs). No implicit derivation from `pod_name` at
-    /// construction time — set explicitly, or use [`Default::default`]
-    /// which pairs `"vx5g"`/`"vx5g-ran"`.
+    /// construction time — set explicitly, or use [`Self::for_instance`]
+    /// which pairs `"vx5g<s>"`/`"vx5g<s>-ran"`.
     pub ran_pod_name: String,
     pub ran_image: String,
     /// Image of every pod's namespace-owning infra container, digest-pinned
