@@ -6,6 +6,17 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-11-13
+
+`network.shaping` with `kind: gate-schedule`: an IEEE 802.1Qbv gate schedule on the gateway uplink,
+in software-mode `taprio`, in place of the HTB tree. Each vlan slice is one traffic class, a schedule
+lists timed windows that open classes, and validation refuses what the kernel or the schedule cannot
+carry. The run record says which mechanism shaped the uplink (`Run.shaping`), and
+`HostService.Capabilities` reports `taprio`. `vxedge doctor --tier 2` now checks what the 5G pods need
+rather than host Open5GS and UERANSIM binaries. vxAPI stays `vxedge.v1`; both new fields are additive.
+vxtelemetry 0.9.0 records the shaping kind in each archive. With vxtelemetry 0.8.0, archives omit it.
+A package that uses `shaping` requires vxedge 0.28.0.
+
 ### Added
 
 - `network.shaping` (`kind: gate-schedule`): an IEEE 802.1Qbv gate schedule on the gateway uplink in
