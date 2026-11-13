@@ -297,6 +297,25 @@ pub struct Part {
     /// `local/…`, `localhost/…`, a relative path, or an absolute path — none of which name a
     /// registry artifact, so none of which can be digest-pinned.
     pub local: bool,
+    /// How the part starts when a `container` device runs it as its payload. Empty when the
+    /// baseline entry has no `run`, which starts the image on its own defaults.
+    pub run: PartRun,
+}
+
+/// `run` on a baseline part (`ARCHITECTURE.md` §6.0.2), validated: `cap_add` holds only what
+/// [`crate::workspace::RUN_CAPABILITIES`] allows, and the part is a container device's payload.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PartRun {
+    /// Replaces the image's `CMD`; the image's `ENTRYPOINT` is kept. Empty keeps the `CMD` too.
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub cap_add: Vec<String>,
+}
+
+impl PartRun {
+    pub fn is_empty(&self) -> bool {
+        self.args.is_empty() && self.env.is_empty() && self.cap_add.is_empty()
+    }
 }
 
 /// One thing running in a device's container group beside its payload.

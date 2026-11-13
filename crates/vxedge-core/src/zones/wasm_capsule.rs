@@ -285,6 +285,7 @@ mod tests {
             bundle: None,
             remote_bundle: None,
             image: None,
+            run: Default::default(),
             module: Some("/parts/sensor.wasm".into()),
             pinned_cpus,
             qemu: Default::default(),

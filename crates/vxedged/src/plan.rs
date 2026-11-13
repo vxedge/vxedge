@@ -955,6 +955,7 @@ mod pinning_tests {
             bundle: None,
             remote_bundle: None,
             image: image.map(String::from),
+            run: Default::default(),
             module: None,
             pinned_cpus: pinned,
             qemu: Default::default(),

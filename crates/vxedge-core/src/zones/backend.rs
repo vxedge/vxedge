@@ -402,7 +402,7 @@ fn container_up(sh: &Shell, np: &NodePlan) -> Result<(), ZoneBackendError> {
     let client = block_on(ContainerClient::connect_user()).map_err(|e| ct(np, e))?;
     let (handle, _) = block_on(client.ensure_group(&group)).map_err(|e| ct(np, e))?;
     attach_port(sh, np, &infra_netns(&handle))?;
-    block_on(client.ensure_member(&group, &handle, &payload_spec(image, &np.pinned_cpus)))
+    block_on(client.ensure_member(&group, &handle, &payload_spec(image, np)))
         .map_err(|e| ct(np, e))?;
     Ok(())
 }
@@ -607,13 +607,19 @@ fn payload_group(np: &NodePlan) -> Result<GroupSpec, ZoneBackendError> {
 /// every such container at `down`.
 const PAYLOAD_STOP_TIMEOUT_S: u32 = 2;
 
-/// The payload: the planned image with its own default command, on the device's pinned CPUs if
-/// it has any. Nothing else is set, so what runs is exactly what was published under that digest.
-fn payload_spec(image: &str, pinned_cpus: &[u32]) -> ContainerSpec {
+/// The payload: the planned image, started as the baseline entry's `run` says (`ARCHITECTURE.md`
+/// §6.0.2), on the device's pinned CPUs if it has any. `run.args` becomes the command and the
+/// image's entrypoint is kept; with no `run`, the image runs on its own defaults, exactly what
+/// was published under that digest. All of `run` is in the spec hash, so changing it recreates
+/// the payload, and an empty `run` hashes as a payload did before `run` existed.
+fn payload_spec(image: &str, np: &NodePlan) -> ContainerSpec {
     ContainerSpec {
         name: "payload".to_string(),
         image: image.to_string(),
-        cpuset_cpus: pinned_cpus.to_vec(),
+        cmd: np.run.args.clone(),
+        env: np.run.env.clone(),
+        cap_add: np.run.cap_add.clone(),
+        cpuset_cpus: np.pinned_cpus.clone(),
         stop_timeout_s: Some(PAYLOAD_STOP_TIMEOUT_S),
         ..Default::default()
     }
@@ -1469,6 +1475,7 @@ mod tests {
             bundle: None,
             remote_bundle: None,
             image: Some(PAUSE_IMAGE.into()),
+            run: Default::default(),
             module: None,
             pinned_cpus: Vec::new(),
             qemu: Default::default(),
@@ -1981,14 +1988,111 @@ mod tests {
     #[test]
     fn a_pinned_container_node_carries_its_pins_into_both_containers() {
         let mut np = image_node();
-        assert!(payload_spec("img", &np.pinned_cpus).cpuset_cpus.is_empty());
-        np.pinned_cpus = vec![8];
-        assert_eq!(payload_spec("img", &np.pinned_cpus).cpuset_cpus, vec![8]);
-        assert_eq!(payload_group(&np).unwrap().infra().cpuset_cpus, vec![8]);
+        assert!(payload_spec("img", &np).cpuset_cpus.is_empty());
         assert_eq!(
-            payload_spec("img", &[]).stop_timeout_s,
+            payload_spec("img", &np).stop_timeout_s,
             Some(PAYLOAD_STOP_TIMEOUT_S)
         );
+        np.pinned_cpus = vec![8];
+        assert_eq!(payload_spec("img", &np).cpuset_cpus, vec![8]);
+        assert_eq!(payload_group(&np).unwrap().infra().cpuset_cpus, vec![8]);
+    }
+
+    /// `run` starts the payload: `args` is its command (the image's entrypoint is kept, so no
+    /// entrypoint is set), and `env` and `cap_add` go to the container as written.
+    #[test]
+    fn a_payload_starts_as_its_part_run_says() {
+        let np = NodePlan {
+            run: crate::model::PartRun {
+                args: vec!["--listen".into(), "0.0.0.0:9801".into()],
+                env: std::collections::BTreeMap::from([("ROLE".into(), "pub".into())]),
+                cap_add: vec!["NET_ADMIN".into()],
+            },
+            ..image_node()
+        };
+        let spec = payload_spec("img", &np);
+        assert_eq!(spec.cmd, ["--listen", "0.0.0.0:9801"]);
+        assert!(spec.entrypoint.is_empty(), "the image's entrypoint is kept");
+        assert_eq!(spec.env["ROLE"], "pub");
+        assert_eq!(spec.cap_add, ["NET_ADMIN"]);
+        let bare = payload_spec("img", &image_node());
+        assert!(bare.cmd.is_empty() && bare.env.is_empty() && bare.cap_add.is_empty());
+    }
+
+    /// A changed `run` is a changed payload: each field moves the spec hash, so the second `up`
+    /// recreates the container. And a payload with no `run` hashes exactly as it did before `run`
+    /// existed, so upgrading vxedge recreates no running payload.
+    #[test]
+    fn a_changed_run_recreates_the_payload_and_no_run_keeps_the_old_hash() {
+        use crate::containers::spec::{member_network_mode, spec_hash};
+        use crate::containers::{MemberAction, ObservedContainer};
+        let mode = member_network_mode("infra-1");
+        let base = image_node();
+        let bare = spec_hash(&payload_spec("img", &base), &mode);
+        let with = |run: crate::model::PartRun| {
+            spec_hash(
+                &payload_spec(
+                    "img",
+                    &NodePlan {
+                        run,
+                        ..image_node()
+                    },
+                ),
+                &mode,
+            )
+        };
+        let args = with(crate::model::PartRun {
+            args: vec!["--listen".into(), "0.0.0.0:9801".into()],
+            ..Default::default()
+        });
+        let other_args = with(crate::model::PartRun {
+            args: vec!["--listen".into(), "0.0.0.0:9802".into()],
+            ..Default::default()
+        });
+        let env = with(crate::model::PartRun {
+            env: std::collections::BTreeMap::from([("A".into(), "1".into())]),
+            ..Default::default()
+        });
+        let caps = with(crate::model::PartRun {
+            cap_add: vec!["NET_ADMIN".into()],
+            ..Default::default()
+        });
+        let all = [&bare, &args, &other_args, &env, &caps];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b, "every field of `run` is in the hash");
+            }
+        }
+        let observed = ObservedContainer {
+            id: "id-payload".into(),
+            name: "vx-node-payload".into(),
+            member: Some("payload".into()),
+            spec_hash: Some(bare.clone()),
+            state: "running".into(),
+        };
+        let spec = payload_spec(
+            "img",
+            &NodePlan {
+                run: crate::model::PartRun {
+                    args: vec!["x".into()],
+                    ..Default::default()
+                },
+                ..image_node()
+            },
+        );
+        assert_eq!(
+            crate::containers::member_action(&spec, "infra-1", Some(&observed)),
+            MemberAction::Recreate
+        );
+
+        // The bytes a payload was hashed from before `run`: what `payload_spec` built then.
+        let before = crate::containers::ContainerSpec {
+            name: "payload".to_string(),
+            image: "img".to_string(),
+            stop_timeout_s: Some(PAYLOAD_STOP_TIMEOUT_S),
+            ..Default::default()
+        };
+        assert_eq!(bare, spec_hash(&before, &mode), "no `run`, no recreate");
     }
 
     /// `status` reports and never fails: with no socket (CI) or no such group (a dev host), an

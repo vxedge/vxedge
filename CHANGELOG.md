@@ -6,6 +6,25 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- `run` on a baseline `parts` entry (`ARCHITECTURE.md` §6.0.2) says how a container payload starts:
+  `args` replaces the image's command (`CMD`) and keeps its entrypoint, `env` adds environment
+  variables, and `cap_add` adds Linux capabilities to the payload container. Every target of the entry
+  starts the same way, so two roles of one part are two entries. Infra containers are unchanged.
+- `run` is in the payload's spec hash, so a changed `run` recreates the payload container on the next
+  `up` and keeps the node's namespace. A payload with no `run` hashes as before, so upgrading recreates
+  no running payload. `run` is part of the baseline document, so the workspace identity and the package
+  digest already cover it.
+- vxAPI: `NodePayload.run` (`PayloadRun`: `args`, `env`, `cap_add`) reports a container payload's `run`
+  in `WorkspaceService.Plan` and in every `NodeStatus`. Unset when the part has none. Additive; vxAPI
+  stays `vxedge.v1`.
+- Validation refuses, with `ERROR_REASON_WORKSPACE_INVALID`, a `cap_add` other than `NET_ADMIN` and
+  `run` on any part a `container` device does not run as its payload, naming the entry: a part a VM,
+  `wasm-capsule` or `attach` device runs, a `local/` host process, a bare-path image, a member a stack
+  part wins over, or an entry with no `target_ids`. An `env` value or `args` item that is not a string,
+  and an unknown key under `run`, fail to parse, with the same reason.
+
 ### Changed
 
 - The experiment's `baseline:` selects its baseline. A workspace may hold several `kind: baseline`
