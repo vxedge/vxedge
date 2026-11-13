@@ -69,6 +69,25 @@ recorded as failed. No vxAPI change. Released from the `release/0.29` branch, cu
   ("text file busy"), which another process forked while the file was open for writing can cause
   for a moment. The daemon retries briefly. This also made a `vxedged` unit test flaky in CI.
 
+### Changed
+
+- Every host object a run creates carries its instance slot, as `ARCHITECTURE.md` §6.0.5 specifies (Track F,
+  first step). The daemon still runs one run at a time, always in slot `0`. Holding several runs is the next step.
+  Scripts that address interface or container names directly need the new names:
+  - bridge, uplink and uplink peer: `vxbr0`, `vxup0`, `vxup0p` (unchanged in slot `0`);
+  - a device's access port, veth peer and ingress IFB: `vz0-<stem>`, `vp0-<stem>`, `vi0-<stem>` (were `vz-`,
+    `vzp-`, `vxi-`). Stems keep their 11 characters, so `vz-node-a-c06a` is now `vz0-node-a-c06a`;
+  - WireGuard and VXLAN tunnels: `vxwg0-<stem>`, `vxln0-<stem>`. A tunnel stem is now at most 9 characters;
+  - a node's netns, container group, VM domain, pidfile, serial log and Cloud Hypervisor socket: `vx0-<node>`
+    (was `vx-<node>`);
+  - the 5G pods: `vx5g0`, `vx5g0-ran` and their containers (were `vx5g`, `vx5g-ran`);
+  - a check step's container: `vx0-check-<id>`;
+  - a gPTP follower's directory: `<runtime-dir>/gptp/vx0-<node>`.
+- A VM guest's command line carries `vx.slot=<s>` beside `vx.node=<id>`, and the `vxcapsule` runner takes
+  `--slot <s> --node <id> <module>`. The check for unknown objects on the host reads the slot: another slot's
+  ports and guests belong to another run, and an object with no slot is foreign to every run.
+
+
 ## [0.29.0] - 2026-11-13
 
 A container payload can be started with its own arguments, environment and `NET_ADMIN`: a

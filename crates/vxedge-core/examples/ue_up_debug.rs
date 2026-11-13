@@ -32,7 +32,7 @@ async fn main() -> ExitCode {
     let cfg = FiveGLifecycleConfig {
         pod_name: pod_name.clone(),
         ran_pod_name: format!("{pod_name}-ran"),
-        ..FiveGLifecycleConfig::default()
+        ..FiveGLifecycleConfig::for_instance(vxedge_core::instance::Instance::FIRST)
     };
     let client = match ContainerClient::connect_user().await {
         Ok(c) => c,

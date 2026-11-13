@@ -116,9 +116,16 @@ pub fn grandmaster_dir(runtime_dir: &Path, bridge: &str) -> PathBuf {
     dir(runtime_dir, &format!("gm-{bridge}"))
 }
 
-/// A follower's directory: named after its node.
-pub fn follower_dir(runtime_dir: &Path, device: &str) -> PathBuf {
-    dir(runtime_dir, &crate::zones::runtime_name_of(device))
+/// A follower's directory: named after its node's runtime name, so after its slot too.
+pub fn follower_dir(
+    runtime_dir: &Path,
+    instance: crate::instance::Instance,
+    device: &str,
+) -> PathBuf {
+    dir(
+        runtime_dir,
+        &crate::zones::runtime_name_of(instance, device),
+    )
 }
 
 /// The management socket of the `ptp4l` whose directory is `dir`. The read-only one is
@@ -397,8 +404,13 @@ pub async fn grandmaster_down(
 /// The container a follower's `ptp4l` runs as, in its device's group: free-running, on the
 /// node's port, its management socket in [`follower_dir`] mounted at the same path. `NET_RAW`
 /// for its raw socket, which Podman's default capabilities lack.
-pub fn follower_spec(image: &str, runtime_dir: &Path, device: &str) -> ContainerSpec {
-    let dir = follower_dir(runtime_dir, device);
+pub fn follower_spec(
+    image: &str,
+    runtime_dir: &Path,
+    instance: crate::instance::Instance,
+    device: &str,
+) -> ContainerSpec {
+    let dir = follower_dir(runtime_dir, instance, device);
     ContainerSpec {
         name: FOLLOWER_MEMBER.to_string(),
         image: image.to_string(),
@@ -452,7 +464,11 @@ pub fn read_follower(dir: &Path) -> Option<Reading> {
 /// `vxedge_gptp_offset_seconds` and `vxedge_gptp_path_delay_seconds` (§12, host-side
 /// measurements) for each follower of `exp` that answers, with the follower as entity, as
 /// Prometheus text. A follower that does not answer has no sample: the run's samples show a gap.
-pub fn metrics(exp: &crate::model::Experiment, runtime_dir: &Path) -> String {
+pub fn metrics(
+    exp: &crate::model::Experiment,
+    runtime_dir: &Path,
+    instance: crate::instance::Instance,
+) -> String {
     let Some(ts) = &exp.time_sync else {
         return String::new();
     };
@@ -461,7 +477,10 @@ pub fn metrics(exp: &crate::model::Experiment, runtime_dir: &Path) -> String {
         .iter()
         .filter_map(|device| {
             let entity = crate::entities::node_path(exp, device)?;
-            Some((entity, read_follower(&follower_dir(runtime_dir, device))?))
+            Some((
+                entity,
+                read_follower(&follower_dir(runtime_dir, instance, device))?,
+            ))
         })
         .collect();
     render(&readings)
@@ -750,7 +769,12 @@ mod tests {
 
     #[test]
     fn a_follower_runs_free_on_the_nodes_port_with_its_socket_in_the_run() {
-        let spec = follower_spec(LINUXPTP_IMAGE, Path::new(RUNTIME), "ecu1");
+        let spec = follower_spec(
+            LINUXPTP_IMAGE,
+            Path::new(RUNTIME),
+            crate::instance::Instance::FIRST,
+            "ecu1",
+        );
         assert_eq!(spec.name, FOLLOWER_MEMBER);
         assert_eq!(spec.image, LINUXPTP_IMAGE);
         assert_eq!(
@@ -758,7 +782,7 @@ mod tests {
             [
                 "follower",
                 "--uds",
-                "/run/user/1000/vxedged/gptp/vx-ecu1/ptp4l",
+                "/run/user/1000/vxedged/gptp/vx0-ecu1/ptp4l",
                 "eth0"
             ]
         );
@@ -767,8 +791,8 @@ mod tests {
         assert_eq!(
             spec.binds,
             [Bind {
-                host: PathBuf::from("/run/user/1000/vxedged/gptp/vx-ecu1"),
-                container: "/run/user/1000/vxedged/gptp/vx-ecu1".into(),
+                host: PathBuf::from("/run/user/1000/vxedged/gptp/vx0-ecu1"),
+                container: "/run/user/1000/vxedged/gptp/vx0-ecu1".into(),
                 read_only: false,
                 relabel: false,
             }]
@@ -802,7 +826,11 @@ mod tests {
     fn a_socket_path_too_long_for_a_unix_address_is_refused() {
         let long = PathBuf::from(format!("/{}", "r".repeat(100)));
         assert!(matches!(
-            prepare_dir(&follower_dir(&long, "ecu1")),
+            prepare_dir(&follower_dir(
+                &long,
+                crate::instance::Instance::FIRST,
+                "ecu1"
+            )),
             Err(GptpError::SocketPathTooLong { .. })
         ));
     }
@@ -847,6 +875,9 @@ mod tests {
         let plain = "kind: experiment\nid: e\nvehicles: [veh]\nnetwork:\n  slices:\n    - { id: adas, mode: vlan, vlan: 101 }\n---\nkind: vehicle\nid: veh\ndevices: {}\n";
         let m = crate::model::load_yaml(plain).unwrap();
         assert!(gptp_images(&m).is_empty());
-        assert_eq!(metrics(&m, Path::new(RUNTIME)), "");
+        assert_eq!(
+            metrics(&m, Path::new(RUNTIME), crate::instance::Instance::FIRST),
+            ""
+        );
     }
 }

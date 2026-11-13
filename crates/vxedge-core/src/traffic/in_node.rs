@@ -289,7 +289,7 @@ traffic_profiles:
 
     fn plan_of(id: &str) -> Result<InNode, String> {
         let model = crate::model::load_yaml(WS).unwrap();
-        let gateway = GatewayPlan::from_model(&model).unwrap();
+        let gateway = GatewayPlan::from_model(&model, crate::instance::Instance::FIRST).unwrap();
         let nodes =
             crate::zones::plan_nodes_from_model(&model, &gateway, Path::new("/nonexistent"))
                 .unwrap();

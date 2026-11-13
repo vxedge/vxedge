@@ -127,7 +127,11 @@ fn opt_escape(value: &str) -> String {
 pub(super) fn semihosting_config(np: &NodePlan) -> String {
     let ip = np.ip_cidr.as_deref().unwrap_or("");
     let mut config = String::from("enable=on,target=native");
-    for word in [format!("vx.ip={ip}"), format!("vx.node={}", np.node_id)] {
+    for word in [
+        format!("vx.ip={ip}"),
+        format!("vx.node={}", np.node_id),
+        format!("{}{}", super::foreign::SLOT_MARKER, np.instance),
+    ] {
         config.push_str(",arg=");
         config.push_str(&opt_escape(&word));
     }
@@ -205,6 +209,7 @@ mod tests {
 
     fn node(dir: &Path) -> NodePlan {
         NodePlan {
+            instance: crate::instance::Instance::FIRST,
             zone_id: "front-left".into(),
             node_id: "ecu-m3".into(),
             role: crate::model::DeviceRole::Ecu,
@@ -258,7 +263,7 @@ mod tests {
         assert_eq!(arg_after(&argv, "-kernel"), "/b/firmware.elf");
         assert_eq!(
             arg_after(&argv, "-semihosting-config"),
-            "enable=on,target=native,arg=vx.ip=10.20.1.21/24,arg=vx.node=ecu-m3"
+            "enable=on,target=native,arg=vx.ip=10.20.1.21/24,arg=vx.node=ecu-m3,arg=vx.slot=0"
         );
         assert_eq!(
             arg_after(&argv, "-nic"),

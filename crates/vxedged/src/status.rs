@@ -137,7 +137,7 @@ pub fn node_spec(np: &NodePlan) -> NodeSpec {
 }
 
 /// `peer` is here because interface names are derived from the device id and shortened to fit
-/// IFNAMSIZ, so `vz-node-a-c06a` is not something an operator reconstructs by eye. For a
+/// IFNAMSIZ, so `vz0-node-a-c06a` is not something an operator reconstructs by eye. For a
 /// container-backed node the useful half is the peer: that is the end campaign scripts address.
 fn node_detail(np: &NodePlan) -> String {
     format!(

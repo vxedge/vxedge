@@ -14,6 +14,7 @@ pub mod fiveg;
 pub mod gateway;
 pub mod gptp;
 pub mod identity;
+pub mod instance;
 pub mod intent;
 pub mod measurements;
 pub mod model;

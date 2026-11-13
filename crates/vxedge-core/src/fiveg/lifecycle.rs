@@ -38,9 +38,9 @@
 //! wired to any vxAPI RPC or manifest lifecycle verb; that wiring
 //! (GatewayService recognizing `mode: s-nssai` slices, and deciding
 //! whether/how the bridge attachment joins `vxgateway`'s real, VLAN-aware
-//! `vxbr0`) is not part of this module, since it is a
+//! `vxbr<s>`) is not part of this module, since it is a
 //! proto/RPC design decision, not a mechanism one — [`bridge_up`]
-//! deliberately does not touch `vxbr0` or any VLAN membership itself.
+//! deliberately does not touch `vxbr<s>` or any VLAN membership itself.
 //!
 //! Two-layer split for testability (rust-patterns: pure logic vs. I/O):
 //! [`core_run_specs`] (here) and [`super::subscriber::subscriber_insert_commands`]
@@ -151,9 +151,12 @@ pub struct FiveGLifecycleConfig {
     pub infra_image: String,
 }
 
-impl Default for FiveGLifecycleConfig {
-    fn default() -> Self {
-        let pod_name = "vx5g".to_string();
+impl FiveGLifecycleConfig {
+    /// The 5G pods of the run in slot `instance`: `vx5g<s>` and `vx5g<s>-ran`
+    /// (`ARCHITECTURE.md` §6.0.5). One run per host may declare `s-nssai` slices, so the slot
+    /// keeps a second run's pods apart by name, not its routes.
+    pub fn for_instance(instance: crate::instance::Instance) -> Self {
+        let pod_name = format!("vx5g{instance}");
         Self {
             ran_pod_name: format!("{pod_name}-ran"),
             pod_name,
@@ -768,7 +771,7 @@ fn bridge_veth_names(pod_name: &str) -> (String, String) {
 
 /// Host-side device [`bridge_up`] plugs into `bridge` — the port a caller
 /// needs to name when deciding VLAN membership on a `vlan_filtering 1`
-/// bridge (`vxbr0`), since `bridge_up` itself deliberately does not decide
+/// bridge (`vxbr<s>`), since `bridge_up` itself deliberately does not decide
 /// that (see its doc comment).
 pub fn bridge_host_veth(pod_name: &str) -> String {
     bridge_veth_names(pod_name).0
@@ -793,8 +796,8 @@ pub const FIVEG_UPLINK_VLAN: u16 = 4000;
 ///
 /// **Not `vxgateway`'s real bridge, and not wired into `fiveg_up`.** Uses
 /// whatever bridge name is passed in — pass a throwaway test bridge, not
-/// `vxbr0`, unless you have deliberately decided to attach to the real
-/// one (`vxbr0` is `vlan_filtering 1`; a port needs an explicit `bridge
+/// `vxbr<s>`, unless you have deliberately decided to attach to the real
+/// one (`vxbr<s>` is `vlan_filtering 1`; a port needs an explicit `bridge
 /// vlan add ... pvid untagged` to pass any traffic on such a bridge, which
 /// this function does not do — that VLAN-membership decision belongs to
 /// the real GatewayService integration, not decided as a side effect
@@ -1184,7 +1187,7 @@ devices: {}
 
     #[test]
     fn gnb_and_ue_specs_match_what_the_cli_ran() {
-        let cfg = FiveGLifecycleConfig::default();
+        let cfg = FiveGLifecycleConfig::for_instance(crate::instance::Instance::FIRST);
         let cfg_dir = Path::new("/run/vx/fiveg-config");
         let gnb = gnb_spec(&cfg, cfg_dir);
         assert_eq!(gnb.image, FIVEG_RAN_IMAGE);
@@ -1201,10 +1204,12 @@ devices: {}
 
     #[test]
     fn legacy_check_names_exact_member_containers_and_every_pod() {
-        let (names, pods) = legacy_core_check(&FiveGLifecycleConfig::default());
-        assert_eq!(names, ["vx5g-mongo", "vx5g-nrf", "vx5g-ran-gnb"]);
-        assert!(pods.starts_with("vx5g vx5g-ran "), "{pods}");
-        assert!(pods.contains("name=vx5g-ran-ue-"), "UE pods too: {pods}");
+        let (names, pods) = legacy_core_check(&FiveGLifecycleConfig::for_instance(
+            crate::instance::Instance::FIRST,
+        ));
+        assert_eq!(names, ["vx5g0-mongo", "vx5g0-nrf", "vx5g0-ran-gnb"]);
+        assert!(pods.starts_with("vx5g0 vx5g0-ran "), "{pods}");
+        assert!(pods.contains("name=vx5g0-ran-ue-"), "UE pods too: {pods}");
     }
 
     #[test]
@@ -1231,10 +1236,10 @@ devices: {}
 
     #[test]
     fn default_config_runs_the_digest_pinned_parts() {
-        let cfg = FiveGLifecycleConfig::default();
-        assert_eq!(cfg.pod_name, "vx5g");
+        let cfg = FiveGLifecycleConfig::for_instance(crate::instance::Instance::FIRST);
+        assert_eq!(cfg.pod_name, "vx5g0");
         assert_eq!(cfg.core_image, FIVEG_CORE_IMAGE);
-        assert_eq!(cfg.ran_pod_name, "vx5g-ran");
+        assert_eq!(cfg.ran_pod_name, "vx5g0-ran");
         assert_eq!(cfg.ran_image, FIVEG_RAN_IMAGE);
         assert_eq!(cfg.infra_image, PAUSE_IMAGE);
         for image in [
@@ -1253,13 +1258,13 @@ devices: {}
 
     fn nrf_running() -> ContainerStatus {
         ContainerStatus {
-            name: "vx5g-nrf".into(),
+            name: "vx5g0-nrf".into(),
             state: "running".into(),
         }
     }
     fn gnb_running() -> ContainerStatus {
         ContainerStatus {
-            name: "vx5g-ran-gnb".into(),
+            name: "vx5g0-ran-gnb".into(),
             state: "running".into(),
         }
     }

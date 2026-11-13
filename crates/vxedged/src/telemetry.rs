@@ -41,7 +41,7 @@ pub(crate) fn entities(
     runtime_dir: &Path,
 ) -> Vec<vxedge_core::entities::EntityRecord> {
     let mut entities = vxedge_core::entities::entities_with(model, &crate::exporter::targets());
-    vxedge_core::entities::add_logs(&mut entities, model, runtime_dir);
+    vxedge_core::entities::add_logs(&mut entities, model, runtime_dir, crate::services::RUN_SLOT);
     entities
 }
 

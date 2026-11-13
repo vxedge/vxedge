@@ -200,7 +200,7 @@ fn a_probe_guest_boots_on_the_gateway_tap_and_its_reflector_answers_at_the_pinne
 
     let model =
         vxedge_core::model::load_yaml(&workspace(&bundle, &arm.block)).expect("workspace loads");
-    let plan = GatewayPlan::from_model(&model).unwrap();
+    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST).unwrap();
     apply(&sh, &plan).unwrap();
     let nodes = plan_nodes_from_model(&model, &plan, Path::new("/")).unwrap();
     let node = &nodes[0];
