@@ -381,7 +381,7 @@ fn tier2() -> Vec<Check> {
         } else {
             "not found — needed only for s-nssai slice experiments".to_string()
         },
-        Some("preferred: vx5g-core container image (containers/fiveg/) — host install only for non-container runs"),
+        Some("preferred: the vxparts gw/5gc/os/open5gs image vxedged pulls — host install only for non-container runs"),
     ));
 
     // UERANSIM's nr-gnb/nr-ue expect a config and error without one; PATH
@@ -397,7 +397,7 @@ fn tier2() -> Vec<Check> {
         } else {
             "nr-gnb/nr-ue not found — needed only for s-nssai slice experiments".to_string()
         },
-        Some("preferred: vx5g-ran container image (containers/fiveg/) — host binaries only needed for non-container runs"),
+        Some("preferred: the vxparts gw/ran/os/ueransim image vxedged pulls — host binaries only needed for non-container runs"),
     ));
 
     let gpu = present("nvidia-smi", &["--query-gpu=name", "--format=csv,noheader"]);

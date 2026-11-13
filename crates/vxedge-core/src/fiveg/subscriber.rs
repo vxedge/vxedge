@@ -4,7 +4,7 @@
 //! Why: `dbctl`'s CLI helpers do not just require an SD for
 //! `add_ue_with_slice` — its SD-less fallback, `add_ue_with_apn`,
 //! **hardcodes `sst: NumberInt(1)` and omits the `sd` field entirely**
-//! (confirmed by reading `/usr/local/bin/open5gs-dbctl` inside `vx5g-core`,
+//! (confirmed by reading `/usr/local/bin/open5gs-dbctl` inside the core image,
 //! v2.8.0 tag script). A slice declared with e.g. `sst: 2` and no SD would
 //! silently register its subscriber under SST 1 — wrong, not just
 //! "default". The document shape below is copied from `dbctl`'s own

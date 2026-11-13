@@ -3,8 +3,7 @@
 //! up/down, state observed rather than assumed. Where `services.rs` tracks
 //! one pidfile per process, this tracks **two pods**: shared-netns
 //! container groups, driven through [`crate::containers`] over the Podman
-//! API (Track V2; until then the `podman` CLI — `containers/fiveg/pod-up.sh`
-//! is the shell reference both replaced). "Pod" below means one such group:
+//! API (Track V2; until then the `podman` CLI). "Pod" below means one such group:
 //! an infra container ([`FiveGLifecycleConfig::infra_image`]) owning a
 //! network namespace that every member joins, containers named
 //! `<pod>-<member>` as before.
@@ -245,7 +244,7 @@ pub fn ue_pod_name(ran_pod_name: &str, slice_id: &str) -> String {
 }
 
 /// Settle time between dependency phases. A fixed sleep, not a health poll —
-/// matches `pod-up.sh`'s proven-live timings; polling a readiness signal
+/// matches the timings the first live runs proved; polling a readiness signal
 /// (e.g. NRF's SBI port) is a tracked hardening follow-up, not a correctness
 /// gap in what's shipped today.
 const PHASE_SETTLE: Duration = Duration::from_secs(2);
@@ -273,8 +272,8 @@ async fn run(program: &str, args: &[String]) -> Result<String, FiveGLifecycleErr
 /// as the calling process's own UID: **podman itself must stay unprivileged**
 /// — found live, 2026-07-17, running the whole test under `sudo` switched
 /// `podman` to *root's* separate rootless-podman identity (its own
-/// `/etc/containers` storage), which had never built `vx5g-core`/`vx5g-ran`
-/// and refused to resolve the short image name at all. Host networking
+/// `/etc/containers` storage), which did not hold the user's locally built 5G
+/// images and refused to resolve their short names at all. Host networking
 /// genuinely needs CAP_NET_ADMIN (same requirement `netops::Shell` already
 /// documents for gateway provisioning); podman does not — so only `ip` and
 /// `nsenter` escalate, `podman` never does. Requires either a cached `sudo`

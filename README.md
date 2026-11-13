@@ -55,7 +55,6 @@ Proto changes are also checked with `buf lint` in CI. Contributor rules are in [
 | `crates/vxedge-core` | Domain library: manifest model and validation, reconciler, backends |
 | `crates/vxedged` | Daemon serving vxAPI over a Unix socket |
 | `crates/vxedge-cli` | The `vxedge` binary, a thin vxAPI client |
-| `containers/fiveg/` | Open5GS and UERANSIM container builds |
 
 ## Status
 

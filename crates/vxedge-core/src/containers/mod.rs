@@ -76,8 +76,8 @@ pub enum ContainerError {
     SocketUnreachable { path: String, detail: String },
     #[error(
         "image `{image}` is not in this user's Podman store and pulling it failed: {detail}. A \
-         locally built image (`vx5g-core`, `vx5g-ran`) exists only in the store of the user who \
-         built it: build it as the user vxedged runs as (containers/fiveg/README.md)"
+         locally built image exists only in the store of the user who built it: build or pull it \
+         as the user vxedged runs as"
     )]
     ImageUnavailable { image: String, detail: String },
     #[error(
