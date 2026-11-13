@@ -2250,6 +2250,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     unlocked,
                     reference_workspace,
                 } => {
+                    let root = vxedge_core::discover(&here()?)?.root;
+                    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+                    if let Some(w) = home_workspace_warning(&root, home.as_deref()) {
+                        eprintln!("{w}");
+                    }
                     let job = campaigns
                         .start(CampaignStartRequest {
                             manifest: here_ref()?,
@@ -2974,8 +2979,46 @@ fn print_criterion(c: &vxedge_api::v1::CriterionVerdict, depth: usize) {
     }
 }
 
+/// A campaign writes its archives under the workspace. Under the home directory, desktop indexers
+/// and sync clients can react to those writes while trials run, and a timed criterion reads that
+/// load as the arm's effect. The CLI warns and starts anyway.
+fn home_workspace_warning(
+    root: &std::path::Path,
+    home: Option<&std::path::Path>,
+) -> Option<String> {
+    use std::path::Path;
+    let home = home?;
+    if home.as_os_str().is_empty() || home == Path::new("/") {
+        return None;
+    }
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    if !canon(root).starts_with(canon(home)) {
+        return None;
+    }
+    Some(format!(
+        "warning: the workspace {} is under the home directory, where file indexers and sync clients \
+         can load the host while trials write archives; for timed campaigns, run from an unindexed \
+         path such as /var/tmp",
+        root.display()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn home_workspace_warning_only_under_home() {
+        use super::home_workspace_warning;
+        use std::path::Path;
+        let home = Path::new("/home/someone");
+        assert!(
+            home_workspace_warning(Path::new("/home/someone/ws/exp-003"), Some(home)).is_some()
+        );
+        assert!(home_workspace_warning(Path::new("/var/tmp/gate/exp-003"), Some(home)).is_none());
+        assert!(home_workspace_warning(Path::new("/home/someone2/ws"), Some(home)).is_none());
+        assert!(home_workspace_warning(Path::new("/home/someone/ws"), None).is_none());
+        assert!(home_workspace_warning(Path::new("/ws"), Some(Path::new("/"))).is_none());
+    }
+
     #[test]
     fn a_refusal_prints_the_daemons_sentence_and_its_reason() {
         use tonic_types::{ErrorDetails, StatusExt};
