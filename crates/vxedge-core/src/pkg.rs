@@ -498,64 +498,82 @@ pub fn lock(root: &Path, locked_with: &str) -> Result<Lock, PkgError> {
 
     let ws =
         crate::workspace::Workspace::load(root).map_err(|e| PkgError::Workspace(e.to_string()))?;
-    let model = crate::model::build(&ws).map_err(|e| PkgError::Workspace(e.to_string()))?;
+    // One model per baseline: a parameter may bind `baseline` to run another per arm, and the
+    // lock pins what every arm runs, so `pkg pull` and an offline copy can run any of them.
+    let models = if ws.baselines.len() > 1 {
+        ws.baselines
+            .iter()
+            .map(|b| {
+                let mut one = ws.clone();
+                if let Some(exp) = one.experiments.first_mut() {
+                    exp.baseline = Some(b.id.clone());
+                }
+                crate::model::build(&one)
+            })
+            .collect::<Result<Vec<_>, _>>()
+    } else {
+        crate::model::build(&ws).map(|m| vec![m])
+    }
+    .map_err(|e| PkgError::Workspace(e.to_string()))?;
     let mut parts = BTreeSet::new();
     let mut images = BTreeSet::new();
-    let published = model
-        .entities
-        .iter()
-        .flat_map(|e| e.functions.values())
-        .filter_map(|f| f.part.as_ref())
-        .filter(|p| !p.local);
-    for p in published {
-        let r = LockedRef {
-            reference: p.reference.clone(),
-            digest: p.digest.clone(),
-        };
-        match p.kind {
-            PartKind::Container => images.insert(r),
-            PartKind::Bundle | PartKind::Wasm | PartKind::Attach => parts.insert(r),
-        };
-    }
-    // A published artifact store is fetched into the part cache like a guest bundle, so it is a
-    // part; a local one is content, already in `files`.
-    for def in model.services.values() {
-        if let Some(crate::services::ArtifactStore::Published { reference, digest }) =
-            crate::services::ota_store(def)
+    for model in &models {
+        let published = model
+            .entities
+            .iter()
+            .flat_map(|e| e.functions.values())
+            .filter_map(|f| f.part.as_ref())
+            .filter(|p| !p.local);
+        for p in published {
+            let r = LockedRef {
+                reference: p.reference.clone(),
+                digest: p.digest.clone(),
+            };
+            match p.kind {
+                PartKind::Container => images.insert(r),
+                PartKind::Bundle | PartKind::Wasm | PartKind::Attach => parts.insert(r),
+            };
+        }
+        // A published artifact store is fetched into the part cache like a guest bundle, so it is a
+        // part; a local one is content, already in `files`.
+        for def in model.services.values() {
+            if let Some(crate::services::ArtifactStore::Published { reference, digest }) =
+                crate::services::ota_store(def)
+            {
+                parts.insert(LockedRef {
+                    reference,
+                    digest: Some(digest),
+                });
+            }
+        }
+        if let Some(nos) = &model.nos_check
+            && let Some(reference) = &nos.part_ref
         {
             parts.insert(LockedRef {
-                reference,
-                digest: Some(digest),
+                reference: reference.clone(),
+                digest: nos.digest.clone(),
             });
         }
-    }
-    if let Some(nos) = &model.nos_check
-        && let Some(reference) = &nos.part_ref
-    {
-        parts.insert(LockedRef {
-            reference: reference.clone(),
-            digest: nos.digest.clone(),
-        });
-    }
-    // The 5G core and RAN are not placements: vxedged starts its own digest-pinned images.
-    let fiveg = crate::fiveg::fiveg_images(&model)
-        .into_iter()
-        .map(str::to_string);
-    for url in model.placements().map(|p| p.image.url.clone()).chain(fiveg) {
-        let url = &url;
-        if url.starts_with("localhost/") || url.starts_with("local/") {
-            continue;
+        // The 5G core and RAN are not placements: vxedged starts its own digest-pinned images.
+        let fiveg = crate::fiveg::fiveg_images(model)
+            .into_iter()
+            .map(str::to_string);
+        for url in model.placements().map(|p| p.image.url.clone()).chain(fiveg) {
+            let url = &url;
+            if url.starts_with("localhost/") || url.starts_with("local/") {
+                continue;
+            }
+            images.insert(match url.split_once('@') {
+                Some((reference, digest)) => LockedRef {
+                    reference: reference.to_string(),
+                    digest: Some(digest.to_string()),
+                },
+                None => LockedRef {
+                    reference: url.clone(),
+                    digest: None,
+                },
+            });
         }
-        images.insert(match url.split_once('@') {
-            Some((reference, digest)) => LockedRef {
-                reference: reference.to_string(),
-                digest: Some(digest.to_string()),
-            },
-            None => LockedRef {
-                reference: url.clone(),
-                digest: None,
-            },
-        });
     }
 
     let vendored = match std::fs::read_to_string(root.join(LOCK_FILE)) {
@@ -1480,6 +1498,34 @@ mod tests {
         fs::create_dir_all(root.join("parts")).unwrap();
         fs::write(root.join("parts/p.bin"), "p").unwrap();
         root
+    }
+
+    /// A workspace with two baselines locks what both run: a parameter may bind `baseline` to run
+    /// either per arm, so a pull or an offline copy needs every arm's references.
+    #[test]
+    fn a_lock_pins_every_baselines_references() {
+        let root = locked_workspace("two-baselines");
+        let parts = fs::read_to_string(root.join("parts.yaml")).unwrap();
+        fs::write(
+            root.join("parts-alt.yaml"),
+            parts.replace("id: bl-local", "id: bl-alt").replace(
+                "ghcr.io/vxedge/parts/vxprobe",
+                "ghcr.io/vxedge/parts/agent/load/app/alt",
+            ),
+        )
+        .unwrap();
+        let locked = lock(&root, "0.8.0").unwrap();
+        for reference in [
+            "ghcr.io/vxedge/parts/vxprobe",
+            "ghcr.io/vxedge/parts/agent/load/app/alt",
+        ] {
+            assert!(
+                locked.images.iter().any(|r| r.reference == reference),
+                "{reference}: {:?}",
+                locked.images
+            );
+        }
+        fs::remove_dir_all(root.parent().unwrap()).ok();
     }
 
     /// An `s-nssai` slice starts the 5G core and RAN, which are no placement: the lock pins their

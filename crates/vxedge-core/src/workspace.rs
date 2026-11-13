@@ -76,10 +76,19 @@ pub enum WorkspaceValidationError {
         baseline: String,
     },
     #[error(
-        "component `{component}` (vehicle `{vehicle}`) has no part in any baseline — it would \
-         boot nothing. Add a `parts` entry with `target_ids: {component}`."
+        "component `{component}` (vehicle `{vehicle}`) has no part in baseline `{baseline}` — \
+         it would boot nothing under it. Add a `parts` entry with `target_ids: {component}`."
     )]
-    ComponentWithoutPart { vehicle: String, component: String },
+    ComponentWithoutPart {
+        vehicle: String,
+        component: String,
+        baseline: String,
+    },
+    #[error(
+        "experiment `{experiment}` names no `baseline`, and this workspace has {count}; name the \
+         one it runs"
+    )]
+    UnnamedBaseline { experiment: String, count: usize },
     #[error("baseline `{baseline}`: part `{part}` targets unknown component `{target}`")]
     UnknownTarget {
         baseline: String,
@@ -1267,15 +1276,15 @@ impl Workspace {
             }
         }
 
-        // Every component must be given software by some baseline. Found by the lowering
+        // Every component must be given software by every baseline. Found by the lowering
         // (2026-07-30) rather than by review: a gateway with no part validated cleanly and
         // then could not be lowered to anything runnable, because "boots nothing" is not a
-        // shape error — it is a completeness one.
-        if !self.baselines.is_empty() {
-            let targeted: BTreeSet<&str> = self
-                .baselines
+        // shape error — it is a completeness one. Each baseline on its own, since an experiment
+        // runs the one it names, and a parameter may bind `baseline` to run another per arm.
+        for b in &self.baselines {
+            let targeted: BTreeSet<&str> = b
+                .parts
                 .iter()
-                .flat_map(|b| b.parts.iter())
                 .filter_map(|p| p.target_ids.as_ref())
                 .flat_map(|t| t.as_slice())
                 .collect();
@@ -1285,9 +1294,18 @@ impl Workspace {
                         errors.push(E::ComponentWithoutPart {
                             vehicle: v.id.clone(),
                             component: c.to_string(),
+                            baseline: b.id.clone(),
                         });
                     }
                 }
+            }
+        }
+        if self.baselines.len() > 1 {
+            for e in self.experiments.iter().filter(|e| e.baseline.is_none()) {
+                errors.push(E::UnnamedBaseline {
+                    experiment: e.id.clone(),
+                    count: self.baselines.len(),
+                });
             }
         }
 

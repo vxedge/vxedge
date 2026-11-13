@@ -56,6 +56,14 @@ pub enum ModelError {
     #[error("experiment `{experiment}` isolates `{device}`, which is not a device of its vehicles")]
     UnknownIsolate { experiment: String, device: String },
     #[error(
+        "experiment `{experiment}` names baseline `{baseline}`, which is not a `kind: baseline` \
+         document in this workspace"
+    )]
+    UnknownBaseline {
+        experiment: String,
+        baseline: String,
+    },
+    #[error(
         "component `{component}` has {count} parts. A device runs one loadable; publish them as \
          a single `stack`-layer composite and reference that."
     )]
@@ -348,14 +356,21 @@ fn resources_of(device: &str, spec: &Value) -> Result<Option<Resources>, ModelEr
 
 /// The one part targeting `component`. A `stack`-layer part wins over its own members: a stack
 /// exists precisely to be the single pullable unit, so carrying both is not ambiguous.
+///
+/// Only the parts of `baseline`, the one the experiment names, are candidates: a workspace may
+/// hold several baselines over one vehicle, and an A/B arm is two of them (`ARCHITECTURE.md`
+/// §6.0). With no baseline named, every baseline document is read, which the workspace validator
+/// allows only when there is one.
 fn sole_part(
     ws: &Workspace,
+    baseline: Option<&str>,
     component: &str,
     backend: Option<Backend>,
 ) -> Result<Part, ModelError> {
     let candidates: Vec<&PartEntry> = ws
         .baselines
         .iter()
+        .filter(|b| baseline.is_none_or(|id| b.id == id))
         .flat_map(|b| b.parts.iter())
         .filter(|p| {
             p.target_ids
@@ -734,7 +749,11 @@ fn qemu_options_of(
 /// §6.0 → entity. Nothing is synthesized: the schema declares zones, devices and functions as
 /// separate things, so this reads them. The earlier builder had to invent a function per device
 /// because §6.0 could not say what a function was — that was the gap this schema closed.
-fn build_entity(ws: &Workspace, doc: &VehicleDoc) -> Result<Entity, ModelError> {
+fn build_entity(
+    ws: &Workspace,
+    doc: &VehicleDoc,
+    baseline: Option<&str>,
+) -> Result<Entity, ModelError> {
     let zones = doc
         .zones
         .iter()
@@ -791,7 +810,7 @@ fn build_entity(ws: &Workspace, doc: &VehicleDoc) -> Result<Entity, ModelError> 
                 // against the file the author wrote (`ComponentWithoutPart`). Any *other*
                 // failure is a real defect in the part they did declare, and swallowing it
                 // turned a kind mismatch into a function that silently ran nothing.
-                part: match sole_part(ws, id, backend) {
+                part: match sole_part(ws, baseline, id, backend) {
                     Ok(part) => Some(part),
                     Err(ModelError::NoPart { .. }) => None,
                     Err(e) => return Err(e),
@@ -1283,6 +1302,14 @@ fn checked(exp: Experiment) -> Result<Experiment, LoadError> {
 pub fn build(ws: &Workspace) -> Result<Experiment, ModelError> {
     let exp = ws.experiments.first().ok_or(ModelError::NoExperiment)?;
     let raw = ws.experiments_raw.first().cloned().unwrap_or(Value::Null);
+    if let Some(b) = &exp.baseline
+        && !ws.baselines.iter().any(|d| &d.id == b)
+    {
+        return Err(ModelError::UnknownBaseline {
+            experiment: exp.id.clone(),
+            baseline: b.clone(),
+        });
+    }
 
     let mut entities = Vec::new();
     for id in &exp.vehicles {
@@ -1294,7 +1321,7 @@ pub fn build(ws: &Workspace) -> Result<Experiment, ModelError> {
                     experiment: exp.id.clone(),
                     entity: id.clone(),
                 })?;
-        entities.push(build_entity(ws, doc)?);
+        entities.push(build_entity(ws, doc, exp.baseline.as_deref())?);
     }
     if entities.is_empty() {
         return Err(ModelError::NoEntity {
@@ -1648,6 +1675,80 @@ parts:
 
         let ws = Workspace::load_validated(&tmp).unwrap();
         (tmp, ws)
+    }
+
+    /// A second baseline over the same vehicle, as an A/B arm would carry: `fn-node-b` runs a
+    /// `localhost/` image under it instead of the host-process load.
+    const ALT_BASELINE: &str = r#"
+kind: baseline
+id: alt
+parts:
+  - { ref: "local/vxprobe:host-process", target_ids: fn-node-a }
+  - { ref: "localhost/vxedge/load:1", target_ids: fn-node-b }
+"#;
+
+    /// The experiment's `baseline:` selects its document: an A/B arm is two baselines over one
+    /// vehicle (`ARCHITECTURE.md` §6.0), so a part from another baseline must not leak in.
+    #[test]
+    fn the_named_baseline_selects_the_parts() {
+        let (tmp, _) = h1_fixture("select");
+        std::fs::write(tmp.join("alt.yaml"), ALT_BASELINE).unwrap();
+        let ws = Workspace::load_validated(&tmp).unwrap();
+        let part = |m: &Experiment| {
+            m.entities[0].functions["fn-node-b"]
+                .part
+                .as_ref()
+                .unwrap()
+                .reference
+                .clone()
+        };
+        assert_eq!(part(&build(&ws).unwrap()), "local/vxtraffic:host-process");
+
+        let mut alt = ws.clone();
+        alt.experiments[0].baseline = Some("alt".into());
+        assert_eq!(part(&build(&alt).unwrap()), "localhost/vxedge/load:1");
+
+        let mut unknown = ws.clone();
+        unknown.experiments[0].baseline = Some("nope".into());
+        assert!(matches!(
+            build(&unknown),
+            Err(ModelError::UnknownBaseline { baseline, .. }) if baseline == "nope"
+        ));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Every baseline must give every function a part, since any of them may run; and with two
+    /// baselines the experiment has to say which.
+    #[test]
+    fn each_baseline_is_complete_and_two_need_a_name() {
+        use crate::workspace::WorkspaceValidationError as E;
+        let (tmp, _) = h1_fixture("complete");
+        std::fs::write(
+            tmp.join("alt.yaml"),
+            ALT_BASELINE.replace(
+                "  - { ref: \"localhost/vxedge/load:1\", target_ids: fn-node-b }\n",
+                "",
+            ),
+        )
+        .unwrap();
+        let ws = Workspace::load(&tmp).unwrap();
+        let errors = ws.validate();
+        assert!(
+            errors.iter().any(|e| matches!(e,
+                E::ComponentWithoutPart { component, baseline, .. }
+                    if component == "fn-node-b" && baseline == "alt")),
+            "{errors:?}"
+        );
+
+        let mut unnamed = ws.clone();
+        unnamed.experiments[0].baseline = None;
+        assert!(
+            unnamed
+                .validate()
+                .iter()
+                .any(|e| matches!(e, E::UnnamedBaseline { count: 2, .. })),
+        );
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     /// Golden assertion on the plans an H1-shaped workspace produces.
