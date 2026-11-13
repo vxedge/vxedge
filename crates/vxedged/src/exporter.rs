@@ -17,6 +17,10 @@
 //!   `vxedge_slice_overlimits_total`. The class is the gateway's, so every vehicle whose links use
 //!   the slice reports the same queue.
 //! - `vxedge_process_*{process="vxedged"}` on `host`: the observer's own cost.
+//! - `vxedge_gptp_offset_seconds`, `vxedge_gptp_path_delay_seconds`: each `network.time_sync`
+//!   follower's offset from the grandmaster and peer delay, with the follower as entity, read
+//!   from its `ptp4l` over its management socket (`vxedge_core::gptp`). A follower that does not
+//!   answer, or follows no grandmaster, has no sample.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -286,8 +290,12 @@ fn render(
     let mut families = vec![cpu, mem];
     families.extend(slice.into_iter().map(|(f, _)| f));
     families.extend([own_cpu, own_mem]);
+    let gptp = match &active {
+        Some((model, _, Some(_))) => vxedge_core::gptp::metrics(model, runtime_dir),
+        _ => String::new(),
+    };
     // Each running measurement's sender, read inside its own namespace (`measurements/<id>`).
-    text(&families) + &vxedge_core::measurements::run::collect_metrics(runtime_dir)
+    text(&families) + &gptp + &vxedge_core::measurements::run::collect_metrics(runtime_dir)
 }
 
 /// What the processes in the network namespace at `ns` use together, or `None` when it runs

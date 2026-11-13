@@ -321,6 +321,9 @@ enum ExperimentStage {
   EXPERIMENT_STAGE_SERVICES = 3;
   EXPERIMENT_STAGE_COMPUTE = 4;
   EXPERIMENT_STAGE_SIGNAL_PLANE = 5;
+  // `network.time_sync`'s followers, each in its device's container group. The grandmaster is
+  // the gateway's, so the gateway stage starts it.
+  EXPERIMENT_STAGE_TIME_SYNC = 6;
 }
 
 message ExperimentUpRequest {

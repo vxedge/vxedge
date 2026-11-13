@@ -51,6 +51,8 @@ enum ResourceKind {
   RESOURCE_KIND_SIGNAL_PLANE = 9;
   // A declared measurement (`MeasurementService`).
   RESOURCE_KIND_MEASUREMENT = 10;
+  // A `network.time_sync` follower's `ptp4l`, in its device's container group.
+  RESOURCE_KIND_TIME_SYNC = 11;
 }
 
 enum ResourceState {

@@ -12,6 +12,7 @@ pub mod distribution;
 pub mod entities;
 pub mod fiveg;
 pub mod gateway;
+pub mod gptp;
 pub mod identity;
 pub mod intent;
 pub mod measurements;

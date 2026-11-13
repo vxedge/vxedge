@@ -53,6 +53,10 @@ pub enum EventKind {
     SignalPlaneUp,
     /// The signal plane left its device's container group.
     SignalPlaneDown,
+    /// A `network.time_sync` follower's `ptp4l` joined its device's container group.
+    TimeSyncUp,
+    /// A follower's `ptp4l` left its device's container group.
+    TimeSyncDown,
     /// A run began: the first `up` of a workspace brought its gateway up. Its resource is the run.
     RunUp,
     /// A run ended: its gateway went down.
@@ -95,6 +99,8 @@ impl EventKind {
             EventKind::ServiceDown => "service.down",
             EventKind::SignalPlaneUp => "signal-plane.up",
             EventKind::SignalPlaneDown => "signal-plane.down",
+            EventKind::TimeSyncUp => "time-sync.up",
+            EventKind::TimeSyncDown => "time-sync.down",
             EventKind::RunUp => "run.up",
             EventKind::RunDown => "run.down",
             EventKind::TrafficStarted => "traffic.started",
@@ -120,6 +126,7 @@ impl EventKind {
             EventKind::ComputeUp | EventKind::ComputeDown => ResourceKind::Compute,
             EventKind::ServiceUp | EventKind::ServiceDown => ResourceKind::Service,
             EventKind::SignalPlaneUp | EventKind::SignalPlaneDown => ResourceKind::SignalPlane,
+            EventKind::TimeSyncUp | EventKind::TimeSyncDown => ResourceKind::TimeSync,
             // A run is a vehicle's unless said otherwise: `emit_run` names the kind it really is.
             EventKind::RunUp | EventKind::RunDown => ResourceKind::Vehicle,
             EventKind::TrafficStarted | EventKind::TrafficStopped => ResourceKind::Traffic,
@@ -286,6 +293,8 @@ mod tests {
             EventKind::ServiceDown,
             EventKind::SignalPlaneUp,
             EventKind::SignalPlaneDown,
+            EventKind::TimeSyncUp,
+            EventKind::TimeSyncDown,
             EventKind::TrafficStarted,
             EventKind::TrafficStopped,
             EventKind::MeasurementStarted,

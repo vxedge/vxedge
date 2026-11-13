@@ -695,6 +695,32 @@ pub struct ShapingWindow {
     pub duration_us: u32,
 }
 
+/// `network.time_sync` (`ARCHITECTURE.md` §6.0.3): the gateway is the grandmaster of an IEEE
+/// 802.1AS domain over the followers' access ports. Absent means no time sync, so every
+/// experiment that predates the block plans exactly as before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimeSync {
+    pub kind: TimeSyncKind,
+    /// Devices that follow the gateway's clock, in manifest order.
+    pub followers: Vec<String>,
+}
+
+/// The protocol. It names the standard, not the program that runs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeSyncKind {
+    /// IEEE 802.1AS, run by linuxptp with software timestamps and free-running followers.
+    Gptp,
+}
+
+impl TimeSyncKind {
+    /// As a manifest and a run record write it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TimeSyncKind::Gptp => "gptp",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SNssai {
     pub sst: u8,
@@ -728,6 +754,8 @@ pub struct Experiment {
     pub data_plane: DataPlaneKind,
     /// The uplink's gate schedule (`network.shaping`). `None` keeps the HTB tree.
     pub shaping: Option<Shaping>,
+    /// The gPTP domain the gateway runs (`network.time_sync`). `None` runs none.
+    pub time_sync: Option<TimeSync>,
     pub traffic: Vec<TrafficProfile>,
     /// What the experiment measures, by node id (`crate::measurements`).
     pub measurements: Vec<crate::measurements::Measurement>,
@@ -995,6 +1023,39 @@ pub enum InvariantError {
          `kernel-bridge` data plane."
     )]
     ShapingOnOvs,
+    #[error(
+        "`network.time_sync` with `network.data_plane: ovs` is refused: the OVS data path takes \
+         every frame on its ports and has not been tested for gPTP. Use the default \
+         `kernel-bridge` data plane."
+    )]
+    TimeSyncOnOvs,
+    #[error("`network.time_sync` lists no `followers`, so the grandmaster would have no port")]
+    TimeSyncWithoutFollowers,
+    #[error("`network.time_sync`: follower `{device}` is listed more than once")]
+    DuplicateFollower { device: String },
+    #[error("`network.time_sync`: follower `{device}` is not a device of any vehicle")]
+    FollowerUnknownDevice { device: String },
+    #[error(
+        "`network.time_sync`: follower `{device}` is not `backend: container`. A VM's guest runs \
+         its own follower, and vxedge has no way into it, so only a container device can follow."
+    )]
+    FollowerNotContainer { device: String },
+    #[error(
+        "`network.time_sync`: follower `{device}` runs no container image. Its `ptp4l` joins the \
+         device's container group, as a placed service does, so deploy a published or \
+         `localhost/` container part on it."
+    )]
+    FollowerWithoutPayload { device: String },
+    #[error(
+        "`network.time_sync`: follower `{device}` has no access port on the gateway bridge (it is \
+         not attached to a `mode: vlan` slice), so the grandmaster has no port to reach it on"
+    )]
+    FollowerWithoutAccessPort { device: String },
+    #[error(
+        "`{name}` is placed on device `{device}`, a `network.time_sync` follower, whose `ptp4l` \
+         takes that name in the device's container group. Rename the service."
+    )]
+    FollowerNameTaken { name: String, device: String },
 }
 
 impl Experiment {
@@ -1108,6 +1169,9 @@ impl Experiment {
 
         if let Some(shaping) = &self.shaping {
             errors.extend(self.shaping_problems(shaping));
+        }
+        if let Some(time_sync) = &self.time_sync {
+            errors.extend(self.time_sync_problems(time_sync));
         }
 
         // Device ids stay unique across the *whole experiment*, not merely per entity: parts
@@ -1312,6 +1376,65 @@ impl Experiment {
                 errors.push(E::ShapingClassNeverOpen {
                     class: class.to_string(),
                 });
+            }
+        }
+        errors
+    }
+
+    /// What `network.time_sync` refuses (`ARCHITECTURE.md` §6.0.3). A follower's `ptp4l` joins
+    /// its device's container group, so a follower is held to a placed service's rules, plus an
+    /// access port on the bridge for the grandmaster's master port.
+    fn time_sync_problems(&self, time_sync: &TimeSync) -> Vec<InvariantError> {
+        use InvariantError as E;
+        let mut errors = Vec::new();
+        if self.data_plane == DataPlaneKind::Ovs {
+            errors.push(E::TimeSyncOnOvs);
+        }
+        if time_sync.followers.is_empty() {
+            errors.push(E::TimeSyncWithoutFollowers);
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for device_id in &time_sync.followers {
+            let device = || device_id.clone();
+            if !seen.insert(device_id.as_str()) {
+                errors.push(E::DuplicateFollower { device: device() });
+                continue;
+            }
+            let Some((entity, found)) = self
+                .entities
+                .iter()
+                .find_map(|e| e.devices.get(device_id).map(|d| (e, d)))
+            else {
+                errors.push(E::FollowerUnknownDevice { device: device() });
+                continue;
+            };
+            if found.backend != Some(Backend::Container) {
+                errors.push(E::FollowerNotContainer { device: device() });
+                continue;
+            }
+            let has_payload = entity
+                .functions_on(device_id)
+                .filter_map(|f| f.part.as_ref())
+                .any(Part::is_oci_payload);
+            if !has_payload {
+                errors.push(E::FollowerWithoutPayload { device: device() });
+            }
+            let on_vlan = entity.links_for(device_id).any(|(link, _)| {
+                link.slice
+                    .as_deref()
+                    .and_then(|s| self.slices.iter().find(|sl| sl.id == s))
+                    .is_some_and(|sl| sl.mode == SliceMode::Vlan)
+            });
+            if !on_vlan {
+                errors.push(E::FollowerWithoutAccessPort { device: device() });
+            }
+            for placement in self.placements() {
+                if placement.on == device_id && placement.id == crate::gptp::FOLLOWER_MEMBER {
+                    errors.push(E::FollowerNameTaken {
+                        name: placement.id.to_string(),
+                        device: device(),
+                    });
+                }
             }
         }
         errors

@@ -113,6 +113,11 @@ message HostCapabilities {
   // running kernel. `Plan` and `up` refuse a workspace with `network.shaping` with
   // ERROR_REASON_HOST_REQUIREMENT_UNMET when it is false.
   bool taprio = 7;
+  // Whether this host can start `network.time_sync`'s gPTP grandmaster (`ARCHITECTURE.md`
+  // §6.0.3): vxedged's commands already run as root, or `sudo -n` allows `nsenter` without a
+  // password. `Plan` and `up` refuse a workspace with `network.time_sync` with
+  // ERROR_REASON_HOST_REQUIREMENT_UNMET when it is false.
+  bool gptp = 8;
 }
 
 message HostGpu {

@@ -612,6 +612,7 @@ enum StageArg {
     Gateway,
     Zones,
     Compute,
+    TimeSync,
     SignalPlane,
     Services,
 }
@@ -622,6 +623,7 @@ impl StageArg {
             StageArg::Gateway => vxedge_api::v1::ExperimentStage::Gateway as i32,
             StageArg::Zones => vxedge_api::v1::ExperimentStage::Zones as i32,
             StageArg::Compute => vxedge_api::v1::ExperimentStage::Compute as i32,
+            StageArg::TimeSync => vxedge_api::v1::ExperimentStage::TimeSync as i32,
             StageArg::SignalPlane => vxedge_api::v1::ExperimentStage::SignalPlane as i32,
             StageArg::Services => vxedge_api::v1::ExperimentStage::Services as i32,
         }

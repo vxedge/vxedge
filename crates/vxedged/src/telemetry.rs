@@ -251,6 +251,7 @@ impl TelemetryService for TelemetrySvc {
         images.extend(
             vxedge_core::fiveg::fiveg_images(&model)
                 .into_iter()
+                .chain(vxedge_core::gptp::gptp_images(&model))
                 .map(str::to_string),
         );
         images.sort();

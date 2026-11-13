@@ -517,6 +517,119 @@ impl Handles {
         Ok(msg)
     }
 
+    /// `network.time_sync`'s followers: one `ptp4l` per follower, as one more member of its
+    /// device's container group (the path a placed service takes). The grandmaster is the
+    /// gateway's, started by the gateway stage. `vehicle up` and `experiment up` both run this, so
+    /// a declared follower either starts or fails the job. Down is best-effort over every
+    /// follower and reports the first failure.
+    pub(crate) async fn stage_time_sync(
+        &self,
+        model: &vxedge_core::model::Experiment,
+        dir: Option<&Path>,
+        up: bool,
+        p: &Progress,
+    ) -> Result<String, JobFailure> {
+        let fail = |e: String| JobFailure::from(format!("time sync: {e}"));
+        let followers = time_sync_members(model, dir, &self.zones.runtime_dir).map_err(fail)?;
+        if followers.is_empty() {
+            return Ok("no time sync declared".into());
+        }
+        let verb = if up { "up" } else { "down" };
+        let mut first_failure = None;
+        for (node, spec) in followers {
+            let on = node.node_id.clone();
+            p.update(70, &format!("time sync: follower on {on} ({verb})"));
+            self.svcs.audit.record(
+                if up { "TimeSync.Up" } else { "TimeSync.Down" },
+                serde_json::json!({ "member": spec.name, "on": on, "image": spec.image }),
+            );
+            let shell = self.zones.shell.clone();
+            let runtime_dir = self.zones.runtime_dir.clone();
+            let (probe_node, probe_spec) = (node.clone(), spec.clone());
+            let change = async move {
+                tokio::task::spawn_blocking(move || {
+                    if up {
+                        vxedge_core::gptp::prepare_dir(&vxedge_core::gptp::follower_dir(
+                            &runtime_dir,
+                            &node.node_id,
+                        ))
+                        .map_err(|e| e.to_string())?;
+                        vxedge_core::zones::member_up(&shell, &node, &runtime_dir, &spec)
+                            .map_err(|e| e.to_string())
+                    } else {
+                        vxedge_core::zones::member_down(&node, &spec).map_err(|e| e.to_string())
+                    }
+                })
+                .await
+                .map_err(|e| format!("task panicked: {e}"))?
+            };
+            let result = if up {
+                let running = || {
+                    let (node, spec) = (probe_node.clone(), probe_spec.clone());
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            vxedge_core::zones::member_status(&node, &spec) == NodeState::Up
+                        })
+                        .await
+                        .unwrap_or(false)
+                    }
+                };
+                start_then_confirm(change, running, START_WINDOW).await
+            } else {
+                change.await
+            };
+            match result {
+                Ok(_) => {
+                    let (kind, msg) = if up {
+                        (EventKind::TimeSyncUp, format!("gPTP follower up on `{on}`"))
+                    } else {
+                        (
+                            EventKind::TimeSyncDown,
+                            format!("gPTP follower stopped on `{on}`"),
+                        )
+                    };
+                    self.engine.events().emit(kind, &on, &msg);
+                }
+                Err(e) if up => return Err(fail(format!("follower `{on}`: {e}"))),
+                Err(e) => {
+                    first_failure.get_or_insert(fail(format!("follower `{on}`: {e}")));
+                }
+            }
+        }
+        match first_failure {
+            Some(failure) => Err(failure),
+            None => Ok(format!("time sync {verb}")),
+        }
+    }
+
+    /// Each follower's `ptp4l` as a status component, observed through Podman. Empty when the
+    /// workspace declares no time sync.
+    pub(crate) async fn time_sync_components(
+        &self,
+        model: &vxedge_core::model::Experiment,
+        dir: Option<&Path>,
+    ) -> Result<Vec<ResourceStatus>, Status> {
+        let followers = time_sync_members(model, dir, &self.zones.runtime_dir)
+            .map_err(|e| crate::errors::precondition(crate::errors::R::WorkspaceInvalid, e))?;
+        let mut components = Vec::new();
+        for (node, spec) in followers {
+            let on = node.node_id.clone();
+            let image = spec.image.clone();
+            let state = tokio::task::spawn_blocking(move || {
+                vxedge_core::zones::member_status(&node, &spec)
+            })
+            .await
+            .map_err(|e| Status::internal(format!("status task panicked: {e}")))?;
+            components.push(crate::status::resource_status(
+                &on,
+                ResourceKind::TimeSync,
+                &state,
+                format!("gPTP follower on `{on}`: {image}"),
+            ));
+        }
+        Ok(components)
+    }
+
     /// The databroker as a status component, observed through Podman. `None` when none is
     /// declared.
     pub(crate) async fn signal_plane_component(
@@ -597,6 +710,41 @@ impl Handles {
         }
         Ok(format!("{} service(s)", types.len()))
     }
+}
+
+/// Each follower's node and `ptp4l` container, in follower order. Empty without time sync.
+fn time_sync_members(
+    model: &vxedge_core::model::Experiment,
+    dir: Option<&Path>,
+    runtime_dir: &Path,
+) -> Result<Vec<(NodePlan, ContainerSpec)>, String> {
+    let Some(time_sync) = &model.time_sync else {
+        return Ok(Vec::new());
+    };
+    let gateway = GatewayPlan::from_model(model).map_err(|e| e.to_string())?;
+    let nodes = vxedge_core::zones::plan_nodes_from_model(
+        model,
+        &gateway,
+        dir.unwrap_or_else(|| Path::new(".")),
+    )
+    .map_err(|e| e.to_string())?;
+    time_sync
+        .followers
+        .iter()
+        .map(|device| {
+            let node = nodes
+                .iter()
+                .find(|n| &n.node_id == device)
+                .cloned()
+                .ok_or_else(|| format!("follower `{device}` has no node plan"))?;
+            let spec = vxedge_core::gptp::follower_spec(
+                vxedge_core::gptp::LINUXPTP_IMAGE,
+                runtime_dir,
+                device,
+            );
+            Ok((node, spec))
+        })
+        .collect()
 }
 
 /// The databroker's node and container, if this workspace declares a signal plane.
@@ -750,6 +898,13 @@ impl ExperimentService for ExperimentSvc {
                         done.push(svc.stage_compute(true, isolate.as_deref(), &p).await?);
                     }
                     p.checkpoint()?;
+                    if wants(&stages, ExperimentStage::TimeSync) {
+                        done.push(
+                            svc.stage_time_sync(&model, dir.as_deref(), true, &p)
+                                .await?,
+                        );
+                    }
+                    p.checkpoint()?;
                     if wants(&stages, ExperimentStage::SignalPlane) {
                         done.push(
                             svc.stage_signal_plane(&model, dir.as_deref(), true, &p)
@@ -837,6 +992,11 @@ impl ExperimentService for ExperimentSvc {
                         && let Err(e) = svc
                             .stage_signal_plane(&model, dir.as_deref(), false, &p)
                             .await
+                    {
+                        failures.push(e);
+                    }
+                    if wants(&stages, ExperimentStage::TimeSync)
+                        && let Err(e) = svc.stage_time_sync(&model, dir.as_deref(), false, &p).await
                     {
                         failures.push(e);
                     }
@@ -935,6 +1095,11 @@ impl ExperimentService for ExperimentSvc {
         components.extend(
             self.handles
                 .signal_plane_component(&model, dir.as_deref())
+                .await?,
+        );
+        components.extend(
+            self.handles
+                .time_sync_components(&model, dir.as_deref())
                 .await?,
         );
 

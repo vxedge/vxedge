@@ -291,6 +291,15 @@ pub(crate) async fn preflight(
             .unwrap_or(false);
         pf.check("gate schedule", taprio_problem(model, taprio));
     }
+    // Likewise only for a workspace that declares time sync.
+    if model.time_sync.is_some() {
+        let sh = gateway.shell.clone();
+        let grandmaster =
+            tokio::task::spawn_blocking(move || vxedge_core::gptp::can_run_grandmaster(&sh))
+                .await
+                .unwrap_or(false);
+        pf.check("time sync", gptp_problem(model, grandmaster));
+    }
     let missing = missing_simulators(dir);
     pf.check(
         "simulators",
@@ -514,16 +523,49 @@ pub(crate) async fn preflight(
     pf
 }
 
-/// [`taprio_problem`] as the refusal `GatewayService.Up` gives, which applies the gateway without
-/// the shared [`preflight`]: the same check, so it refuses with HOST_REQUIREMENT_UNMET instead of
-/// failing at `tc`. `has_taprio` is asked only of a workspace that declares a gate schedule.
+/// [`taprio_problem`] and [`gptp_problem`] as the refusal `GatewayService.Up` gives, which
+/// applies the gateway without the shared [`preflight`]: the same checks, so it refuses with
+/// HOST_REQUIREMENT_UNMET instead of failing at `tc` or at the grandmaster's start. Each probe is
+/// asked only of a workspace that declares its block.
 pub(crate) fn gateway_up_refusal(
     model: &Experiment,
     has_taprio: impl FnOnce() -> bool,
+    can_run_grandmaster: impl FnOnce() -> bool,
 ) -> Option<Status> {
-    model.shaping.as_ref()?;
-    let (reason, _, detail) = taprio_problem(model, has_taprio())?;
+    let shaping = model
+        .shaping
+        .as_ref()
+        .and_then(|_| taprio_problem(model, has_taprio()));
+    let time_sync = || {
+        model
+            .time_sync
+            .as_ref()
+            .and_then(|_| gptp_problem(model, can_run_grandmaster()))
+    };
+    let (reason, _, detail) = shaping.or_else(time_sync)?;
     Some(errors::precondition(reason, detail))
+}
+
+/// `network.time_sync`'s grandmaster runs as root in the bridge's network namespace, started
+/// through `sudo -n nsenter` unless vxedged's commands already run as root
+/// (`vxedge_core::gptp`). A host where sudo refuses that without a password is refused before
+/// anything is provisioned.
+fn gptp_problem(model: &Experiment, can_run_grandmaster: bool) -> Option<(R, String, String)> {
+    let time_sync = model.time_sync.as_ref()?;
+    (!can_run_grandmaster).then(|| {
+        (
+            R::HostRequirementUnmet,
+            model.id.clone(),
+            format!(
+                "`network.time_sync` (`kind: {}`) runs the gateway's grandmaster `ptp4l` as root \
+                 on the bridge's ports, started with `sudo -n nsenter`, and sudo on this host \
+                 refuses `nsenter` without a password (or has no `nsenter`). Add nsenter to the \
+                 deploying user's NOPASSWD sudoers entry, as the 5G pods need. \
+                 HostService.Capabilities reports `gptp`. Nothing was provisioned.",
+                time_sync.kind.as_str()
+            ),
+        )
+    })
 }
 
 /// `network.shaping` renders through the kernel's `taprio` qdisc, so a host whose kernel has none
@@ -608,7 +650,10 @@ pub(crate) fn local_images(model: &Experiment, nodes: &[NodePlan]) -> BTreeSet<S
 fn all_images(model: &Experiment, nodes: &[NodePlan]) -> BTreeSet<String> {
     let payloads = nodes.iter().filter_map(|n| n.image.clone());
     let placed = model.placements().map(|p| p.image.url.clone());
-    payloads.chain(placed).collect()
+    let gptp = vxedge_core::gptp::gptp_images(model)
+        .into_iter()
+        .map(str::to_string);
+    payloads.chain(placed).chain(gptp).collect()
 }
 
 /// What a package's `requires` asks of this host and does not get, **before** anything is
@@ -887,6 +932,12 @@ impl HostService for PlanSvc {
             taprio: tokio::task::spawn_blocking(vxedge_core::package::kernel_has_taprio)
                 .await
                 .unwrap_or(false),
+            gptp: {
+                let sh = self.gateway.shell.clone();
+                tokio::task::spawn_blocking(move || vxedge_core::gptp::can_run_grandmaster(&sh))
+                    .await
+                    .unwrap_or(false)
+            },
         }))
     }
 }
@@ -1047,17 +1098,98 @@ devices: {}
     fn gateway_up_refuses_a_gate_schedule_without_taprio() {
         use tonic_types::StatusExt;
         let shaped = vxedge_core::model::load_yaml(SHAPED).unwrap();
-        let refusal = gateway_up_refusal(&shaped, || false).expect("refused");
+        let refusal =
+            gateway_up_refusal(&shaped, || false, || panic!("not asked")).expect("refused");
         assert_eq!(refusal.code(), tonic::Code::FailedPrecondition);
         assert_eq!(
             refusal.get_error_details().error_info().unwrap().reason,
             "ERROR_REASON_HOST_REQUIREMENT_UNMET"
         );
         assert!(refusal.message().contains("taprio"));
-        assert!(gateway_up_refusal(&shaped, || true).is_none());
+        assert!(gateway_up_refusal(&shaped, || true, || panic!("not asked")).is_none());
 
         let mut plain = shaped.clone();
         plain.shaping = None;
-        assert!(gateway_up_refusal(&plain, || panic!("not asked")).is_none());
+        assert!(
+            gateway_up_refusal(&plain, || panic!("not asked"), || panic!("not asked")).is_none()
+        );
+    }
+}
+
+#[cfg(test)]
+mod time_sync_tests {
+    use super::*;
+
+    const SYNCED: &str = r#"
+kind: experiment
+id: exp-gptp
+vehicles: [veh]
+baseline: bl
+network:
+  slices:
+    - { id: adas, mode: vlan, vlan: 101 }
+  time_sync: { kind: gptp, followers: [ecu1] }
+---
+kind: vehicle
+id: veh
+zones: { central: {} }
+devices:
+  ecu1: { role: ecu, zone: central, backend: container }
+functions:
+  f-ecu: { deployed_on: ecu1 }
+links:
+  - { id: l1, endpoints: [{ node: ecu1, port: eth0, ip: 10.1.0.2/24 }], slice: adas }
+---
+kind: baseline
+id: bl
+parts:
+  - { ref: localhost/vxedge/probe:1, target_ids: f-ecu }
+"#;
+
+    /// A host that cannot start the grandmaster refuses time sync with HOST_REQUIREMENT_UNMET;
+    /// one that can, or a workspace without the block, is not refused.
+    #[test]
+    fn time_sync_needs_a_host_that_can_start_the_grandmaster() {
+        let synced = vxedge_core::model::load_yaml(SYNCED).unwrap();
+        let (reason, subject, detail) = gptp_problem(&synced, false).expect("refused");
+        assert_eq!(reason, R::HostRequirementUnmet);
+        assert_eq!(subject, "exp-gptp");
+        assert!(detail.contains("sudo -n nsenter"), "{detail}");
+        assert!(gptp_problem(&synced, true).is_none());
+        let mut plain = synced.clone();
+        plain.time_sync = None;
+        assert!(gptp_problem(&plain, false).is_none());
+    }
+
+    /// `GatewayService.Up` refuses the same way `Plan` and `experiment up` do, and probes the host
+    /// only for a workspace with time sync.
+    #[test]
+    fn gateway_up_refuses_time_sync_it_cannot_run() {
+        use tonic_types::StatusExt;
+        let synced = vxedge_core::model::load_yaml(SYNCED).unwrap();
+        let refusal =
+            gateway_up_refusal(&synced, || panic!("not asked"), || false).expect("refused");
+        assert_eq!(refusal.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            refusal.get_error_details().error_info().unwrap().reason,
+            "ERROR_REASON_HOST_REQUIREMENT_UNMET"
+        );
+        assert!(refusal.message().contains("time_sync"));
+        assert!(gateway_up_refusal(&synced, || panic!("not asked"), || true).is_none());
+        let mut plain = synced.clone();
+        plain.time_sync = None;
+        assert!(
+            gateway_up_refusal(&plain, || panic!("not asked"), || panic!("not asked")).is_none()
+        );
+    }
+
+    /// The linuxptp image is one the run starts, so a Plan lists it with the rest.
+    #[test]
+    fn the_linuxptp_image_is_one_of_the_runs_images() {
+        let synced = vxedge_core::model::load_yaml(SYNCED).unwrap();
+        assert!(all_images(&synced, &[]).contains(vxedge_core::gptp::LINUXPTP_IMAGE));
+        let mut plain = synced.clone();
+        plain.time_sync = None;
+        assert!(!all_images(&plain, &[]).contains(vxedge_core::gptp::LINUXPTP_IMAGE));
     }
 }

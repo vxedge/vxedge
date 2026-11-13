@@ -387,8 +387,8 @@ impl ExperimentDoc {
     }
 }
 
-/// `tunnels`/`nos_check`/`data_plane`/`defaults`/`shaping` are opaque `Value`s for the same
-/// reason `ExperimentDoc`'s own blocks are: `model::build` already validates each with its own
+/// `tunnels`/`nos_check`/`data_plane`/`defaults`/`shaping`/`time_sync` are opaque `Value`s for
+/// the same reason `ExperimentDoc`'s own blocks are: `model::build` already validates each with its own
 /// named errors, so retyping them here would duplicate that validation rather than add to it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -403,10 +403,12 @@ pub struct NetworkDoc {
     pub data_plane: Option<String>,
     #[serde(default)]
     pub defaults: Option<serde_yaml_ng::Value>,
-    /// The uplink's gate schedule (`model::Shaping`). `time_sync` is not read yet, so it stays an
-    /// unknown key and is refused.
+    /// The uplink's gate schedule (`model::Shaping`).
     #[serde(default)]
     pub shaping: Option<serde_yaml_ng::Value>,
+    /// The gateway's gPTP domain (`model::TimeSync`).
+    #[serde(default)]
+    pub time_sync: Option<serde_yaml_ng::Value>,
 }
 
 /// Every field a slice entry may declare — closes §30's last remaining gap (this struct used

@@ -127,6 +127,8 @@ pub enum ModelError {
     UnknownDataPlane { data_plane: String },
     #[error("`network.shaping` declares `kind: {kind}` — expected `gate-schedule`")]
     UnknownShapingKind { kind: String },
+    #[error("`network.time_sync` declares `kind: {kind}` — expected `gptp`")]
+    UnknownTimeSyncKind { kind: String },
     #[error(
         "`network.shaping`: window `{window}` has `duration_us: {duration_us}` — expected a whole \
          number of microseconds from 1 to {max}"
@@ -346,6 +348,42 @@ fn shaping_of(raw: &Value) -> Result<Option<Shaping>, ModelError> {
         })
         .collect::<Result<_, _>>()?;
     Ok(Some(Shaping { kind, windows }))
+}
+
+/// `network.time_sync` as written. Typed, as `network.shaping` is, so a misspelt key
+/// (`follower`) is refused instead of read as an absent one.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TimeSyncDoc {
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    followers: Vec<String>,
+}
+
+/// `network.time_sync` (`ARCHITECTURE.md` §6.0.3) — absent means none. What its followers refer
+/// to is checked with the rest of the model ([`Experiment::check`]); this reads the block.
+fn time_sync_of(raw: &Value) -> Result<Option<TimeSync>, ModelError> {
+    let Some(block) = raw.get("network").and_then(|n| n.get("time_sync")) else {
+        return Ok(None);
+    };
+    let doc: TimeSyncDoc =
+        serde_yaml_ng::from_value(block.clone()).map_err(|e| ModelError::MalformedBlock {
+            block: "network.time_sync",
+            detail: e.to_string(),
+        })?;
+    let kind = match doc.kind.as_deref() {
+        None | Some("gptp") => TimeSyncKind::Gptp,
+        Some(other) => {
+            return Err(ModelError::UnknownTimeSyncKind {
+                kind: other.to_string(),
+            });
+        }
+    };
+    Ok(Some(TimeSync {
+        kind,
+        followers: doc.followers,
+    }))
 }
 
 fn resources_of(device: &str, spec: &Value) -> Result<Option<Resources>, ModelError> {
@@ -1595,6 +1633,7 @@ pub fn build(ws: &Workspace) -> Result<Experiment, ModelError> {
             .and_then(|v| v.as_u64()),
         data_plane: data_plane_of(&raw)?,
         shaping: shaping_of(&raw)?,
+        time_sync: time_sync_of(&raw)?,
         slices: slices_of(&raw)?,
         tunnels: tunnels_of(&raw)?,
         nos_check: nos_check_of(&raw)?,
@@ -3578,15 +3617,221 @@ devices: {}
         assert!(load_yaml(&ws).is_ok());
     }
 
-    /// `network.time_sync` is specified but not read yet, so it is refused as any unknown key is.
+    /// `ARCHITECTURE.md` §6.0.3's time sync over two container followers, beside devices each
+    /// refusal needs: a VM, a container with no image, and a container on no slice.
+    const SYNCED: &str = r#"
+kind: experiment
+id: exp-gptp
+vehicles: [veh]
+baseline: bl
+network:
+  slices:
+    - { id: adas, mode: vlan, vlan: 101 }
+  time_sync:
+    kind: gptp
+    followers: [ecu1, hpc1]
+---
+kind: vehicle
+id: veh
+zones: { central: {} }
+devices:
+  ecu1: { role: ecu, zone: central, backend: container }
+  hpc1: { role: hpc, zone: central, backend: container }
+  vm1: { role: ecu, zone: central, backend: qemu-microvm }
+  bare: { role: ecu, zone: central, backend: container }
+  loose: { role: ecu, zone: central, backend: container }
+functions:
+  f-ecu: { deployed_on: ecu1 }
+  f-hpc: { deployed_on: hpc1 }
+  f-vm: { deployed_on: vm1 }
+  f-bare: { deployed_on: bare }
+  f-loose: { deployed_on: loose }
+links:
+  - { id: l1, endpoints: [{ node: ecu1, port: eth0, ip: 10.1.0.2/24 }], slice: adas }
+  - { id: l2, endpoints: [{ node: hpc1, port: eth0, ip: 10.1.0.3/24 }], slice: adas }
+  - { id: l3, endpoints: [{ node: vm1, port: eth0, ip: 10.1.0.4/24 }], slice: adas }
+  - { id: l4, endpoints: [{ node: bare, port: eth0, ip: 10.1.0.5/24 }], slice: adas }
+---
+kind: baseline
+id: bl
+parts:
+  - { ref: localhost/vxedge/probe:1, target_ids: [f-ecu, f-hpc, f-loose] }
+  - { ref: ./bundle, kind: bundle, target_ids: f-vm }
+  - { ref: 'local/vxprobe:host-process', target_ids: f-bare }
+"#;
+
+    fn synced(from: &str, to: &str) -> String {
+        assert!(SYNCED.contains(from), "{from}");
+        SYNCED.replacen(from, to, 1)
+    }
+
+    fn time_sync_violations(ws: &str) -> Vec<InvariantError> {
+        match load_yaml(ws) {
+            Ok(_) => Vec::new(),
+            Err(LoadError::Invariants(v)) => v,
+            Err(other) => panic!("expected invariant violations, got {other}"),
+        }
+    }
+
     #[test]
-    fn time_sync_is_still_an_unknown_key() {
-        let ws = shaped(
-            "  shaping:\n",
-            "  time_sync: { kind: gptp, followers: [zonefl] }\n  shaping:\n",
+    fn the_spec_time_sync_reaches_the_model() {
+        let m = load_yaml(SYNCED).expect("valid workspace");
+        assert_eq!(
+            m.time_sync,
+            Some(TimeSync {
+                kind: TimeSyncKind::Gptp,
+                followers: vec!["ecu1".into(), "hpc1".into()],
+            })
         );
-        let err = load_yaml(&ws).unwrap_err().to_string();
-        assert!(err.contains("time_sync"), "{err}");
+        // Absent is no time sync, as every experiment before the block plans.
+        let plain = load_yaml(&synced(
+            "  time_sync:\n    kind: gptp\n    followers: [ecu1, hpc1]\n",
+            "",
+        ))
+        .unwrap();
+        assert!(plain.time_sync.is_none());
+        // `kind` names the only protocol there is, so leaving it out means that one.
+        let unkinded = load_yaml(&synced("    kind: gptp\n", "")).unwrap();
+        assert_eq!(unkinded.time_sync.unwrap().kind, TimeSyncKind::Gptp);
+    }
+
+    #[test]
+    fn an_unknown_time_sync_kind_is_refused() {
+        match load_yaml(&synced("kind: gptp", "kind: ptp-e2e")) {
+            Err(LoadError::Model(ModelError::UnknownTimeSyncKind { kind })) => {
+                assert_eq!(kind, "ptp-e2e")
+            }
+            other => panic!("expected UnknownTimeSyncKind, got {other:?}"),
+        }
+    }
+
+    /// A misspelt key is refused, not read as an absent one.
+    #[test]
+    fn a_typo_d_time_sync_field_is_refused() {
+        match load_yaml(&synced("followers: [ecu1, hpc1]", "follower: [ecu1]")) {
+            Err(LoadError::Model(ModelError::MalformedBlock { block, detail })) => {
+                assert_eq!(block, "network.time_sync");
+                assert!(detail.contains("follower"), "{detail}");
+            }
+            other => panic!("expected MalformedBlock, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn time_sync_on_ovs_is_refused() {
+        let ws = synced("network:\n", "network:\n  data_plane: ovs\n");
+        assert_eq!(
+            time_sync_violations(&ws),
+            vec![InvariantError::TimeSyncOnOvs]
+        );
+        let ws = synced("network:\n", "network:\n  data_plane: kernel-bridge\n");
+        assert!(load_yaml(&ws).is_ok());
+    }
+
+    #[test]
+    fn time_sync_without_followers_is_refused() {
+        for empty in ["followers: []", ""] {
+            let ws = synced("    followers: [ecu1, hpc1]\n", &format!("    {empty}\n"));
+            assert_eq!(
+                time_sync_violations(&ws),
+                vec![InvariantError::TimeSyncWithoutFollowers],
+                "{empty:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_follower_listed_twice_is_refused() {
+        let ws = synced("[ecu1, hpc1]", "[ecu1, hpc1, ecu1]");
+        assert_eq!(
+            time_sync_violations(&ws),
+            vec![InvariantError::DuplicateFollower {
+                device: "ecu1".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn an_unknown_follower_is_refused() {
+        let ws = synced("[ecu1, hpc1]", "[ecu1, zonefl]");
+        assert_eq!(
+            time_sync_violations(&ws),
+            vec![InvariantError::FollowerUnknownDevice {
+                device: "zonefl".into()
+            }]
+        );
+    }
+
+    /// A VM's guest runs its own follower, which vxedge cannot reach.
+    #[test]
+    fn a_vm_follower_is_refused() {
+        let ws = synced("[ecu1, hpc1]", "[ecu1, vm1]");
+        assert_eq!(
+            time_sync_violations(&ws),
+            vec![InvariantError::FollowerNotContainer {
+                device: "vm1".into()
+            }]
+        );
+        let err = InvariantError::FollowerNotContainer {
+            device: "vm1".into(),
+        }
+        .to_string();
+        assert!(err.contains("guest runs its own follower"), "{err}");
+    }
+
+    /// A follower's ptp4l joins the device's container group, so the device needs one.
+    #[test]
+    fn a_follower_without_a_container_payload_is_refused() {
+        let ws = synced("[ecu1, hpc1]", "[ecu1, bare]");
+        assert_eq!(
+            time_sync_violations(&ws),
+            vec![InvariantError::FollowerWithoutPayload {
+                device: "bare".into()
+            }]
+        );
+    }
+
+    /// The grandmaster's port is the follower's access port, so a follower needs one.
+    #[test]
+    fn a_follower_without_an_access_port_is_refused() {
+        let ws = synced("[ecu1, hpc1]", "[ecu1, loose]");
+        assert_eq!(
+            time_sync_violations(&ws),
+            vec![InvariantError::FollowerWithoutAccessPort {
+                device: "loose".into()
+            }]
+        );
+        // An s-nssai attachment has no port on the bridge either.
+        let ws = synced(
+            "    - { id: adas, mode: vlan, vlan: 101 }\n",
+            "    - { id: adas, mode: vlan, vlan: 101 }\n    - { id: adas5g, mode: s-nssai, s_nssai: { sst: 1 } }\n",
+        )
+        .replace(
+            "  - { id: l2, endpoints: [{ node: hpc1, port: eth0, ip: 10.1.0.3/24 }], slice: adas }",
+            "  - { id: l2, endpoints: [{ node: hpc1, port: eth0 }], slice: adas5g }",
+        );
+        assert_eq!(
+            time_sync_violations(&ws),
+            vec![InvariantError::FollowerWithoutAccessPort {
+                device: "hpc1".into()
+            }]
+        );
+    }
+
+    /// The follower's ptp4l takes its name in the device's group.
+    #[test]
+    fn a_service_named_like_the_follower_is_refused_on_a_follower() {
+        let ws = synced(
+            "---\nkind: baseline",
+            "services:\n  ota:\n    id: gptp\n    type: ota\n    image: { url: localhost/vxedge/ota:1, kind: container }\n    on: ecu1\n    config: { artifacts: ./store, listen: \"0.0.0.0:9900\" }\n---\nkind: baseline",
+        );
+        assert_eq!(
+            time_sync_violations(&ws),
+            vec![InvariantError::FollowerNameTaken {
+                name: "gptp".into(),
+                device: "ecu1".into()
+            }]
+        );
     }
 
     /// Two container devices and a VM, each with its own part, for the `run` tests. `{RUN_A}`
