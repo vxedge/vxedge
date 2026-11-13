@@ -93,24 +93,28 @@ fn present(program: &str, args: &[&str]) -> bool {
     cmd_version(program, args).is_some()
 }
 
-/// Presence by PATH lookup only — for programs that must never be executed
-/// to probe them (the Open5GS daemons treat any invocation as "start up",
-/// so `--version` under sudo would leave a running daemon behind).
-fn on_path(program: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|paths| {
-            std::env::split_paths(&paths).any(|dir| {
-                let p = dir.join(program);
-                p.is_file()
-                    && std::fs::metadata(&p)
-                        .map(|m| {
-                            use std::os::unix::fs::PermissionsExt;
-                            m.permissions().mode() & 0o111 != 0
-                        })
-                        .unwrap_or(false)
-            })
+/// The executable `program` resolves to on PATH, without running it. sudoers rules name a full
+/// path, so the sudo check asks about this one.
+fn find_on_path(program: &str) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .chain(["/usr/sbin", "/sbin"].map(std::path::PathBuf::from))
+        .map(|dir| dir.join(program))
+        .find(|p| {
+            std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         })
-        .unwrap_or(false)
+}
+
+/// Whether `sudo -n` would run `program` now, without asking for a password: a NOPASSWD rule,
+/// or a credential still cached for this terminal. `sudo -l <cmd>` only lists; it runs nothing.
+fn sudo_runs_without_password(program: &std::path::Path) -> bool {
+    Command::new("sudo")
+        .arg("-n")
+        .arg("-l")
+        .arg(program)
+        .output()
+        .is_ok_and(|o| o.status.success())
 }
 
 fn check(
@@ -366,38 +370,82 @@ fn tier2() -> Vec<Check> {
         Some("apt install wireguard-tools"),
     ));
 
-    // PATH-presence only: executing an Open5GS daemon starts it (no --version
-    // support), which under sudo would leave a stray daemon running.
-    let open5gs = on_path("open5gs-amfd");
+    // The 5G core and RAN run as Podman pods from published images that vxedged pulls on first
+    // use (`mode: s-nssai` slices only), so what the host needs is what those pods need.
+    let uid = effective_uid();
+    let socket = vxedge_core::containers::user_socket_path(
+        uid,
+        std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+    );
+    let socket_ok = socket.as_ref().is_ok_and(|p| {
+        use std::os::unix::fs::FileTypeExt;
+        std::fs::metadata(p).is_ok_and(|m| m.file_type().is_socket())
+    });
     c.push(check(
         2,
-        "Open5GS (5G core, for `mode: s-nssai` slices / H2)",
+        "Podman API socket (5G pods, `mode: s-nssai`)",
         false,
-        open5gs,
-        if open5gs {
-            cmd_version("dpkg-query", &["-W", "-f=${Version}", "open5gs-amf"])
-                .map(|v| format!("present ({v})"))
-                .unwrap_or_else(|| "present".to_string())
-        } else {
-            "not found — needed only for s-nssai slice experiments".to_string()
+        socket_ok,
+        match &socket {
+            Err(_) => "not checked as root: run doctor as the user vxedged runs as".to_string(),
+            Ok(p) if socket_ok => format!("{} is listening", p.display()),
+            Ok(p) => format!("{} not found", p.display()),
         },
-        Some("preferred: the vxparts gw/5gc/os/open5gs image vxedged pulls — host install only for non-container runs"),
+        Some(
+            "as the user vxedged runs as: systemctl --user enable --now podman.socket; \
+             loginctl enable-linger $USER",
+        ),
     ));
 
-    // UERANSIM's nr-gnb/nr-ue expect a config and error without one; PATH
-    // presence avoids relying on that behavior.
-    let ueransim = on_path("nr-gnb") && on_path("nr-ue");
+    let pasta = cmd_version("pasta", &["--version"]);
     c.push(check(
         2,
-        "UERANSIM (gNB/UE simulator, for `mode: s-nssai` slices / H2)",
+        "passt (pasta networking for the 5G pods)",
         false,
-        ueransim,
-        if ueransim {
-            "present".to_string()
+        pasta.is_some(),
+        pasta.unwrap_or_else(|| "pasta not found".to_string()),
+        Some("apt install passt"),
+    ));
+
+    // UERANSIM's NGAP uses the host kernel's SCTP, which is not namespaced.
+    let sctp = std::path::Path::new("/sys/module/sctp").exists();
+    c.push(check(
+        2,
+        "SCTP kernel module (5G NGAP)",
+        false,
+        sctp,
+        if sctp {
+            "loaded".to_string()
         } else {
-            "nr-gnb/nr-ue not found — needed only for s-nssai slice experiments".to_string()
+            "not loaded".to_string()
         },
-        Some("preferred: the vxparts gw/ran/os/ueransim image vxedged pulls — host binaries only needed for non-container runs"),
+        Some(
+            "sudo modprobe sctp (once per boot; to load it at boot: \
+             echo sctp | sudo tee /etc/modules-load.d/sctp.conf)",
+        ),
+    ));
+
+    // The 5G transit link and bridge attachment run `sudo ip` and `sudo nsenter` (join a pod's
+    // network namespace by PID), and must not stop at a password prompt.
+    let missing: Vec<String> = ["ip", "nsenter"]
+        .into_iter()
+        .filter(|prog| !find_on_path(prog).is_some_and(|p| sudo_runs_without_password(&p)))
+        .map(str::to_string)
+        .collect();
+    c.push(check(
+        2,
+        "sudo without a password for ip and nsenter (5G pods)",
+        false,
+        missing.is_empty(),
+        if missing.is_empty() {
+            "sudo -n allows both (a NOPASSWD rule, or a credential cached right now)".to_string()
+        } else {
+            format!("sudo -n refuses: {}", missing.join(", "))
+        },
+        Some(
+            "add /usr/bin/nsenter (and /usr/sbin/ip) to the deploying user's NOPASSWD sudoers \
+             entry (docs/TESTBED-SETUP.md, Tier 1 and Tier 2)",
+        ),
     ));
 
     let gpu = present("nvidia-smi", &["--query-gpu=name", "--format=csv,noheader"]);
