@@ -6,6 +6,16 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-11-14
+
+`network.time_sync` with `kind: gptp`: the gateway becomes the grandmaster of an IEEE 802.1AS domain
+over the followers' access ports, each follower runs a free-running `ptp4l` on software timestamps,
+and the exporter serves each follower's offset and peer path delay. It runs the vxparts `linuxptp`
+image pinned by digest and needs passwordless `sudo nsenter`, as the 5G pods do. vxAPI stays
+`vxedge.v1`, with `Run.time_sync`, `HostCapabilities.gptp`, a `time-sync` stage and resource kind
+added. vxtelemetry 0.10.0 records the time sync in each archive. A package that uses `time_sync`
+requires vxedge 0.30.0.
+
 ### Added
 
 - `network.time_sync` with `kind: gptp` (`ARCHITECTURE.md` §6.0.3): the gateway is the grandmaster of
