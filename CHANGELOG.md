@@ -6,6 +6,15 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-11-13
+
+A container payload can be started with its own arguments, environment and `NET_ADMIN`: a
+baseline `parts` entry's `run` (`args`, `env`, `cap_add`), so a load generator or client part runs
+in its role without a rebuilt image. The experiment's `baseline:` now selects the one baseline that
+runs, and a parameter may bind it, so an arm that changes software is a second baseline over the
+same vehicle; `pkg lock` pins every baseline's references. vxAPI stays `vxedge.v1`, with
+`NodePayload.run` added. vxtelemetry 0.9.0 remains the matching release.
+
 ### Added
 
 - `run` on a baseline `parts` entry (`ARCHITECTURE.md` §6.0.2) says how a container payload starts:
