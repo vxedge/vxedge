@@ -283,6 +283,14 @@ pub(crate) async fn preflight(
         "host requirements",
         unmet.map(|detail| (R::HostRequirementUnmet, model.id.clone(), detail)),
     );
+    // Asked only of a workspace that declares a gate schedule, so every other run's checks are
+    // the ones it always had.
+    if model.shaping.is_some() {
+        let taprio = tokio::task::spawn_blocking(vxedge_core::package::kernel_has_taprio)
+            .await
+            .unwrap_or(false);
+        pf.check("gate schedule", taprio_problem(model, taprio));
+    }
     let missing = missing_simulators(dir);
     pf.check(
         "simulators",
@@ -504,6 +512,25 @@ pub(crate) async fn preflight(
     );
     pf.check("attach pinning", attach_pinning_problem(nodes));
     pf
+}
+
+/// `network.shaping` renders through the kernel's `taprio` qdisc, so a host whose kernel has none
+/// is refused before anything is provisioned.
+fn taprio_problem(model: &Experiment, has_taprio: bool) -> Option<(R, String, String)> {
+    let shaping = model.shaping.as_ref()?;
+    (!has_taprio).then(|| {
+        (
+            R::HostRequirementUnmet,
+            model.id.clone(),
+            format!(
+                "`network.shaping` (`kind: {}`) renders as the kernel's `taprio` qdisc, and this \
+                 host's kernel has none: no `sch_taprio` module is loaded, built in or installed \
+                 for it (`CONFIG_NET_SCH_TAPRIO`). HostService.Capabilities reports `taprio`. \
+                 Nothing was provisioned.",
+                shaping.kind.as_str()
+            ),
+        )
+    })
 }
 
 /// An `attach` device runs on its platform's own stack, whose processes vxedge does not start, so
@@ -845,6 +872,9 @@ impl HostService for PlanSvc {
                 .map(|s| s.to_string())
                 .collect(),
             simulators: vxedge_core::scenario::available_simulators(),
+            taprio: tokio::task::spawn_blocking(vxedge_core::package::kernel_has_taprio)
+                .await
+                .unwrap_or(false),
         }))
     }
 }
@@ -951,5 +981,50 @@ mod pinning_tests {
         let n = node(None, vec![8]);
         let (_, _, detail) = container_pinning_problem(&[&n], || true).unwrap();
         assert!(detail.contains("host process"), "{detail}");
+    }
+}
+
+#[cfg(test)]
+mod shaping_tests {
+    use super::*;
+
+    const SHAPED: &str = r#"
+kind: experiment
+id: exp-tsn
+vehicles: [veh]
+network:
+  slices:
+    - { id: adas, mode: vlan, vlan: 101 }
+  shaping:
+    kind: gate-schedule
+    windows:
+      - { id: adas, open: [adas], duration_us: 10000 }
+      - { id: rest, open: [default], duration_us: 90000 }
+---
+kind: vehicle
+id: veh
+devices: {}
+"#;
+
+    /// A host without `taprio` refuses a gate schedule with HOST_REQUIREMENT_UNMET; one with it,
+    /// or a workspace without a schedule, is not asked.
+    #[test]
+    fn a_gate_schedule_needs_taprio() {
+        let shaped = vxedge_core::model::load_yaml(SHAPED).unwrap();
+        let (reason, subject, detail) = taprio_problem(&shaped, false).expect("refused");
+        assert_eq!(reason, R::HostRequirementUnmet);
+        assert_eq!(subject, "exp-tsn");
+        assert!(detail.contains("taprio"), "{detail}");
+        assert!(taprio_problem(&shaped, true).is_none());
+
+        let plain = vxedge_core::model::load_yaml(
+            &SHAPED.replace(
+                "  shaping:\n    kind: gate-schedule\n    windows:\n      - { id: adas, open: [adas], duration_us: 10000 }\n      - { id: rest, open: [default], duration_us: 90000 }\n",
+                "",
+            ),
+        )
+        .unwrap();
+        assert!(plain.shaping.is_none());
+        assert!(taprio_problem(&plain, false).is_none());
     }
 }

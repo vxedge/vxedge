@@ -108,6 +108,11 @@ message HostCapabilities {
   // The simulators a scenario can run on here (`esmini`, `carla`): those with an executable on
   // vxedged's `PATH` (`esmini`; `CarlaUE4.sh` or `CarlaUnreal.sh`).
   repeated string simulators = 6;
+  // Whether the kernel has `taprio`, which renders `network.shaping`'s gate schedule
+  // (`ARCHITECTURE.md` §6.0.3): its `sch_taprio` module is loaded, built in, or installed for the
+  // running kernel. `Plan` and `up` refuse a workspace with `network.shaping` with
+  // ERROR_REASON_HOST_REQUIREMENT_UNMET when it is false.
+  bool taprio = 7;
 }
 
 message HostGpu {

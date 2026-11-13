@@ -37,10 +37,37 @@ pub fn apply_links(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
     netlink::ensure_bridge(ns, &plan.bridge).map_err(nl)?;
     netlink::link_up(ns, &plan.bridge).map_err(nl)?;
 
-    netlink::ensure_veth_pair(ns, &plan.uplink, &plan.uplink_peer).map_err(nl)?;
+    ensure_uplink(sh, plan)?;
     netlink::set_master(ns, &plan.uplink, &plan.bridge).map_err(nl)?;
     netlink::link_up(ns, &plan.uplink).map_err(nl)?;
     netlink::link_up(ns, &plan.uplink_peer).map_err(nl)?;
+    Ok(())
+}
+
+/// The trunk uplink's veth pair. Under a gate schedule it has one transmit queue per class,
+/// which `taprio` needs and which the kernel fixes when the veth is created, so an uplink left
+/// with another count (by a run without the schedule, never taken `down`) is refused rather
+/// than rendered onto: `taprio` would fail on it.
+fn ensure_uplink(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
+    let ns = sh.netns.as_deref();
+    let queues = plan.uplink_tx_queues();
+    netlink::ensure_veth_pair_with_queues(ns, &plan.uplink, &plan.uplink_peer, queues)
+        .map_err(nl)?;
+    let Some(want) = queues else {
+        return Ok(());
+    };
+    let have = netlink::link_tx_queues(ns, &plan.uplink).map_err(nl)?;
+    if have != Some(want) {
+        return Err(NetOpsError::Command {
+            cmdline: format!("uplink `{}` transmit queues", plan.uplink),
+            stderr: format!(
+                "the uplink has {} transmit queue(s) and the gate schedule needs {want}, one per \
+                 class. A veth's queue count is fixed when it is created: take the gateway \
+                 `down` and bring it `up` again.",
+                have.map_or_else(|| "no".to_string(), |n| n.to_string())
+            ),
+        });
+    }
     Ok(())
 }
 
@@ -170,8 +197,12 @@ fn apply_slice_htb_class(
     Ok(())
 }
 
-/// Phase 2 of apply: per-slice VLANs on the trunk + the HTB queue tree.
+/// Phase 2 of apply: per-slice VLANs on the trunk + the HTB queue tree, or the gate schedule
+/// that replaces it.
 pub fn apply_slices(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
+    if let Some(shaping) = &plan.shaping {
+        return apply_gate_schedule(sh, plan, shaping);
+    }
     ensure_htb_root_and_default(sh, &plan.uplink, plan.root_rate_mbps)?;
     for (i, slice) in plan.slices.iter().enumerate() {
         // Trunk carries every slice VLAN tagged.
@@ -180,6 +211,173 @@ pub fn apply_slices(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
         apply_slice_htb_class(sh, &plan.uplink, slice, i)?;
     }
     Ok(())
+}
+
+/// The egress filter preference of slice `i`'s classifier, and of the catch-all after them.
+const SHAPING_FILTER_PREF: usize = 10;
+const SHAPING_DEFAULT_PREF: &str = "100";
+
+/// The `taprio` qdisc that renders `shaping` on `dev`, as an argument vector: software mode (no
+/// offload flags), timed by the kernel's TAI clock, starting on the TAI epoch (`base-time 0`) so
+/// the schedule's phase is the same in every run. Pure, so the tokens are pinned by unit tests.
+fn taprio_args(dev: &str, shaping: &super::plan::ShapingPlan) -> Vec<String> {
+    let n = shaping.num_classes();
+    let mut args: Vec<String> = [
+        "qdisc",
+        "replace",
+        "dev",
+        dev,
+        "parent",
+        "root",
+        "handle",
+        super::plan::TAPRIO_HANDLE,
+        "taprio",
+        "num_tc",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    args.push(n.to_string());
+    args.push("map".into());
+    args.extend(shaping.priority_map().iter().map(u8::to_string));
+    args.push("queues".into());
+    args.extend((0..n).map(|q| format!("1@{q}")));
+    args.extend(["base-time".into(), "0".into()]);
+    for w in &shaping.windows {
+        args.push("sched-entry".into());
+        args.push("S".into());
+        args.push(format!("{:x}", w.gate_mask));
+        args.push(w.interval_ns.to_string());
+    }
+    args.extend(["clockid".into(), "CLOCK_TAI".into()]);
+    args
+}
+
+/// The egress classifier for one slice's class: its VLAN tag sets the frame's priority, which
+/// `taprio`'s map sends to the class. The same `flower vlan_id` match the HTB filters use.
+fn shaping_filter_args(dev: &str, i: usize, slice: &super::plan::ShapedSlice) -> Vec<String> {
+    let (pref, vlan, priority) = (
+        (SHAPING_FILTER_PREF + i).to_string(),
+        slice.vlan.to_string(),
+        slice.class.to_string(),
+    );
+    [
+        "filter",
+        "replace",
+        "dev",
+        dev,
+        "egress",
+        "pref",
+        pref.as_str(),
+        "handle",
+        "1",
+        "protocol",
+        "802.1q",
+        "flower",
+        "vlan_id",
+        vlan.as_str(),
+        "action",
+        "skbedit",
+        "priority",
+        priority.as_str(),
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// Every frame no slice filter matched goes to `default` (priority 0), whatever priority it
+/// arrived with, as HTB's default class takes every unclassified frame.
+fn shaping_default_filter_args(dev: &str) -> Vec<String> {
+    [
+        "filter",
+        "replace",
+        "dev",
+        dev,
+        "egress",
+        "pref",
+        SHAPING_DEFAULT_PREF,
+        "handle",
+        "1",
+        "matchall",
+        "action",
+        "skbedit",
+        "priority",
+        "0",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// True when `dev`'s qdiscs include one of `kind` (`tc qdisc show` text, as
+/// [`htb_root_present`] reads it).
+fn qdisc_present(sh: &Shell, dev: &str, kind: &str) -> Result<bool, NetOpsError> {
+    let prefix = format!("qdisc {kind} ");
+    let out = sh.run("tc", &["qdisc", "show", "dev", dev])?;
+    Ok(out.lines().any(|l| l.starts_with(&prefix)))
+}
+
+/// Phase 2 under `network.shaping`: the slice VLANs on the trunk, then the gate schedule on the
+/// uplink's egress in place of the HTB tree (`ARCHITECTURE.md` §6.0.3).
+///
+/// # Order
+///
+/// The `clsact` qdisc is created **before** `taprio`. Installed the other way round, the gates
+/// held no traffic when tested, and nothing reported a fault. So `clsact` is created once and
+/// never rebuilt (rebuilding it under a running `taprio` would be that order again); the filters
+/// may come after `taprio`, which is the order tested.
+///
+/// # Idempotence
+///
+/// `taprio` uses `replace`, which on a running schedule installs the new one (the mapping must
+/// not change, and does not while the slices do not); the filters use `replace` on a fixed
+/// handle.
+fn apply_gate_schedule(
+    sh: &Shell,
+    plan: &GatewayPlan,
+    shaping: &super::plan::ShapingPlan,
+) -> Result<(), NetOpsError> {
+    let dev = plan.uplink.as_str();
+    for slice in &plan.slices {
+        netlink::bridge_vlan_add(sh.netns.as_deref(), dev, slice.vlan, false).map_err(nl)?;
+    }
+    if !qdisc_present(sh, dev, "clsact")? {
+        sh.run("tc", &["qdisc", "add", "dev", dev, "clsact"])?;
+    }
+    let taprio = taprio_args(dev, shaping);
+    sh.run("tc", &taprio.iter().map(String::as_str).collect::<Vec<_>>())?;
+    for (i, class) in shaping.classes.iter().enumerate() {
+        let filter = shaping_filter_args(dev, i, class);
+        sh.run_tolerate_exists("tc", &filter.iter().map(String::as_str).collect::<Vec<_>>())?;
+    }
+    let catch_all = shaping_default_filter_args(dev);
+    sh.run_tolerate_exists(
+        "tc",
+        &catch_all.iter().map(String::as_str).collect::<Vec<_>>(),
+    )?;
+    Ok(())
+}
+
+/// The VLAN ids `dev`'s egress `flower` filters match, read from `tc -j filter show`. Output
+/// that is not JSON reads as none, which observes as a missing classifier.
+fn egress_vlan_filters(sh: &Shell, dev: &str) -> Vec<u16> {
+    let Ok(out) = sh.run("tc", &["-j", "filter", "show", "dev", dev, "egress"]) else {
+        return Vec::new();
+    };
+    parse_vlan_filters(&out)
+}
+
+fn parse_vlan_filters(json: &str) -> Vec<u16> {
+    let Ok(serde_json::Value::Array(filters)) = serde_json::from_str(json.trim()) else {
+        return Vec::new();
+    };
+    filters
+        .iter()
+        .filter(|f| f["kind"] == "flower")
+        .filter_map(|f| f["options"]["keys"]["vlan_id"].as_u64())
+        .filter_map(|v| u16::try_from(v).ok())
+        .collect()
 }
 
 /// Phase 3 of apply: zone endpoints as access ports (pvid untagged).
@@ -1061,6 +1259,15 @@ fn ovs_apply_links(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
 /// care which switching fabric the uplink is attached to, because they act on the uplink's own
 /// kernel qdisc, which exists either way.
 fn ovs_apply_slices(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
+    // Refused at validation (`InvariantError::ShapingOnOvs`); a hand-built plan is refused here
+    // rather than given an HTB tree it did not ask for.
+    if plan.shaping.is_some() {
+        return Err(NetOpsError::Command {
+            cmdline: "ovs apply_slices".to_string(),
+            stderr: "`network.shaping` with `network.data_plane: ovs` has not been tested"
+                .to_string(),
+        });
+    }
     ensure_htb_root_and_default(sh, &plan.uplink, plan.root_rate_mbps)?;
     // A `set`, not an `add`: OVS's trunk list is one column holding the whole set, so the
     // converged value is assigned outright on every apply — idempotent by construction, unlike
@@ -1253,6 +1460,8 @@ fn ovs_observe(sh: &Shell, plan: &GatewayPlan) -> Result<GatewayObservation, Net
     Ok(GatewayObservation {
         bridge_present,
         uplink_present,
+        // `network.shaping` is refused with `ovs`, and `ovs_apply_slices` never renders one.
+        schedule_present: plan.shaping.is_none(),
         slices,
         endpoints_present,
         endpoints_expected: plan.endpoints.len(),
@@ -1366,6 +1575,129 @@ mod seam_tests {
         );
     }
 
+    fn spec_schedule() -> crate::gateway::plan::ShapingPlan {
+        use crate::gateway::plan::{GateWindow, ShapedSlice, ShapingPlan};
+        ShapingPlan {
+            kind: crate::model::ShapingKind::GateSchedule,
+            classes: vec![
+                ShapedSlice {
+                    slice: "adas".into(),
+                    vlan: 101,
+                    class: 1,
+                },
+                ShapedSlice {
+                    slice: "infotainment".into(),
+                    vlan: 103,
+                    class: 2,
+                },
+            ],
+            windows: vec![
+                GateWindow {
+                    id: "adas".into(),
+                    gate_mask: 0b010,
+                    interval_ns: 10_000_000,
+                    duration_us: 10_000,
+                },
+                GateWindow {
+                    id: "rest".into(),
+                    gate_mask: 0b101,
+                    interval_ns: 90_000_000,
+                    duration_us: 90_000,
+                },
+            ],
+        }
+    }
+
+    /// The exact `taprio` tokens: software mode (no `flags`), one queue per class, the identity
+    /// map on the slices' priorities, the TAI epoch as base time, and nanosecond intervals — a
+    /// microsecond read as a nanosecond would pass every live check with a schedule a thousand
+    /// times too fast.
+    #[test]
+    fn taprio_renders_the_schedule_in_software_mode() {
+        assert_eq!(
+            taprio_args("vxup0", &spec_schedule()),
+            [
+                "qdisc",
+                "replace",
+                "dev",
+                "vxup0",
+                "parent",
+                "root",
+                "handle",
+                "100:",
+                "taprio",
+                "num_tc",
+                "3",
+                "map",
+                "0",
+                "1",
+                "2",
+                "0",
+                "0",
+                "0",
+                "0",
+                "0",
+                "0",
+                "0",
+                "0",
+                "0",
+                "0",
+                "0",
+                "0",
+                "0",
+                "queues",
+                "1@0",
+                "1@1",
+                "1@2",
+                "base-time",
+                "0",
+                "sched-entry",
+                "S",
+                "2",
+                "10000000",
+                "sched-entry",
+                "S",
+                "5",
+                "90000000",
+                "clockid",
+                "CLOCK_TAI",
+            ]
+        );
+    }
+
+    /// A slice's VLAN tag sets its frames' priority to its class, on the uplink's egress; the
+    /// catch-all sends everything else to `default`.
+    #[test]
+    fn slice_classifiers_set_priority_from_the_vlan_tag() {
+        let s = spec_schedule();
+        assert_eq!(
+            shaping_filter_args("vxup0", 1, &s.classes[1]),
+            [
+                "filter", "replace", "dev", "vxup0", "egress", "pref", "11", "handle", "1",
+                "protocol", "802.1q", "flower", "vlan_id", "103", "action", "skbedit", "priority",
+                "2",
+            ]
+        );
+        assert_eq!(
+            shaping_default_filter_args("vxup0"),
+            [
+                "filter", "replace", "dev", "vxup0", "egress", "pref", "100", "handle", "1",
+                "matchall", "action", "skbedit", "priority", "0",
+            ]
+        );
+    }
+
+    #[test]
+    fn egress_flower_filters_are_read_by_vlan() {
+        let json = r#"[{"protocol":"802.1Q","pref":10,"kind":"flower","chain":0},
+            {"protocol":"802.1Q","pref":10,"kind":"flower","chain":0,"options":{"handle":1,
+            "keys":{"vlan_id":101},"not_in_hw":true,"actions":[{"order":1,"kind":"skbedit"}]}},
+            {"protocol":"all","pref":100,"kind":"matchall","chain":0,"options":{"handle":1}}]"#;
+        assert_eq!(parse_vlan_filters(json), [101]);
+        assert!(parse_vlan_filters("").is_empty());
+        assert!(parse_vlan_filters("Cannot find device").is_empty());
+    }
+
     /// The ppm scale's endpoints, in the percentages `tc` is given. Loss is the one value that
     /// changes representation between the manifest and the plan, so both ends of its range are
     /// checked rather than assumed.
@@ -1423,7 +1755,8 @@ pub fn teardown(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
 pub struct SliceObservation {
     pub id: String,
     pub vlan: u16,
-    /// HTB class for this slice exists on the uplink.
+    /// The slice's class exists on the uplink: its HTB class, or under a gate schedule its
+    /// `taprio` class together with the egress classifier that fills it.
     pub class_present: bool,
     /// VLAN is carried (tagged) on the trunk uplink.
     pub trunk_vlan_present: bool,
@@ -1468,6 +1801,9 @@ pub struct IngressFilterObservation {
 pub struct GatewayObservation {
     pub bridge_present: bool,
     pub uplink_present: bool,
+    /// The planned gate schedule's `taprio` and `clsact` qdiscs are on the uplink. True when no
+    /// schedule is planned.
+    pub schedule_present: bool,
     pub slices: Vec<SliceObservation>,
     pub endpoints_present: usize,
     pub endpoints_expected: usize,
@@ -1480,6 +1816,7 @@ impl GatewayObservation {
     pub fn fully_up(&self) -> bool {
         self.bridge_present
             && self.uplink_present
+            && self.schedule_present
             && self.endpoints_present == self.endpoints_expected
             && self.slices.iter().all(|s| s.healthy())
             // An impairment that failed to install turns a 100BASE-T1 run into a clean-wire run
@@ -1523,16 +1860,35 @@ pub fn observe(sh: &Shell, plan: &GatewayPlan) -> Result<GatewayObservation, Net
         Vec::new()
     };
 
+    // Under a gate schedule a slice's class is its `taprio` class, and it only carries the
+    // slice's frames while `clsact` and the slice's VLAN classifier are there too: without them
+    // every frame lands in `default` and the run measures something else, silently.
+    let schedule = match &plan.shaping {
+        Some(_) if uplink_present => Some((
+            qdisc_present(sh, &plan.uplink, "taprio")?
+                && qdisc_present(sh, &plan.uplink, "clsact")?,
+            egress_vlan_filters(sh, &plan.uplink),
+        )),
+        Some(_) => Some((false, Vec::new())),
+        None => None,
+    };
+
     let slices = plan
         .slices
         .iter()
-        .map(|s| SliceObservation {
-            id: s.id.clone(),
-            vlan: s.vlan,
-            class_present: class_handles
-                .iter()
-                .any(|h| h == &format!("1:{:x}", s.class_minor)),
-            trunk_vlan_present: trunk_vlans.contains(&s.vlan),
+        .map(|s| {
+            let handle = plan.slice_class_handle(s);
+            let class = class_handles.iter().any(|h| h == &handle);
+            let classified = match &schedule {
+                Some((qdiscs, vlans)) => *qdiscs && vlans.contains(&s.vlan),
+                None => true,
+            };
+            SliceObservation {
+                id: s.id.clone(),
+                vlan: s.vlan,
+                class_present: class && classified,
+                trunk_vlan_present: trunk_vlans.contains(&s.vlan),
+            }
         })
         .collect();
 
@@ -1584,6 +1940,7 @@ pub fn observe(sh: &Shell, plan: &GatewayPlan) -> Result<GatewayObservation, Net
     Ok(GatewayObservation {
         bridge_present,
         uplink_present,
+        schedule_present: schedule.as_ref().is_none_or(|(qdiscs, _)| *qdiscs),
         slices,
         endpoints_present,
         endpoints_expected: plan.endpoints.len(),

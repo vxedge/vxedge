@@ -1793,6 +1793,44 @@ campaign:
         assert!(mistyped[0].detail.contains("is a string"), "{mistyped:?}");
     }
 
+    /// A gate schedule's window is reached by its id (`ARCHITECTURE.md` §6.0.3), so a campaign
+    /// can sweep one window's length and leave the others as written.
+    #[test]
+    fn a_window_duration_binds_by_id_path() {
+        let path = "network.shaping.windows[adas].duration_us";
+        let mut d = doc(&format!(
+            r#"
+kind: experiment
+id: exp-tsn
+network:
+  slices:
+    - {{ id: adas, mode: vlan, vlan: 101 }}
+  shaping:
+    kind: gate-schedule
+    windows:
+      - {{ id: adas, open: [adas], duration_us: 10000 }}
+      - {{ id: rest, open: [default], duration_us: 90000 }}
+parameters:
+  adas_window_us: {{ type: integer, unit: us, default: 10000, min: 1, binds: "{path}" }}
+"#
+        ));
+        assert_eq!(check(&d), Vec::new());
+        assert_eq!(resolve(&d, path).unwrap().as_u64(), Some(10_000));
+        set(&mut d, path, Value::from(20_000u64)).unwrap();
+        assert_eq!(resolve(&d, path).unwrap().as_u64(), Some(20_000));
+        assert_eq!(
+            resolve(&d, "network.shaping.windows[rest].duration_us")
+                .unwrap()
+                .as_u64(),
+            Some(90_000)
+        );
+        assert!(
+            resolve(&d, "network.shaping.windows[nope].duration_us")
+                .unwrap_err()
+                .contains("no element has `id: nope`")
+        );
+    }
+
     /// A bind into the scenario's storyboard parameters is not resolved in the experiment
     /// document; `crate::scenario` checks it.
     #[test]

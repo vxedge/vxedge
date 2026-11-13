@@ -107,6 +107,17 @@ pub enum ModelError {
     LossOutOfRange { link: String, loss: f64 },
     #[error("`network.data_plane` is `{data_plane}` — expected `kernel-bridge` or `ovs`")]
     UnknownDataPlane { data_plane: String },
+    #[error("`network.shaping` declares `kind: {kind}` — expected `gate-schedule`")]
+    UnknownShapingKind { kind: String },
+    #[error(
+        "`network.shaping`: window `{window}` has `duration_us: {duration_us}` — expected a whole \
+         number of microseconds from 1 to {max}"
+    )]
+    WindowDurationOutOfRange {
+        window: String,
+        duration_us: u64,
+        max: u64,
+    },
     #[error("tunnel `{tunnel}` declares `kind: {kind}` — expected `wireguard` or `vxlan`")]
     UnknownTunnelKind { tunnel: String, kind: String },
     #[error(
@@ -257,6 +268,66 @@ fn data_plane_of(raw: &Value) -> Result<DataPlaneKind, ModelError> {
             data_plane: other.to_string(),
         }),
     }
+}
+
+/// `network.shaping` as written. Typed here, unlike the rest of `network`, so a misspelt key in a
+/// window (`duration_ms`) is refused instead of read as an absent one.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShapingDoc {
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    windows: Vec<ShapingWindowDoc>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShapingWindowDoc {
+    id: String,
+    #[serde(default)]
+    open: Vec<String>,
+    duration_us: u64,
+}
+
+/// `network.shaping` (`ARCHITECTURE.md` §6.0.3) — absent means the HTB tree. What its windows
+/// refer to is checked with the rest of the model ([`Experiment::check`]); this reads the block.
+fn shaping_of(raw: &Value) -> Result<Option<Shaping>, ModelError> {
+    let Some(block) = raw.get("network").and_then(|n| n.get("shaping")) else {
+        return Ok(None);
+    };
+    let doc: ShapingDoc =
+        serde_yaml_ng::from_value(block.clone()).map_err(|e| ModelError::MalformedBlock {
+            block: "network.shaping",
+            detail: e.to_string(),
+        })?;
+    let kind = match doc.kind.as_deref() {
+        None | Some("gate-schedule") => ShapingKind::GateSchedule,
+        Some(other) => {
+            return Err(ModelError::UnknownShapingKind {
+                kind: other.to_string(),
+            });
+        }
+    };
+    let windows = doc
+        .windows
+        .into_iter()
+        .map(|w| {
+            if w.duration_us == 0 || w.duration_us > MAX_WINDOW_US {
+                return Err(ModelError::WindowDurationOutOfRange {
+                    window: w.id,
+                    duration_us: w.duration_us,
+                    max: MAX_WINDOW_US,
+                });
+            }
+            Ok(ShapingWindow {
+                id: w.id,
+                open: w.open,
+                duration_us: w.duration_us as u32,
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(Some(Shaping { kind, windows }))
 }
 
 fn resources_of(device: &str, spec: &Value) -> Result<Option<Resources>, ModelError> {
@@ -1389,6 +1460,7 @@ pub fn build(ws: &Workspace) -> Result<Experiment, ModelError> {
             .and_then(|d| d.get("bandwidth"))
             .and_then(|v| v.as_u64()),
         data_plane: data_plane_of(&raw)?,
+        shaping: shaping_of(&raw)?,
         slices: slices_of(&raw)?,
         tunnels: tunnels_of(&raw)?,
         nos_check: nos_check_of(&raw)?,
@@ -3028,5 +3100,264 @@ services:
                 ModelError::PartKindMismatch { .. }
             ))
         ));
+    }
+
+    /// `ARCHITECTURE.md` §6.0.3's own example: two vlan slices, a 100 ms cycle.
+    const SHAPED: &str = r#"
+kind: experiment
+id: exp-tsn
+vehicles: [veh]
+network:
+  slices:
+    - { id: adas, mode: vlan, vlan: 101 }
+    - { id: infotainment, mode: vlan, vlan: 103 }
+  shaping:
+    kind: gate-schedule
+    windows:
+      - { id: adas, open: [adas], duration_us: 10000 }
+      - { id: rest, open: [infotainment, default], duration_us: 90000 }
+---
+kind: vehicle
+id: veh
+devices: {}
+"#;
+
+    fn shaped(from: &str, to: &str) -> String {
+        assert!(SHAPED.contains(from), "{from}");
+        SHAPED.replacen(from, to, 1)
+    }
+
+    /// Every invariant a shaped workspace violates, or the load error that came first.
+    fn shaping_violations(ws: &str) -> Vec<InvariantError> {
+        match load_yaml(ws) {
+            Ok(_) => Vec::new(),
+            Err(LoadError::Invariants(v)) => v,
+            Err(other) => panic!("expected invariant violations, got {other}"),
+        }
+    }
+
+    #[test]
+    fn the_spec_gate_schedule_reaches_the_model() {
+        let m = load_yaml(SHAPED).expect("valid workspace");
+        let s = m.shaping.expect("shaping is read");
+        assert_eq!(s.kind, ShapingKind::GateSchedule);
+        assert_eq!(
+            s.windows,
+            vec![
+                ShapingWindow {
+                    id: "adas".into(),
+                    open: vec!["adas".into()],
+                    duration_us: 10_000
+                },
+                ShapingWindow {
+                    id: "rest".into(),
+                    open: vec!["infotainment".into(), "default".into()],
+                    duration_us: 90_000
+                },
+            ]
+        );
+        // Absent is the HTB tree, as every experiment before the block plans.
+        let plain = load_yaml(&shaped(
+            "  shaping:\n    kind: gate-schedule\n    windows:\n      - { id: adas, open: [adas], duration_us: 10000 }\n      - { id: rest, open: [infotainment, default], duration_us: 90000 }\n",
+            "",
+        ))
+        .unwrap();
+        assert!(plain.shaping.is_none());
+        // `kind` names the only schedule there is, so leaving it out means that one.
+        let unkinded = load_yaml(&shaped("    kind: gate-schedule\n", "")).unwrap();
+        assert_eq!(unkinded.shaping.unwrap().kind, ShapingKind::GateSchedule);
+    }
+
+    #[test]
+    fn an_unknown_shaping_kind_is_refused() {
+        match load_yaml(&shaped("kind: gate-schedule", "kind: credit-based")) {
+            Err(LoadError::Model(ModelError::UnknownShapingKind { kind })) => {
+                assert_eq!(kind, "credit-based")
+            }
+            other => panic!("expected UnknownShapingKind, got {other:?}"),
+        }
+    }
+
+    /// A misspelt key in a window is refused, not read as an absent one.
+    #[test]
+    fn a_typo_d_window_field_is_refused() {
+        match load_yaml(&shaped("duration_us: 10000", "duration_ms: 10")) {
+            Err(LoadError::Model(ModelError::MalformedBlock { block, detail })) => {
+                assert_eq!(block, "network.shaping");
+                assert!(detail.contains("duration_ms"), "{detail}");
+            }
+            other => panic!("expected MalformedBlock, got {other:?}"),
+        }
+    }
+
+    /// A positive whole number of microseconds, small enough for the kernel's 32-bit interval.
+    #[test]
+    fn a_window_duration_out_of_range_is_refused() {
+        for bad in ["0", "4294968"] {
+            match load_yaml(&shaped(
+                "duration_us: 10000",
+                &format!("duration_us: {bad}"),
+            )) {
+                Err(LoadError::Model(ModelError::WindowDurationOutOfRange {
+                    window,
+                    duration_us,
+                    max,
+                })) => {
+                    assert_eq!(window, "adas");
+                    assert_eq!(duration_us.to_string(), bad);
+                    assert_eq!(max, 4_294_967);
+                }
+                other => panic!("{bad}: expected WindowDurationOutOfRange, got {other:?}"),
+            }
+        }
+        for bad in ["-5", "1.5"] {
+            assert!(
+                matches!(
+                    load_yaml(&shaped(
+                        "duration_us: 10000",
+                        &format!("duration_us: {bad}")
+                    )),
+                    Err(LoadError::Model(ModelError::MalformedBlock { .. }))
+                ),
+                "{bad}"
+            );
+        }
+        // The longest the kernel holds is accepted.
+        assert!(load_yaml(&shaped("duration_us: 10000", "duration_us: 4294967")).is_ok());
+    }
+
+    #[test]
+    fn a_class_no_window_opens_is_refused() {
+        // `infotainment` and `default` are only in the second window.
+        let v = shaping_violations(&shaped(
+            "      - { id: rest, open: [infotainment, default], duration_us: 90000 }\n",
+            "",
+        ));
+        assert_eq!(
+            v,
+            vec![
+                InvariantError::ShapingClassNeverOpen {
+                    class: "infotainment".into()
+                },
+                InvariantError::ShapingClassNeverOpen {
+                    class: "default".into()
+                },
+            ]
+        );
+        // `default` is a class like any other: it must be opened too.
+        let v = shaping_violations(&shaped("[infotainment, default]", "[infotainment]"));
+        assert_eq!(
+            v,
+            vec![InvariantError::ShapingClassNeverOpen {
+                class: "default".into()
+            }]
+        );
+        // No windows at all opens nothing.
+        let v = shaping_violations(&shaped(
+            "    windows:\n      - { id: adas, open: [adas], duration_us: 10000 }\n      - { id: rest, open: [infotainment, default], duration_us: 90000 }\n",
+            "    windows: []\n",
+        ));
+        assert_eq!(v.len(), 3, "{v:?}");
+    }
+
+    #[test]
+    fn an_unknown_slice_in_open_is_refused() {
+        let v = shaping_violations(&shaped("open: [adas]", "open: [adas, telematics]"));
+        assert_eq!(
+            v,
+            vec![InvariantError::ShapingUnknownClass {
+                window: "adas".into(),
+                slice: "telematics".into()
+            }]
+        );
+    }
+
+    /// An s-nssai slice has no VLAN to class its frames by, so a window cannot open it.
+    #[test]
+    fn an_snssai_slice_in_open_is_refused() {
+        let ws = shaped(
+            "    - { id: infotainment, mode: vlan, vlan: 103 }\n",
+            "    - { id: infotainment, mode: vlan, vlan: 103 }\n    - { id: adas5g, mode: s-nssai, s_nssai: { sst: 1 } }\n",
+        )
+        .replace("open: [adas]", "open: [adas, adas5g]");
+        assert_eq!(
+            shaping_violations(&ws),
+            vec![InvariantError::ShapingSnssaiSlice {
+                window: "adas".into(),
+                slice: "adas5g".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn duplicate_window_ids_are_refused() {
+        let v = shaping_violations(&shaped("{ id: rest,", "{ id: adas,"));
+        assert_eq!(
+            v,
+            vec![InvariantError::DuplicateShapingWindow { id: "adas".into() }]
+        );
+    }
+
+    #[test]
+    fn more_than_seven_slices_are_refused() {
+        let slices: String = (0..8)
+            .map(|i| format!("    - {{ id: s{i}, mode: vlan, vlan: {} }}\n", 110 + i))
+            .collect();
+        let open: Vec<String> = (0..8).map(|i| format!("s{i}")).collect();
+        let ws = format!(
+            "kind: experiment\nid: e\nvehicles: [veh]\nnetwork:\n  slices:\n{slices}  shaping:\n    windows:\n      - {{ id: all, open: [{}, default], duration_us: 10000 }}\n---\nkind: vehicle\nid: veh\ndevices: {{}}\n",
+            open.join(", ")
+        );
+        assert_eq!(
+            shaping_violations(&ws),
+            vec![InvariantError::TooManyShapedSlices { count: 8, max: 7 }]
+        );
+        // Seven fit, with `default` the eighth class.
+        let seven = ws
+            .replace("    - { id: s7, mode: vlan, vlan: 117 }\n", "")
+            .replace(", s7,", ",");
+        assert!(load_yaml(&seven).is_ok(), "{seven}");
+    }
+
+    /// HTB's own parameters beside a gate schedule are refused, not ignored.
+    #[test]
+    fn qos_and_bandwidth_beside_shaping_are_refused() {
+        let ws = shaped(
+            "    - { id: adas, mode: vlan, vlan: 101 }",
+            "    - { id: adas, mode: vlan, vlan: 101, qos: { min_rate_mbps: 100 } }",
+        )
+        .replace(
+            "network:\n",
+            "network:\n  defaults: { bandwidth: 500000000 }\n",
+        );
+        assert_eq!(
+            shaping_violations(&ws),
+            vec![
+                InvariantError::BandwidthBesideShaping,
+                InvariantError::QosBesideShaping {
+                    slice: "adas".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn shaping_on_ovs_is_refused() {
+        let ws = shaped("network:\n", "network:\n  data_plane: ovs\n");
+        assert_eq!(shaping_violations(&ws), vec![InvariantError::ShapingOnOvs]);
+        // `kernel-bridge`, named or not, is the data plane a gate schedule runs on.
+        let ws = shaped("network:\n", "network:\n  data_plane: kernel-bridge\n");
+        assert!(load_yaml(&ws).is_ok());
+    }
+
+    /// `network.time_sync` is specified but not read yet, so it is refused as any unknown key is.
+    #[test]
+    fn time_sync_is_still_an_unknown_key() {
+        let ws = shaped(
+            "  shaping:\n",
+            "  time_sync: { kind: gptp, followers: [zonefl] }\n  shaping:\n",
+        );
+        let err = load_yaml(&ws).unwrap_err().to_string();
+        assert!(err.contains("time_sync"), "{err}");
     }
 }

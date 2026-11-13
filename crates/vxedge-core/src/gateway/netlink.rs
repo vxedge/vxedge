@@ -53,11 +53,11 @@
 use futures_util::TryStreamExt;
 use rtnetlink::packet_route::AddressFamily;
 use rtnetlink::packet_route::link::{
-    AfSpecBridge, BridgeVlanInfoFlags, LinkAttribute, LinkExtentMask,
+    AfSpecBridge, BridgeVlanInfoFlags, InfoData, InfoVeth, LinkAttribute, LinkExtentMask,
 };
 use rtnetlink::{
-    LinkBridge, LinkBridgeVlan, LinkUnspec, LinkVeth, LinkVlan, LinkVxlan, LinkWireguard,
-    NetworkNamespace, RouteMessageBuilder,
+    LinkBridge, LinkBridgeVlan, LinkMessageBuilder, LinkUnspec, LinkVeth, LinkVlan, LinkVxlan,
+    LinkWireguard, NetworkNamespace, RouteMessageBuilder,
 };
 use std::os::fd::AsRawFd;
 
@@ -294,6 +294,24 @@ pub fn link_master(netns: Option<&str>, dev: &str) -> Result<Option<String>, Net
     })
 }
 
+/// `dev`'s transmit queue count (`IFLA_NUM_TX_QUEUES`), or `None` when `dev` does not exist.
+pub fn link_tx_queues(netns: Option<&str>, dev: &str) -> Result<Option<u32>, NetlinkError> {
+    let dev = dev.to_string();
+    run_async(netns, "link_tx_queues", move |handle| async move {
+        let mut links = handle.link().get().match_name(dev).execute();
+        let msg = match links.try_next().await {
+            Ok(Some(msg)) => msg,
+            Ok(None) => return Ok(None),
+            Err(e) if is_missing(&e) => return Ok(None),
+            Err(e) => return Err(op_err("link_tx_queues", e)),
+        };
+        Ok(msg.attributes.iter().find_map(|a| match a {
+            LinkAttribute::NumTxQueues(n) => Some(*n),
+            _ => None,
+        }))
+    })
+}
+
 /// `dev`'s interface alias (`IFLA_IFALIAS`), if it has one.
 pub fn link_alias(netns: Option<&str>, dev: &str) -> Result<Option<String>, NetlinkError> {
     let dev = dev.to_string();
@@ -379,6 +397,18 @@ pub fn ensure_bridge(netns: Option<&str>, name: &str) -> Result<(), NetlinkError
 
 /// Idempotent, same contract as [`ensure_bridge`].
 pub fn ensure_veth_pair(netns: Option<&str>, name: &str, peer: &str) -> Result<(), NetlinkError> {
+    ensure_veth_pair_with_queues(netns, name, peer, None)
+}
+
+/// [`ensure_veth_pair`], with `queues` transmit and receive queues on each end when set
+/// (`ip link add ... numtxqueues <n> numrxqueues <n>`). A veth's queue count is fixed when it is
+/// created, so an existing pair is left as it is: the caller reads [`link_tx_queues`] to know.
+pub fn ensure_veth_pair_with_queues(
+    netns: Option<&str>,
+    name: &str,
+    peer: &str,
+    queues: Option<u32>,
+) -> Result<(), NetlinkError> {
     let name = name.to_string();
     let peer = peer.to_string();
     run_async(netns, "ensure_veth_pair", move |handle| async move {
@@ -389,9 +419,21 @@ pub fn ensure_veth_pair(netns: Option<&str>, name: &str, peer: &str) -> Result<(
         {
             return Ok(());
         }
+        let mut link = LinkVeth::new(&name, &peer);
+        if let Some(n) = queues {
+            let peer = LinkMessageBuilder::<LinkUnspec>::new()
+                .name(peer.clone())
+                .append_extra_attribute(LinkAttribute::NumTxQueues(n))
+                .append_extra_attribute(LinkAttribute::NumRxQueues(n))
+                .build();
+            link = link
+                .append_extra_attribute(LinkAttribute::NumTxQueues(n))
+                .append_extra_attribute(LinkAttribute::NumRxQueues(n))
+                .set_info_data(InfoData::Veth(InfoVeth::Peer(peer)));
+        }
         handle
             .link()
-            .add(LinkVeth::new(&name, &peer).build())
+            .add(link.build())
             .execute()
             .await
             .or_else(|e| {

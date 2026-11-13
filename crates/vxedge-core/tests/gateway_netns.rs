@@ -1194,3 +1194,255 @@ fn fiveg_uplink_creates_a_real_vlan_subinterface_and_routes_a_ue_subnet() {
 
     teardown(&sh, &plan).unwrap();
 }
+
+/// `ARCHITECTURE.md` §6.0.3's example gate schedule: a 100 ms cycle, `adas` open for the first
+/// 10 ms, `infotainment` and `default` for the other 90. Its own device ids, as every fixture
+/// here has, because a device's netns name is host-wide.
+const SHAPED_WORKSPACE: &str = r#"
+kind: experiment
+id: exp-gates
+vehicles: [veh]
+network:
+  slices:
+    - { id: adas, mode: vlan, vlan: 101 }
+    - { id: infotainment, mode: vlan, vlan: 103 }
+  shaping:
+    kind: gate-schedule
+    windows:
+      - { id: adas, open: [adas], duration_us: 10000 }
+      - { id: rest, open: [infotainment, default], duration_us: 90000 }
+---
+kind: vehicle
+id: veh
+devices:
+  node-gate-adas: { role: ecu, backend: container }
+  node-gate-info: { role: ecu, backend: container }
+links:
+  - { id: l-gate-adas, endpoints: [{ node: node-gate-adas, port: eth0, ip: 10.121.0.2/24 }], slice: adas }
+  - { id: l-gate-info, endpoints: [{ node: node-gate-info, port: eth0, ip: 10.123.0.2/24 }], slice: infotainment }
+"#;
+
+/// The control: the same slices with every gate open for the whole cycle.
+const ALL_OPEN: &str =
+    "      - { id: all, open: [adas, infotainment, default], duration_us: 100000 }\n";
+
+/// `rtt min/avg/max/mdev = a/b/c/d ms[, pipe n]` → `(avg, max)` in milliseconds.
+fn rtt_avg_max(ping: &str) -> (f64, f64) {
+    let stats = ping
+        .lines()
+        .find(|l| l.contains("min/avg/max"))
+        .and_then(|l| l.split('=').nth(1))
+        .and_then(|v| v.split(" ms").next())
+        .unwrap_or_else(|| panic!("no rtt summary in: {ping}"));
+    let v: Vec<f64> = stats
+        .trim()
+        .split('/')
+        .map(|x| x.parse().unwrap_or_else(|_| panic!("rtt `{x}` in: {ping}")))
+        .collect();
+    (v[1], v[2])
+}
+
+/// Deletes the device namespaces a test brought up, even if an assertion panics first.
+struct NodeNetnsGuard(Vec<String>);
+
+impl Drop for NodeNetnsGuard {
+    fn drop(&mut self) {
+        for ns in &self.0 {
+            let _ = std::process::Command::new("ip")
+                .args(["netns", "del", ns])
+                .output();
+        }
+    }
+}
+
+/// A closed gate holds a slice's frames until its window opens.
+///
+/// Only a kernel can say whether `taprio` installs on the uplink, whether the `clsact` classifier
+/// actually lands a slice's frames in its class (installed in the wrong order, it silently does
+/// not), and how long a frame waits. Each slice's device pings a far side across the uplink, so
+/// every request leaves through the schedule. Under the 100 ms cycle an `adas` request waits for
+/// a 10 ms window, up to 90 ms; an `infotainment` request waits out at most the 10 ms its gate is
+/// closed. The control, every gate open, shows the wait is the gate and not the host. Applying
+/// the control is also a re-apply with a changed schedule, which a campaign sweeping a bound
+/// `duration_us` does between trials.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN; run under sudo (see module docs)"]
+fn a_closed_gate_delays_a_slices_frames() {
+    let ns = format!("vxgates{}", std::process::id());
+    let created = std::process::Command::new("ip")
+        .args(["netns", "add", &ns])
+        .output()
+        .expect("iproute2 installed");
+    assert!(
+        created.status.success(),
+        "cannot create netns (run as root): {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let _guard = NetnsGuard(ns.clone());
+    let sh = Shell {
+        netns: Some(ns),
+        escalate: false,
+    };
+
+    let model = vxedge_core::model::load_yaml(SHAPED_WORKSPACE).expect("workspace loads");
+    let plan = GatewayPlan::from_model(&model).unwrap();
+    let shaping = plan.shaping.as_ref().expect("a gate schedule is planned");
+
+    // --- gateway: apply, observe, idempotency -------------------------------
+    apply(&sh, &plan).unwrap();
+    let obs = observe(&sh, &plan).unwrap();
+    assert!(
+        obs.fully_up(),
+        "gateway not fully up with a gate schedule (is `sch_taprio` available?): {obs:?}"
+    );
+    assert_eq!(
+        netlink::link_tx_queues(sh.netns.as_deref(), &plan.uplink).unwrap(),
+        Some(u32::from(shaping.num_classes())),
+        "one transmit queue per class"
+    );
+    apply(&sh, &plan).unwrap(); // double-apply converges
+    assert!(observe(&sh, &plan).unwrap().fully_up(), "re-apply");
+    let qdiscs = sh
+        .run("tc", &["qdisc", "show", "dev", &plan.uplink])
+        .unwrap();
+    assert!(qdiscs.contains("qdisc taprio 100: root"), "{qdiscs}");
+    assert_eq!(
+        qdiscs
+            .lines()
+            .filter(|l| l.starts_with("qdisc clsact"))
+            .count(),
+        1,
+        "{qdiscs}"
+    );
+    let filters = sh
+        .run("tc", &["filter", "show", "dev", &plan.uplink, "egress"])
+        .unwrap();
+    assert_eq!(
+        filters.matches("vlan_id").count(),
+        plan.slices.len(),
+        "re-apply stacked a classifier: {filters}"
+    );
+
+    // --- a device per slice, and a far side for each across the uplink -------
+    let runtime = std::env::temp_dir().join(format!("vxzones-gates-test-{}", std::process::id()));
+    std::fs::create_dir_all(&runtime).unwrap();
+    let nodes = plan_nodes_from_model(&model, &plan, std::path::Path::new("/")).unwrap();
+    let _nodes_guard = NodeNetnsGuard(nodes.iter().map(|n| n.runtime_name()).collect());
+    sh.run("ip", &["link", "set", &plan.uplink_peer, "up"])
+        .unwrap();
+    let mut far = std::collections::BTreeMap::new();
+    for node in &nodes {
+        node_up(&sh, node, &runtime, &runtime).unwrap();
+        let slice = plan
+            .slices
+            .iter()
+            .find(|s| Some(&s.id) == node.slice.as_ref())
+            .expect("the device's slice is planned");
+        let (addr, prefix) = sibling_address(node.ip_cidr.as_deref().expect("declared ip"));
+        let dev = format!("{}.{}", plan.uplink_peer, slice.vlan);
+        sh.run(
+            "ip",
+            &[
+                "link",
+                "add",
+                "link",
+                &plan.uplink_peer,
+                "name",
+                &dev,
+                "type",
+                "vlan",
+                "id",
+                &slice.vlan.to_string(),
+            ],
+        )
+        .unwrap();
+        sh.run(
+            "ip",
+            &["addr", "add", &format!("{addr}/{prefix}"), "dev", &dev],
+        )
+        .unwrap();
+        sh.run("ip", &["link", "set", &dev, "up"]).unwrap();
+        far.insert(slice.id.clone(), (node.runtime_name(), addr));
+    }
+    // 60 requests 23 ms apart sample every phase of the 100 ms cycle.
+    let ping = |slice: &str| -> (f64, f64) {
+        let (netns, addr) = &far[slice];
+        let out = sh
+            .run_host(
+                "ip",
+                &[
+                    "netns", "exec", netns, "ping", "-c", "60", "-i", "0.023", "-W", "1", addr,
+                ],
+            )
+            .unwrap();
+        assert!(out.contains(" 0% packet loss"), "{slice}: {out}");
+        rtt_avg_max(&out)
+    };
+
+    let (adas_avg, adas_max) = ping("adas");
+    let (info_avg, info_max) = ping("infotainment");
+    println!(
+        "gate schedule, 100 ms cycle: adas (open 10 ms) rtt avg {adas_avg:.1} ms max \
+         {adas_max:.1} ms; infotainment (open 90 ms) rtt avg {info_avg:.1} ms max {info_max:.1} ms"
+    );
+
+    // Each slice's counters come from its own `taprio` class, as the exporter reads them.
+    let classes = vxedge_core::gateway::stats::class_stats(&sh, &plan.uplink).unwrap();
+    for slice in &plan.slices {
+        let handle = plan.slice_class_handle(slice);
+        let class = classes
+            .iter()
+            .find(|c| c.handle == handle)
+            .unwrap_or_else(|| panic!("no class {handle} for {} in {classes:?}", slice.id));
+        assert!(
+            class.packets >= 60,
+            "{}'s requests did not pass through its class {handle}: {class:?}",
+            slice.id
+        );
+    }
+
+    // --- control: every gate open, applied over the running schedule ---------
+    let control = SHAPED_WORKSPACE
+        .replace(
+            "      - { id: adas, open: [adas], duration_us: 10000 }\n",
+            ALL_OPEN,
+        )
+        .replace(
+            "      - { id: rest, open: [infotainment, default], duration_us: 90000 }\n",
+            "",
+        );
+    let control_plan =
+        GatewayPlan::from_model(&vxedge_core::model::load_yaml(&control).unwrap()).unwrap();
+    apply(&sh, &control_plan).unwrap();
+    assert!(observe(&sh, &control_plan).unwrap().fully_up());
+    // The new schedule takes over at a cycle boundary.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let (open_avg, open_max) = ping("adas");
+    println!("control, every gate open: adas rtt avg {open_avg:.1} ms max {open_max:.1} ms");
+
+    assert!(
+        adas_max >= 50.0,
+        "adas frames should wait for their 10 ms window, up to 90 ms; max was {adas_max:.1} ms"
+    );
+    assert!(
+        info_max <= 20.0,
+        "infotainment's gate is closed 10 ms per cycle; max was {info_max:.1} ms"
+    );
+    assert!(
+        adas_avg > info_avg * 3.0,
+        "adas avg {adas_avg:.1} ms vs infotainment {info_avg:.1} ms"
+    );
+    assert!(
+        open_max <= 20.0,
+        "with every gate open nothing should wait; max was {open_max:.1} ms"
+    );
+
+    for node in &nodes {
+        node_down(&sh, node, &runtime).unwrap();
+    }
+    teardown(&sh, &control_plan).unwrap();
+    let gone = observe(&sh, &plan).unwrap();
+    assert!(!gone.bridge_present && !gone.uplink_present);
+    teardown(&sh, &plan).unwrap();
+    let _ = std::fs::remove_dir_all(&runtime);
+}

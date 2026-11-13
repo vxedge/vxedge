@@ -320,6 +320,35 @@ pub fn kernel_is_preempt_rt(realtime: Option<&str>, version: &str) -> bool {
     }
 }
 
+/// Whether the running kernel can run `taprio`, the qdisc that renders `network.shaping`'s gate
+/// schedule: its module is loaded, built in, or installed for this kernel, where `tc` loads it on
+/// first use. Read from files any user may read, so an unprivileged daemon answers it too.
+pub fn kernel_has_taprio() -> bool {
+    let release = RunningKernel::probe().release;
+    let modules = Path::new("/lib/modules").join(&release);
+    let read = |name: &str| std::fs::read_to_string(modules.join(name)).ok();
+    taprio_available(
+        Path::new("/sys/module/sch_taprio").exists(),
+        read("modules.builtin").as_deref(),
+        read("modules.dep").as_deref(),
+    )
+}
+
+/// [`kernel_has_taprio`]'s decision, from what the kernel exposes: `loaded` is
+/// `/sys/module/sch_taprio`, and the two lists are the kernel's `modules.builtin` and
+/// `modules.dep`, whose lines name a module by its path (`kernel/net/sched/sch_taprio.ko.zst:`).
+/// Pure.
+pub fn taprio_available(loaded: bool, builtin: Option<&str>, dep: Option<&str>) -> bool {
+    let lists = |list: Option<&str>| {
+        list.unwrap_or_default().lines().any(|l| {
+            let path = l.split(':').next().unwrap_or_default().trim();
+            let file = path.rsplit('/').next().unwrap_or_default();
+            file == "sch_taprio.ko" || file.starts_with("sch_taprio.ko.")
+        })
+    };
+    loaded || lists(builtin) || lists(dep)
+}
+
 /// The kernel this process runs on, as every run records it (`ARCHITECTURE.md` §13):
 /// `kernel.preempt_rt: preferred` runs on either kind, so the result has to say which.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1165,6 +1194,30 @@ mod tests {
 
     /// `/sys/kernel/realtime` decides when the kernel has it; older real-time kernels only say so
     /// in their version string.
+    #[test]
+    fn taprio_is_found_loaded_built_in_or_installed() {
+        let dep = "kernel/net/sched/sch_htb.ko.zst:\nkernel/net/sched/sch_taprio.ko.zst:\n";
+        assert!(taprio_available(false, None, Some(dep)));
+        assert!(taprio_available(
+            false,
+            Some("kernel/net/sched/sch_taprio.ko\n"),
+            None
+        ));
+        assert!(taprio_available(true, None, None));
+        assert!(taprio_available(
+            false,
+            None,
+            Some("kernel/net/sched/sch_taprio.ko: kernel/net/sched/sch_mqprio_lib.ko\n")
+        ));
+        // A neighbour's name is not taprio's.
+        assert!(!taprio_available(
+            false,
+            Some("kernel/net/sched/sch_mqprio.ko\n"),
+            Some("kernel/net/sched/sch_htb.ko.zst:\nkernel/net/sched/sch_taprio_x.ko:\n")
+        ));
+        assert!(!taprio_available(false, None, None));
+    }
+
     #[test]
     fn a_preempt_rt_kernel_is_recognised() {
         assert!(kernel_is_preempt_rt(Some("1\n"), ""));

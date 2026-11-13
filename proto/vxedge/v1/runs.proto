@@ -31,6 +31,10 @@ message Run {
   bool package_locked = 9;
   // The kernel the run came up on. Unset for a run recorded before kernels were.
   Kernel kernel = 10;
+  // How the gateway uplink shapes the slices (`ARCHITECTURE.md` §6.0.3): `gate-schedule` for
+  // `network.shaping`'s IEEE 802.1Qbv schedule, `htb` for the HTB tree. Empty for a run recorded
+  // before shaping was.
+  string shaping = 11;
 }
 
 // A `vxp/1` package as a result cites it.

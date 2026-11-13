@@ -12,8 +12,10 @@
 //!   network namespace, such as a measurement's reflector (`source` says which: `cgroup`,
 //!   `process` or `netns`). A node nothing on this host runs (an empty namespace, an attached
 //!   platform, a node that is down) has no series.
-//! - `vxedge_slice_*`: the counters of the slice's HTB class on the gateway uplink. The class is
-//!   the gateway's, so every vehicle whose links use the slice reports the same queue.
+//! - `vxedge_slice_*`: the counters of the slice's class on the gateway uplink: its HTB class, or
+//!   its `taprio` class under `network.shaping`, which has no rate and so serves no
+//!   `vxedge_slice_overlimits_total`. The class is the gateway's, so every vehicle whose links use
+//!   the slice reports the same queue.
 //! - `vxedge_process_*{process="vxedged"}` on `host`: the observer's own cost.
 
 use std::fmt::Write as _;
@@ -122,6 +124,16 @@ async fn answer(
     stream.shutdown().await
 }
 
+/// Served for an HTB class only: a `taprio` class has no rate to be over.
+const OVERLIMITS: &str = "vxedge_slice_overlimits_total";
+
+/// Whether a `vxedge_slice_*` family is served for a slice: all of them for an HTB class, all
+/// but the overlimits under a gate schedule, which has no rate to be over (`ARCHITECTURE.md`
+/// §6.0.3).
+fn slice_family_served(name: &str, gate_schedule: bool) -> bool {
+    !(gate_schedule && name == OVERLIMITS)
+}
+
 /// One metric family.
 struct Family {
     name: &'static str,
@@ -162,7 +174,7 @@ fn render(
             Family::new(
                 "vxedge_slice_sent_bytes_total",
                 "counter",
-                "Bytes the slice's HTB class sent on the uplink.",
+                "Bytes the slice's class sent on the uplink.",
             ),
             (|c: &vxedge_core::gateway::stats::ClassStats| c.bytes) as fn(&_) -> u64,
         ),
@@ -170,7 +182,7 @@ fn render(
             Family::new(
                 "vxedge_slice_sent_packets_total",
                 "counter",
-                "Packets the slice's HTB class sent on the uplink.",
+                "Packets the slice's class sent on the uplink.",
             ),
             |c| c.packets,
         ),
@@ -184,7 +196,7 @@ fn render(
         ),
         (
             Family::new(
-                "vxedge_slice_overlimits_total",
+                OVERLIMITS,
                 "counter",
                 "Times the slice's class was over its rate and held a packet back.",
             ),
@@ -248,7 +260,7 @@ fn render(
         let classes =
             vxedge_core::gateway::stats::class_stats(sh, &gateway.uplink).unwrap_or_default();
         for s in &gateway.slices {
-            let handle = format!("1:{:x}", s.class_minor);
+            let handle = gateway.slice_class_handle(s);
             let Some(c) = classes.iter().find(|c| c.handle == handle) else {
                 continue;
             };
@@ -262,6 +274,9 @@ fn render(
                 }
                 let labels = vec![("entity", format!("{}/slices/{}", vehicle.id, s.id))];
                 for (family, value) in &mut slice {
+                    if !slice_family_served(family.name, gateway.shaping.is_some()) {
+                        continue;
+                    }
                     family.samples.push((labels.clone(), value(c) as f64));
                 }
             }
@@ -367,6 +382,14 @@ mod tests {
         assert!(own.memory_bytes >= me.memory_bytes, "{own:?} {me:?}");
         assert!(own.cpu_seconds >= 0.0);
         assert_eq!(namespace_usage(Path::new("/nonexistent/ns")), None);
+    }
+
+    #[test]
+    fn a_gate_schedule_serves_no_overlimits() {
+        assert!(slice_family_served(OVERLIMITS, false));
+        assert!(!slice_family_served(OVERLIMITS, true));
+        assert!(slice_family_served("vxedge_slice_sent_bytes_total", true));
+        assert!(slice_family_served("vxedge_slice_backlog_packets", true));
     }
 
     #[test]
