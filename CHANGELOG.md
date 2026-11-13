@@ -25,6 +25,18 @@ All notable changes to this repo are documented here. Format follows
   part wins over, or an entry with no `target_ids`. An `env` value or `args` item that is not a string,
   and an unknown key under `run`, fail to parse, with the same reason.
 
+### Changed
+
+- The experiment's `baseline:` selects its baseline. A workspace may hold several `kind: baseline`
+  documents over one vehicle, and only the named one's parts run; before, every baseline document
+  was read whatever the experiment named, so a second one either merged in or made a component
+  ambiguous. A string parameter that binds `baseline` runs another per arm, so an A/B arm that
+  changes software is two baselines over one unchanged vehicle (`ARCHITECTURE.md` §6.0.3).
+  Validation requires every baseline to give every function a part, refuses an experiment that
+  names no baseline when there are several, and `Plan` builds each arm's bound documents, so an
+  unknown baseline is refused before a trial starts. `pkg lock` pins the references of every
+  baseline, so a pulled or offline package can run any arm.
+
 ## [0.28.0] - 2026-11-13
 
 `network.shaping` with `kind: gate-schedule`: an IEEE 802.1Qbv gate schedule on the gateway uplink,
