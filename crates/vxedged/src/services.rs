@@ -813,9 +813,9 @@ impl GatewaySvc {
                                 .await
                                 .map_err(|e| e.to_string())?;
 
-                            p.update(97, "attaching 5G core to vxbr0");
-                            let sh = shell.clone();
                             let bridge = plan.bridge.clone();
+                            p.update(97, &format!("attaching 5G core to {bridge}"));
+                            let sh = shell.clone();
                             let ue_subnets: Vec<String> =
                                 fp.sessions.iter().map(|s| s.ue_subnet.clone()).collect();
                             let slice_qos: Vec<gateway::provision::FiveGSliceQos> = fp
