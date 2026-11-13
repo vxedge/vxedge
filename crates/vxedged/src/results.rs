@@ -89,7 +89,9 @@ pub(crate) fn describe(path: &Path, digest: Option<String>) -> Option<ResultInfo
         digest: digest.or_else(|| sha256_file(path))?,
         path: path.display().to_string(),
         size_bytes,
-        archive: m["archive"].as_str().unwrap_or("vxarchive/1").to_string(),
+        // As the archive names it: empty for a `vxarchive/1` archive, which names none and which
+        // `Verdict` and `Compare` refuse (`vxedge_core::verdict::check_format`).
+        archive: s(&m["archive"]),
         experiment_id: s(&m["experiment_id"]),
         package_id: s(&package["id"]),
         package_version: s(&package["version"]),

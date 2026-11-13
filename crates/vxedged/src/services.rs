@@ -84,7 +84,7 @@ pub(crate) async fn resolve_manifest_yaml(mref: &ManifestRef) -> Result<String, 
 }
 
 /// The workspace directory a `ManifestRef` names, if it names one. An inline manifest has no
-/// directory and therefore no `.vxp`.
+/// directory and therefore no `vxp.yaml`.
 pub(crate) async fn resolve_manifest_dir(mref: &ManifestRef) -> Option<PathBuf> {
     resolve_manifest(Some(mref))
         .await
@@ -111,7 +111,7 @@ pub(crate) fn preflight_vxedge_version(dir: Option<&std::path::Path>) -> Result<
             "package `{}` requires vxedge `{range}`, and this daemon is {ours}. Nothing was \
              provisioned. Run it on a vxedge inside that range, or use a package version built \
              for this one.",
-            found.package.id()
+            found.package.id.as_str()
         ),
     ))
 }
@@ -320,8 +320,8 @@ pub(crate) struct ActiveRecord {
     pub identity_algorithm: Option<String>,
     pub run_id: Option<String>,
     pub started_unix_ms: Option<i64>,
-    /// The `vxp/1` package the run came from. `None` for a legacy descriptor, an inline manifest,
-    /// or a record written before packages were recorded.
+    /// The `vxp/1` package the run came from. `None` for an inline manifest, a directory without
+    /// a `vxp.yaml`, or a record written before packages were recorded.
     pub package: Option<RunPackage>,
     /// The kernel the run came up on. `None` in a record written before kernels were recorded.
     pub kernel: Option<RunningKernel>,
@@ -3173,8 +3173,8 @@ mod tests {
         assert!(stream.next().await.is_none(), "and then ends");
     }
 
-    /// What `up` writes into the run record reads back as written, and a run of a legacy
-    /// package records the kernel and nothing about a package.
+    /// What `up` writes into the run record reads back as written, and a run without a package
+    /// records the kernel and nothing about a package.
     #[test]
     fn provenance_round_trips_through_the_run_record() {
         let package = RunPackage {
@@ -3192,8 +3192,8 @@ mod tests {
             provenance_of(&record),
             (Some(package), Some(kernel.clone()))
         );
-        let legacy = serde_json::Value::Object(provenance(None, &kernel));
-        assert!(legacy.get("package_digest").is_none());
-        assert_eq!(provenance_of(&legacy), (None, Some(kernel)));
+        let bare = serde_json::Value::Object(provenance(None, &kernel));
+        assert!(bare.get("package_digest").is_none());
+        assert_eq!(provenance_of(&bare), (None, Some(kernel)));
     }
 }

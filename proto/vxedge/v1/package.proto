@@ -200,7 +200,8 @@ message PackageInfo {
   string id = 1;
   string version = 2;
   string digest = 3;
-  // `vxp/1`, or `legacy` for a `<name>.vxp` descriptor.
+  // `vxp/1`. (`legacy`, for a `<name>.vxp` descriptor, is no longer reported: such a descriptor
+  // is refused with `ERROR_REASON_WORKSPACE_INVALID`.)
   string schema = 4;
   // The experiment document the package runs.
   string entry = 5;

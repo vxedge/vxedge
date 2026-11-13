@@ -348,7 +348,7 @@ impl TrustPolicy {
 
     /// The check `up` and `Plan` make: under `require_signed`, the package with `digest` must have
     /// a verification record here from an allowed signer. `None` is a run with no package digest
-    /// (a legacy descriptor or an inline manifest), which cannot be verified.
+    /// (an inline manifest, or a bare directory of documents), which cannot be verified.
     pub fn check(&self, cache_dir: &Path, digest: Option<&str>) -> Result<(), String> {
         if !self.require_signed {
             return Ok(());
@@ -356,8 +356,8 @@ impl TrustPolicy {
         let Some(digest) = digest else {
             return Err(
                 "this host requires signed packages, and only a `vxp/1` package has a \
-                        package digest to verify; a legacy descriptor or an inline manifest \
-                        cannot run here"
+                        package digest to verify; an inline manifest or a directory without a \
+                        `vxp.yaml` cannot run here"
                     .to_string(),
             );
         };
@@ -469,7 +469,12 @@ mod tests {
         let cache = dir.join("cache");
         let unverified = policy.check(&cache, Some(DIGEST)).unwrap_err();
         assert!(unverified.contains("has not been verified"), "{unverified}");
-        assert!(policy.check(&cache, None).unwrap_err().contains("legacy"));
+        assert!(
+            policy
+                .check(&cache, None)
+                .unwrap_err()
+                .contains("only a `vxp/1` package")
+        );
         let record = |signer| VerificationRecord {
             package_digest: DIGEST.into(),
             method: Method::SigstoreKey,

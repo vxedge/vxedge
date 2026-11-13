@@ -109,8 +109,9 @@ pub(crate) fn set_host_trust(policy: vxedge_core::trust::TrustPolicy, cache_dir:
 
 /// The `vxp/1` package checks `up` makes, as a refusal: the lock (unless `unlocked`), whether the
 /// package packs, and the host trust policy. Shared by the preflight and the gateway's own `up`,
-/// which records the result. Legacy descriptors and inline manifests pass the package checks
-/// with nothing to record, and are refused only by a policy that requires signatures.
+/// which records the result. Inline manifests and directories without a `vxp.yaml` pass the
+/// package checks with nothing to record, and are refused only by a policy that requires
+/// signatures.
 pub(crate) fn package_run(
     dir: Option<&Path>,
     unlocked: bool,
@@ -199,7 +200,7 @@ pub(crate) async fn preflight(
     let mut pf = Preflight::default();
     let workspace = dir.unwrap_or_else(|| Path::new("."));
 
-    // The daemon reads a directory as joined documents, which carry no `.vxp`, so the
+    // The daemon reads a directory as joined documents, which carry no `vxp.yaml`, so the
     // descriptor's agreement with them is checked here, from the directory itself, with the
     // same function `experiment validate` uses. Document errors are not repeated: the model
     // build already reported them.
@@ -596,7 +597,7 @@ async fn host_requirements(dir: Option<&Path>) -> (Option<String>, Option<Vec<Ba
             .unwrap_or_default()
     };
     let unmet = requires
-        .check(found.package.id(), &host)
+        .check(found.package.id.as_str(), &host)
         .err()
         .map(|unmet| {
             unmet

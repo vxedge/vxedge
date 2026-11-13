@@ -132,7 +132,8 @@ enum ErrorReason {
   ERROR_REASON_LOCK_MISMATCH = 26;
   // This host's trust policy requires signed packages, and the package's digest has no
   // verification record from an allowed signer (`vxedge pkg verify`), or the run has no package
-  // digest to verify (a legacy descriptor or an inline manifest). Nothing was provisioned.
+  // digest to verify (an inline manifest, or a directory without a `vxp.yaml`). Nothing was
+  // provisioned.
   ERROR_REASON_SIGNATURE_INVALID = 27;
   // An experiment's typed intent names a parameter wrongly: a type, unit, bound or `binds` path
   // that does not hold, two parameters binding one field, or an arm, sweep or profile that sets

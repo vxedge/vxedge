@@ -32,7 +32,9 @@ message ResultInfo {
   // Where it is on the daemon's host.
   string path = 2;
   uint64 size_bytes = 3;
-  // `vxarchive/2`, or `vxarchive/1` for an archive that names none.
+  // The format the archive's `metadata.json` names: `vxarchive/2`. Empty for an archive that names
+  // none, a `vxarchive/1` archive, which is listed and fetched but no longer read: `Verdict` and
+  // `Compare` refuse it.
   string archive = 4;
   string experiment_id = 5;
   // The package it ran, when its metadata names one.

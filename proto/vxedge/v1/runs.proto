@@ -23,8 +23,8 @@ message Run {
   // no workspace directory (the hash of that document). Identities under different algorithms
   // are not comparable.
   string workspace_identity_algorithm = 7;
-  // The `vxp/1` package the run came from (`ARCHITECTURE.md` §13). Unset for a legacy descriptor
-  // or an inline manifest, and for a run recorded before packages were.
+  // The `vxp/1` package the run came from (`ARCHITECTURE.md` §13). Unset for an inline manifest
+  // or a directory without a `vxp.yaml`, and for a run recorded before packages were.
   PackageRef package = 8;
   // Whether `up` checked the package's lock: false only for `up --unlocked`. Meaningful only
   // with `package`.

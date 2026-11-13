@@ -58,12 +58,6 @@ pub enum PkgError {
     PathTooLong { path: String },
     #[error("`{path}` is {size} bytes, more than a packed entry can hold")]
     TooLarge { path: String, size: u64 },
-    #[error(
-        "{} is a legacy descriptor, which has no lock and no packed form. Migrate it: rename it \
-         to `vxp.yaml` and add `schema: vxp/1`, a `namespace/name` id and an `entry`.",
-        .path.display()
-    )]
-    Legacy { path: PathBuf },
     #[error("the workspace does not build: {0}")]
     Workspace(String),
     #[error("`{LOCK_FILE}`: {0}")]
@@ -246,7 +240,7 @@ fn check_path(path: &str) -> Result<(), PkgError> {
 
 /// The packed bytes of the package at `root`.
 pub fn pack(root: &Path) -> Result<Vec<u8>, PkgError> {
-    require_v1(root)?;
+    crate::package::discover(root)?;
     pack_entries(&entries(root)?)
 }
 
@@ -256,14 +250,8 @@ pub fn package_digest(root: &Path) -> Result<String, PkgError> {
     Ok(sha256(&pack(root)?))
 }
 
-fn require_v1(root: &Path) -> Result<PackageDoc, PkgError> {
-    let found = crate::package::discover(root)?;
-    match found.package {
-        PackageDoc::Legacy(_) => Err(PkgError::Legacy {
-            path: found.descriptor_path,
-        }),
-        doc => Ok(doc),
-    }
+fn descriptor(root: &Path) -> Result<PackageDoc, PkgError> {
+    Ok(crate::package::discover(root)?.package)
 }
 
 fn field_str<'a>(h: &'a [u8], entry: &str) -> Result<&'a str, PkgError> {
@@ -501,9 +489,7 @@ impl Lock {
 /// The lock the package at `root` has now, written by vxedge `locked_with`. `vendored` is carried
 /// over from the existing lock, which only `pkg vendor` writes.
 pub fn lock(root: &Path, locked_with: &str) -> Result<Lock, PkgError> {
-    let PackageDoc::V1(descriptor) = require_v1(root)? else {
-        unreachable!("require_v1 refuses legacy descriptors")
-    };
+    let descriptor = descriptor(root)?;
     let files = entries(root)?
         .into_iter()
         .filter(|(path, _)| path != LOCK_FILE)
@@ -620,9 +606,7 @@ fn drift_from_written(root: &Path, current: &Lock) -> Result<Vec<String>, PkgErr
 
 /// The packed file name: `<name>-<version>.vxp`.
 pub fn packed_file_name(root: &Path) -> Result<String, PkgError> {
-    let PackageDoc::V1(d) = require_v1(root)? else {
-        unreachable!("require_v1 refuses legacy descriptors")
-    };
+    let d = descriptor(root)?;
     Ok(format!("{}-{}.vxp", d.id.name(), d.version))
 }
 
@@ -666,17 +650,14 @@ pub enum RunRefusal {
     Package(#[from] PkgError),
 }
 
-/// The package a run from `root` records, after the checks `up` makes on it. `None` for a legacy
-/// descriptor, or for none at all, which record no package digest and have no lock. Unless
+/// The package a run from `root` records, after the checks `up` makes on it. `None` without a
+/// readable `vxp.yaml`, which the descriptor check reports. Unless
 /// `unlocked`, a lock that does not match is refused, naming each difference. Locked or not, a
 /// package that cannot be packed is refused with `pkg pack`'s error, since its run could not
 /// record a digest.
 pub fn run_package(root: &Path, unlocked: bool) -> Result<Option<RunPackage>, RunRefusal> {
-    let Ok(found) = crate::package::discover(root) else {
+    if crate::package::discover(root).is_err() {
         // Reported by the descriptor check, which runs first.
-        return Ok(None);
-    };
-    if !matches!(found.package, PackageDoc::V1(_)) {
         return Ok(None);
     }
     let digest = package_digest(root)?;
@@ -806,9 +787,7 @@ pub fn vendor(
     locked_with: &str,
     tracked: Option<&[String]>,
 ) -> Result<VendorReport, PkgError> {
-    let PackageDoc::V1(descriptor) = require_v1(root)? else {
-        unreachable!("require_v1 refuses legacy descriptors")
-    };
+    let descriptor = descriptor(root)?;
     let canonical = |p: &Path| p.canonicalize().map_err(io(p));
     let (root_c, source_c) = (canonical(root)?, canonical(source)?);
     if source_c.starts_with(&root_c) {
@@ -1332,13 +1311,19 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    /// A legacy `<name>.vxp` descriptor is no longer read, so it has no packed form.
     #[test]
     fn a_legacy_descriptor_has_no_packed_form() {
         let root = workspace(
             "legacy",
             &[("id-test.vxp", "id: id-test\n"), ("main.yaml", MAIN)],
         );
-        assert!(matches!(pack(&root), Err(PkgError::Legacy { .. })));
+        assert!(matches!(
+            pack(&root),
+            Err(PkgError::Discover(
+                crate::package::DiscoverError::LegacyDescriptor { .. }
+            ))
+        ));
         fs::remove_dir_all(&root).ok();
     }
 
@@ -1644,20 +1629,6 @@ mod tests {
             }
         }
         fs::remove_dir_all(root.parent().unwrap()).ok();
-    }
-
-    /// A legacy descriptor runs as before: no lock check, and no package digest to record.
-    #[test]
-    fn a_legacy_package_records_no_package() {
-        let root = workspace(
-            "run-legacy",
-            &[
-                ("demo.vxp", "id: demo\nversion: 0.1.0\n"),
-                ("main.yaml", MAIN),
-            ],
-        );
-        assert_eq!(run_package(&root, false).unwrap(), None);
-        fs::remove_dir_all(&root).ok();
     }
 
     /// A source folder like a reference vehicle: documents, a script and a build output.

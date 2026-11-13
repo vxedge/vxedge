@@ -3,10 +3,9 @@
 //!
 //! Each trial gives each metric one value (decision X-24): the metric's series on its entity
 //! inside the trial's measure phase, or the whole archive when it records no phases, reduced as
-//! the metric's `reduce` says (the last sample, by default). A criterion's aggregates then run across the trials it selects. A `vxarchive/1` archive names
-//! no entities, so its series is matched by name and labels, and refused as ambiguous when more
-//! than one scrape target served it. It counts failed scrapes without placing them in time, so
-//! they are noted on the value instead of making it incomplete.
+//! the metric's `reduce` says (the last sample, by default). A criterion's aggregates then run
+//! across the trials it selects. Only `vxarchive/2` archives are read: a `vxarchive/1` archive is
+//! refused with a pointer to the republished sets.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read as _;
@@ -21,10 +20,8 @@ use crate::intent::{self, Intent, Judgement, Metric, Outcome, SampleSource, Samp
 #[derive(Debug, Clone, PartialEq)]
 pub struct Sample {
     pub ts_ns: i64,
-    /// The entity it is about; `None` in a `vxarchive/1` archive.
+    /// The entity it is about; `None` when the record names none.
     pub entity: Option<String>,
-    /// The scrape target that served it, in a `vxarchive/1` archive.
-    pub target: Option<String>,
     pub metric: String,
     pub labels: BTreeMap<String, String>,
     pub value: f64,
@@ -42,8 +39,6 @@ pub struct Gap {
 /// What a verdict reads from one archive.
 #[derive(Debug, Clone, Default)]
 pub struct Records {
-    /// `vxarchive/2`, or `vxarchive/1` for an archive that names none.
-    pub archive: String,
     pub metadata: serde_json::Value,
     pub samples: Vec<Sample>,
     pub gaps: Vec<Gap>,
@@ -63,7 +58,8 @@ pub struct Phase {
     pub window: Option<String>,
 }
 
-const V1_SAMPLES: &str = "ingest/samples.jsonl";
+/// The one archive format this build reads.
+pub const ARCHIVE_FORMAT: &str = "vxarchive/2";
 const V2_SAMPLES: &str = "metrics/samples.jsonl.zst";
 const V2_PHASES: &str = "phases.jsonl";
 /// Where a check step's output is archived: the log member of its entity `checks/<step>`.
@@ -81,50 +77,30 @@ fn member(zip: &mut zip::ZipArchive<std::fs::File>, name: &str) -> Result<Option
     Ok(Some(bytes))
 }
 
-/// The labels of a `vxarchive/1` sample, written as `{key="value",…}`.
-pub fn parse_v1_labels(text: &str) -> BTreeMap<String, String> {
-    let body = text.trim().trim_start_matches('{').trim_end_matches('}');
-    let mut out = BTreeMap::new();
-    let mut chars = body.chars().peekable();
-    loop {
-        let key: String = chars
-            .by_ref()
-            .skip_while(|c| *c == ',' || c.is_whitespace())
-            .take_while(|c| *c != '=')
-            .collect();
-        if key.is_empty() {
-            break;
-        }
-        if chars.next() != Some('"') {
-            break;
-        }
-        let mut value = String::new();
-        while let Some(c) = chars.next() {
-            match c {
-                '\\' => {
-                    if let Some(next) = chars.next() {
-                        value.push(match next {
-                            'n' => '\n',
-                            other => other,
-                        });
-                    }
-                }
-                '"' => break,
-                other => value.push(other),
-            }
-        }
-        out.insert(key.trim().to_string(), value);
-    }
-    out
-}
-
 fn lines(bytes: &[u8]) -> impl Iterator<Item = serde_json::Value> + '_ {
     bytes
         .split(|b| *b == b'\n')
         .filter_map(|l| serde_json::from_slice::<serde_json::Value>(l).ok())
 }
 
-/// Read the records of the archive at `path`, `vxarchive/1` or `vxarchive/2`.
+/// Refuse an archive that is not `vxarchive/2`, naming what it is and where the current sets are.
+pub fn check_format(path: &Path, metadata: &serde_json::Value) -> Result<(), String> {
+    match metadata["archive"].as_str() {
+        Some(ARCHIVE_FORMAT) => Ok(()),
+        None | Some("vxarchive/1") => Err(format!(
+            "`{}` is a vxarchive/1 archive, which is no longer read; use the {ARCHIVE_FORMAT} \
+             sets (Zenodo 2026-11-v2, doi:10.5281/zenodo.24192950), or collect the run again",
+            path.display()
+        )),
+        Some(other) => Err(format!(
+            "`{}` is a `{other}` archive; this vxedge reads {ARCHIVE_FORMAT}",
+            path.display()
+        )),
+    }
+}
+
+/// Read the records of the `vxarchive/2` archive at `path`. A `vxarchive/1` archive (one whose
+/// `metadata.json` names no format) is refused: it is no longer read.
 pub fn read_archive(path: &Path) -> Result<Records, String> {
     let file =
         std::fs::File::open(path).map_err(|e| format!("cannot open `{}`: {e}", path.display()))?;
@@ -133,38 +109,11 @@ pub fn read_archive(path: &Path) -> Result<Records, String> {
     let metadata: serde_json::Value = member(&mut zip, "metadata.json")?
         .and_then(|b| serde_json::from_slice(&b).ok())
         .ok_or_else(|| format!("`{}` has no readable `metadata.json`", path.display()))?;
-    let archive = metadata["archive"]
-        .as_str()
-        .unwrap_or("vxarchive/1")
-        .to_string();
+    check_format(path, &metadata)?;
     let mut records = Records {
-        archive: archive.clone(),
         metadata,
         ..Records::default()
     };
-    if archive == "vxarchive/1" {
-        for v in member(&mut zip, V1_SAMPLES)?
-            .iter()
-            .flat_map(|b| lines(b).collect::<Vec<_>>())
-        {
-            let (Some(metric), Some(value), Some(ts)) = (
-                v["metric"].as_str(),
-                v["value"].as_f64(),
-                v["ts_unix_ms"].as_i64(),
-            ) else {
-                continue;
-            };
-            records.samples.push(Sample {
-                ts_ns: ts.saturating_mul(1_000_000),
-                entity: None,
-                target: v["target"].as_str().map(String::from),
-                metric: metric.to_string(),
-                labels: parse_v1_labels(v["labels"].as_str().unwrap_or("")),
-                value,
-            });
-        }
-        return Ok(records);
-    }
     if let Some(compressed) = member(&mut zip, V2_SAMPLES)? {
         let bytes = zstd::decode_all(compressed.as_slice())
             .map_err(|e| format!("cannot decompress `{V2_SAMPLES}`: {e}"))?;
@@ -189,7 +138,6 @@ pub fn read_archive(path: &Path) -> Result<Records, String> {
                     records.samples.push(Sample {
                         ts_ns: ts,
                         entity: v["entity"].as_str().map(String::from),
-                        target: None,
                         metric: metric.to_string(),
                         labels,
                         value,
@@ -301,31 +249,17 @@ fn measure_window(records: &Records, window: Option<&str>) -> Result<(i64, i64),
 
 fn series_value(records: &Records, m: &Metric, series: &str, window: (i64, i64)) -> TrialValue {
     let (from, to) = window;
-    let v1 = records.archive == "vxarchive/1";
     let matching: Vec<&Sample> = records
         .samples
         .iter()
         .filter(|s| {
             s.metric == series
-                && (v1 || s.entity.as_deref() == Some(m.entity.as_str()))
+                && s.entity.as_deref() == Some(m.entity.as_str())
                 && m.labels.iter().all(|(k, v)| s.labels.get(k) == Some(v))
                 && s.ts_ns >= from
                 && s.ts_ns < to
         })
         .collect();
-    if v1 {
-        let targets: BTreeSet<&str> = matching
-            .iter()
-            .filter_map(|s| s.target.as_deref())
-            .collect();
-        if targets.len() > 1 {
-            return TrialValue::none(format!(
-                "`{series}` is served by {} scrape targets, and a vxarchive/1 archive names no \
-                 entities",
-                targets.len()
-            ));
-        }
-    }
     if matching.is_empty() {
         return TrialValue::none(format!(
             "no `{series}` sample on `{}` while the trial measured",
@@ -336,25 +270,6 @@ fn series_value(records: &Records, m: &Metric, series: &str, window: (i64, i64))
         Ok(v) => v,
         Err(why) => return TrialValue::none(why),
     };
-    if v1 {
-        // A vxarchive/1 archive counts its failed scrapes but cannot place them in time, and
-        // its runs scraped on after the probe had stopped, so a count is not a gap in the series.
-        let failed = records.metadata["ingest"]["scrapes_failed"]
-            .as_u64()
-            .unwrap_or(0);
-        return TrialValue {
-            value: Some(value),
-            complete: true,
-            why: (failed > 0)
-                .then(|| {
-                    format!(
-                        "the run counted {failed} failed scrapes, which a vxarchive/1 archive \
-                         cannot place in time"
-                    )
-                })
-                .or(note),
-        };
-    }
     let complete = !records.gaps.iter().any(|g| {
         g.entity == m.entity
             && g.metric.as_deref().is_none_or(|x| x == series)
@@ -622,7 +537,6 @@ pub fn check_samples(records: &Records, checks: &crate::checks::Checks) -> Vec<S
                     out.push(Sample {
                         ts_ns: times.get(i).copied().unwrap_or_default(),
                         entity: Some(crate::checks::entity(id)),
-                        target: None,
                         metric: d.series.clone(),
                         labels,
                         value,
@@ -1285,84 +1199,37 @@ criteria:
         );
     }
 
+    /// A `vxarchive/1` archive, named or not, is refused with a pointer to the current sets, and
+    /// a format this build does not know is named.
     #[test]
-    fn v1_labels_parse_as_the_exporter_writes_them() {
-        assert_eq!(
-            parse_v1_labels(r#"{quantile="0.99",path="a\"b"}"#),
-            BTreeMap::from([
-                ("quantile".into(), "0.99".into()),
-                ("path".into(), "a\"b".into())
-            ])
-        );
-        assert!(parse_v1_labels("").is_empty());
-    }
-
-    /// A v1 archive: the series' last sample of the whole run, matched by labels; a failed scrape
-    /// is noted, as it cannot be placed in time; a second target makes it ambiguous.
-    #[test]
-    fn a_v1_trial_value_is_the_last_sample_of_the_run() {
+    fn a_vxarchive_1_archive_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let line = |ts: i64, target: &str, q: &str, v: f64| {
-            format!(
-                "{{\"ts_unix_ms\":{ts},\"target\":\"{target}\",\"metric\":\"vxprobe_rtt_seconds\",\"labels\":\"{{quantile=\\\"{q}\\\"}}\",\"value\":{v}}}\n"
-            )
-        };
-        let samples = [
-            line(1, "a:9801", "0.99", 0.5),
-            line(2, "a:9801", "0.99", 0.7),
-            line(2, "a:9801", "0.5", 0.1),
-        ]
-        .concat();
         let path = dir.path().join("rep1-load0.zip");
+        for metadata in [
+            br#"{"ingest":{"scrapes_failed":0}}"#.to_vec(),
+            br#"{"archive":"vxarchive/1"}"#.to_vec(),
+        ] {
+            zip_with(
+                &path,
+                &[
+                    ("metadata.json", metadata),
+                    ("ingest/samples.jsonl", b"{}\n".to_vec()),
+                ],
+            );
+            let err = read_archive(&path).unwrap_err();
+            assert!(
+                err.contains("vxarchive/1 archive, which is no longer read")
+                    && err.contains("vxarchive/2")
+                    && err.contains("Zenodo 2026-11-v2"),
+                "{err}"
+            );
+        }
         zip_with(
             &path,
-            &[
-                (
-                    "metadata.json",
-                    br#"{"ingest":{"scrapes_failed":0}}"#.to_vec(),
-                ),
-                (V1_SAMPLES, samples.clone().into_bytes()),
-            ],
+            &[("metadata.json", br#"{"archive":"vxarchive/3"}"#.to_vec())],
         );
-        let p99 = metric(
-            "{ id: p99, kind: gauge, unit: s, entity: measurements/ctl, series: vxprobe_rtt_seconds, labels: { quantile: \"0.99\" } }",
-        );
-        let r = read_archive(&path).unwrap();
-        assert_eq!(r.archive, "vxarchive/1");
-        let v = &values(&r, std::slice::from_ref(&p99))["p99"];
-        assert_eq!((v.value, v.complete), (Some(0.7), true));
-
-        zip_with(
-            &path,
-            &[
-                (
-                    "metadata.json",
-                    br#"{"ingest":{"scrapes_failed":1}}"#.to_vec(),
-                ),
-                (V1_SAMPLES, samples.clone().into_bytes()),
-            ],
-        );
-        let v = &values(&read_archive(&path).unwrap(), std::slice::from_ref(&p99))["p99"];
-        assert_eq!((v.value, v.complete), (Some(0.7), true));
-        assert!(
-            v.why.as_deref().unwrap().contains("1 failed scrapes"),
-            "{v:?}"
-        );
-
-        let two = samples + &line(3, "b:9801", "0.99", 0.9);
-        zip_with(
-            &path,
-            &[
-                ("metadata.json", b"{}".to_vec()),
-                (V1_SAMPLES, two.into_bytes()),
-            ],
-        );
-        let v = &values(&read_archive(&path).unwrap(), std::slice::from_ref(&p99))["p99"];
-        assert_eq!(v.value, None);
-        assert!(
-            v.why.as_deref().unwrap().contains("2 scrape targets"),
-            "{v:?}"
-        );
+        let err = read_archive(&path).unwrap_err();
+        assert!(err.contains("`vxarchive/3` archive"), "{err}");
     }
 
     /// A v2 archive: the last sample on the metric's entity inside the measure phase; a gap there
@@ -1459,7 +1326,6 @@ criteria:
         let s = |ts_s: f64, metric: &str, source: &str, v: f64| Sample {
             ts_ns: (ts_s * 1e9) as i64,
             entity: Some(node.into()),
-            target: None,
             metric: metric.into(),
             labels: BTreeMap::from([("source".into(), source.into())]),
             value: v,
@@ -1467,7 +1333,6 @@ criteria:
         let cpu = "vxedge_node_cpu_seconds_total";
         let mem = "vxedge_node_memory_bytes";
         let records = |samples: Vec<Sample>| Records {
-            archive: "vxarchive/2".into(),
             samples,
             phases: vec![
                 Phase {

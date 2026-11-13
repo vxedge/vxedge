@@ -10,7 +10,7 @@
 //! stubs server-side, not merely unwired.
 //!
 //! `experiment` verbs are **addressed by the working directory**, not by
-//! `--manifest`: they resolve the single `.vxp` where they were run, the way
+//! `--manifest`: they resolve the `vxp.yaml` where they were run, the way
 //! `terraform apply` resolves the configuration in the current directory.
 //! `--chdir` is the escape hatch for scripts.
 
@@ -325,7 +325,7 @@ enum TelemetryCmd {
 /// file generation, not a daemon call, so it does not fit `ManifestLifecycleCmd`.
 ///
 /// Every verb except `new` is **addressed by the working directory** — no `--manifest`, no
-/// name. `vxedge experiment up` resolves the single `.vxp` where it was run, exactly as
+/// name. `vxedge experiment up` resolves the `vxp.yaml` where it was run, exactly as
 /// `terraform apply` resolves the configuration in the current directory. Use `--chdir` to
 /// run from elsewhere.
 #[derive(Subcommand, Debug)]

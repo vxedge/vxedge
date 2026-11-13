@@ -422,10 +422,10 @@ pub(crate) fn inspect(
         .map(|e| e.id.clone())
         .unwrap_or_default();
     if let Some(p) = &ws.package {
-        info.id = p.id().to_string();
-        info.version = p.version().unwrap_or_default();
-        info.schema = p.schema().unwrap_or("legacy").to_string();
-        info.entry = p.entry().unwrap_or_default().to_string();
+        info.id = p.id.as_str().to_string();
+        info.version = p.version.to_string();
+        info.schema = vxedge_core::package::SCHEMA_V1.to_string();
+        info.entry = p.entry.clone();
         let r = p.host_requires();
         info.requires = Some(PackageRequirements {
             gpu: r.gpu.unwrap_or_else(|| "none".into()),

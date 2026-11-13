@@ -13,6 +13,36 @@ All notable changes to this repo are documented here. Format follows
   run, and a timed criterion then reads that load as the arm's effect (exp-003's H4 flipped this
   way). The campaign still starts.
 
+### Changed
+
+- **`TelemetryService.Collect` no longer passes `--archive-version` to vxtelemetry.** vxtelemetry
+  writes `vxarchive/2` only and drops the option (vxedge/vxtelemetry#46), so this vxedge needs that
+  vxtelemetry: an older one still defaults to `vxarchive/1`, which this vxedge cannot judge.
+  `CollectRequest.archive_version` stays on the wire and is ignored; no value is refused. vxAPI
+  stays `vxedge.v1`.
+
+### Removed
+
+- **BREAKING: `vxarchive/1` archives are no longer read (decision X-30).** The frozen sets are
+  republished as `vxarchive/2` (Zenodo 2026-11-v2, doi:10.5281/zenodo.24192950), so the v1 reader
+  is gone: `ingest/samples.jsonl`, its Prometheus-text labels, its matching by scrape target and
+  its `scrapes_failed` note. `ResultService.Verdict` and `Compare`, `vxedge results verdict`, and
+  the verdict a campaign records refuse an archive whose `metadata.json` names no format or
+  `vxarchive/1`: "`<path>` is a vxarchive/1 archive, which is no longer read; use the vxarchive/2
+  sets (Zenodo 2026-11-v2, doi:10.5281/zenodo.24192950), or collect the run again".
+  `ResultService.List` still lists and `Fetch` still serves such an archive, with
+  `ResultInfo.archive` empty instead of a guessed `vxarchive/1`.
+- **BREAKING: legacy `<name>.vxp` descriptors are no longer read (decision X-30).** A workspace is
+  a `vxp/1` package: `vxp.yaml` with `schema: vxp/1`, beside its `vxp.lock`. A directory that holds
+  a YAML `<name>.vxp` and no `vxp.yaml` is refused by every verb that reads it (`experiment` and
+  `pkg` verbs, `Plan`, `up`, `PackageService.Inspect`) with `ERROR_REASON_WORKSPACE_INVALID` and
+  the steps to migrate: rename it to `vxp.yaml`, add `schema: vxp/1`, make `id` `namespace/name`,
+  give it a `version` and an `entry`, and run `vxedge pkg lock`. `PackageInfo.schema` is always
+  `vxp/1`, never `legacy`. Rust callers: `PackageDoc` is now the `vxp/1` descriptor struct (the
+  `Legacy` variant, `LegacyDescriptor`, `DiscoverError::SchemaInLegacyFile` and `Ambiguous`,
+  `PkgError::Legacy` and `WorkspaceValidationError::PackageIdMismatch` are gone), and
+  `verdict::parse_v1_labels`, `Sample::target` and `Records::archive` are gone.
+
 ## [0.25.0] - 2026-11-13
 
 Check samples, metric reductions and QEMU options. A check step's output can carry the numbers a

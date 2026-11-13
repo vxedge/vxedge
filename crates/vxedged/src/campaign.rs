@@ -296,10 +296,8 @@ impl CampaignService for CampaignSvc {
             let (telemetry_key, ingest_dir) = telemetry_service(&model, &runtime_dir)
                 .expect("plan_of refuses a campaign without a telemetry service");
             let digest = match &ws.package {
-                Some(vxedge_core::package::PackageDoc::V1(_)) => {
-                    vxedge_core::pkg::package_digest(&r).unwrap_or_default()
-                }
-                _ => String::new(),
+                Some(_) => vxedge_core::pkg::package_digest(&r).unwrap_or_default(),
+                None => String::new(),
             };
             Ok((
                 run::Campaign {
