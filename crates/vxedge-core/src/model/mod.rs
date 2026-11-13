@@ -629,6 +629,53 @@ pub enum DataPlaneKind {
     Ovs,
 }
 
+/// `network.shaping` (`ARCHITECTURE.md` §6.0.3): an IEEE 802.1Qbv gate schedule on the gateway
+/// uplink in place of the HTB tree. Absent means the HTB tree, so every experiment that predates
+/// the block plans exactly as before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shaping {
+    pub kind: ShapingKind,
+    /// One cycle, in order. The cycle is their sum.
+    pub windows: Vec<ShapingWindow>,
+}
+
+/// The schedule's kind. It names the schedule, not the qdisc that renders it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShapingKind {
+    GateSchedule,
+}
+
+impl ShapingKind {
+    /// As a manifest and a run record write it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ShapingKind::GateSchedule => "gate-schedule",
+        }
+    }
+}
+
+/// What a run records as its shaping when the experiment declares none: the HTB tree.
+pub const HTB_SHAPING: &str = "htb";
+
+/// The traffic class for frames that match no slice, as `open` names it.
+pub const DEFAULT_CLASS: &str = "default";
+
+/// An 802.1Q port has 8 traffic classes, and `default` takes one.
+pub const MAX_SHAPED_SLICES: usize = 7;
+
+/// The longest window the kernel can time: `taprio` holds an interval in 32-bit nanoseconds.
+pub const MAX_WINDOW_US: u64 = u32::MAX as u64 / 1000;
+
+/// One window of the cycle: the classes it opens, for how long.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShapingWindow {
+    pub id: String,
+    /// Slice ids, and [`DEFAULT_CLASS`].
+    pub open: Vec<String>,
+    /// Positive, and at most [`MAX_WINDOW_US`].
+    pub duration_us: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SNssai {
     pub sst: u8,
@@ -660,6 +707,8 @@ pub struct Experiment {
     /// `DataPlaneKind::KernelBridge`, so every existing experiment (none of which declares this
     /// field) keeps planning and provisioning byte-for-byte as before.
     pub data_plane: DataPlaneKind,
+    /// The uplink's gate schedule (`network.shaping`). `None` keeps the HTB tree.
+    pub shaping: Option<Shaping>,
     pub traffic: Vec<TrafficProfile>,
     /// What the experiment measures, by node id (`crate::measurements`).
     pub measurements: Vec<crate::measurements::Measurement>,
@@ -884,6 +933,49 @@ pub enum InvariantError {
         link: String,
         slice: String,
     },
+    #[error(
+        "`network.shaping`: no window opens class `{class}`, so its frames could never be sent. \
+         Add it to a window's `open`."
+    )]
+    ShapingClassNeverOpen { class: String },
+    #[error(
+        "`network.shaping`: window `{window}` opens `{slice}`, which is neither a slice of this \
+         experiment nor `default`"
+    )]
+    ShapingUnknownClass { window: String, slice: String },
+    #[error(
+        "`network.shaping`: window `{window}` opens `{slice}`, a `mode: s-nssai` slice. An \
+         s-nssai slice carries no VLAN, so no uplink frame can be classed into it. Open vlan \
+         slices and `default` only."
+    )]
+    ShapingSnssaiSlice { window: String, slice: String },
+    #[error(
+        "slice `{slice}` shares its id with the `default` class of `network.shaping`, so a \
+         window's `open: [default]` could name either. Rename the slice."
+    )]
+    SliceNamedDefault { slice: String },
+    #[error("`network.shaping`: window id `{id}` is declared more than once")]
+    DuplicateShapingWindow { id: String },
+    #[error(
+        "`network.shaping` takes at most {max} vlan slices, and this experiment declares {count}: \
+         an 802.1Q port has 8 traffic classes, and `default` takes one"
+    )]
+    TooManyShapedSlices { count: usize, max: usize },
+    #[error(
+        "slice `{slice}` declares `qos` beside `network.shaping`. `qos` sets the HTB tree's \
+         rates, which a gate schedule replaces, so it is refused rather than ignored. Drop it."
+    )]
+    QosBesideShaping { slice: String },
+    #[error(
+        "`network.defaults.bandwidth` is set beside `network.shaping`. It is the HTB tree's root \
+         rate, which a gate schedule replaces, so it is refused rather than ignored. Drop it."
+    )]
+    BandwidthBesideShaping,
+    #[error(
+        "`network.shaping` with `network.data_plane: ovs` has not been tested. Use the default \
+         `kernel-bridge` data plane."
+    )]
+    ShapingOnOvs,
 }
 
 impl Experiment {
@@ -993,6 +1085,10 @@ impl Experiment {
                     });
                 }
             }
+        }
+
+        if let Some(shaping) = &self.shaping {
+            errors.extend(self.shaping_problems(shaping));
         }
 
         // Device ids stay unique across the *whole experiment*, not merely per entity: parts
@@ -1137,6 +1233,68 @@ impl Experiment {
             }
         }
 
+        errors
+    }
+
+    /// What `network.shaping` refuses (`ARCHITECTURE.md` §6.0.3). The classes are the vlan slices
+    /// and `default`; every one must be opened by some window.
+    fn shaping_problems(&self, shaping: &Shaping) -> Vec<InvariantError> {
+        use InvariantError as E;
+        let mut errors = Vec::new();
+        if self.data_plane == DataPlaneKind::Ovs {
+            errors.push(E::ShapingOnOvs);
+        }
+        if self.uplink_bandwidth_bps.is_some() {
+            errors.push(E::BandwidthBesideShaping);
+        }
+        for s in self.slices.iter().filter(|s| s.qos.is_some()) {
+            errors.push(E::QosBesideShaping {
+                slice: s.id.clone(),
+            });
+        }
+        let vlan_slices: Vec<&str> = self
+            .slices
+            .iter()
+            .filter(|s| s.mode == SliceMode::Vlan)
+            .map(|s| s.id.as_str())
+            .collect();
+        if vlan_slices.contains(&DEFAULT_CLASS) {
+            errors.push(E::SliceNamedDefault {
+                slice: DEFAULT_CLASS.to_string(),
+            });
+        }
+        if vlan_slices.len() > MAX_SHAPED_SLICES {
+            errors.push(E::TooManyShapedSlices {
+                count: vlan_slices.len(),
+                max: MAX_SHAPED_SLICES,
+            });
+        }
+        let mut window_ids = std::collections::BTreeSet::new();
+        let mut opened = std::collections::BTreeSet::new();
+        for w in &shaping.windows {
+            if !window_ids.insert(w.id.as_str()) {
+                errors.push(E::DuplicateShapingWindow { id: w.id.clone() });
+            }
+            for class in &w.open {
+                opened.insert(class.as_str());
+                if class == DEFAULT_CLASS || vlan_slices.contains(&class.as_str()) {
+                    continue;
+                }
+                let (window, slice) = (w.id.clone(), class.clone());
+                if self.slices.iter().any(|s| &s.id == class) {
+                    errors.push(E::ShapingSnssaiSlice { window, slice });
+                } else {
+                    errors.push(E::ShapingUnknownClass { window, slice });
+                }
+            }
+        }
+        for class in vlan_slices.iter().copied().chain([DEFAULT_CLASS]) {
+            if !opened.contains(class) {
+                errors.push(E::ShapingClassNeverOpen {
+                    class: class.to_string(),
+                });
+            }
+        }
         errors
     }
 

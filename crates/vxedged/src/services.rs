@@ -325,6 +325,19 @@ pub(crate) struct ActiveRecord {
     pub package: Option<RunPackage>,
     /// The kernel the run came up on. `None` in a record written before kernels were recorded.
     pub kernel: Option<RunningKernel>,
+    /// How the uplink shapes the slices, [`shaping_kind`]. `None` in a record written before
+    /// shaping was recorded.
+    pub shaping: Option<String>,
+}
+
+/// What a run records as its uplink shaping (`ARCHITECTURE.md` §6.0.3): `network.shaping`'s kind,
+/// or `htb` for the HTB tree every experiment without one runs on. `Compare` and a verdict read
+/// it to say which mode each run was in.
+pub(crate) fn shaping_kind(model: &vxedge_core::model::Experiment) -> &'static str {
+    model
+        .shaping
+        .as_ref()
+        .map_or(vxedge_core::model::HTB_SHAPING, |s| s.kind.as_str())
 }
 
 /// What a run records beside its workspace identity (`ARCHITECTURE.md` §13), as the fields of
@@ -466,6 +479,7 @@ fn read_active_record(runtime_dir: &Path) -> Option<ActiveRecord> {
         started_unix_ms: v["started_unix_ms"].as_i64(),
         package,
         kernel,
+        shaping: v["shaping"].as_str().map(str::to_string),
     })
 }
 
@@ -625,6 +639,22 @@ impl GatewaySvc {
                         format!("{detail} Nothing was provisioned."),
                     )
                 })?;
+                // The taprio check `Plan` and `experiment up` make, so a gate schedule on a host
+                // without it is refused here rather than failing at `tc`. A workspace that does
+                // not parse is left to the job, which reports it as before.
+                if let Ok(model) = parse_to_model(&yaml) {
+                    let refusal = tokio::task::spawn_blocking(move || {
+                        crate::plan::gateway_up_refusal(
+                            &model,
+                            vxedge_core::package::kernel_has_taprio,
+                        )
+                    })
+                    .await
+                    .map_err(|e| Status::internal(format!("taprio check panicked: {e}")))?;
+                    if let Some(refusal) = refusal {
+                        return Err(refusal);
+                    }
+                }
                 (package, Some(RunningKernel::probe()))
             }
             _ => (None, None),
@@ -854,6 +884,7 @@ impl GatewaySvc {
                             "identity_algorithm": identity_algorithm(manifest_dir.as_deref()),
                             "run_id": run_id,
                             "started_unix_ms": started,
+                            "shaping": shaping_kind(&model),
                         });
                         if let (Some(fields), Some(kernel)) = (record.as_object_mut(), &kernel) {
                             fields.extend(provenance(package.as_ref(), kernel));
@@ -3117,6 +3148,19 @@ mod tests {
     }
 
     #[test]
+    fn a_run_records_its_shaping_kind() {
+        let plain = "kind: experiment\nid: e\nvehicles: [veh]\nnetwork:\n  slices:\n    - { id: adas, mode: vlan, vlan: 101 }\n---\nkind: vehicle\nid: veh\ndevices: {}\n";
+        let model = vxedge_core::model::load_yaml(plain).unwrap();
+        assert_eq!(shaping_kind(&model), "htb");
+        let shaped = plain.replace(
+            "vlan: 101 }\n",
+            "vlan: 101 }\n  shaping:\n    kind: gate-schedule\n    windows:\n      - { id: w, open: [adas, default], duration_us: 10000 }\n",
+        );
+        let model = vxedge_core::model::load_yaml(&shaped).unwrap();
+        assert_eq!(shaping_kind(&model), "gate-schedule");
+    }
+
+    #[test]
     fn the_active_record_reads_back_and_a_damaged_one_does_not() {
         let dir = std::env::temp_dir().join(format!("vxedged-active-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -3140,7 +3184,17 @@ mod tests {
                 started_unix_ms: None,
                 package: None,
                 kernel: None,
+                shaping: None,
             })
+        );
+        std::fs::write(
+            active_record(&dir),
+            r#"{"id":"exp-tsn","dir":"/ws/t","bridge":"vxbr0","shaping":"gate-schedule"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_active_record(&dir).unwrap().shaping.as_deref(),
+            Some("gate-schedule")
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }

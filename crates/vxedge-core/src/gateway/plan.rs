@@ -49,6 +49,22 @@ pub enum PlanError {
     )]
     TunnelNameCollision { a: String, b: String, name: String },
     #[error(
+        "`network.shaping`: window `{window}` opens `{class}`, which is not a vlan slice of this \
+         plan or `default`"
+    )]
+    ShapingUnknownClass { window: String, class: String },
+    #[error(
+        "`network.shaping` needs {count} traffic classes, and an 802.1Q port has 8 — at most \
+         {max} vlan slices beside `default`",
+        max = crate::model::MAX_SHAPED_SLICES
+    )]
+    ShapingTooManyClasses { count: usize },
+    #[error(
+        "`network.shaping`: window `{window}` lasts {duration_us}us, longer than the kernel's \
+         32-bit nanosecond interval holds"
+    )]
+    ShapingWindowTooLong { window: String, duration_us: u32 },
+    #[error(
         "vxlan tunnel `{tunnel}` extends slice `{slice}`, which is `mode: s-nssai` — an s-nssai \
          slice has no VLAN for a vxlan tunnel to carry (`model::build`'s own \
          `UndefinedVxlanSlice` check only confirms the slice exists, not that it's `mode: \
@@ -147,6 +163,135 @@ pub struct TunnelPlan {
     pub vxlan_vlans: Vec<u16>,
 }
 
+/// The `taprio` qdisc's handle on the uplink. Its classes are `100:1` (queue 0) upward.
+pub const TAPRIO_HANDLE: &str = "100:";
+
+/// The uplink's IEEE 802.1Qbv gate schedule (`network.shaping`), resolved to what the kernel is
+/// given: a traffic class and a priority per slice, a gate mask and an interval per window.
+///
+/// `default` is class 0 and every other class is one slice, in plan order: slice `i` is class
+/// `i + 1`. A slice's frames carry the priority equal to their class, set from their VLAN tag on
+/// the uplink's egress, so the priority map is the identity on `0..=n` and sends every other
+/// priority to `default`. One transmit queue per class, queue `k` for class `k`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShapingPlan {
+    pub kind: crate::model::ShapingKind,
+    pub classes: Vec<ShapedSlice>,
+    pub windows: Vec<GateWindow>,
+}
+
+/// One slice's traffic class. Its frames get priority `class`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShapedSlice {
+    pub slice: String,
+    pub vlan: u16,
+    pub class: u8,
+}
+
+/// One schedule entry: bit `k` of `gate_mask` opens class `k`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateWindow {
+    pub id: String,
+    pub gate_mask: u8,
+    pub interval_ns: u32,
+    pub duration_us: u32,
+}
+
+impl ShapingPlan {
+    /// The slices' classes and `default`, which is also the number of transmit queues.
+    pub fn num_classes(&self) -> u8 {
+        self.classes.len() as u8 + 1
+    }
+
+    /// The cycle: the windows' sum.
+    pub fn cycle_us(&self) -> u64 {
+        self.windows.iter().map(|w| u64::from(w.duration_us)).sum()
+    }
+
+    pub fn class_of(&self, slice: &str) -> Option<u8> {
+        self.classes
+            .iter()
+            .find(|c| c.slice == slice)
+            .map(|c| c.class)
+    }
+
+    /// Priority to class, for all 16 priorities: each slice's own priority to its class, every
+    /// other to `default`.
+    pub fn priority_map(&self) -> [u8; 16] {
+        let mut map = [0u8; 16];
+        for c in &self.classes {
+            map[usize::from(c.class)] = c.class;
+        }
+        map
+    }
+
+    /// The `taprio` class that holds `class`'s queue, as `tc` prints it.
+    pub fn class_handle(class: u8) -> String {
+        format!("{TAPRIO_HANDLE}{:x}", u16::from(class) + 1)
+    }
+
+    /// Plan the schedule over the vlan slices, in plan order.
+    fn plan(shaping: &crate::model::Shaping, slices: &[SlicePlan]) -> Result<Self, PlanError> {
+        if slices.len() > crate::model::MAX_SHAPED_SLICES {
+            return Err(PlanError::ShapingTooManyClasses {
+                count: slices.len() + 1,
+            });
+        }
+        let classes: Vec<ShapedSlice> = slices
+            .iter()
+            .enumerate()
+            .map(|(i, s)| ShapedSlice {
+                slice: s.id.clone(),
+                vlan: s.vlan,
+                class: i as u8 + 1,
+            })
+            .collect();
+        let windows = shaping
+            .windows
+            .iter()
+            .map(|w| {
+                let mut gate_mask = 0u8;
+                for name in &w.open {
+                    let class = if name == crate::model::DEFAULT_CLASS {
+                        0
+                    } else {
+                        classes
+                            .iter()
+                            .find(|c| &c.slice == name)
+                            .map(|c| c.class)
+                            .ok_or_else(|| PlanError::ShapingUnknownClass {
+                                window: w.id.clone(),
+                                class: name.clone(),
+                            })?
+                    };
+                    gate_mask |= 1 << class;
+                }
+                let interval_ns = w.duration_us.checked_mul(1000).ok_or_else(|| {
+                    PlanError::ShapingWindowTooLong {
+                        window: w.id.clone(),
+                        duration_us: w.duration_us,
+                    }
+                })?;
+                Ok(GateWindow {
+                    id: w.id.clone(),
+                    gate_mask,
+                    interval_ns,
+                    duration_us: w.duration_us,
+                })
+            })
+            .collect::<Result<_, PlanError>>()?;
+        Ok(Self {
+            kind: shaping.kind,
+            classes,
+            windows,
+        })
+    }
+}
+
+/// The shortest window tested (`ARCHITECTURE.md` §6.0.3). A shorter one is accepted, and the plan
+/// says its result has software gates' timer jitter in it.
+pub const SHORTEST_TESTED_WINDOW_US: u32 = 10_000;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayPlan {
     pub bridge: String,
@@ -176,6 +321,9 @@ pub struct GatewayPlan {
     /// intent itself — the same reason `slices`/`endpoints` live here rather than being derived
     /// again at each call site.
     pub data_plane: crate::model::DataPlaneKind,
+    /// The gate schedule that replaces the HTB tree on the uplink, when the experiment declares
+    /// `network.shaping`. `None` is the HTB tree.
+    pub shaping: Option<ShapingPlan>,
 }
 
 /// One half of a collision message: which attachment a name was derived from.
@@ -319,6 +467,11 @@ impl GatewayPlan {
             })
             .collect();
         let (slices, snssai_slice_ids) = plan_slices(&flat)?;
+        let shaping = exp
+            .shaping
+            .as_ref()
+            .map(|s| ShapingPlan::plan(s, &slices))
+            .transpose()?;
 
         let vlan_of = |slice: &str| -> Option<u16> {
             exp.slices
@@ -493,7 +646,23 @@ impl GatewayPlan {
             tunnels,
             snssai_slice_ids,
             data_plane: exp.data_plane,
+            shaping,
         })
+    }
+
+    /// The uplink's transmit queues: one per class under a gate schedule, the kernel's default
+    /// (`None`) for the HTB tree.
+    pub fn uplink_tx_queues(&self) -> Option<u32> {
+        self.shaping.as_ref().map(|s| u32::from(s.num_classes()))
+    }
+
+    /// The uplink class that carries `slice`, as `tc` prints its handle: its HTB class, or its
+    /// `taprio` class under a gate schedule.
+    pub fn slice_class_handle(&self, slice: &SlicePlan) -> String {
+        match self.shaping.as_ref().and_then(|s| s.class_of(&slice.id)) {
+            Some(class) => ShapingPlan::class_handle(class),
+            None => format!("1:{:x}", slice.class_minor),
+        }
     }
 
     /// Human-readable plan summary (Apply output, logs).
@@ -531,11 +700,54 @@ impl GatewayPlan {
         } else {
             format!("; impaired link(s): [{}]", impaired.join(", "))
         };
+        if let Some(shaping) = &self.shaping {
+            return self.shaping_summary(shaping, &snssai, &harness);
+        }
         format!(
             "bridge {} + uplink {} @ {} mbit; slices: [{slices}]{snssai}; {} endpoint(s){harness}",
             self.bridge,
             self.uplink,
             self.root_rate_mbps,
+            self.endpoints.len()
+        )
+    }
+
+    /// [`Self::summary`] under a gate schedule: the cycle and its windows in place of the rates.
+    fn shaping_summary(&self, shaping: &ShapingPlan, snssai: &str, harness: &str) -> String {
+        let slices = shaping
+            .classes
+            .iter()
+            .map(|c| format!("{} (vlan {}, class {})", c.slice, c.vlan, c.class))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let windows = shaping
+            .windows
+            .iter()
+            .map(|w| format!("{} {}us", w.id, w.duration_us))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let short: Vec<&str> = shaping
+            .windows
+            .iter()
+            .filter(|w| w.duration_us < SHORTEST_TESTED_WINDOW_US)
+            .map(|w| w.id.as_str())
+            .collect();
+        let jitter = if short.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; window(s) [{}] are shorter than the 10 ms tested, so software gates' timer \
+                 jitter is in their result",
+                short.join(", ")
+            )
+        };
+        format!(
+            "bridge {} + uplink {} with a {} schedule, cycle {}us: [{windows}]; slices: \
+             [{slices}]{snssai}; {} endpoint(s){harness}{jitter}",
+            self.bridge,
+            self.uplink,
+            shaping.kind.as_str(),
+            shaping.cycle_us(),
             self.endpoints.len()
         )
     }
@@ -1136,6 +1348,136 @@ links:
         assert!(matches!(
             GatewayPlan::from_model(&model(ws)),
             Err(PlanError::NoSlices)
+        ));
+    }
+
+    /// `ARCHITECTURE.md` §6.0.3's example schedule over BASE's devices, without HTB's parameters.
+    fn shaped() -> String {
+        BASE.replace("  defaults: { bandwidth: 500000000 }\n", "")
+            .replace(
+                ", qos: { min_rate_mbps: 100, max_rate_mbps: 200, priority: 1 } }",
+                " }",
+            )
+            .replace(
+                ", qos: { min_rate_mbps: 0, max_rate_mbps: 400, priority: 5 } }",
+                " }\n  shaping:\n    kind: gate-schedule\n    windows:\n      - { id: adas, open: [adas], duration_us: 10000 }\n      - { id: rest, open: [infotainment, default], duration_us: 90000 }",
+            )
+    }
+
+    #[test]
+    fn a_gate_schedule_plans_one_class_per_slice_and_default() {
+        let plan = GatewayPlan::from_model(&model(&shaped())).unwrap();
+        let s = plan.shaping.as_ref().expect("planned");
+        assert_eq!(
+            s.classes,
+            vec![
+                ShapedSlice {
+                    slice: "adas".into(),
+                    vlan: 101,
+                    class: 1
+                },
+                ShapedSlice {
+                    slice: "infotainment".into(),
+                    vlan: 103,
+                    class: 2
+                },
+            ]
+        );
+        assert_eq!(s.num_classes(), 3);
+        assert_eq!(plan.uplink_tx_queues(), Some(3));
+        // `adas` opens class 1 alone; `rest` opens class 2 and `default` (class 0).
+        assert_eq!(
+            s.windows,
+            vec![
+                GateWindow {
+                    id: "adas".into(),
+                    gate_mask: 0b010,
+                    interval_ns: 10_000_000,
+                    duration_us: 10_000
+                },
+                GateWindow {
+                    id: "rest".into(),
+                    gate_mask: 0b101,
+                    interval_ns: 90_000_000,
+                    duration_us: 90_000
+                },
+            ]
+        );
+        assert_eq!(s.cycle_us(), 100_000);
+        // Each slice's priority is its class; every other priority is `default`'s.
+        assert_eq!(
+            s.priority_map(),
+            [0, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        // A slice's counters come from its `taprio` class: queue k is class `100:k+1`.
+        assert_eq!(plan.slice_class_handle(&plan.slices[0]), "100:2");
+        assert_eq!(plan.slice_class_handle(&plan.slices[1]), "100:3");
+        assert_eq!(ShapingPlan::class_handle(0), "100:1");
+        assert_eq!(
+            plan.summary(),
+            "bridge vxbr0 + uplink vxup0 with a gate-schedule schedule, cycle 100000us: \
+             [adas 10000us, rest 90000us]; slices: [adas (vlan 101, class 1), infotainment \
+             (vlan 103, class 2)]; 2 endpoint(s)"
+        );
+        assert_eq!(plan, GatewayPlan::from_model(&model(&shaped())).unwrap());
+    }
+
+    /// Without `network.shaping` nothing about the plan changes: the HTB tree, a single-queue
+    /// uplink and the summary every frozen experiment's plan has always printed.
+    #[test]
+    fn without_shaping_the_htb_plan_is_unchanged() {
+        let plan = GatewayPlan::from_model(&model(BASE)).unwrap();
+        assert_eq!(plan.shaping, None);
+        assert_eq!(plan.uplink_tx_queues(), None);
+        assert_eq!(plan.slice_class_handle(&plan.slices[0]), "1:10");
+        assert_eq!(
+            plan.summary(),
+            "bridge vxbr0 + uplink vxup0 @ 500 mbit; slices: [adas (vlan 101, 100..200 mbit, prio \
+             1), infotainment (vlan 103, 1..400 mbit, prio 5)]; 2 endpoint(s)"
+        );
+    }
+
+    /// A window shorter than the 10 ms tested is accepted, and the plan says what that costs.
+    #[test]
+    fn a_window_shorter_than_tested_is_named_in_the_summary() {
+        let plan = GatewayPlan::from_model(&model(
+            &shaped().replace("duration_us: 10000", "duration_us: 500"),
+        ))
+        .unwrap();
+        assert!(
+            plan.summary().ends_with(
+                "window(s) [adas] are shorter than the 10 ms tested, so software \
+                            gates' timer jitter is in their result"
+            ),
+            "{}",
+            plan.summary()
+        );
+        assert!(
+            !GatewayPlan::from_model(&model(&shaped()))
+                .unwrap()
+                .summary()
+                .contains("jitter")
+        );
+    }
+
+    /// The planner refuses what the model's own check refuses, for a model that reached it by
+    /// another route.
+    #[test]
+    fn the_planner_refuses_a_class_it_cannot_render() {
+        let mut m = model(&shaped());
+        m.shaping.as_mut().unwrap().windows[0]
+            .open
+            .push("telematics".into());
+        assert!(matches!(
+            GatewayPlan::from_model(&m),
+            Err(PlanError::ShapingUnknownClass { window, class })
+                if window == "adas" && class == "telematics"
+        ));
+        let mut m = model(&shaped());
+        m.shaping.as_mut().unwrap().windows[0].duration_us = u32::MAX;
+        assert!(matches!(
+            GatewayPlan::from_model(&m),
+            Err(PlanError::ShapingWindowTooLong { .. })
         ));
     }
 }

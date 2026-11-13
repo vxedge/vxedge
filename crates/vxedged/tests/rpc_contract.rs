@@ -1573,6 +1573,44 @@ async fn experiment_up_runs_the_same_checks() {
     assert_eq!(reason(&refused), "ERROR_REASON_LOCAL_BUNDLE_MISSING");
 }
 
+/// A gate schedule's refusals are the workspace's (WORKSPACE_INVALID), and a valid one is checked
+/// against the host's `taprio` by the same preflight `up` runs.
+#[tokio::test]
+async fn a_gate_schedule_is_planned_against_the_hosts_taprio() {
+    let daemon = Daemon::start();
+    let channel = daemon.channel().await;
+    let shaped = format!(
+        "kind: experiment\nid: exp-tsn\nvehicles: [plain]\nbaseline: bl\nnetwork:\n  slices: \
+         [{{ id: adas, mode: vlan, vlan: 101 }}]\n  shaping:\n    windows:\n      - {{ id: w, \
+         open: [adas, default], duration_us: 10000 }}\n---{PROCESS_ONLY}"
+    );
+    let plan = plan_of(&channel, &workspace_of(&shaped)).await;
+    let check = plan
+        .host_checks
+        .iter()
+        .find(|c| c.name == "gate schedule")
+        .expect("a gate schedule is checked against the host");
+    assert_eq!(check.passed, vxedge_core::package::kernel_has_taprio());
+    if !check.passed {
+        assert!(plan.problems.iter().any(|p| p.reason
+            == vxedge_api::v1::ErrorReason::HostRequirementUnmet as i32
+            && p.detail.contains("taprio")));
+    }
+
+    let on_ovs = shaped.replace("network:\n", "network:\n  data_plane: ovs\n");
+    let refused = plan_of(&channel, &workspace_of(&on_ovs)).await;
+    assert!(!refused.valid);
+    assert_eq!(
+        refused.problems[0].reason,
+        vxedge_api::v1::ErrorReason::WorkspaceInvalid as i32
+    );
+    assert!(
+        refused.problems[0].detail.contains("data_plane: ovs"),
+        "{:?}",
+        refused.problems
+    );
+}
+
 #[tokio::test]
 async fn a_valid_plan_lists_what_up_would_run() {
     let daemon = Daemon::start();
@@ -1615,6 +1653,7 @@ async fn host_capabilities_cover_every_backend() {
     assert_eq!(caps.part_kinds, ["container", "bundle", "wasm", "attach"]);
     assert_eq!(caps.max_runs, 1);
     assert_eq!(caps.package_schemas, ["vxp/1"]);
+    assert_eq!(caps.taprio, vxedge_core::package::kernel_has_taprio());
     // The container backend is available only where `up`'s own Podman check would pass.
     let container = caps
         .backends
