@@ -1446,3 +1446,68 @@ fn a_closed_gate_delays_a_slices_frames() {
     teardown(&sh, &plan).unwrap();
     let _ = std::fs::remove_dir_all(&runtime);
 }
+
+/// Two slices and nothing attached: enough for an uplink to shape. `SHAPING` is spliced in to
+/// make the gate-schedule half.
+const SWITCH_WORKSPACE: &str = r#"
+kind: experiment
+id: exp-switch
+vehicles: [veh]
+network:
+  slices:
+    - { id: adas, mode: vlan, vlan: 101 }
+    - { id: infotainment, mode: vlan, vlan: 103 }
+SHAPING---
+kind: vehicle
+id: veh
+devices: {}
+"#;
+
+/// A running gateway is not switched between the HTB tree and a gate schedule, in either
+/// direction: the second `up` is refused with "take the gateway down first", and what was running
+/// keeps running. Before the refusal, HTB → gate schedule failed on the queue count and gate
+/// schedule → HTB at the HTB root `add`, neither saying what to do.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN; run under sudo (see module docs)"]
+fn switching_a_running_gateway_between_htb_and_a_gate_schedule_is_refused() {
+    let ns = format!("vxswitch{}", std::process::id());
+    let created = std::process::Command::new("ip")
+        .args(["netns", "add", &ns])
+        .output()
+        .expect("iproute2 installed");
+    assert!(
+        created.status.success(),
+        "cannot create netns (run as root): {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let _guard = NetnsGuard(ns.clone());
+    let sh = Shell {
+        netns: Some(ns),
+        escalate: false,
+    };
+    let plan = |shaping: &str| {
+        let ws = SWITCH_WORKSPACE.replace("SHAPING", shaping);
+        GatewayPlan::from_model(&vxedge_core::model::load_yaml(&ws).unwrap()).unwrap()
+    };
+    let htb = plan("");
+    let gates = plan(
+        "  shaping:\n    windows:\n      - { id: w, open: [adas, infotainment, default], \
+         duration_us: 10000 }\n",
+    );
+    assert!(gates.shaping.is_some() && htb.shaping.is_none());
+
+    for (running, asked) in [(&htb, &gates), (&gates, &htb)] {
+        apply(&sh, running).unwrap();
+        let err = apply(&sh, asked).unwrap_err().to_string();
+        assert!(err.contains("take the gateway down first"), "{err}");
+        assert!(
+            observe(&sh, running).unwrap().fully_up(),
+            "the refused switch changed the running gateway"
+        );
+        teardown(&sh, running).unwrap();
+    }
+    // After `down`, either comes up.
+    apply(&sh, &gates).unwrap();
+    assert!(observe(&sh, &gates).unwrap().fully_up());
+    teardown(&sh, &gates).unwrap();
+}

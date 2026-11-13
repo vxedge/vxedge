@@ -3289,6 +3289,26 @@ devices: {}
         );
     }
 
+    /// A vlan slice called `default` would make `open: [default]` name two classes.
+    #[test]
+    fn a_slice_named_default_is_refused_beside_shaping() {
+        let ws = shaped(
+            "{ id: infotainment, mode: vlan",
+            "{ id: default, mode: vlan",
+        )
+        .replace("[infotainment, default]", "[default]");
+        assert_eq!(
+            shaping_violations(&ws),
+            vec![InvariantError::SliceNamedDefault {
+                slice: "default".into()
+            }]
+        );
+        // Without a schedule `default` is an ordinary slice id, as it always was.
+        let plain = ws.split("  shaping:\n").next().unwrap().to_string()
+            + "---\nkind: vehicle\nid: veh\ndevices: {}\n";
+        assert!(load_yaml(&plain).is_ok(), "{plain}");
+    }
+
     #[test]
     fn duplicate_window_ids_are_refused() {
         let v = shaping_violations(&shaped("{ id: rest,", "{ id: adas,"));

@@ -141,6 +141,29 @@ fn check(
     }
 }
 
+/// `network.shaping`'s gate schedule renders as the kernel's `taprio` qdisc
+/// (`vxedge_core::package::kernel_has_taprio`, the probe `Plan` and `up` use). Optional: only an
+/// experiment with a gate schedule needs it. Pure, given what the probe found.
+fn taprio_check(loaded: bool, available: bool) -> Check {
+    check(
+        2,
+        "taprio (TSN gate schedule)",
+        false,
+        available,
+        if loaded {
+            "sch_taprio loaded"
+        } else if available {
+            "sch_taprio built in or installed for this kernel; `tc` loads it on first use"
+        } else {
+            "no sch_taprio for this kernel — only needed for `network.shaping`"
+        },
+        Some(
+            "sudo modprobe sch_taprio (a kernel built without CONFIG_NET_SCH_TAPRIO has none; \
+             only `network.shaping` needs it)",
+        ),
+    )
+}
+
 fn tier0() -> Vec<Check> {
     let mut c = Vec::new();
 
@@ -425,6 +448,11 @@ fn tier2() -> Vec<Check> {
         ),
     ));
 
+    c.push(taprio_check(
+        std::path::Path::new("/sys/module/sch_taprio").exists(),
+        vxedge_core::package::kernel_has_taprio(),
+    ));
+
     // The 5G transit link and bridge attachment run `sudo ip` and `sudo nsenter` (join a pod's
     // network namespace by PID), and must not stop at a password prompt.
     let missing: Vec<String> = ["ip", "nsenter"]
@@ -573,6 +601,31 @@ pub fn run(target_tier: u8, json: bool) -> Result<(), Box<dyn std::error::Error>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An optional check: without the module it warns and hints `modprobe`, never fails tier 2.
+    #[test]
+    fn taprio_is_an_optional_tier2_check() {
+        let missing = taprio_check(false, false);
+        assert_eq!(missing.tier, 2);
+        assert_eq!(missing.name, "taprio (TSN gate schedule)");
+        assert!(!missing.required);
+        assert_eq!(missing.status, CheckStatus::Warn);
+        assert!(
+            missing
+                .fix_hint
+                .as_deref()
+                .unwrap()
+                .starts_with("sudo modprobe sch_taprio")
+        );
+        assert_eq!(taprio_check(true, true).status, CheckStatus::Ok);
+        let installed = taprio_check(false, true);
+        assert_eq!(installed.status, CheckStatus::Ok);
+        assert!(
+            installed.detail.contains("first use"),
+            "{}",
+            installed.detail
+        );
+    }
 
     #[test]
     fn parses_tool_version_lines() {

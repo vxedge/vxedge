@@ -514,6 +514,18 @@ pub(crate) async fn preflight(
     pf
 }
 
+/// [`taprio_problem`] as the refusal `GatewayService.Up` gives, which applies the gateway without
+/// the shared [`preflight`]: the same check, so it refuses with HOST_REQUIREMENT_UNMET instead of
+/// failing at `tc`. `has_taprio` is asked only of a workspace that declares a gate schedule.
+pub(crate) fn gateway_up_refusal(
+    model: &Experiment,
+    has_taprio: impl FnOnce() -> bool,
+) -> Option<Status> {
+    model.shaping.as_ref()?;
+    let (reason, _, detail) = taprio_problem(model, has_taprio())?;
+    Some(errors::precondition(reason, detail))
+}
+
 /// `network.shaping` renders through the kernel's `taprio` qdisc, so a host whose kernel has none
 /// is refused before anything is provisioned.
 fn taprio_problem(model: &Experiment, has_taprio: bool) -> Option<(R, String, String)> {
@@ -1026,5 +1038,25 @@ devices: {}
         .unwrap();
         assert!(plain.shaping.is_none());
         assert!(taprio_problem(&plain, false).is_none());
+    }
+
+    /// `GatewayService.Up` refuses the same way `Plan` and `experiment up` do, and asks the host
+    /// only about a workspace with a gate schedule.
+    #[test]
+    fn gateway_up_refuses_a_gate_schedule_without_taprio() {
+        use tonic_types::StatusExt;
+        let shaped = vxedge_core::model::load_yaml(SHAPED).unwrap();
+        let refusal = gateway_up_refusal(&shaped, || false).expect("refused");
+        assert_eq!(refusal.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            refusal.get_error_details().error_info().unwrap().reason,
+            "ERROR_REASON_HOST_REQUIREMENT_UNMET"
+        );
+        assert!(refusal.message().contains("taprio"));
+        assert!(gateway_up_refusal(&shaped, || true).is_none());
+
+        let mut plain = shaped.clone();
+        plain.shaping = None;
+        assert!(gateway_up_refusal(&plain, || panic!("not asked")).is_none());
     }
 }

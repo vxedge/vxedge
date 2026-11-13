@@ -14,17 +14,25 @@ All notable changes to this repo are documented here. Format follows
   lists for `duration_us`, and the cycle is their sum. The planner creates the uplink with one transmit
   queue per class; a `clsact` egress filter per slice sets a frame's priority from its VLAN tag, and a
   software-mode `taprio`, timed by the TAI clock from the TAI epoch, maps each priority to its class.
-  `clsact` is created before `taprio`. A parameter reaches a window by id path, `binds:
+  `clsact` is created before `taprio`. A `matchall` egress filter after the slice filters sets priority 0
+  on every other frame, so `default` takes every frame that matches no slice, whatever priority it
+  arrived with. A parameter reaches a window by id path, `binds:
   network.shaping.windows[<id>].duration_us`. An experiment without the block keeps its HTB tree.
+- `mode: s-nssai` slices carry no VLAN, so they are not traffic classes: the classes are the vlan slices
+  and `default`, an `s-nssai` slice does not count toward the 7, and a window may not open one.
 - Validation refuses, with `ERROR_REASON_WORKSPACE_INVALID`, a class no window opens, an unknown slice or
-  an `s-nssai` slice in `open`, two windows with one `id`, more than 7 vlan slices, a slice `qos` or
-  `network.defaults.bandwidth` beside `shaping`, `shaping` with `network.data_plane: ovs`, and a
-  `duration_us` that is not a whole number from 1 to 4294967 (the kernel's 32-bit nanosecond interval).
-  A window shorter than the 10 ms tested is accepted, and the plan summary says its result carries
-  software gates' timer jitter.
-- `Plan`, `vehicle up` and `experiment up` refuse a workspace with `network.shaping` with
-  `ERROR_REASON_HOST_REQUIREMENT_UNMET` when the kernel has no `taprio`, and
-  `HostService.Capabilities` reports it in the new `taprio` field.
+  an `s-nssai` slice in `open`, two windows with one `id`, more than 7 vlan slices, a vlan slice named
+  `default`, a slice `qos` or `network.defaults.bandwidth` beside `shaping`, `shaping` with
+  `network.data_plane: ovs`, and a `duration_us` that is not a whole number from 1 to 4294967 (the
+  kernel's 32-bit nanosecond interval). A window shorter than the 10 ms tested is accepted, and the plan
+  summary says its result carries software gates' timer jitter.
+- `Plan`, `vehicle up`, `experiment up` and `GatewayService.Up` refuse a workspace with
+  `network.shaping` with `ERROR_REASON_HOST_REQUIREMENT_UNMET` when the kernel has no `taprio`, and
+  `HostService.Capabilities` reports it in the new `taprio` field. `vxedge doctor --tier 2` has an
+  optional "taprio (TSN gate schedule)" check, which warns and hints `sudo modprobe sch_taprio`.
+- A running gateway is not switched between the HTB tree and a gate schedule: `up` with the other
+  mechanism is refused with "take the gateway down first", in either direction, and leaves the running
+  uplink as it was.
 - Under `network.shaping` the `vxedge_slice_*` series are read from the slice's `taprio` class, and
   `vxedge_slice_overlimits_total` is not served, since a gate schedule has no rate.
 - The run record carries the uplink's shaping, `gate-schedule` or `htb`, served as the new

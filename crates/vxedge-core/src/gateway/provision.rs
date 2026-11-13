@@ -37,11 +37,50 @@ pub fn apply_links(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
     netlink::ensure_bridge(ns, &plan.bridge).map_err(nl)?;
     netlink::link_up(ns, &plan.bridge).map_err(nl)?;
 
+    refuse_shaping_switch(sh, plan)?;
     ensure_uplink(sh, plan)?;
     netlink::set_master(ns, &plan.uplink, &plan.bridge).map_err(nl)?;
     netlink::link_up(ns, &plan.uplink).map_err(nl)?;
     netlink::link_up(ns, &plan.uplink_peer).map_err(nl)?;
     Ok(())
+}
+
+/// A running gateway's uplink shapes with one mechanism, and a plan that asks for the other is
+/// refused rather than rendered over it: `taprio` and the HTB tree each need the uplink built for
+/// them (one queue per class, or the HTB root `add`), so the switch goes through `down`.
+fn refuse_shaping_switch(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
+    if !netlink::link_exists(sh.netns.as_deref(), &plan.uplink) {
+        return Ok(());
+    }
+    let qdiscs = sh.run("tc", &["qdisc", "show", "dev", &plan.uplink])?;
+    match shaping_switch(plan.shaping.is_some(), &qdiscs) {
+        None => Ok(()),
+        Some(detail) => Err(NetOpsError::Command {
+            cmdline: format!("uplink `{}` shaping", plan.uplink),
+            stderr: detail.to_string(),
+        }),
+    }
+}
+
+/// Why a plan cannot be rendered over the uplink's current qdiscs (`tc qdisc show` text): it asks
+/// for a gate schedule where the HTB tree runs, or the other way round. Pure.
+fn shaping_switch(gate_schedule: bool, qdiscs: &str) -> Option<&'static str> {
+    let has = |prefix: &str| qdiscs.lines().any(|l| l.starts_with(prefix));
+    if gate_schedule && has("qdisc htb 1:") {
+        Some(
+            "the running gateway shapes its uplink with the HTB tree, and this plan asks for a \
+             `network.shaping` gate schedule. Switching a running uplink is not supported: take \
+             the gateway down first, then bring it up.",
+        )
+    } else if !gate_schedule && has("qdisc taprio ") {
+        Some(
+            "the running gateway shapes its uplink with a `network.shaping` gate schedule, and \
+             this plan asks for the HTB tree. Switching a running uplink is not supported: take \
+             the gateway down first, then bring it up.",
+        )
+    } else {
+        None
+    }
 }
 
 /// The trunk uplink's veth pair. Under a gate schedule it has one transmit queue per class,
@@ -1606,6 +1645,31 @@ mod seam_tests {
                 },
             ],
         }
+    }
+
+    /// A running uplink is not switched between HTB and a gate schedule, in either direction;
+    /// a re-apply of the same mechanism, or a fresh uplink, passes.
+    #[test]
+    fn switching_a_running_uplinks_shaping_is_refused() {
+        let htb = "qdisc htb 1: root refcnt 2 r2q 10 default 0xfffe direct_packets_stat 0\n";
+        let taprio = "qdisc taprio 100: root refcnt 9 tc 3 map 0 1 2 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
+                      qdisc clsact ffff: parent ffff:fff1\n";
+        let fresh = "qdisc noqueue 0: root refcnt 2\n";
+        assert!(
+            shaping_switch(true, htb)
+                .unwrap()
+                .contains("take the gateway down first")
+        );
+        assert!(
+            shaping_switch(false, taprio)
+                .unwrap()
+                .contains("take the gateway down first")
+        );
+        assert_eq!(shaping_switch(true, taprio), None);
+        assert_eq!(shaping_switch(false, htb), None);
+        assert_eq!(shaping_switch(true, fresh), None);
+        assert_eq!(shaping_switch(false, fresh), None);
+        assert_eq!(shaping_switch(false, ""), None);
     }
 
     /// The exact `taprio` tokens: software mode (no `flags`), one queue per class, the identity

@@ -639,6 +639,22 @@ impl GatewaySvc {
                         format!("{detail} Nothing was provisioned."),
                     )
                 })?;
+                // The taprio check `Plan` and `experiment up` make, so a gate schedule on a host
+                // without it is refused here rather than failing at `tc`. A workspace that does
+                // not parse is left to the job, which reports it as before.
+                if let Ok(model) = parse_to_model(&yaml) {
+                    let refusal = tokio::task::spawn_blocking(move || {
+                        crate::plan::gateway_up_refusal(
+                            &model,
+                            vxedge_core::package::kernel_has_taprio,
+                        )
+                    })
+                    .await
+                    .map_err(|e| Status::internal(format!("taprio check panicked: {e}")))?;
+                    if let Some(refusal) = refusal {
+                        return Err(refusal);
+                    }
+                }
                 (package, Some(RunningKernel::probe()))
             }
             _ => (None, None),

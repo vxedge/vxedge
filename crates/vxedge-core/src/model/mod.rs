@@ -949,6 +949,11 @@ pub enum InvariantError {
          slices and `default` only."
     )]
     ShapingSnssaiSlice { window: String, slice: String },
+    #[error(
+        "slice `{slice}` shares its id with the `default` class of `network.shaping`, so a \
+         window's `open: [default]` could name either. Rename the slice."
+    )]
+    SliceNamedDefault { slice: String },
     #[error("`network.shaping`: window id `{id}` is declared more than once")]
     DuplicateShapingWindow { id: String },
     #[error(
@@ -1253,6 +1258,11 @@ impl Experiment {
             .filter(|s| s.mode == SliceMode::Vlan)
             .map(|s| s.id.as_str())
             .collect();
+        if vlan_slices.contains(&DEFAULT_CLASS) {
+            errors.push(E::SliceNamedDefault {
+                slice: DEFAULT_CLASS.to_string(),
+            });
+        }
         if vlan_slices.len() > MAX_SHAPED_SLICES {
             errors.push(E::TooManyShapedSlices {
                 count: vlan_slices.len(),
