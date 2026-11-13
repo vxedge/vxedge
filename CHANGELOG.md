@@ -6,39 +6,8 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
-### Fixed
-
-- A tool rebuilt in place is no longer recorded as failed when its `--version` run meets ETXTBSY
-  ("text file busy"), which another process forked while the file was open for writing can cause
-  for a moment. The daemon retries briefly. This also made a `vxedged` unit test flaky in CI.
-
-## [0.29.0] - 2026-11-13
-
-A container payload can be started with its own arguments, environment and `NET_ADMIN`: a
-baseline `parts` entry's `run` (`args`, `env`, `cap_add`), so a load generator or client part runs
-in its role without a rebuilt image. The experiment's `baseline:` now selects the one baseline that
-runs, and a parameter may bind it, so an arm that changes software is a second baseline over the
-same vehicle; `pkg lock` pins every baseline's references. vxAPI stays `vxedge.v1`, with
-`NodePayload.run` added. vxtelemetry 0.9.0 remains the matching release.
-
 ### Added
 
-- `run` on a baseline `parts` entry (`ARCHITECTURE.md` §6.0.2) says how a container payload starts:
-  `args` replaces the image's command (`CMD`) and keeps its entrypoint, `env` adds environment
-  variables, and `cap_add` adds Linux capabilities to the payload container. Every target of the entry
-  starts the same way, so two roles of one part are two entries. Infra containers are unchanged.
-- `run` is in the payload's spec hash, so a changed `run` recreates the payload container on the next
-  `up` and keeps the node's namespace. A payload with no `run` hashes as before, so upgrading recreates
-  no running payload. `run` is part of the baseline document, so the workspace identity and the package
-  digest already cover it.
-- vxAPI: `NodePayload.run` (`PayloadRun`: `args`, `env`, `cap_add`) reports a container payload's `run`
-  in `WorkspaceService.Plan` and in every `NodeStatus`. Unset when the part has none. Additive; vxAPI
-  stays `vxedge.v1`.
-- Validation refuses, with `ERROR_REASON_WORKSPACE_INVALID`, a `cap_add` other than `NET_ADMIN` and
-  `run` on any part a `container` device does not run as its payload, naming the entry: a part a VM,
-  `wasm-capsule` or `attach` device runs, a `local/` host process, a bare-path image, a member a stack
-  part wins over, or an entry with no `target_ids`. An `env` value or `args` item that is not a string,
-  and an unknown key under `run`, fail to parse, with the same reason.
 - `network.time_sync` with `kind: gptp` (`ARCHITECTURE.md` §6.0.3): the gateway is the grandmaster of
   an IEEE 802.1AS domain, one `ptp4l` with a master port on each follower's access port, and each
   follower device runs a `ptp4l` that follows it. Every `ptp4l` runs the vxparts `linuxptp` part with
@@ -72,6 +41,40 @@ same vehicle; `pkg lock` pins every baseline's references. vxAPI stays `vxedge.v
     root. `HostService.Capabilities` reports `gptp`.
   - A package that uses `time_sync` requires the first vxedge release that reads it. The linuxptp
     image's digest is a placeholder, the local build's, until the part is published.
+
+### Fixed
+
+- A tool rebuilt in place is no longer recorded as failed when its `--version` run meets ETXTBSY
+  ("text file busy"), which another process forked while the file was open for writing can cause
+  for a moment. The daemon retries briefly. This also made a `vxedged` unit test flaky in CI.
+
+## [0.29.0] - 2026-11-13
+
+A container payload can be started with its own arguments, environment and `NET_ADMIN`: a
+baseline `parts` entry's `run` (`args`, `env`, `cap_add`), so a load generator or client part runs
+in its role without a rebuilt image. The experiment's `baseline:` now selects the one baseline that
+runs, and a parameter may bind it, so an arm that changes software is a second baseline over the
+same vehicle; `pkg lock` pins every baseline's references. vxAPI stays `vxedge.v1`, with
+`NodePayload.run` added. vxtelemetry 0.9.0 remains the matching release.
+
+### Added
+
+- `run` on a baseline `parts` entry (`ARCHITECTURE.md` §6.0.2) says how a container payload starts:
+  `args` replaces the image's command (`CMD`) and keeps its entrypoint, `env` adds environment
+  variables, and `cap_add` adds Linux capabilities to the payload container. Every target of the entry
+  starts the same way, so two roles of one part are two entries. Infra containers are unchanged.
+- `run` is in the payload's spec hash, so a changed `run` recreates the payload container on the next
+  `up` and keeps the node's namespace. A payload with no `run` hashes as before, so upgrading recreates
+  no running payload. `run` is part of the baseline document, so the workspace identity and the package
+  digest already cover it.
+- vxAPI: `NodePayload.run` (`PayloadRun`: `args`, `env`, `cap_add`) reports a container payload's `run`
+  in `WorkspaceService.Plan` and in every `NodeStatus`. Unset when the part has none. Additive; vxAPI
+  stays `vxedge.v1`.
+- Validation refuses, with `ERROR_REASON_WORKSPACE_INVALID`, a `cap_add` other than `NET_ADMIN` and
+  `run` on any part a `container` device does not run as its payload, naming the entry: a part a VM,
+  `wasm-capsule` or `attach` device runs, a `local/` host process, a bare-path image, a member a stack
+  part wins over, or an entry with no `target_ids`. An `env` value or `args` item that is not a string,
+  and an unknown key under `run`, fail to parse, with the same reason.
 
 ### Changed
 
