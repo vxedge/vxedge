@@ -6,6 +6,13 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- `vxedge campaign start` warns when the workspace, where the campaign writes its archives, is
+  under the home directory. File indexers and sync clients there can load the host while trials
+  run, and a timed criterion then reads that load as the arm's effect (exp-003's H4 flipped this
+  way). The campaign still starts.
+
 ## [0.25.0] - 2026-11-13
 
 Check samples, metric reductions and QEMU options. A check step's output can carry the numbers a
