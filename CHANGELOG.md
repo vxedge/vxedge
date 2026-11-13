@@ -6,6 +6,15 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-11-13
+
+The 5G core and RAN run published images pinned by digest. vxedged pulls the vxparts parts
+`gw/5gc/os/open5gs:0.1.0` and `gw/ran/os/ueransim:0.1.0` and a digest-pinned `mongo:7` on first
+5G use, so no local image build is needed and every host runs the same bytes. A package with an
+`s-nssai` slice locks these images, and its archives record their digests. Packages locked by an
+earlier version that use `s-nssai` slices must be locked again. vxAPI stays `vxedge.v1`, and
+vxtelemetry 0.8.0 is still the matching release.
+
 ### Changed
 
 - The 5G core and RAN run published images pinned by digest instead of the locally built
