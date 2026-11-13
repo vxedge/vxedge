@@ -16,6 +16,11 @@ All notable changes to this repo are documented here. Format follows
   build, and two hosts run the same bytes. The constants are `fiveg::FIVEG_CORE_IMAGE`,
   `FIVEG_RAN_IMAGE` and `FIVEG_MONGO_IMAGE`. Pods left by an earlier version are recreated on the
   next `up`, because their image changed.
+- A package with an `s-nssai` slice locks those three images in `vxp.lock` `images`, and
+  `TelemetryService.Collect` records their digests in the archive's `image_digests`, as for a
+  zone's image. The 5G core and RAN are not placements, so neither listed them before. A package
+  locked by an earlier version that has an `s-nssai` slice reports its lock as stale until it is
+  locked again.
 
 ## [0.26.0] - 2026-11-13
 

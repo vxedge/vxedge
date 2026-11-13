@@ -248,6 +248,11 @@ impl TelemetryService for TelemetrySvc {
                 .filter(|p| p.kind == vxedge_core::model::PartKind::Container)
                 .map(|p| p.reference.clone())
         }));
+        images.extend(
+            vxedge_core::fiveg::fiveg_images(&model)
+                .into_iter()
+                .map(str::to_string),
+        );
         images.sort();
         images.dedup();
         // Whether the run being archived checked its lock is the daemon's to say: vxtelemetry

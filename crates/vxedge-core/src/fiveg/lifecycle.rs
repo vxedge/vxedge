@@ -120,6 +120,21 @@ pub const FIVEG_RAN_IMAGE: &str = "ghcr.io/vxedge/parts/gw/ran/os/ueransim:0.1.0
 /// digest of `mongo:7` (resolved 2026-11-13). Pulled on first use when absent.
 pub const FIVEG_MONGO_IMAGE: &str = "docker.io/library/mongo:7@sha256:8bb4442761a63a8dda452744082cdac9644b429807eb977b42324a63cef59ca4";
 
+/// The images a run of `exp` starts for its 5G core and RAN: [`FIVEG_CORE_IMAGE`],
+/// [`FIVEG_RAN_IMAGE`] and [`FIVEG_MONGO_IMAGE`] when any slice is `s-nssai`, none otherwise. The
+/// package lock pins them and an archive records their digests, as for a zone's image.
+pub fn fiveg_images(exp: &crate::model::Experiment) -> Vec<&'static str> {
+    if exp
+        .slices
+        .iter()
+        .any(|s| s.mode == crate::model::SliceMode::SNssai)
+    {
+        vec![FIVEG_CORE_IMAGE, FIVEG_RAN_IMAGE, FIVEG_MONGO_IMAGE]
+    } else {
+        Vec::new()
+    }
+}
+
 /// Which pods + images to drive. The images default to [`FIVEG_CORE_IMAGE`] and
 /// [`FIVEG_RAN_IMAGE`], each pinned by digest.
 #[derive(Debug, Clone)]

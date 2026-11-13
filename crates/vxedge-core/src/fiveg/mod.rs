@@ -34,8 +34,9 @@
 //! sharing one netns collide on it. Still started separately per test run,
 //! not by `fiveg_up` (the vxprobe/vxtraffic pattern).
 //!
-//! Remaining before H2 numbers: URSP-style `slice_policy`, image-digest
-//! recording into results metadata.
+//! Remaining before H2 numbers: URSP-style `slice_policy`. The core, RAN and
+//! database images are digest-pinned ([`fiveg_images`]); the package lock pins
+//! them and an archive records their digests.
 
 pub mod lifecycle;
 pub mod plan;
@@ -45,8 +46,9 @@ pub mod subscriber;
 pub use lifecycle::{
     BRIDGE_ATTACH_CN_ADDR, BRIDGE_ATTACH_HOST_ADDR, FIVEG_CORE_IMAGE, FIVEG_MONGO_IMAGE,
     FIVEG_RAN_IMAGE, FIVEG_UPLINK_VLAN, FiveGLifecycleConfig, FiveGLifecycleError, FiveGStatus,
-    bridge_down, bridge_host_veth, bridge_up, fiveg_down, fiveg_status, fiveg_up, pod_exists,
-    pod_pid, ue_down, ue_pod_name, ue_probe_up, ue_reflector_up, ue_up, wait_for_ue_pdu_addr,
+    bridge_down, bridge_host_veth, bridge_up, fiveg_down, fiveg_images, fiveg_status, fiveg_up,
+    pod_exists, pod_pid, ue_down, ue_pod_name, ue_probe_up, ue_reflector_up, ue_up,
+    wait_for_ue_pdu_addr,
 };
 pub use plan::{FiveGPlan, FiveGPlanError, SliceSession};
 pub use render::{ConfigFile, render_all};
