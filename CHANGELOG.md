@@ -6,6 +6,17 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-11-13
+
+One archive format and one package descriptor (decision X-30). vxedge reads only `vxarchive/2`
+archives and `vxp.yaml` packages: a `vxarchive/1` archive or a legacy `<name>.vxp` descriptor is
+refused with the current format named, and the frozen result sets are republished in
+`vxarchive/2` (Zenodo 2026-11-v2). `TelemetryService.Collect` no longer passes `--archive-version`,
+so this release needs vxtelemetry 0.8.0, which writes `vxarchive/2` only; with an older vxtelemetry
+a campaign's archives cannot be judged. `campaign start` warns when the workspace is under the home
+directory. vxAPI stays `vxedge.v1`; no field is removed, and `CollectRequest.archive_version` is
+ignored.
+
 ### Added
 
 - `vxedge campaign start` warns when the workspace, where the campaign writes its archives, is
