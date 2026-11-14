@@ -6,17 +6,45 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
-### Fixed
+### Added
 
-- `pkg lock` pins the image of every check tool (`checks.tools.<id>.image`) that is published, and
-  `TelemetryService.Collect` records the digests of all of them. A check tool is no placement, so
-  neither listed it: a package whose checks run a published client locked nothing for it, and an
-  offline copy could not run its checks.
+- Several runs on one host (`ARCHITECTURE.md` §5.2, §6.0.5). Each run holds an instance slot, `0`–`9` then
+  `a`–`z`, and keeps its files in its own directory, `<runtime-dir>/runs/<s>/`: its record, manifest, 5G and
+  gPTP config, check output, measurement and traffic pidfiles, telemetry ingest, `collect.log` and `tools.json`.
+  - `up` keeps the workspace's own run's slot, or takes the one `instance` names
+    (`VehicleUpRequest`, `GatewayUpRequest`, `ExperimentUpRequest`, `CampaignStartRequest`; `--instance` on
+    the CLI), or the lowest free one. `Run.instance` reports it, and `RunService.List` returns every run.
+  - A verb that names no run acts on its workspace's run, or on the only run. When more than one matches it is
+    refused with the new `ERROR_REASON_RUN_AMBIGUOUS`, which lists the runs. `VehicleDownRequest`,
+    `VehicleStatusRequest`, `GatewayDownRequest`, `GatewayStatusRequest`, `ExperimentDownRequest` and
+    `ExperimentStatusRequest` gain a `RunRef run`, and the CLI takes a global `--run <run id>`.
+    `vxedge runs` lists the host's runs.
+  - Another workspace's `up` takes another slot instead of being refused as `ERROR_REASON_WRONG_WORKSPACE`. A
+    verb whose workspace has no run while others do is refused as `ERROR_REASON_NO_ACTIVE_RUN`, never acted
+    on another run.
+  - What one host has once is held by one run: `s-nssai` slices, overlapping host-side addresses (traffic and
+    measurement far sides, host-side peers), a WireGuard listen port, a VXLAN VNI and port, an adopted host
+    interface. A second run that declares one, or asks for a slot another run holds, is refused with the new
+    `ERROR_REASON_HELD_BY_RUN`, naming the holder.
+  - A campaign holds its slot from start to end, so its trials keep their names, and another `up` between two
+    trials skips it. The hold survives a daemon restart, so a retry resumes in the same slot, and is released
+    at the end, on failure and on cancel. `campaign.json` records `instance`.
+  - A campaign no longer holds the host's lifecycle claim for its whole run: each trial's `up` and `down`
+    waits its turn for it, so another run's `up` between trials delays a trial instead of failing it.
+    Lifecycle operations still run one at a time across the host, and an interactive one is still refused as
+    `ERROR_REASON_BUSY` while another runs. Concurrent runs are for functional work: a timed campaign still
+    takes the host on its own.
+  - The daemon restores every run whose bridge is still up when it starts.
+  - The metrics exporter serves each run its own page, `/runs/<s>/metrics`, and a run's host entity scrapes
+    it, so one run's series never reach another's archive. `/metrics` serves the only run. Needs the matching
+    vxtelemetry, which reads a path in a scrape target.
+  - `TelemetryService.Collect` takes `instance`, the slot whose ingest it archives (a campaign collects after
+    its trial's run is down), and passes it to vxtelemetry as `VXTELEMETRY_INSTANCE`, which records it in the
+    archive's `metadata.json`.
 
 ### Changed
 
-- Every host object a run creates carries its instance slot, as `ARCHITECTURE.md` §6.0.5 specifies (Track F,
-  first step). The daemon still runs one run at a time, always in slot `0`. Holding several runs is the next step.
+- Every host object a run creates carries its instance slot, as `ARCHITECTURE.md` §6.0.5 specifies.
   Scripts that address interface or container names directly need the new names:
   - bridge, uplink and uplink peer: `vxbr0`, `vxup0`, `vxup0p` (unchanged in slot `0`);
   - a device's access port, veth peer and ingress IFB: `vz0-<stem>`, `vp0-<stem>`, `vi0-<stem>` (were `vz-`,
@@ -32,6 +60,13 @@ All notable changes to this repo are documented here. Format follows
   ports and guests belong to another run, and an object with no slot is foreign to every run.
 - Archives record entity log paths under the new names, such as `vx0-<node>.serial.log`. Entity ids are
   device ids and do not change, so verdicts and comparisons read old and new archives alike.
+
+### Fixed
+
+- `pkg lock` pins the image of every check tool (`checks.tools.<id>.image`) that is published, and
+  `TelemetryService.Collect` records the digests of all of them. A check tool is no placement, so
+  neither listed it: a package whose checks run a published client locked nothing for it, and an
+  offline copy could not run its checks.
 
 ## [0.30.0] - 2026-11-14
 
