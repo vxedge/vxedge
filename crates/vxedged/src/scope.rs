@@ -159,6 +159,36 @@ pub(crate) fn run_of(root: &Path, workspace: &Path) -> Option<RunScope> {
     }
 }
 
+/// Which workspace last ran in a slot, kept after its run is down so a later `Collect` finds the
+/// ingest that run filled.
+fn last_file(root: &Path, instance: Instance) -> PathBuf {
+    run_dir(root, instance).join("workspace.json")
+}
+
+pub(crate) fn remember_workspace(root: &Path, instance: Instance, workspace: &Path) {
+    let _ = std::fs::write(
+        last_file(root, instance),
+        serde_json::json!({ "dir": workspace }).to_string(),
+    );
+}
+
+/// The slot the workspace in `workspace` last ran in, the latest when several did.
+pub(crate) fn last_slot_of(root: &Path, workspace: &Path) -> Option<Instance> {
+    Instance::all()
+        .filter_map(|i| {
+            let file = last_file(root, i);
+            let text = std::fs::read_to_string(&file).ok()?;
+            let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+            let dir = PathBuf::from(v["dir"].as_str()?);
+            same_dir(&dir, workspace).then(|| {
+                let at = std::fs::metadata(&file).and_then(|m| m.modified()).ok();
+                (at, i)
+            })
+        })
+        .max()
+        .map(|(_, i)| i)
+}
+
 /// A campaign's hold on its slot between trials, in that slot's directory so it outlives a
 /// daemon restart. A campaign downs and ups its vehicle for every trial, and another workspace's
 /// `up` in that gap must not take the slot.
@@ -192,6 +222,9 @@ pub(crate) fn release(root: &Path, instance: Instance, campaign: &str) {
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct Asker<'a> {
     pub campaign: Option<&'a str>,
+    /// The id of the model being brought up: an inline manifest has no folder, so its own run is
+    /// the one with no folder and this id.
+    pub id: Option<&'a str>,
 }
 
 /// The slot an `up` of the workspace in `workspace` takes (`ARCHITECTURE.md` §6.0.5): its own
@@ -222,7 +255,10 @@ pub(crate) fn choose_in(
     let own = |i: Instance| {
         runs.iter()
             .find(|(s, _)| *s == i)
-            .is_some_and(|(_, r)| workspace.is_some_and(|w| same_dir(&r.dir, w)))
+            .is_some_and(|(_, r)| match workspace {
+                Some(w) => same_dir(&r.dir, w),
+                None => r.dir == Path::new(".") && asker.id.is_some_and(|id| id == r.id),
+            })
     };
     let held_by = |i: Instance| runs.iter().find(|(s, _)| *s == i).map(|(_, r)| r);
     let reserved_for_other =
@@ -329,7 +365,11 @@ pub(crate) fn of<T>(
 /// Refuse a lifecycle verb from outside a campaign on the slot the campaign holds: its trials
 /// down and up its run, and another caller's `down` or `zone up` there would cut a trial short.
 /// The campaign's own requests, and the stages of a composite verb, name their slot or campaign.
-pub(crate) fn guard<T>(req: &tonic::Request<T>, root: &Path, scope: &RunScope) -> Result<(), Status> {
+pub(crate) fn guard<T>(
+    req: &tonic::Request<T>,
+    root: &Path,
+    scope: &RunScope,
+) -> Result<(), Status> {
     Caller::of(req).check(root, scope)
 }
 
@@ -354,8 +394,8 @@ impl Caller {
         }
         match reserved_by(root, scope.instance) {
             Some(c) if Some(&c) != self.campaign.as_ref() => Err(crate::errors::precondition(
-            R::HeldByRun,
-            format!(
+                R::HeldByRun,
+                format!(
                     "slot {} is held by campaign `{c}` between its trials; wait for it to finish",
                     scope.instance
                 ),
@@ -381,10 +421,17 @@ pub(crate) enum Target {
 
 impl Target {
     /// The run this target is, for a request whose workspace is in `workspace`.
-    pub(crate) fn scope(&self, root: &Path, workspace: Option<&Path>) -> Result<RunScope, Status> {
+    pub(crate) fn scope(
+        &self,
+        root: &Path,
+        workspace: Option<&Path>,
+        id: Option<&str>,
+    ) -> Result<RunScope, Status> {
         match self {
-            Target::Start(requested) => choose(root, workspace, *requested, Asker::default())
-                .map(|i| RunScope::new(root, i)),
+            Target::Start(requested) => {
+                choose(root, workspace, *requested, Asker { campaign: None, id })
+                    .map(|i| RunScope::new(root, i))
+            }
             Target::Existing(run) => resolve(root, run.as_ref(), workspace),
             Target::At(i) => Ok(RunScope::new(root, *i)),
         }
@@ -603,6 +650,7 @@ mod tests {
         assert_eq!(reason(&e), "ERROR_REASON_HELD_BY_RUN");
         let campaign = Asker {
             campaign: Some("camp-1"),
+            id: None,
         };
         assert_eq!(
             choose_in(&runs(), reserved, Some(Path::new("/ws/c")), None, campaign).unwrap(),
@@ -622,6 +670,29 @@ mod tests {
         assert_eq!(reserved_by(&root, i), None);
         release(&root, i, "camp-1");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An inline manifest has no folder: its own run is the one with none and the same id, so a
+    /// repeated `up` keeps its slot instead of taking another.
+    #[test]
+    fn a_repeated_inline_up_keeps_its_slot() {
+        let runs = vec![(slot("3"), record("car", ".", "run-i"))];
+        let ask = Asker {
+            campaign: None,
+            id: Some("car"),
+        };
+        assert_eq!(
+            choose_in(&runs, |_| None, None, None, ask).unwrap(),
+            slot("3")
+        );
+        let other = Asker {
+            campaign: None,
+            id: Some("bus"),
+        };
+        assert_eq!(
+            choose_in(&runs, |_| None, None, None, other).unwrap(),
+            Instance::FIRST
+        );
     }
 
     #[test]

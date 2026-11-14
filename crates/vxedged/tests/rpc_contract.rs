@@ -243,6 +243,17 @@ fn slot0(runtime: &Path) -> PathBuf {
     dir
 }
 
+/// A run in slot 0 of the workspace in `ws` that is down: its ingest folder is there, and the
+/// slot remembers the workspace, as a daemon leaves them after `down`.
+fn ingested_in_slot0(runtime: &Path, ws: &Path) {
+    std::fs::create_dir_all(slot0(runtime).join("ingest")).unwrap();
+    std::fs::write(
+        slot0(runtime).join("workspace.json"),
+        serde_json::json!({ "dir": ws }).to_string(),
+    )
+    .unwrap();
+}
+
 /// What a daemon leaves behind for a workspace that is still up.
 fn write_active_record(runtime: &Path, id: &str, dir: &Path, sha256: Option<&str>) {
     let mut record = serde_json::json!({ "id": id, "dir": dir, "bridge": "lo" });
@@ -1865,7 +1876,7 @@ async fn collect_returns_the_archive_and_its_digest() {
     let (ws, _) = experiment_workspace();
     let bin = fake_vxtelemetry(0);
     let daemon = Daemon::start_env(
-        |run| std::fs::create_dir_all(slot0(run).join("ingest")).unwrap(),
+        |run| ingested_in_slot0(run, &ws),
         &[("VXEDGE_VXTELEMETRY_BIN", &bin)],
     );
     let channel = daemon.channel().await;
@@ -1985,7 +1996,7 @@ async fn a_failed_collect_fails_its_job_and_nothing_ingested_is_refused() {
     let (ws, _) = experiment_workspace();
     let bin = fake_vxtelemetry(3);
     let daemon = Daemon::start_env(
-        |run| std::fs::create_dir_all(slot0(run).join("ingest")).unwrap(),
+        |run| ingested_in_slot0(run, &ws),
         &[("VXEDGE_VXTELEMETRY_BIN", &bin)],
     );
     let channel = daemon.channel().await;
@@ -3922,7 +3933,7 @@ async fn plan_and_collect_name_the_entities_records_use() {
     let (ws, _) = experiment_workspace();
     let bin = fake_vxtelemetry(0);
     let daemon = Daemon::start_env(
-        |run| std::fs::create_dir_all(slot0(run).join("ingest")).unwrap(),
+        |run| ingested_in_slot0(run, &ws),
         &[("VXEDGE_VXTELEMETRY_BIN", &bin)],
     );
     let channel = daemon.channel().await;

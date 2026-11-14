@@ -192,7 +192,10 @@ impl VehicleService for VehicleSvc {
             &root,
             dir.as_deref(),
             crate::scope::requested(&req.get_ref().instance)?,
-            crate::scope::Asker::default(),
+            crate::scope::Asker {
+                campaign: None,
+                id: Some(&model.id),
+            },
         )?;
         let scope = crate::scope::RunScope::new(&root, instance);
         // Every check `up` makes before touching the host, shared with `WorkspaceService.Plan` so
@@ -428,11 +431,14 @@ impl VehicleService for VehicleSvc {
                 let observed = self
                     .handles
                     .svcs
-                    .status(crate::scope::with_slot(Request::new(SvcStatusRequest {
-                        service_type,
-                        experiment: inline(&yaml, dir.as_deref()),
-                        run: run.run.clone(),
-                    }), run.scope.instance))
+                    .status(crate::scope::with_slot(
+                        Request::new(SvcStatusRequest {
+                            service_type,
+                            experiment: inline(&yaml, dir.as_deref()),
+                            run: run.run.clone(),
+                        }),
+                        run.scope.instance,
+                    ))
                     .await?;
                 out.push(observed.into_inner());
             }

@@ -280,6 +280,7 @@ impl CampaignService for CampaignSvc {
             crate::scope::requested(&req.instance)?,
             crate::scope::Asker {
                 campaign: Some(&id),
+                id: None,
             },
         )?;
         let runtime_dir = crate::scope::run_dir(&self.runtime_dir, instance);

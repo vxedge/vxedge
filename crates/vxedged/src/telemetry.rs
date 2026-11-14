@@ -210,7 +210,17 @@ impl TelemetryService for TelemetrySvc {
             Some(i) => i,
             None => crate::scope::run_of(&self.runtime_dir, &workspace)
                 .map(|s| s.instance)
-                .unwrap_or(vxedge_core::instance::Instance::FIRST),
+                .or_else(|| crate::scope::last_slot_of(&self.runtime_dir, &workspace))
+                .ok_or_else(|| {
+                    errors::precondition(
+                        R::NotFound,
+                        format!(
+                            "nothing has been ingested: `{}` has run in no slot on this host; \
+                             name the slot with `instance`",
+                            workspace.display()
+                        ),
+                    )
+                })?,
         };
         let scope = crate::scope::RunScope::new(&self.runtime_dir, instance);
         let ingest = match vxedge_core::services::ServiceDef::find(&model, "telemetry") {

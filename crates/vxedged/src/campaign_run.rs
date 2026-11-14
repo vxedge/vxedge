@@ -317,15 +317,18 @@ async fn measure(
     if c.has_measurements {
         let job = MeasurementService::start(
             &*steps.measure,
-            crate::scope::with_slot(stage(
-                MeasurementStartRequest {
-                    manifest: manifest.clone(),
-                    run: run.clone(),
-                    duration_s: duration_s.ceil() as u32,
-                    ..Default::default()
-                },
-                parent,
-            ), c.instance),
+            crate::scope::with_slot(
+                stage(
+                    MeasurementStartRequest {
+                        manifest: manifest.clone(),
+                        run: run.clone(),
+                        duration_s: duration_s.ceil() as u32,
+                        ..Default::default()
+                    },
+                    parent,
+                ),
+                c.instance,
+            ),
         )
         .await
         .map_err(|s| JobFailure::from_status(&s).context("measure start"))?
@@ -428,14 +431,17 @@ async fn stop_measurements(
 ) -> Result<(), JobFailure> {
     let job = MeasurementService::stop(
         &*steps.measure,
-        crate::scope::with_slot(stage(
-            MeasurementStopRequest {
-                manifest: manifest.clone(),
-                run: run.clone(),
-                ..Default::default()
-            },
-            parent,
-        ), instance),
+        crate::scope::with_slot(
+            stage(
+                MeasurementStopRequest {
+                    manifest: manifest.clone(),
+                    run: run.clone(),
+                    ..Default::default()
+                },
+                parent,
+            ),
+            instance,
+        ),
     )
     .await
     .map_err(|s| JobFailure::from_status(&s).context("measure stop"))?
@@ -474,15 +480,18 @@ pub async fn run_trial(
     mark("provision");
     // In the campaign's own slot, queued for the host's lifecycle claim: another run's `up` in
     // flight delays the trial instead of failing it.
-    let mut up_req = crate::scope::with_slot(queued_stage(
-        ExperimentUpRequest {
-            manifest: manifest.clone(),
-            unlocked: c.unlocked,
-            instance: c.instance.to_string(),
-            ..Default::default()
-        },
-        &parent,
-    ), c.instance);
+    let mut up_req = crate::scope::with_slot(
+        queued_stage(
+            ExperimentUpRequest {
+                manifest: manifest.clone(),
+                unlocked: c.unlocked,
+                instance: c.instance.to_string(),
+                ..Default::default()
+            },
+            &parent,
+        ),
+        c.instance,
+    );
     up_req
         .extensions_mut()
         .insert(crate::scope::Campaign(campaign_id.to_string()));
@@ -503,15 +512,18 @@ pub async fn run_trial(
         if c.has_traffic {
             let job = TrafficService::up(
                 &*steps.traffic,
-                crate::scope::with_slot(stage(
-                    TrafficUpRequest {
-                        manifest: manifest.clone(),
-                        duration_s: load_s,
-                        run: run.clone(),
-                        ..Default::default()
-                    },
-                    &parent,
-                ), c.instance),
+                crate::scope::with_slot(
+                    stage(
+                        TrafficUpRequest {
+                            manifest: manifest.clone(),
+                            duration_s: load_s,
+                            run: run.clone(),
+                            ..Default::default()
+                        },
+                        &parent,
+                    ),
+                    c.instance,
+                ),
             )
             .await
             .map_err(|s| JobFailure::from_status(&s).context("traffic up"))?
@@ -548,14 +560,17 @@ pub async fn run_trial(
         if c.has_traffic {
             let job = TrafficService::down(
                 &*steps.traffic,
-                crate::scope::with_slot(stage(
-                    TrafficDownRequest {
-                        manifest: manifest.clone(),
-                        run: run.clone(),
-                        ..Default::default()
-                    },
-                    &parent,
-                ), c.instance),
+                crate::scope::with_slot(
+                    stage(
+                        TrafficDownRequest {
+                            manifest: manifest.clone(),
+                            run: run.clone(),
+                            ..Default::default()
+                        },
+                        &parent,
+                    ),
+                    c.instance,
+                ),
             )
             .await
             .map_err(|s| JobFailure::from_status(&s).context("traffic down"))?
@@ -567,14 +582,17 @@ pub async fn run_trial(
         // The ingest stops before the archive is cut, so the archive is all of it.
         let job = SvcService::down(
             &*steps.svcs,
-            crate::scope::with_slot(stage(
-                SvcDownRequest {
-                    service_type: "telemetry".into(),
-                    experiment: manifest.clone(),
-                    run: run.clone(),
-                },
-                &parent,
-            ), c.instance),
+            crate::scope::with_slot(
+                stage(
+                    SvcDownRequest {
+                        service_type: "telemetry".into(),
+                        experiment: manifest.clone(),
+                        run: run.clone(),
+                    },
+                    &parent,
+                ),
+                c.instance,
+            ),
         )
         .await
         .map_err(|s| JobFailure::from_status(&s).context("telemetry down"))?
@@ -589,18 +607,21 @@ pub async fn run_trial(
         .await?;
         let job = TelemetryService::collect(
             &*steps.telemetry,
-            crate::scope::with_slot(stage(
-                // The trial's bound document, read from its folder: the archive's
-                // `entities.json` then names what this trial ran, such as an arm's fetch
-                // clients, not the defaults the package declares.
-                CollectRequest {
-                    manifest: manifest.clone(),
-                    out_path: archive.display().to_string(),
-                    instance: c.instance.to_string(),
-                    ..Default::default()
-                },
-                &parent,
-            ), c.instance),
+            crate::scope::with_slot(
+                stage(
+                    // The trial's bound document, read from its folder: the archive's
+                    // `entities.json` then names what this trial ran, such as an arm's fetch
+                    // clients, not the defaults the package declares.
+                    CollectRequest {
+                        manifest: manifest.clone(),
+                        out_path: archive.display().to_string(),
+                        instance: c.instance.to_string(),
+                        ..Default::default()
+                    },
+                    &parent,
+                ),
+                c.instance,
+            ),
         )
         .await
         .map_err(|s| JobFailure::from_status(&s).context("collect"))?
@@ -629,14 +650,17 @@ pub async fn run_trial(
     });
     let down = ExperimentService::down(
         &*steps.experiments,
-        crate::scope::with_slot(queued_stage(
-            ExperimentDownRequest {
-                manifest: manifest.clone(),
-                run: down_run,
-                ..Default::default()
-            },
-            &parent,
-        ), c.instance),
+        crate::scope::with_slot(
+            queued_stage(
+                ExperimentDownRequest {
+                    manifest: manifest.clone(),
+                    run: down_run,
+                    ..Default::default()
+                },
+                &parent,
+            ),
+            c.instance,
+        ),
     )
     .await;
     let down = match down {

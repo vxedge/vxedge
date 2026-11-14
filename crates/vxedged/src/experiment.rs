@@ -227,24 +227,30 @@ impl Handles {
         );
         let job = if let Some(unlocked) = up {
             self.gateway
-                .up(crate::scope::with_slot(stage(
-                    GatewayUpRequest {
-                        instance: run.scope.instance.to_string(),
-                        manifest: inline(yaml, dir),
-                        unlocked,
-                    },
-                    p.job_id(),
-                ), run.scope.instance))
+                .up(crate::scope::with_slot(
+                    stage(
+                        GatewayUpRequest {
+                            instance: run.scope.instance.to_string(),
+                            manifest: inline(yaml, dir),
+                            unlocked,
+                        },
+                        p.job_id(),
+                    ),
+                    run.scope.instance,
+                ))
                 .await
         } else {
             self.gateway
-                .down(crate::scope::with_slot(stage(
-                    GatewayDownRequest {
-                        run: run.run.clone(),
-                        manifest: inline(yaml, dir),
-                    },
-                    p.job_id(),
-                ), run.scope.instance))
+                .down(crate::scope::with_slot(
+                    stage(
+                        GatewayDownRequest {
+                            run: run.run.clone(),
+                            manifest: inline(yaml, dir),
+                        },
+                        p.job_id(),
+                    ),
+                    run.scope.instance,
+                ))
                 .await
         }
         .map_err(|e| JobFailure::from_status(&e).context("gateway"))?;
@@ -409,46 +415,58 @@ impl Handles {
         let job = match (stage, up) {
             (NodeStage::Zones, true) => {
                 self.zones
-                    .up(crate::scope::with_slot(crate::jobs::stage(
-                        ZoneUpRequest {
-                            r#ref,
-                            run: run.run.clone(),
-                        },
-                        parent,
-                    ), run.scope.instance))
+                    .up(crate::scope::with_slot(
+                        crate::jobs::stage(
+                            ZoneUpRequest {
+                                r#ref,
+                                run: run.run.clone(),
+                            },
+                            parent,
+                        ),
+                        run.scope.instance,
+                    ))
                     .await
             }
             (NodeStage::Zones, false) => {
                 self.zones
-                    .down(crate::scope::with_slot(crate::jobs::stage(
-                        ZoneDownRequest {
-                            r#ref,
-                            run: run.run.clone(),
-                        },
-                        parent,
-                    ), run.scope.instance))
+                    .down(crate::scope::with_slot(
+                        crate::jobs::stage(
+                            ZoneDownRequest {
+                                r#ref,
+                                run: run.run.clone(),
+                            },
+                            parent,
+                        ),
+                        run.scope.instance,
+                    ))
                     .await
             }
             (NodeStage::Compute, true) => {
                 self.compute
-                    .up(crate::scope::with_slot(crate::jobs::stage(
-                        ComputeUpRequest {
-                            r#ref,
-                            run: run.run.clone(),
-                        },
-                        parent,
-                    ), run.scope.instance))
+                    .up(crate::scope::with_slot(
+                        crate::jobs::stage(
+                            ComputeUpRequest {
+                                r#ref,
+                                run: run.run.clone(),
+                            },
+                            parent,
+                        ),
+                        run.scope.instance,
+                    ))
                     .await
             }
             (NodeStage::Compute, false) => {
                 self.compute
-                    .down(crate::scope::with_slot(crate::jobs::stage(
-                        ComputeDownRequest {
-                            r#ref,
-                            run: run.run.clone(),
-                        },
-                        parent,
-                    ), run.scope.instance))
+                    .down(crate::scope::with_slot(
+                        crate::jobs::stage(
+                            ComputeDownRequest {
+                                r#ref,
+                                run: run.run.clone(),
+                            },
+                            parent,
+                        ),
+                        run.scope.instance,
+                    ))
                     .await
             }
         }?;
@@ -697,25 +715,31 @@ impl Handles {
             );
             let job = if up {
                 self.svcs
-                    .up(crate::scope::with_slot(stage(
-                        SvcUpRequest {
-                            service_type: ty.clone(),
-                            experiment: inline(yaml, dir),
-                            run: run.run.clone(),
-                        },
-                        p.job_id(),
-                    ), run.scope.instance))
+                    .up(crate::scope::with_slot(
+                        stage(
+                            SvcUpRequest {
+                                service_type: ty.clone(),
+                                experiment: inline(yaml, dir),
+                                run: run.run.clone(),
+                            },
+                            p.job_id(),
+                        ),
+                        run.scope.instance,
+                    ))
                     .await
             } else {
                 self.svcs
-                    .down(crate::scope::with_slot(stage(
-                        SvcDownRequest {
-                            service_type: ty.clone(),
-                            experiment: inline(yaml, dir),
-                            run: run.run.clone(),
-                        },
-                        p.job_id(),
-                    ), run.scope.instance))
+                    .down(crate::scope::with_slot(
+                        stage(
+                            SvcDownRequest {
+                                service_type: ty.clone(),
+                                experiment: inline(yaml, dir),
+                                run: run.run.clone(),
+                            },
+                            p.job_id(),
+                        ),
+                        run.scope.instance,
+                    ))
                     .await
             }
             .map_err(|e| JobFailure::from_status(&e).context(format!("service `{ty}`")))?;
@@ -869,6 +893,7 @@ impl ExperimentService for ExperimentSvc {
             crate::scope::requested(&req.get_ref().instance)?,
             crate::scope::Asker {
                 campaign: campaign.as_deref(),
+                id: Some(&model.id),
             },
         )?;
         let scope = crate::scope::RunScope::new(&root, instance);
@@ -1115,9 +1140,12 @@ impl ExperimentService for ExperimentSvc {
         let gw = self
             .handles
             .gateway
-            .status(crate::scope::with_slot(Request::new(GatewayStatusRequest {
-                run: run.run.clone(),
-            }), run.scope.instance))
+            .status(crate::scope::with_slot(
+                Request::new(GatewayStatusRequest {
+                    run: run.run.clone(),
+                }),
+                run.scope.instance,
+            ))
             .await?
             .into_inner();
         let gw_status = gw.status.clone().unwrap_or_default();
@@ -1125,18 +1153,24 @@ impl ExperimentService for ExperimentSvc {
         let mut nodes = self
             .handles
             .zones
-            .list(crate::scope::with_slot(Request::new(vxedge_api::v1::ZoneListRequest {
-                run: run.run.clone(),
-            }), run.scope.instance))
+            .list(crate::scope::with_slot(
+                Request::new(vxedge_api::v1::ZoneListRequest {
+                    run: run.run.clone(),
+                }),
+                run.scope.instance,
+            ))
             .await
             .map(|r| r.into_inner().nodes)
             .unwrap_or_default();
         nodes.extend(
             self.handles
                 .compute
-                .list(crate::scope::with_slot(Request::new(ComputeListRequest {
-                    run: run.run.clone(),
-                }), run.scope.instance))
+                .list(crate::scope::with_slot(
+                    Request::new(ComputeListRequest {
+                        run: run.run.clone(),
+                    }),
+                    run.scope.instance,
+                ))
                 .await
                 .map(|r| r.into_inner().node_status)
                 .unwrap_or_default(),
@@ -1147,11 +1181,14 @@ impl ExperimentService for ExperimentSvc {
             let observed = self
                 .handles
                 .svcs
-                .status(crate::scope::with_slot(Request::new(vxedge_api::v1::SvcStatusRequest {
-                    service_type,
-                    experiment: inline(&yaml, dir.as_deref()),
-                    run: run.run.clone(),
-                }), run.scope.instance))
+                .status(crate::scope::with_slot(
+                    Request::new(vxedge_api::v1::SvcStatusRequest {
+                        service_type,
+                        experiment: inline(&yaml, dir.as_deref()),
+                        run: run.run.clone(),
+                    }),
+                    run.scope.instance,
+                ))
                 .await?;
             components.push(observed.into_inner());
         }

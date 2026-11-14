@@ -653,7 +653,12 @@ impl GatewaySvc {
         caller: crate::scope::Caller,
     ) -> Result<Response<Job>, Status> {
         let (yaml, sha256, manifest_dir) = resolve_manifest(mref).await?;
-        let scope = target.scope(&self.runtime_dir, manifest_dir.as_deref())?;
+        let model_id = parse_to_model(&yaml).ok().map(|m| m.id);
+        let scope = target.scope(
+            &self.runtime_dir,
+            manifest_dir.as_deref(),
+            model_id.as_deref(),
+        )?;
         if !matches!(verb, Verb::Apply) {
             caller.check(&self.runtime_dir, &scope)?;
         }
@@ -707,6 +712,7 @@ impl GatewaySvc {
         let state = self.state.clone();
         // This run's own directory: its record, manifest, 5G and gPTP files.
         let runtime_dir = scope.dir.clone();
+        let root = self.runtime_dir.clone();
         let instance = scope.instance;
         let containers = self.containers.clone();
         let events = self.engine.events().clone();
@@ -953,6 +959,7 @@ impl GatewaySvc {
                         tokio::fs::write(active_record(&runtime_dir), record.to_string())
                             .await
                             .map_err(|e| format!("cannot record the active workspace: {e}"))?;
+                        crate::scope::remember_workspace(&root, instance, &dir);
                         if fresh && let Some(record) = read_active_record(&runtime_dir) {
                             let (kind, target) = crate::runs::target(&record).await;
                             events.emit_run(
