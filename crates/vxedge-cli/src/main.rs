@@ -105,6 +105,8 @@ enum Command {
     },
     /// Show gateway status.
     Status,
+    /// List the runs on this host, each with its instance slot and run id.
+    Runs,
     /// Zone lifecycle (vxzones).
     Zone {
         #[command(subcommand)]
@@ -1689,6 +1691,38 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     match &cli.command {
+        Command::Runs => {
+            let channel = connect(&cli.endpoint).await?;
+            let mut client = vxedge_api::v1::run_service_client::RunServiceClient::new(channel);
+            let runs = client
+                .list(vxedge_api::v1::RunListRequest::default())
+                .await?
+                .into_inner()
+                .runs;
+            if cli.json {
+                let rows: Vec<serde_json::Value> = runs
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "instance": r.instance, "run_id": r.id, "target": r.target_id,
+                            "state": vxedge_api::v1::ResourceState::try_from(r.state)
+                                .map(|s| s.as_str_name())
+                                .unwrap_or_default(),
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else if runs.is_empty() {
+                println!("no runs on this host");
+            } else {
+                for r in &runs {
+                    println!(
+                        "slot {}  {}  {}  state={}",
+                        r.instance, r.id, r.target_id, r.state
+                    );
+                }
+            }
+        }
         Command::Status => {
             let channel = connect(&cli.endpoint).await.map_err(|e| {
                 format!(
