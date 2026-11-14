@@ -53,7 +53,7 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 # Reads a scenario's OpenSCENARIO entities and parameter declarations; pure Rust, read-only.
 roxmltree = "0.21"
 # Archive v2 members are zstd-compressed (decision X-7); the verdict engine reads them.
-zstd = { version = "0.13", default-features = false }
+zstd = { version = "0.14", default-features = false }
 # Podman's Docker-compatible REST API over the rootless user socket. Unix-socket transport
 # only: no TLS stack, no HTTP/SSH remotes.
 cloud-hypervisor-client = "=0.6.0"
