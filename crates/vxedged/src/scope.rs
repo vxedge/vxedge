@@ -301,6 +301,70 @@ impl RunCtx {
     }
 }
 
+/// The slot an internal request acts on: every stage a composite verb (an `experiment`, a
+/// `vehicle`, a campaign's trial) sends names its run's slot, so it never falls back to "the only
+/// run", which with another run up is that other run.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Slot(pub Instance);
+
+/// `req`, marked as acting on slot `instance`.
+pub(crate) fn with_slot<T>(mut req: tonic::Request<T>, instance: Instance) -> tonic::Request<T> {
+    req.extensions_mut().insert(Slot(instance));
+    req
+}
+
+/// The run a request acts on: the slot an internal request names, else [`resolve`]'s rule.
+pub(crate) fn of<T>(
+    req: &tonic::Request<T>,
+    root: &Path,
+    run: Option<&RunRef>,
+    workspace: Option<&Path>,
+) -> Result<RunScope, Status> {
+    match req.extensions().get::<Slot>() {
+        Some(Slot(i)) => Ok(RunScope::new(root, *i)),
+        None => resolve(root, run, workspace),
+    }
+}
+
+/// Refuse a lifecycle verb from outside a campaign on the slot the campaign holds: its trials
+/// down and up its run, and another caller's `down` or `zone up` there would cut a trial short.
+/// The campaign's own requests, and the stages of a composite verb, name their slot or campaign.
+pub(crate) fn guard<T>(req: &tonic::Request<T>, root: &Path, scope: &RunScope) -> Result<(), Status> {
+    Caller::of(req).check(root, scope)
+}
+
+/// Who sent a lifecycle request, for [`guard`]: a stage of a composite verb, or a campaign.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Caller {
+    internal: bool,
+    campaign: Option<String>,
+}
+
+impl Caller {
+    pub(crate) fn of<T>(req: &tonic::Request<T>) -> Self {
+        Self {
+            internal: req.extensions().get::<Slot>().is_some(),
+            campaign: req.extensions().get::<Campaign>().map(|c| c.0.clone()),
+        }
+    }
+
+    pub(crate) fn check(&self, root: &Path, scope: &RunScope) -> Result<(), Status> {
+        if self.internal {
+            return Ok(());
+        }
+        match reserved_by(root, scope.instance) {
+            Some(c) if Some(&c) != self.campaign.as_ref() => Err(crate::errors::precondition(
+            R::HeldByRun,
+            format!(
+                    "slot {} is held by campaign `{c}` between its trials; wait for it to finish",
+                    scope.instance
+                ),
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
 /// A campaign's id on a request it makes, so the slot it reserves is open to it.
 #[derive(Debug, Clone)]
 pub(crate) struct Campaign(pub String);
@@ -311,6 +375,8 @@ pub(crate) struct Campaign(pub String);
 pub(crate) enum Target {
     Start(Option<Instance>),
     Existing(Option<RunRef>),
+    /// The slot an internal request names.
+    At(Instance),
 }
 
 impl Target {
@@ -320,6 +386,7 @@ impl Target {
             Target::Start(requested) => choose(root, workspace, *requested, Asker::default())
                 .map(|i| RunScope::new(root, i)),
             Target::Existing(run) => resolve(root, run.as_ref(), workspace),
+            Target::At(i) => Ok(RunScope::new(root, *i)),
         }
     }
 }

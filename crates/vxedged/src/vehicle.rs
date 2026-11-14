@@ -305,7 +305,8 @@ impl VehicleService for VehicleSvc {
             id,
         } = resolve_and_synthesize(req.get_ref().manifest.as_ref()).await?;
         let root = self.handles.gateway.runtime_dir.clone();
-        let scope = crate::scope::resolve(&root, req.get_ref().run.as_ref(), dir.as_deref())?;
+        let scope = crate::scope::of(&req, &root, req.get_ref().run.as_ref(), dir.as_deref())?;
+        crate::scope::guard(&req, &root, &scope)?;
         let (gateway, nodes) = plan_vehicle(&model, dir.as_deref(), scope.instance)?;
         self.require_active("vehicle down", &model, dir.as_deref(), &nodes, &scope)
             .await?;
@@ -410,7 +411,7 @@ impl VehicleService for VehicleSvc {
             ..
         } = resolve_and_synthesize(req.get_ref().manifest.as_ref()).await?;
         let root = self.handles.gateway.runtime_dir.clone();
-        let scope = crate::scope::resolve(&root, req.get_ref().run.as_ref(), dir.as_deref())?;
+        let scope = crate::scope::of(&req, &root, req.get_ref().run.as_ref(), dir.as_deref())?;
         let (gateway, nodes) = plan_vehicle(&model, dir.as_deref(), scope.instance)?;
         self.require_active("vehicle status", &model, dir.as_deref(), &nodes, &scope)
             .await?;
@@ -427,11 +428,11 @@ impl VehicleService for VehicleSvc {
                 let observed = self
                     .handles
                     .svcs
-                    .status(Request::new(SvcStatusRequest {
+                    .status(crate::scope::with_slot(Request::new(SvcStatusRequest {
                         service_type,
                         experiment: inline(&yaml, dir.as_deref()),
                         run: run.run.clone(),
-                    }))
+                    }), run.scope.instance))
                     .await?;
                 out.push(observed.into_inner());
             }

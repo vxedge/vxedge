@@ -650,9 +650,13 @@ impl GatewaySvc {
         mref: Option<&ManifestRef>,
         verb: Verb,
         target: crate::scope::Target,
+        caller: crate::scope::Caller,
     ) -> Result<Response<Job>, Status> {
         let (yaml, sha256, manifest_dir) = resolve_manifest(mref).await?;
         let scope = target.scope(&self.runtime_dir, manifest_dir.as_deref())?;
+        if !matches!(verb, Verb::Apply) {
+            caller.check(&self.runtime_dir, &scope)?;
+        }
         let opts = opts.in_run(&scope.dir);
         // `up` checks the package itself, not only through `experiment up`'s preflight: a
         // `GatewayService.Up` call is an `up` too. What passes is what the run records.
@@ -1074,6 +1078,7 @@ impl GatewayService for GatewaySvc {
             req.get_ref().manifest.as_ref(),
             Verb::Apply,
             crate::scope::Target::Start(None),
+            crate::scope::Caller::default(),
         )
         .await
     }
@@ -1088,6 +1093,7 @@ impl GatewayService for GatewaySvc {
                 unlocked: req.get_ref().unlocked,
             },
             crate::scope::Target::Start(crate::scope::requested(&req.get_ref().instance)?),
+            crate::scope::Caller::of(&req),
         )
         .await
     }
@@ -1099,7 +1105,11 @@ impl GatewayService for GatewaySvc {
             "gateway.down",
             req.get_ref().manifest.as_ref(),
             Verb::Down,
-            crate::scope::Target::Existing(req.get_ref().run.clone()),
+            match req.extensions().get::<crate::scope::Slot>() {
+                Some(crate::scope::Slot(i)) => crate::scope::Target::At(*i),
+                None => crate::scope::Target::Existing(req.get_ref().run.clone()),
+            },
+            crate::scope::Caller::of(&req),
         )
         .await
     }
@@ -1108,7 +1118,7 @@ impl GatewayService for GatewaySvc {
         &self,
         req: Request<GatewayStatusRequest>,
     ) -> Result<Response<GatewayStatus>, Status> {
-        let scope = crate::scope::resolve(&self.runtime_dir, req.get_ref().run.as_ref(), None)?;
+        let scope = crate::scope::of(&req, &self.runtime_dir, req.get_ref().run.as_ref(), None)?;
         // Best effort: a workspace that cannot be restored still has a gateway to report.
         if let Err(e) = restore_active(&self.state, &scope, &self.shell).await {
             tracing::warn!(error = %e.message(), "active workspace not restored");
@@ -1733,7 +1743,7 @@ impl ZoneService for ZoneSvc {
     }
 
     async fn up(&self, req: Request<ZoneUpRequest>) -> Result<Response<Job>, Status> {
-        let scope = crate::scope::resolve(&self.runtime_dir, req.get_ref().run.as_ref(), None)?;
+        let scope = crate::scope::of(&req, &self.runtime_dir, req.get_ref().run.as_ref(), None)?;
         let vxid = req
             .get_ref()
             .r#ref
@@ -1746,13 +1756,14 @@ impl ZoneService for ZoneSvc {
                     "--vxid <zone id> is required",
                 )
             })?;
+        crate::scope::guard(&req, &self.runtime_dir, &scope)?;
         let opts = crate::jobs::JobOpts::lifecycle(&req, format!("zone {vxid}"));
         self.lifecycle(opts, "ZoneService.Up", "zone.up", vxid, true, scope)
             .await
     }
 
     async fn down(&self, req: Request<ZoneDownRequest>) -> Result<Response<Job>, Status> {
-        let scope = crate::scope::resolve(&self.runtime_dir, req.get_ref().run.as_ref(), None)?;
+        let scope = crate::scope::of(&req, &self.runtime_dir, req.get_ref().run.as_ref(), None)?;
         let vxid = req
             .get_ref()
             .r#ref
@@ -1765,6 +1776,7 @@ impl ZoneService for ZoneSvc {
                     "--vxid <zone id> is required",
                 )
             })?;
+        crate::scope::guard(&req, &self.runtime_dir, &scope)?;
         let opts = crate::jobs::JobOpts::lifecycle(&req, format!("zone {vxid}"));
         self.lifecycle(opts, "ZoneService.Down", "zone.down", vxid, false, scope)
             .await
@@ -1774,7 +1786,7 @@ impl ZoneService for ZoneSvc {
         &self,
         req: Request<ZoneListRequest>,
     ) -> Result<Response<ZoneListResponse>, Status> {
-        let scope = crate::scope::resolve(&self.runtime_dir, req.get_ref().run.as_ref(), None)?;
+        let scope = crate::scope::of(&req, &self.runtime_dir, req.get_ref().run.as_ref(), None)?;
         let plans = self.plans_for(&scope, None).await?;
         let nodes = observed_nodes(self.shell.clone(), scope.dir.clone(), plans).await?;
         let zones = nodes.iter().filter_map(|n| n.status.clone()).collect();
@@ -1983,7 +1995,7 @@ impl ComputeService for ComputeSvc {
     }
 
     async fn up(&self, req: Request<ComputeUpRequest>) -> Result<Response<Job>, Status> {
-        let scope = crate::scope::resolve(&self.runtime_dir, req.get_ref().run.as_ref(), None)?;
+        let scope = crate::scope::of(&req, &self.runtime_dir, req.get_ref().run.as_ref(), None)?;
         let vxid = req
             .get_ref()
             .r#ref
@@ -1996,13 +2008,14 @@ impl ComputeService for ComputeSvc {
                     "--vxid <compute node id> is required",
                 )
             })?;
+        crate::scope::guard(&req, &self.runtime_dir, &scope)?;
         let opts = crate::jobs::JobOpts::lifecycle(&req, format!("compute {vxid}"));
         self.lifecycle(opts, "ComputeService.Up", "compute.up", vxid, true, scope)
             .await
     }
 
     async fn down(&self, req: Request<ComputeDownRequest>) -> Result<Response<Job>, Status> {
-        let scope = crate::scope::resolve(&self.runtime_dir, req.get_ref().run.as_ref(), None)?;
+        let scope = crate::scope::of(&req, &self.runtime_dir, req.get_ref().run.as_ref(), None)?;
         let vxid = req
             .get_ref()
             .r#ref
@@ -2015,6 +2028,7 @@ impl ComputeService for ComputeSvc {
                     "--vxid <compute node id> is required",
                 )
             })?;
+        crate::scope::guard(&req, &self.runtime_dir, &scope)?;
         let opts = crate::jobs::JobOpts::lifecycle(&req, format!("compute {vxid}"));
         self.lifecycle(
             opts,
@@ -2031,7 +2045,7 @@ impl ComputeService for ComputeSvc {
         &self,
         req: Request<ComputeListRequest>,
     ) -> Result<Response<ComputeListResponse>, Status> {
-        let scope = crate::scope::resolve(&self.runtime_dir, req.get_ref().run.as_ref(), None)?;
+        let scope = crate::scope::of(&req, &self.runtime_dir, req.get_ref().run.as_ref(), None)?;
         let plans = self.plans_for(&scope, None).await?;
         let node_status = observed_nodes(self.shell.clone(), scope.dir.clone(), plans).await?;
         let nodes = node_status
@@ -2101,6 +2115,7 @@ impl SvcSvc {
     /// The run a service verb acts on: the run it names, or its workspace's run, or the only one.
     async fn scope_of(
         &self,
+        slot: Option<&crate::scope::Slot>,
         run: Option<&RunRef>,
         experiment: Option<&ManifestRef>,
     ) -> Result<crate::scope::RunScope, Status> {
@@ -2108,7 +2123,10 @@ impl SvcSvc {
             Some(m) => resolve_manifest_dir(m).await,
             None => None,
         };
-        crate::scope::resolve(&self.runtime_dir, run, dir.as_deref())
+        match slot {
+            Some(crate::scope::Slot(i)) => Ok(crate::scope::RunScope::new(&self.runtime_dir, *i)),
+            None => crate::scope::resolve(&self.runtime_dir, run, dir.as_deref()),
+        }
     }
 
     async fn service_def(
@@ -2239,10 +2257,12 @@ impl SvcService for SvcSvc {
     async fn up(&self, req: Request<SvcUpRequest>) -> Result<Response<Job>, Status> {
         let scope = self
             .scope_of(
+                req.extensions().get(),
                 req.get_ref().run.as_ref(),
                 req.get_ref().experiment.as_ref(),
             )
             .await?;
+        crate::scope::guard(&req, &self.runtime_dir, &scope)?;
         let opts =
             crate::jobs::JobOpts::lifecycle(&req, format!("svc {}", req.get_ref().service_type));
         let req = req.into_inner();
@@ -2351,10 +2371,12 @@ impl SvcService for SvcSvc {
     async fn down(&self, req: Request<SvcDownRequest>) -> Result<Response<Job>, Status> {
         let scope = self
             .scope_of(
+                req.extensions().get(),
                 req.get_ref().run.as_ref(),
                 req.get_ref().experiment.as_ref(),
             )
             .await?;
+        crate::scope::guard(&req, &self.runtime_dir, &scope)?;
         let opts =
             crate::jobs::JobOpts::lifecycle(&req, format!("svc {}", req.get_ref().service_type));
         let req = req.into_inner();
@@ -2406,6 +2428,7 @@ impl SvcService for SvcSvc {
     ) -> Result<Response<ResourceStatus>, Status> {
         let scope = self
             .scope_of(
+                req.extensions().get(),
                 req.get_ref().run.as_ref(),
                 req.get_ref().experiment.as_ref(),
             )
@@ -2476,6 +2499,7 @@ impl TrafficSvc {
     /// The run a traffic verb acts on: the run it names, or its workspace's run, or the only one.
     async fn scope_of(
         &self,
+        slot: Option<&crate::scope::Slot>,
         run: Option<&RunRef>,
         manifest: Option<&ManifestRef>,
     ) -> Result<crate::scope::RunScope, Status> {
@@ -2483,7 +2507,10 @@ impl TrafficSvc {
             Some(m) => resolve_manifest_dir(m).await,
             None => None,
         };
-        crate::scope::resolve(&self.runtime_dir, run, dir.as_deref())
+        match slot {
+            Some(crate::scope::Slot(i)) => Ok(crate::scope::RunScope::new(&self.runtime_dir, *i)),
+            None => crate::scope::resolve(&self.runtime_dir, run, dir.as_deref()),
+        }
     }
 
     /// Resolve a manifest into everything `TrafficPlan::from_manifest`
@@ -2586,7 +2613,11 @@ impl TrafficService for TrafficSvc {
         req: Request<TrafficStatusRequest>,
     ) -> Result<Response<TrafficStatus>, Status> {
         let scope = self
-            .scope_of(req.get_ref().run.as_ref(), req.get_ref().manifest.as_ref())
+            .scope_of(
+                req.extensions().get(),
+                req.get_ref().run.as_ref(),
+                req.get_ref().manifest.as_ref(),
+            )
             .await?;
         let (plan, _, _, _) = self
             .resolve_plans(req.get_ref().manifest.as_ref(), &scope)
@@ -2626,8 +2657,13 @@ impl TrafficService for TrafficSvc {
 
     async fn up(&self, req: Request<TrafficUpRequest>) -> Result<Response<Job>, Status> {
         let scope = self
-            .scope_of(req.get_ref().run.as_ref(), req.get_ref().manifest.as_ref())
+            .scope_of(
+                req.extensions().get(),
+                req.get_ref().run.as_ref(),
+                req.get_ref().manifest.as_ref(),
+            )
             .await?;
+        crate::scope::guard(&req, &self.runtime_dir, &scope)?;
         let opts = crate::jobs::JobOpts::request(&req, &req.get_ref().request_id);
         let req = req.into_inner();
         let (traffic_plan, five_g_plan, sha256, method_duration_s) =
@@ -2735,8 +2771,13 @@ impl TrafficService for TrafficSvc {
 
     async fn down(&self, req: Request<TrafficDownRequest>) -> Result<Response<Job>, Status> {
         let scope = self
-            .scope_of(req.get_ref().run.as_ref(), req.get_ref().manifest.as_ref())
+            .scope_of(
+                req.extensions().get(),
+                req.get_ref().run.as_ref(),
+                req.get_ref().manifest.as_ref(),
+            )
             .await?;
+        crate::scope::guard(&req, &self.runtime_dir, &scope)?;
         let req = req.into_inner();
         let (traffic_plan, _five_g_plan, sha256, _duration_s) =
             self.resolve_plans(req.manifest.as_ref(), &scope).await?;
@@ -2956,7 +2997,8 @@ fn boot_disposable_copy(
 #[tonic::async_trait]
 impl NosCheckService for NosCheckSvc {
     async fn up(&self, req: Request<NosCheckUpRequest>) -> Result<Response<Job>, Status> {
-        let scope = crate::scope::resolve(&self.runtime_dir, req.get_ref().run.as_ref(), None)?;
+        let scope = crate::scope::of(&req, &self.runtime_dir, req.get_ref().run.as_ref(), None)?;
+        crate::scope::guard(&req, &self.runtime_dir, &scope)?;
         let req = req.into_inner();
         let (model, image, sha256) = self.resolve(req.experiment.as_ref()).await?;
         self.audit.record(
@@ -2982,7 +3024,8 @@ impl NosCheckService for NosCheckSvc {
     }
 
     async fn down(&self, req: Request<NosCheckDownRequest>) -> Result<Response<Job>, Status> {
-        let scope = crate::scope::resolve(&self.runtime_dir, req.get_ref().run.as_ref(), None)?;
+        let scope = crate::scope::of(&req, &self.runtime_dir, req.get_ref().run.as_ref(), None)?;
+        crate::scope::guard(&req, &self.runtime_dir, &scope)?;
         let req = req.into_inner();
         let (yaml, sha256, _dir) = resolve_manifest(req.experiment.as_ref()).await?;
         let model = parse_to_model(&yaml).map_err(|e| {
@@ -3031,7 +3074,7 @@ impl NosCheckService for NosCheckSvc {
         &self,
         req: Request<NosCheckStatusRequest>,
     ) -> Result<Response<NosCheckStatus>, Status> {
-        let scope = crate::scope::resolve(&self.runtime_dir, req.get_ref().run.as_ref(), None)?;
+        let scope = crate::scope::of(&req, &self.runtime_dir, req.get_ref().run.as_ref(), None)?;
         let req = req.into_inner();
         let (yaml, _sha256, _dir) = resolve_manifest(req.experiment.as_ref()).await?;
         let model = parse_to_model(&yaml).map_err(|e| {
@@ -3080,7 +3123,7 @@ impl NosCheckService for NosCheckSvc {
     }
 
     async fn verify(&self, req: Request<NosCheckVerifyRequest>) -> Result<Response<Job>, Status> {
-        let scope = crate::scope::resolve(&self.runtime_dir, req.get_ref().run.as_ref(), None)?;
+        let scope = crate::scope::of(&req, &self.runtime_dir, req.get_ref().run.as_ref(), None)?;
         let opts = crate::jobs::JobOpts::request(&req, &req.get_ref().request_id);
         let req = req.into_inner();
         let (model, image, sha256) = self.resolve(req.experiment.as_ref()).await?;

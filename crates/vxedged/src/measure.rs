@@ -44,9 +44,13 @@ impl MeasurementSvc {
         &self,
         mref: Option<&ManifestRef>,
         run: Option<&vxedge_api::v1::RunRef>,
+        slot: Option<crate::scope::Slot>,
     ) -> Result<(Resolved, crate::scope::RunScope), Status> {
         let (yaml, sha256, dir) = resolve_manifest(mref).await?;
-        let scope = crate::scope::resolve(&self.runtime_dir, run, dir.as_deref())?;
+        let scope = match slot {
+            Some(crate::scope::Slot(i)) => crate::scope::RunScope::new(&self.runtime_dir, i),
+            None => crate::scope::resolve(&self.runtime_dir, run, dir.as_deref())?,
+        };
         let invalid = |e: String| errors::invalid(R::WorkspaceInvalid, e);
         let model = vxedge_core::model::load_yaml(&yaml).map_err(|e| invalid(e.to_string()))?;
         if let Some(p) = vxedge_core::measurements::problems(&model).first() {
@@ -91,10 +95,13 @@ fn select(placements: Vec<Placement>, ids: &[String]) -> Result<Vec<Placement>, 
 impl MeasurementService for MeasurementSvc {
     async fn start(&self, req: Request<MeasurementStartRequest>) -> Result<Response<Job>, Status> {
         let opts = crate::jobs::JobOpts::request(&req, &req.get_ref().request_id);
+        let slot = req.extensions().get::<crate::scope::Slot>().copied();
+        let caller = crate::scope::Caller::of(&req);
         let req = req.into_inner();
         let (resolved, scope) = self
-            .resolve(req.manifest.as_ref(), req.run.as_ref())
+            .resolve(req.manifest.as_ref(), req.run.as_ref(), slot)
             .await?;
+        caller.check(&self.runtime_dir, &scope)?;
         self.audit.record(
             "MeasurementService.Start",
             serde_json::json!({ "manifest_sha256": resolved.sha256, "ids": req.ids }),
@@ -145,10 +152,13 @@ impl MeasurementService for MeasurementSvc {
     }
 
     async fn stop(&self, req: Request<MeasurementStopRequest>) -> Result<Response<Job>, Status> {
+        let slot = req.extensions().get::<crate::scope::Slot>().copied();
+        let caller = crate::scope::Caller::of(&req);
         let req = req.into_inner();
         let (resolved, scope) = self
-            .resolve(req.manifest.as_ref(), req.run.as_ref())
+            .resolve(req.manifest.as_ref(), req.run.as_ref(), slot)
             .await?;
+        caller.check(&self.runtime_dir, &scope)?;
         self.audit.record(
             "MeasurementService.Stop",
             serde_json::json!({ "manifest_sha256": resolved.sha256, "ids": req.ids }),
@@ -186,7 +196,11 @@ impl MeasurementService for MeasurementSvc {
         req: Request<MeasurementStatusRequest>,
     ) -> Result<Response<MeasurementStatusResponse>, Status> {
         let (resolved, scope) = self
-            .resolve(req.get_ref().manifest.as_ref(), req.get_ref().run.as_ref())
+            .resolve(
+                req.get_ref().manifest.as_ref(),
+                req.get_ref().run.as_ref(),
+                req.extensions().get::<crate::scope::Slot>().copied(),
+            )
             .await?;
         let kinds: Vec<(String, String)> = resolved
             .model
