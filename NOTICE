@@ -8,6 +8,18 @@ Source code is licensed under the Apache License, Version 2.0 (see LICENSE).
 
 ---
 
+Origin and name
+
+vxedge was created by Fouzi Djaafri (https://orcid.org/0009-0004-7173-9344), who leads its
+design, experiments and published results. Under section 4(d) of the Apache License,
+derivative works must keep a copy of this NOTICE file.
+
+"vxedge" is the name of this project and is used as a trademark of Fouzi Djaafri. The Apache
+License does not grant permission to use it (section 6). A fork or derivative product must use
+a different name and must not suggest that it is vxedge or is endorsed by its author.
+
+---
+
 Third-party notices
 
 This repository does not vendor or redistribute third-party source code or binaries.
