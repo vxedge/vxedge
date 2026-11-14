@@ -13,7 +13,7 @@
 use sha2::Digest;
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -115,10 +115,13 @@ impl From<&str> for JobFailure {
 }
 
 /// Marks a request as a stage of a composite job: it names its parent, and it does not take the
-/// lifecycle claim the parent already holds.
+/// lifecycle claim the parent already holds, unless it `queues` for one.
 #[derive(Clone, Debug)]
 pub struct Stage {
     pub parent: String,
+    /// A stage of a job that holds no claim of its own (a campaign's trial), which takes the
+    /// lifecycle claim itself and waits for it rather than being refused as busy.
+    pub queue: bool,
 }
 
 /// A request a composite job makes to another service.
@@ -126,6 +129,19 @@ pub fn stage<T>(message: T, parent: &str) -> Request<T> {
     let mut req = Request::new(message);
     req.extensions_mut().insert(Stage {
         parent: parent.to_string(),
+        queue: false,
+    });
+    req
+}
+
+/// A lifecycle request a campaign makes for one trial: it takes the host's lifecycle claim and
+/// waits its turn for it. Another workspace's `up` arriving mid-campaign then delays a trial
+/// instead of failing it.
+pub fn queued_stage<T>(message: T, parent: &str) -> Request<T> {
+    let mut req = Request::new(message);
+    req.extensions_mut().insert(Stage {
+        parent: parent.to_string(),
+        queue: true,
     });
     req
 }
@@ -136,12 +152,22 @@ pub struct JobOpts {
     parent: String,
     claim: Option<String>,
     request_key: Option<String>,
+    /// Wait for a claim another job holds, rather than be refused as busy.
+    queue: bool,
+    /// The directory of the run the job acts on, whose record names the job's `run_id`.
+    run_dir: Option<PathBuf>,
 }
 
 impl JobOpts {
     /// A lifecycle verb on `target`. A stage of a composite job takes no claim.
     pub fn lifecycle<T>(req: &Request<T>, target: impl Into<String>) -> Self {
         match req.extensions().get::<Stage>() {
+            Some(stage) if stage.queue => Self {
+                parent: stage.parent.clone(),
+                claim: Some(target.into()),
+                queue: true,
+                ..Default::default()
+            },
             Some(stage) => Self {
                 parent: stage.parent.clone(),
                 ..Default::default()
@@ -157,10 +183,26 @@ impl JobOpts {
     /// request id: a campaign, whose trials are its stages.
     pub fn claimed_request(target: impl Into<String>, request_id: &str) -> Self {
         Self {
-            parent: String::new(),
             claim: Some(target.into()),
             request_key: (!request_id.is_empty()).then(|| request_id.to_string()),
+            ..Default::default()
         }
+    }
+
+    /// A verb that runs a long time and takes no lifecycle claim of its own, with a request id:
+    /// a campaign, whose trials each queue for the claim (`queued_stage`), so the host is free
+    /// between them.
+    pub fn unclaimed_request(request_id: &str) -> Self {
+        Self {
+            request_key: (!request_id.is_empty()).then(|| request_id.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// The job acts on the run whose directory is `dir`.
+    pub fn in_run(mut self, dir: &Path) -> Self {
+        self.run_dir = Some(dir.to_path_buf());
+        self
     }
 
     /// A verb that does not converge, so a retry with the same id returns the original job.
@@ -171,8 +213,8 @@ impl JobOpts {
                 .get::<Stage>()
                 .map(|s| s.parent.clone())
                 .unwrap_or_default(),
-            claim: None,
             request_key: (!request_id.is_empty()).then(|| request_id.to_string()),
+            ..Default::default()
         }
     }
 }
@@ -233,6 +275,9 @@ struct State {
     /// `kind:request_id` to the job it started.
     requests: HashMap<String, String>,
 }
+
+/// How often a queued request looks for the lifecycle claim to be free.
+const QUEUE_POLL: Duration = Duration::from_millis(200);
 
 #[derive(Clone)]
 pub struct JobEngine {
@@ -304,13 +349,17 @@ impl JobEngine {
         }
     }
 
-    fn run_id(inner: &Inner) -> String {
-        inner
-            .runtime_dir
-            .as_deref()
-            .and_then(crate::services::active_run)
-            .map(|r| r.run_id().to_string())
-            .unwrap_or_default()
+    /// The run a job acts on: the record in its run's directory, or with none named, the only
+    /// run on the host.
+    fn run_id(inner: &Inner, run_dir: Option<&Path>) -> String {
+        let record = match run_dir {
+            Some(dir) => crate::services::read_active_record(dir),
+            None => match inner.runtime_dir.as_deref().map(crate::scope::recorded) {
+                Some(runs) if runs.len() == 1 => runs.into_iter().next().map(|(_, r)| r),
+                _ => None,
+            },
+        };
+        record.map(|r| r.run_id().to_string()).unwrap_or_default()
     }
 
     /// Submit a job with no claim, parent or request id. `work` receives a `Progress` handle; its
@@ -342,6 +391,16 @@ impl JobEngine {
     {
         let inner = self.inner.clone();
         let mut st = inner.state.lock().await;
+        // A queued request waits for another job's claim to end; anything else is refused below.
+        while opts.queue
+            && let Some(target) = &opts.claim
+            && let Some((held_kind, held_target, _)) = &st.lifecycle
+            && !(held_kind == kind && held_target == target)
+        {
+            drop(st);
+            tokio::time::sleep(QUEUE_POLL).await;
+            st = inner.state.lock().await;
+        }
         let request_key = opts.request_key.map(|r| format!("{kind}:{r}"));
         if let Some(key) = &request_key
             && let Some(entry) = st.requests.get(key).and_then(|id| st.jobs.get(id))
@@ -376,7 +435,7 @@ impl JobEngine {
             created_unix_ms: now_ms(),
             updated_unix_ms: now_ms(),
             parent_job_id: opts.parent,
-            run_id: Self::run_id(&inner),
+            run_id: Self::run_id(&inner, opts.run_dir.as_deref()),
             ..Default::default()
         };
         let (tx, _) = watch::channel(job.clone());
@@ -400,6 +459,7 @@ impl JobEngine {
 
         let events = inner.events.clone();
         let job_kind = kind.to_string();
+        let run_dir = opts.run_dir.clone();
         events.emit(crate::events::EventKind::JobState, &id, "pending");
         tokio::spawn(async move {
             tx.send_modify(|j| {
@@ -414,7 +474,7 @@ impl JobEngine {
                 cancel,
             };
             let result = work(progress).await.map_err(Into::into);
-            let run_id = Self::run_id(&inner);
+            let run_id = Self::run_id(&inner, run_dir.as_deref());
 
             match result {
                 Ok(message) => {
@@ -692,6 +752,34 @@ mod tests {
             claim: Some(target.into()),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn a_queued_trial_waits_for_another_runs_claim_instead_of_failing() {
+        let engine = engine();
+        let (release, work) = held();
+        let other = engine
+            .submit_with(claim("vehicle car-b"), "vehicle.up", |_| work)
+            .await
+            .unwrap();
+        let req = queued_stage((), "job-campaign");
+        let opts = JobOpts::lifecycle(&req, "experiment car-a");
+        let engine2 = engine.clone();
+        let trial = tokio::spawn(async move {
+            engine2
+                .submit_with(opts, "experiment.up", |_| async {
+                    Ok::<_, String>("trial".to_string())
+                })
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!trial.is_finished(), "the trial waits while another run holds the claim");
+        release.send(()).unwrap();
+        wait_terminal(engine.watch(&other.id).await.unwrap()).await;
+        let job = trial.await.unwrap().expect("the queued trial is not refused as busy");
+        assert_eq!(job.parent_job_id, "job-campaign");
+        let done = wait_terminal(engine.watch(&job.id).await.unwrap()).await;
+        assert_eq!(done.state, JobState::Succeeded as i32);
     }
 
     #[tokio::test]
