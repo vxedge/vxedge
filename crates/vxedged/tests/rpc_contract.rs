@@ -1785,7 +1785,7 @@ fn fake_vxtelemetry(exit: i32) -> PathBuf {
         &bin,
         format!(
             "#!/bin/sh\necho \"$@\" > \"{0}/args\"\necho \"${{VXTELEMETRY_PACKAGE_LOCKED-unset}}\" > \
-             \"{0}/locked\"\nwhile [ $# -gt 0 ]; do [ \"$1\" = --out ] && printf archive > \"$2\"; \
+             \"{0}/locked\"\necho \"${{VXTELEMETRY_INSTANCE-unset}}\" > \"{0}/instance\"\nwhile [ $# -gt 0 ]; do [ \"$1\" = --out ] && printf archive > \"$2\"; \
              shift; done\nexit {exit}\n",
             dir.display()
         ),
@@ -1793,6 +1793,71 @@ fn fake_vxtelemetry(exit: i32) -> PathBuf {
     .unwrap();
     std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     bin
+}
+
+/// Two runs on one host: each `Collect` archives its own run's ingest folder, in its own slot, so
+/// one run's samples never reach the other's archive (`ARCHITECTURE.md` §6.0.5).
+#[tokio::test]
+async fn two_runs_collect_two_archives_each_from_its_own_ingest() {
+    let (ws_a, id_a) = experiment_workspace();
+    let (ws_b, id_b) = experiment_workspace();
+    let bin = fake_vxtelemetry(0);
+    let daemon = Daemon::start_env(
+        |run| {
+            for (slot, id, ws, run_id) in
+                [("0", &id_a, &ws_a, "run-a"), ("1", &id_b, &ws_b, "run-b")]
+            {
+                let dir = run.join("runs").join(slot);
+                std::fs::create_dir_all(dir.join("ingest")).unwrap();
+                std::fs::write(
+                    dir.join("ingest/records.jsonl"),
+                    format!("{{\"run\":\"{run_id}\"}}\n"),
+                )
+                .unwrap();
+                let record = serde_json::json!({
+                    "id": id, "dir": ws, "bridge": "lo", "run_id": run_id,
+                });
+                std::fs::write(dir.join("active.json"), record.to_string()).unwrap();
+            }
+        },
+        &[("VXEDGE_VXTELEMETRY_BIN", &bin)],
+    );
+    let channel = daemon.channel().await;
+    let fake = bin.parent().unwrap().to_path_buf();
+    for (slot, ws) in [("0", &ws_a), ("1", &ws_b)] {
+        let job =
+            vxedge_api::v1::telemetry_service_client::TelemetryServiceClient::new(channel.clone())
+                .collect(vxedge_api::v1::CollectRequest {
+                    manifest: path_ref(ws),
+                    out_path: "results/run.zip".into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .into_inner();
+        assert_eq!(
+            wait_for_job(channel.clone(), job.id.clone()).await,
+            JobState::Succeeded as i32
+        );
+        let args = std::fs::read_to_string(fake.join("args")).unwrap();
+        let ingest = daemon.root.join("run/runs").join(slot).join("ingest");
+        assert!(
+            args.contains(&format!("--ingest-dir {}", ingest.display())),
+            "slot {slot} archives its own ingest: {args}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fake.join("instance"))
+                .unwrap()
+                .trim(),
+            slot,
+            "vxtelemetry is told the slot"
+        );
+        let entities = std::fs::read_to_string(ingest.join("entities.json")).unwrap();
+        assert!(
+            entities.contains(&format!("/runs/{slot}\"")) || !entities.contains("127.0.0.1:"),
+            "the run's exporter target is its own page: {entities}"
+        );
+    }
 }
 
 #[tokio::test]
