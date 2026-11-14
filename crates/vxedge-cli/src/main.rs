@@ -67,8 +67,20 @@ struct Cli {
     #[arg(long, global = true, value_name = "DIR")]
     chdir: Option<String>,
 
+    /// The run to act on, by its run id, when the host runs several (`vxedge runs`). Without it,
+    /// a verb acts on its workspace's run, or on the only run.
+    #[arg(long, global = true, value_name = "RUN_ID")]
+    run: Option<String>,
+
     #[command(subcommand)]
     command: Command,
+}
+
+/// The `RunRef` a `--run` names, if it names one.
+fn run_ref(run: &Option<String>) -> Option<vxedge_api::v1::RunRef> {
+    run.as_ref().map(|run_id| vxedge_api::v1::RunRef {
+        run_id: run_id.clone(),
+    })
 }
 
 #[derive(Subcommand, Debug)]
@@ -81,6 +93,10 @@ enum Command {
         /// Skip the `vxp.lock` check while authoring. The run records that it ran unlocked.
         #[arg(long)]
         unlocked: bool,
+        /// The instance slot to run in, 0-9 or a-z. Default: the workspace's own run's, or the
+        /// lowest free one.
+        #[arg(long, value_name = "SLOT")]
+        instance: Option<String>,
     },
     /// Tear the edge gateway down.
     Down {
@@ -365,6 +381,10 @@ enum ExperimentCmd {
         /// Skip the `vxp.lock` check while authoring. The run records that it ran unlocked.
         #[arg(long)]
         unlocked: bool,
+        /// The instance slot to run in, 0-9 or a-z. Default: the workspace's own run's, or the
+        /// lowest free one.
+        #[arg(long, value_name = "SLOT")]
+        instance: Option<String>,
     },
     /// Tear the workspace here down.
     Down {
@@ -641,6 +661,10 @@ enum ManifestLifecycleCmd {
         /// Skip the `vxp.lock` check while authoring. The run records that it ran unlocked.
         #[arg(long)]
         unlocked: bool,
+        /// The instance slot to run in, 0-9 or a-z. Default: the workspace's own run's, or the
+        /// lowest free one.
+        #[arg(long, value_name = "SLOT")]
+        instance: Option<String>,
     },
     Down {
         #[arg(long)]
@@ -672,6 +696,9 @@ enum CampaignCmd {
         /// Skip each trial's `vxp.lock` check while authoring. Recorded with the campaign.
         #[arg(long)]
         unlocked: bool,
+        /// The instance slot every trial runs in. Default: the lowest free one at start.
+        #[arg(long, value_name = "SLOT")]
+        instance: Option<String>,
         /// A workspace whose `results/` records the reference campaigns the experiment's
         /// `references` name, such as a frozen one. Recorded with the campaign.
         #[arg(long)]
@@ -1671,7 +1698,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             })?;
             let mut client = GatewayServiceClient::new(channel);
             let status = client
-                .status(GatewayStatusRequest { run: None })
+                .status(GatewayStatusRequest {
+                    run: run_ref(&cli.run),
+                })
                 .await?
                 .into_inner();
             if cli.json {
@@ -1709,12 +1738,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("gateway: no status reported");
             }
         }
-        Command::Up { manifest, unlocked } => {
+        Command::Up {
+            manifest,
+            unlocked,
+            instance,
+        } => {
             let channel = connect(&cli.endpoint).await?;
             let mut gw = GatewayServiceClient::new(channel.clone());
             let job = gw
                 .up(GatewayUpRequest {
-                    instance: String::new(),
+                    instance: instance.clone().unwrap_or_default(),
                     manifest: manifest_ref(manifest),
                     unlocked: *unlocked,
                 })
@@ -1727,7 +1760,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mut gw = GatewayServiceClient::new(channel.clone());
             let job = gw
                 .down(GatewayDownRequest {
-                    run: None,
+                    run: run_ref(&cli.run),
                     manifest: manifest_ref(manifest),
                 })
                 .await?
@@ -1740,8 +1773,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let mut zc = ZoneServiceClient::new(channel.clone());
                 let job = zc
                     .up(ZoneUpRequest {
+                        run: run_ref(&cli.run),
                         r#ref: Some(VxidRef { vxid: vxid.clone() }),
-                        ..Default::default()
                     })
                     .await?
                     .into_inner();
@@ -1752,8 +1785,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let mut zc = ZoneServiceClient::new(channel.clone());
                 let job = zc
                     .down(ZoneDownRequest {
+                        run: run_ref(&cli.run),
                         r#ref: Some(VxidRef { vxid: vxid.clone() }),
-                        ..Default::default()
                     })
                     .await?
                     .into_inner();
@@ -1762,7 +1795,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             ZoneCmd::List => {
                 let channel = connect(&cli.endpoint).await?;
                 let mut zc = ZoneServiceClient::new(channel);
-                let resp = zc.list(ZoneListRequest::default()).await?.into_inner();
+                let resp = zc
+                    .list(ZoneListRequest {
+                        run: run_ref(&cli.run),
+                    })
+                    .await?
+                    .into_inner();
                 if cli.json {
                     let rows: Vec<serde_json::Value> = resp
                         .zones
@@ -1788,8 +1826,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let mut cc = ComputeServiceClient::new(channel.clone());
                 let job = cc
                     .up(ComputeUpRequest {
+                        run: run_ref(&cli.run),
                         r#ref: Some(VxidRef { vxid: vxid.clone() }),
-                        ..Default::default()
                     })
                     .await?
                     .into_inner();
@@ -1800,8 +1838,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let mut cc = ComputeServiceClient::new(channel.clone());
                 let job = cc
                     .down(ComputeDownRequest {
+                        run: run_ref(&cli.run),
                         r#ref: Some(VxidRef { vxid: vxid.clone() }),
-                        ..Default::default()
                     })
                     .await?
                     .into_inner();
@@ -1810,7 +1848,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             ComputeCmd::List => {
                 let channel = connect(&cli.endpoint).await?;
                 let mut cc = ComputeServiceClient::new(channel);
-                let resp = cc.list(ComputeListRequest::default()).await?.into_inner();
+                let resp = cc
+                    .list(ComputeListRequest {
+                        run: run_ref(&cli.run),
+                    })
+                    .await?
+                    .into_inner();
                 if cli.json {
                     let rows: Vec<serde_json::Value> = resp
                         .nodes
@@ -1837,9 +1880,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let mut svc = SvcServiceClient::new(channel.clone());
                 let job = svc
                     .up(SvcUpRequest {
+                        run: run_ref(&cli.run),
                         service_type: "ota".to_string(),
                         experiment: manifest_ref(&Some(workspace)),
-                        ..Default::default()
                     })
                     .await?
                     .into_inner();
@@ -1851,9 +1894,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let mut svc = SvcServiceClient::new(channel.clone());
                 let job = svc
                     .down(SvcDownRequest {
+                        run: run_ref(&cli.run),
                         service_type: "ota".to_string(),
                         experiment: manifest_ref(&Some(workspace)),
-                        ..Default::default()
                     })
                     .await?
                     .into_inner();
@@ -1864,9 +1907,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let channel = connect(&cli.endpoint).await?;
                 let status = SvcServiceClient::new(channel)
                     .status(SvcStatusRequest {
+                        run: run_ref(&cli.run),
                         service_type: "ota".to_string(),
                         experiment: manifest_ref(&Some(workspace)),
-                        ..Default::default()
                     })
                     .await?
                     .into_inner();
@@ -1892,8 +1935,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let mut nc = NosCheckServiceClient::new(channel.clone());
                 let job = nc
                     .up(NosCheckUpRequest {
+                        run: run_ref(&cli.run),
                         experiment: manifest_ref(&Some(workspace)),
-                        ..Default::default()
                     })
                     .await?
                     .into_inner();
@@ -1905,8 +1948,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let mut nc = NosCheckServiceClient::new(channel.clone());
                 let job = nc
                     .down(NosCheckDownRequest {
+                        run: run_ref(&cli.run),
                         experiment: manifest_ref(&Some(workspace)),
-                        ..Default::default()
                     })
                     .await?
                     .into_inner();
@@ -1918,8 +1961,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let mut nc = NosCheckServiceClient::new(channel);
                 let resp = nc
                     .status(NosCheckStatusRequest {
+                        run: run_ref(&cli.run),
                         experiment: manifest_ref(&Some(workspace)),
-                        ..Default::default()
                     })
                     .await?
                     .into_inner();
@@ -1944,6 +1987,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let mut nc = NosCheckServiceClient::new(channel.clone());
                 let job = nc
                     .verify(NosCheckVerifyRequest {
+                        run: run_ref(&cli.run),
                         experiment: manifest_ref(&Some(workspace)),
                         ..Default::default()
                     })
@@ -1960,16 +2004,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let workspace = manifest_ref(&Some(experiment.clone()));
                     let job = if matches!(cmd, TelemetryCmd::Up { .. }) {
                         svc.up(SvcUpRequest {
+                            run: run_ref(&cli.run),
                             service_type: "telemetry".to_string(),
                             experiment: workspace,
-                            ..Default::default()
                         })
                         .await?
                     } else {
                         svc.down(SvcDownRequest {
+                            run: run_ref(&cli.run),
                             service_type: "telemetry".to_string(),
                             experiment: workspace,
-                            ..Default::default()
                         })
                         .await?
                     }
@@ -2003,7 +2047,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 ManifestLifecycleCmd::Status { manifest } => {
                     let st = veh
                         .status(VehicleStatusRequest {
-                            run: None,
+                            run: run_ref(&cli.run),
                             manifest: manifest_ref(&Some(manifest.clone())),
                         })
                         .await?
@@ -2021,10 +2065,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     manifest,
                     stages,
                     unlocked,
+                    instance,
                 } => {
                     let job = veh
                         .up(VehicleUpRequest {
-                            instance: String::new(),
+                            instance: instance.clone().unwrap_or_default(),
                             manifest: manifest_ref(&Some(manifest.clone())),
                             stages: stages.iter().map(|s| s.as_proto()).collect(),
                             unlocked: *unlocked,
@@ -2036,7 +2081,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 ManifestLifecycleCmd::Down { manifest, stages } => {
                     let job = veh
                         .down(VehicleDownRequest {
-                            run: None,
+                            run: run_ref(&cli.run),
                             manifest: manifest_ref(&Some(manifest.clone())),
                             stages: stages.iter().map(|s| s.as_proto()).collect(),
                         })
@@ -2115,7 +2160,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     ExperimentCmd::Status => {
                         let st = exp
                             .status(ExperimentStatusRequest {
-                                run: None,
+                                run: run_ref(&cli.run),
                                 manifest: manifest_ref(&Some(workspace)),
                             })
                             .await?
@@ -2144,10 +2189,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
-                    ExperimentCmd::Up { stages, unlocked } => {
+                    ExperimentCmd::Up {
+                        stages,
+                        unlocked,
+                        instance,
+                    } => {
                         let job = exp
                             .up(ExperimentUpRequest {
-                                instance: String::new(),
+                                instance: instance.clone().unwrap_or_default(),
                                 manifest: manifest_ref(&Some(workspace)),
                                 stages: stages.iter().map(|s| s.as_proto()).collect(),
                                 unlocked: *unlocked,
@@ -2165,7 +2214,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         };
                         let job = exp
                             .down(ExperimentDownRequest {
-                                run: None,
+                                run: run_ref(&cli.run),
                                 manifest: manifest_ref(&Some(workspace)),
                                 stages,
                             })
@@ -2182,6 +2231,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let mut traffic = TrafficServiceClient::new(channel.clone());
                 let job = traffic
                     .up(TrafficUpRequest {
+                        run: run_ref(&cli.run),
                         manifest: manifest_ref(&Some(manifest.clone())),
                         profiles: profiles.clone(),
                         ..Default::default()
@@ -2195,9 +2245,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let mut traffic = TrafficServiceClient::new(channel.clone());
                 let job = traffic
                     .down(TrafficDownRequest {
+                        run: run_ref(&cli.run),
                         manifest: manifest_ref(&Some(manifest.clone())),
                         profiles: profiles.clone(),
-                        ..Default::default()
                     })
                     .await?
                     .into_inner();
@@ -2262,6 +2312,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     request_id,
                     unlocked,
                     reference_workspace,
+                    instance,
                 } => {
                     let root = vxedge_core::discover(&here()?)?.root;
                     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
@@ -2276,6 +2327,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             caller: "vxedge-cli".into(),
                             unlocked: *unlocked,
                             reference_workspace: manifest_ref(reference_workspace),
+                            instance: instance.clone().unwrap_or_default(),
                             ..Default::default()
                         })
                         .await?
@@ -2488,6 +2540,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 MeasureCmd::Start { ids, duration_s } => {
                     let job = measure
                         .start(MeasurementStartRequest {
+                            run: run_ref(&cli.run),
                             manifest,
                             ids: ids.clone(),
                             duration_s: *duration_s,
@@ -2500,9 +2553,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 MeasureCmd::Stop { ids } => {
                     let job = measure
                         .stop(MeasurementStopRequest {
+                            run: run_ref(&cli.run),
                             manifest,
                             ids: ids.clone(),
-                            ..Default::default()
                         })
                         .await?
                         .into_inner();
@@ -2511,8 +2564,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 MeasureCmd::Status => {
                     let st = measure
                         .status(MeasurementStatusRequest {
+                            run: run_ref(&cli.run),
                             manifest,
-                            ..Default::default()
                         })
                         .await?
                         .into_inner();
