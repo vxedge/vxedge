@@ -1913,7 +1913,7 @@ parts:
         let model = build(&ws).unwrap();
         assert!(model.check().is_empty(), "{:?}", model.check());
 
-        let gw = GatewayPlan::from_model(&model).unwrap();
+        let gw = GatewayPlan::from_model(&model, crate::instance::Instance::FIRST).unwrap();
         assert_eq!(gw.root_rate_mbps, 500, "shared uplink bottleneck");
         let eps: Vec<(&str, &str, u16)> = gw
             .endpoints
@@ -1923,8 +1923,8 @@ parts:
         assert_eq!(
             eps,
             vec![
-                ("vz-node-a", "vzp-node-a", 101),
-                ("vz-node-b", "vzp-node-b", 103)
+                ("vz0-node-a", "vp0-node-a", 101),
+                ("vz0-node-b", "vp0-node-b", 103)
             ]
         );
 
@@ -1933,7 +1933,7 @@ parts:
             nodes.iter().map(|n| n.node_id.as_str()).collect::<Vec<_>>(),
             vec!["node-a", "node-b"]
         );
-        assert_eq!(nodes[0].runtime_name(), "vx-node-a");
+        assert_eq!(nodes[0].runtime_name(), "vx0-node-a");
 
         let traffic = TrafficPlan::from_model(&model, &gw).unwrap();
         assert_eq!(traffic.profiles.len(), 1);
@@ -1959,7 +1959,7 @@ parts:
 
         let ws = Workspace::load_validated(&tmp).expect("still validates");
         let model = build(&ws).unwrap();
-        let gw = GatewayPlan::from_model(&model).unwrap();
+        let gw = GatewayPlan::from_model(&model, crate::instance::Instance::FIRST).unwrap();
         let nodes = plan_nodes_from_model(&model, &gw, &tmp).unwrap();
         let node_a = nodes.iter().find(|n| n.node_id == "node-a").unwrap();
         assert_eq!(node_a.ip_cidr.as_deref(), Some("10.101.0.11/24"));
@@ -2511,7 +2511,7 @@ links:
         let (tmp, mut ws) = scaffolded("nobackend");
         ws.vehicles[0].devices.get_mut("zonefl").unwrap().backend = None;
         let m = build(&ws).unwrap();
-        match GatewayPlan::from_model(&m) {
+        match GatewayPlan::from_model(&m, crate::instance::Instance::FIRST) {
             Err(crate::gateway::plan::PlanError::DeviceWithoutBackend(d)) => {
                 assert!(!d.is_empty())
             }
@@ -2851,7 +2851,8 @@ devices: {}
     #[test]
     fn a_vxlan_tunnel_builds_and_plans_successfully() {
         let m = load_yaml(VXLAN_TUNNEL_BASE).expect("model itself is valid");
-        let plan = crate::gateway::GatewayPlan::from_model(&m).expect("plans successfully");
+        let plan = crate::gateway::GatewayPlan::from_model(&m, crate::instance::Instance::FIRST)
+            .expect("plans successfully");
         assert_eq!(plan.tunnels.len(), 1);
         assert_eq!(plan.tunnels[0].id, "site-b");
         assert_eq!(plan.tunnels[0].kind, TunnelKind::Vxlan);
@@ -3893,7 +3894,7 @@ parts:
              cap_add: [NET_ADMIN] }",
         );
         let model = load_yaml(&yaml).unwrap();
-        let gw = GatewayPlan::from_model(&model).unwrap();
+        let gw = GatewayPlan::from_model(&model, crate::instance::Instance::FIRST).unwrap();
         let nodes = plan_nodes_from_model(&model, &gw, std::path::Path::new("/")).unwrap();
         for id in ["ct-a", "ct-b"] {
             let node = nodes.iter().find(|n| n.node_id == id).unwrap();

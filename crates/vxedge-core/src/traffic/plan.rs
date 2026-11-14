@@ -417,7 +417,8 @@ links:
 
     fn plans(yaml: &str) -> (crate::model::Experiment, GatewayPlan) {
         let m = model(yaml);
-        let gw = GatewayPlan::from_model(&m).expect("gateway plans");
+        let gw =
+            GatewayPlan::from_model(&m, crate::instance::Instance::FIRST).expect("gateway plans");
         (m, gw)
     }
 
@@ -433,7 +434,7 @@ links:
         assert_eq!(
             p.source,
             ProfileEndpoint::VlanNodePeer {
-                peer_iface: "vzp-node-a-cd63".to_string(),
+                peer_iface: "vp0-node-a-cd63".to_string(),
                 vlan: 101,
                 addr: "10.101.0.2".to_string(),
             }
@@ -538,7 +539,7 @@ links:
         assert_eq!(
             p.source,
             ProfileEndpoint::VlanNodePeer {
-                peer_iface: "vzp-node-a".to_string(),
+                peer_iface: "vp0-node-a".to_string(),
                 vlan: 101,
                 addr: "10.101.0.2".to_string(),
             }
@@ -546,7 +547,7 @@ links:
         assert_eq!(
             p.target,
             ProfileEndpoint::VlanNodePeer {
-                peer_iface: "vzp-node-b".to_string(),
+                peer_iface: "vp0-node-b".to_string(),
                 vlan: 103,
                 addr: "10.103.0.2".to_string(),
             }

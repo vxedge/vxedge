@@ -42,6 +42,9 @@ pub struct Context<'a> {
     pub out: &'a Path,
     /// The longest the steps may take together.
     pub budget: Duration,
+    /// The slot of the run the steps act on: a step `on` a node runs in that node's container
+    /// group, which carries the slot.
+    pub instance: crate::instance::Instance,
 }
 
 /// How a run went.
@@ -57,9 +60,10 @@ pub fn output_file(out: &Path, id: &str) -> PathBuf {
     out.join(format!("{id}.log"))
 }
 
-/// The container a step's tool runs in.
-pub fn container_name(id: &str) -> String {
-    format!("vx-check-{id}")
+/// The container a step's tool runs in, in the run in slot `instance`: two runs may run the same
+/// package's checks at once.
+pub fn container_name(instance: crate::instance::Instance, id: &str) -> String {
+    format!("vx{instance}-check-{id}")
 }
 
 /// What one step's container printed, as it prints it.
@@ -159,7 +163,7 @@ impl Runner<'_> {
         match step.on.as_deref() {
             Some(ALONE) | None => Ok("none".into()),
             Some(node) => {
-                let group = crate::zones::plan::runtime_name_of(node);
+                let group = crate::zones::plan::runtime_name_of(self.ctx.instance, node);
                 self.ctx
                     .client
                     .handle(&group)
@@ -210,7 +214,7 @@ impl Runner<'_> {
             .and_then(|t| self.checks.tools.get(t))
             .ok_or_else(|| format!("step `{id}` names no declared tool"))?;
         let network = self.network(step).await?;
-        let name = container_name(id);
+        let name = container_name(self.ctx.instance, id);
         let labels = BTreeMap::from([(LABEL.to_string(), id.to_string())]);
         let container = self
             .ctx
@@ -370,7 +374,10 @@ impl Runner<'_> {
         let record = match step.observe {
             Some(Observe::Member) => {
                 let member = step.member.as_deref().unwrap_or_default();
-                let name = format!("{}-{member}", crate::zones::plan::runtime_name_of(node));
+                let name = format!(
+                    "{}-{member}",
+                    crate::zones::plan::runtime_name_of(self.ctx.instance, node)
+                );
                 match self.ctx.client.state(&name).await {
                     Ok(Some(s)) => json!({
                         "op": "member", "member": member, "exists": true, "running": s.running,
@@ -381,7 +388,7 @@ impl Runner<'_> {
                 }
             }
             Some(Observe::Port) => {
-                let port = crate::gateway::ifnames::access_port(node, None);
+                let port = crate::gateway::ifnames::access_port(self.ctx.instance, node, None);
                 let stats = Path::new("/sys/class/net").join(&port).join("statistics");
                 let read = |f: &str| {
                     std::fs::read_to_string(stats.join(f))

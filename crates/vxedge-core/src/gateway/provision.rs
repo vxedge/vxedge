@@ -922,7 +922,7 @@ fn observe_vxlan_tunnel(sh: &Shell, t: &super::plan::TunnelPlan) -> TunnelObserv
 }
 
 /// VLAN membership for the 5G core's uplink port on a `vlan_filtering 1`
-/// bridge (`vxbr0`): every port needs an explicit membership or it drops
+/// bridge (`vxbr<s>`): every port needs an explicit membership or it drops
 /// all traffic. `host_veth` must already be attached to the bridge and up
 /// (`fiveg::lifecycle::bridge_up` does that part — this only adds the
 /// membership that primitive deliberately leaves undecided, same convention
@@ -1152,7 +1152,7 @@ pub fn apply_fiveg_slice_qos(
 
 /// Look up which bridge `host_veth` is currently enslaved to, so this stays
 /// correct regardless of the caller's own bridge name (`GatewayPlan.bridge`
-/// is always `vxbr0` today, but this function shouldn't assume it) —
+/// is always `vxbr<s>` today, but this function shouldn't assume it) —
 /// avoids threading a second parameter through every call site just to
 /// duplicate what `ip -json link show` already reports.
 fn host_veth_master(sh: &Shell, host_veth: &str) -> Result<String, NetOpsError> {

@@ -72,7 +72,7 @@ async fn fiveg_up_brings_cn_and_ran_pods_up_idempotently_then_tears_down() {
     let cfg = FiveGLifecycleConfig {
         pod_name: "vx5g-cargo-test".to_string(),
         ran_pod_name: "vx5g-cargo-test-ran".to_string(),
-        ..FiveGLifecycleConfig::default()
+        ..FiveGLifecycleConfig::for_instance(vxedge_core::instance::Instance::FIRST)
     };
     let mut guard = PodGuard {
         client: client.clone(),

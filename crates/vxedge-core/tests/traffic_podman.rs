@@ -128,7 +128,8 @@ async fn traffic_service_runs_vlan_and_snssai_profiles_simultaneously_through_th
         .expect("the rootless Podman API socket (see module docs)")
         .clone();
     let model = vxedge_core::model::load_yaml(WORKSPACE).expect("workspace loads");
-    let gateway_plan = GatewayPlan::from_model(&model).expect("gateway plan");
+    let gateway_plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST)
+        .expect("gateway plan");
     let five_g_plan = FiveGPlan::from_model(&model).expect("fiveg plan");
     let traffic_plan = TrafficPlan::from_model(&model, &gateway_plan).expect("traffic plan");
     assert_eq!(traffic_plan.profiles.len(), 3);
@@ -138,7 +139,7 @@ async fn traffic_service_runs_vlan_and_snssai_profiles_simultaneously_through_th
         escalate: true,
         ..Shell::default()
     };
-    let fiveg_cfg = FiveGLifecycleConfig::default();
+    let fiveg_cfg = FiveGLifecycleConfig::for_instance(vxedge_core::instance::Instance::FIRST);
     let runtime_dir = tempfile::tempdir().expect("tempdir");
 
     let mut guard = Guard {

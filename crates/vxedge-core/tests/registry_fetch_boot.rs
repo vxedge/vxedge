@@ -44,6 +44,7 @@ fn scratch_dirs(name: &str) -> (PathBuf, PathBuf) {
 
 fn remote_plan() -> NodePlan {
     NodePlan {
+        instance: vxedge_core::instance::Instance::FIRST,
         zone_id: "front-left".into(),
         node_id: "node-registry-fetch-test".into(),
         role: DeviceRole::Ecu,

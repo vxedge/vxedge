@@ -380,6 +380,7 @@ mod tests {
 
     fn node(pinned_cpus: Vec<u32>) -> NodePlan {
         NodePlan {
+            instance: crate::instance::Instance::FIRST,
             zone_id: "z".into(),
             node_id: "node-ch-01".into(),
             role: DeviceRole::Ecu,

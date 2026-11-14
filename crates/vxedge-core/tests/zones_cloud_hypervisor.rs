@@ -152,7 +152,7 @@ fn a_guest_boots_on_the_gateway_tap_answers_and_survives_its_vmm_dying() {
     };
 
     let model = vxedge_core::model::load_yaml(&workspace(&bundle)).expect("workspace loads");
-    let plan = GatewayPlan::from_model(&model).unwrap();
+    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST).unwrap();
     apply(&sh, &plan).unwrap();
     let nodes = plan_nodes_from_model(&model, &plan, Path::new("/")).unwrap();
     let node = &nodes[0];

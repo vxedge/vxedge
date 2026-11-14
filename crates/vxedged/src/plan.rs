@@ -370,9 +370,11 @@ pub(crate) async fn preflight(
     );
 
     let plans = nodes.to_vec();
-    let foreign = tokio::task::spawn_blocking(move || vxedge_core::zones::foreign_objects(&plans))
-        .await
-        .unwrap_or_default();
+    let foreign = tokio::task::spawn_blocking(move || {
+        vxedge_core::zones::foreign_objects(crate::services::RUN_SLOT, &plans)
+    })
+    .await
+    .unwrap_or_default();
     pf.check(
         "other vehicles",
         (!foreign.is_empty()).then(|| {
@@ -827,7 +829,7 @@ impl WorkspaceService for PlanSvc {
             Ok(m) => m,
             Err(e) => return Ok(Response::new(invalid(e.to_string()))),
         };
-        let planned = GatewayPlan::from_model(&model)
+        let planned = GatewayPlan::from_model(&model, crate::services::RUN_SLOT)
             .map_err(|e| e.to_string())
             .and_then(|gw| {
                 vxedge_core::zones::plan_nodes_from_model(
@@ -992,6 +994,7 @@ mod pinning_tests {
 
     fn node(image: Option<&str>, pinned: Vec<u32>) -> NodePlan {
         NodePlan {
+            instance: vxedge_core::instance::Instance::FIRST,
             zone_id: "z".into(),
             node_id: "n1".into(),
             role: vxedge_core::model::DeviceRole::Ecu,
