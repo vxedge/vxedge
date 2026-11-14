@@ -160,6 +160,143 @@ fn intent_reason(kind: vxedge_core::intent::ProblemKind) -> R {
     }
 }
 
+/// Something one host has once, whatever the slot (`ARCHITECTURE.md` §6.0.5): what it is, for
+/// the message, and the value two runs must not share.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HostWide {
+    FiveG,
+    ListenPort(u16),
+    Vxlan {
+        vni: u32,
+        port: u16,
+    },
+    Adopted(String),
+    /// A host-side address's subnet: `(network, prefix)`.
+    Subnet(u32, u8),
+}
+
+impl HostWide {
+    fn clashes(&self, other: &HostWide) -> bool {
+        match (self, other) {
+            (HostWide::Subnet(a, pa), HostWide::Subnet(b, pb)) => {
+                let p = (*pa).min(*pb);
+                let mask = if p == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - u32::from(p))
+                };
+                a & mask == b & mask
+            }
+            _ => self == other,
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            HostWide::FiveG => "`s-nssai` slices (the host has one 5G core)".into(),
+            HostWide::ListenPort(p) => format!("WireGuard listen port {p}"),
+            HostWide::Vxlan { vni, port } => format!("VXLAN VNI {vni} on port {port}"),
+            HostWide::Adopted(i) => format!("host interface `{i}`"),
+            HostWide::Subnet(n, p) => format!(
+                "host-side addresses in {}/{p}",
+                std::net::Ipv4Addr::from(*n)
+            ),
+        }
+    }
+}
+
+fn subnet(cidr: &str) -> Option<HostWide> {
+    let (ip, prefix) = cidr.split_once('/').unwrap_or((cidr, "24"));
+    let ip: std::net::Ipv4Addr = ip.parse().ok()?;
+    let prefix: u8 = prefix.parse().ok().filter(|p| *p <= 32)?;
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(prefix))
+    };
+    Some(HostWide::Subnet(u32::from(ip) & mask, prefix))
+}
+
+/// What `model`, run in slot `instance`, holds that one host has once.
+pub(crate) fn host_wide(
+    model: &Experiment,
+    instance: vxedge_core::instance::Instance,
+    nodes: &[NodePlan],
+    cache_dir: &Path,
+) -> Vec<HostWide> {
+    use vxedge_core::traffic::ProfileEndpoint as E;
+    let mut held = Vec::new();
+    if model
+        .slices
+        .iter()
+        .any(|s| s.mode == vxedge_core::model::SliceMode::SNssai)
+    {
+        held.push(HostWide::FiveG);
+    }
+    for t in &model.tunnels {
+        match t.kind {
+            vxedge_core::model::TunnelKind::Wireguard => {
+                held.extend(t.listen_port.map(HostWide::ListenPort));
+            }
+            vxedge_core::model::TunnelKind::Vxlan => {
+                held.extend(t.vni.map(|vni| HostWide::Vxlan {
+                    vni,
+                    port: t.dstport.unwrap_or(4789),
+                }));
+            }
+        }
+    }
+    let Ok(gateway) = GatewayPlan::from_model(model, instance) else {
+        return held;
+    };
+    held.extend(
+        gateway
+            .endpoints
+            .iter()
+            .filter(|e| e.kind == vxedge_core::gateway::plan::EndpointKind::Adopted)
+            .map(|e| HostWide::Adopted(e.name.clone())),
+    );
+    // Addresses on the host's side: traffic far sides and host-side peers, and measurement far
+    // sides. They sit in the host's routing table, so two runs' must not overlap.
+    if let Ok(traffic) = vxedge_core::traffic::TrafficPlan::from_model(model, &gateway) {
+        for p in &traffic.profiles {
+            for end in [&p.source, &p.target] {
+                if let E::VlanUplinkFarSide { addr, .. } | E::VlanNodePeer { addr, .. } = end {
+                    held.extend(subnet(&format!("{addr}/24")));
+                }
+            }
+        }
+    }
+    if let Ok(placements) = vxedge_core::measurements::run::plan(model, &gateway, nodes, cache_dir)
+    {
+        use vxedge_core::measurements::run::{Reflector, Sender};
+        for p in &placements {
+            if let Sender::Host(f) = &p.sender {
+                held.extend(subnet(&f.cidr));
+            }
+            if let Reflector::FarSide(f) = &p.reflector {
+                held.extend(subnet(&f.cidr));
+            }
+        }
+    }
+    held
+}
+
+/// The first thing `mine` holds that another run's `theirs` already does: what it is, and the
+/// run that holds it.
+pub(crate) fn held_by_other_run(
+    mine: &[HostWide],
+    theirs: &[(String, Vec<HostWide>)],
+) -> Option<(String, String)> {
+    mine.iter().find_map(|m| {
+        theirs.iter().find_map(|(run, held)| {
+            held.iter()
+                .any(|h| h.clashes(m))
+                .then(|| (m.describe(), run.clone()))
+        })
+    })
+}
+
 /// Every check `up` makes before it touches the host, in the order it makes them.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn preflight(
@@ -349,6 +486,47 @@ pub(crate) async fn preflight(
                     who,
                     foreign.join(", ")
                 ),
+            )
+        }),
+    );
+
+    // What one host has once, held by another run, refuses this one (`ARCHITECTURE.md` §6.0.5).
+    let others: Vec<(
+        vxedge_core::instance::Instance,
+        String,
+        Experiment,
+        Vec<NodePlan>,
+    )> = {
+        let st = gateway.state.lock().await;
+        st.runs
+            .iter()
+            .filter(|(i, _)| **i != scope.instance)
+            .filter_map(|(i, r)| {
+                let a = r.active.as_ref()?;
+                let g = r.gateway.as_ref()?;
+                let nodes = vxedge_core::zones::plan_nodes_from_model(&a.model, g, &a.dir)
+                    .unwrap_or_default();
+                Some((*i, a.model.id.clone(), a.model.clone(), nodes))
+            })
+            .collect()
+    };
+    let theirs: Vec<(String, Vec<HostWide>)> = others
+        .iter()
+        .map(|(i, id, m, n)| {
+            (
+                format!("`{id}` in slot {i}"),
+                host_wide(m, *i, n, cache_dir),
+            )
+        })
+        .collect();
+    let mine = host_wide(model, scope.instance, nodes, cache_dir);
+    pf.check(
+        "host-wide resources",
+        held_by_other_run(&mine, &theirs).map(|(what, run)| {
+            (
+                R::HeldByRun,
+                model.id.clone(),
+                format!("{what} is held by run {run}; one host has it once"),
             )
         }),
     );
@@ -1135,5 +1313,51 @@ parts:
         let mut plain = synced.clone();
         plain.time_sync = None;
         assert!(!all_images(&plain, &[]).contains(vxedge_core::gptp::LINUXPTP_IMAGE));
+    }
+}
+
+#[cfg(test)]
+mod host_wide_tests {
+    use super::*;
+
+    #[test]
+    fn overlapping_host_side_subnets_clash_and_disjoint_ones_do_not() {
+        let a = subnet("10.101.0.1/24").unwrap();
+        assert!(a.clashes(&subnet("10.101.0.200/24").unwrap()));
+        assert!(
+            a.clashes(&subnet("10.101.0.0/16").unwrap()),
+            "one inside the other"
+        );
+        assert!(!a.clashes(&subnet("10.102.0.1/24").unwrap()));
+    }
+
+    #[test]
+    fn what_one_host_has_once_is_named_with_the_run_that_holds_it() {
+        let theirs = vec![(
+            "`car` in slot 0".to_string(),
+            vec![HostWide::FiveG, HostWide::ListenPort(51820)],
+        )];
+        let (what, run) = held_by_other_run(&[HostWide::ListenPort(51820)], &theirs).expect("held");
+        assert!(
+            what.contains("51820") && run.contains("slot 0"),
+            "{what} {run}"
+        );
+        assert!(held_by_other_run(&[HostWide::ListenPort(51821)], &theirs).is_none());
+        assert!(held_by_other_run(&[HostWide::FiveG], &theirs).is_some());
+        assert!(
+            held_by_other_run(
+                &[HostWide::Vxlan { vni: 7, port: 4789 }],
+                &[("x".into(), vec![HostWide::Vxlan { vni: 7, port: 4790 }])]
+            )
+            .is_none(),
+            "a VNI on another port is another tunnel"
+        );
+        assert!(
+            held_by_other_run(
+                &[HostWide::Adopted("cvd-etap-01".into())],
+                &[("aaos".into(), vec![HostWide::Adopted("cvd-etap-01".into())])]
+            )
+            .is_some()
+        );
     }
 }
