@@ -171,6 +171,13 @@ enum ErrorReason {
   // names a background step that is not running, a mounted file the package does not hold, or a
   // case that reads a step recording nothing. Refused before anything runs.
   ERROR_REASON_CHECK_INVALID = 36;
+  // A verb that names no run matches more than one: the runs of a workspace that runs twice, or
+  // several runs with no workspace named. The message lists them; name one with `RunRef`.
+  ERROR_REASON_RUN_AMBIGUOUS = 37;
+  // Another run holds what this one asks for: an instance slot, or a resource one host has once
+  // (an `s-nssai` slice, overlapping host-side addresses, a WireGuard listen port, a VXLAN VNI and
+  // port, an adopted host interface). The message names the run that holds it.
+  ERROR_REASON_HELD_BY_RUN = 38;
 }
 
 // Names one run. See `RunService`.

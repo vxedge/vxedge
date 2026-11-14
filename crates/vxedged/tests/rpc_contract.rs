@@ -338,6 +338,7 @@ async fn experiment_status_refuses_a_workspace_that_is_not_active() {
     let daemon = Daemon::start_with(|run| write_active_record(run, &id, &active, None));
     let refused = ExperimentServiceClient::new(daemon.channel().await)
         .status(ExperimentStatusRequest {
+            run: None,
             manifest: path_ref(&other),
         })
         .await
@@ -355,6 +356,7 @@ async fn experiment_status_reports_services() {
     let daemon = Daemon::start_with(|run| write_active_record(run, &id, &active, None));
     let status = ExperimentServiceClient::new(daemon.channel().await)
         .status(ExperimentStatusRequest {
+            run: None,
             manifest: path_ref(&active),
         })
         .await
@@ -511,6 +513,7 @@ async fn vehicle_status_reports_a_declared_signal_plane() {
     let ws = signal_plane_workspace();
     let status = VehicleServiceClient::new(daemon.channel().await)
         .status(VehicleStatusRequest {
+            run: None,
             manifest: path_ref(&ws),
         })
         .await
@@ -532,6 +535,7 @@ async fn experiment_status_reports_a_declared_signal_plane() {
     let ws = signal_plane_experiment();
     let status = ExperimentServiceClient::new(daemon.channel().await)
         .status(ExperimentStatusRequest {
+            run: None,
             manifest: path_ref(&ws),
         })
         .await
@@ -1054,6 +1058,7 @@ async fn a_declared_device_nothing_provisions_is_unprovisioned() {
     let daemon = Daemon::start_with(|run| write_active_record(run, &id, &ws, None));
     let status = VehicleServiceClient::new(daemon.channel().await)
         .status(VehicleStatusRequest {
+            run: None,
             manifest: path_ref(&ws),
         })
         .await
@@ -1070,6 +1075,7 @@ async fn experiment_status_carries_the_gateway_and_typed_nodes() {
     let daemon = Daemon::start_with(|run| write_active_record(run, &id, &ws, None));
     let status = ExperimentServiceClient::new(daemon.channel().await)
         .status(ExperimentStatusRequest {
+            run: None,
             manifest: path_ref(&ws),
         })
         .await
@@ -1166,6 +1172,7 @@ async fn refusals_carry_a_reason_an_agent_can_branch_on() {
     let channel = daemon.channel().await;
     let wrong = ExperimentServiceClient::new(channel.clone())
         .status(ExperimentStatusRequest {
+            run: None,
             manifest: path_ref(&other),
         })
         .await
@@ -2001,6 +2008,7 @@ async fn plan_and_up_refuse_a_package_that_does_not_match_its_lock() {
     let refused =
         vxedge_api::v1::gateway_service_client::GatewayServiceClient::new(channel.clone())
             .up(vxedge_api::v1::GatewayUpRequest {
+                instance: String::new(),
                 manifest: path_ref(&dir),
                 unlocked: false,
             })

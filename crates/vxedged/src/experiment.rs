@@ -228,6 +228,7 @@ impl Handles {
             self.gateway
                 .up(stage(
                     GatewayUpRequest {
+                        instance: String::new(),
                         manifest: inline(yaml, dir),
                         unlocked,
                     },
@@ -238,6 +239,7 @@ impl Handles {
             self.gateway
                 .down(stage(
                     GatewayDownRequest {
+                        run: None,
                         manifest: inline(yaml, dir),
                     },
                     p.job_id(),

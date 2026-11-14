@@ -18,6 +18,7 @@ mod plan;
 mod records;
 mod results;
 mod runs;
+mod scope;
 mod services;
 mod status;
 mod telemetry;

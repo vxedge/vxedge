@@ -314,7 +314,7 @@ fn active_record(runtime_dir: &Path) -> PathBuf {
 /// What `active.json` says. A record from before 0.4.1 has no `sha256`, one from before 0.5.0
 /// has no `run_id` or `started_unix_ms`, and one from before `vxws/2` has no
 /// `identity_algorithm`.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ActiveRecord {
     pub id: String,
     pub dir: PathBuf,
@@ -479,7 +479,7 @@ pub(crate) async fn observed_nodes(
 }
 
 /// The record, if it is there and reads.
-fn read_active_record(runtime_dir: &Path) -> Option<ActiveRecord> {
+pub(crate) fn read_active_record(runtime_dir: &Path) -> Option<ActiveRecord> {
     let text = std::fs::read_to_string(active_record(runtime_dir)).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
     let (package, kernel) = provenance_of(&v);

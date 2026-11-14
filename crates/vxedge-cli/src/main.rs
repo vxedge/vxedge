@@ -1711,6 +1711,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mut gw = GatewayServiceClient::new(channel.clone());
             let job = gw
                 .up(GatewayUpRequest {
+                    instance: String::new(),
                     manifest: manifest_ref(manifest),
                     unlocked: *unlocked,
                 })
@@ -1723,6 +1724,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mut gw = GatewayServiceClient::new(channel.clone());
             let job = gw
                 .down(GatewayDownRequest {
+                    run: None,
                     manifest: manifest_ref(manifest),
                 })
                 .await?
@@ -1998,6 +2000,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 ManifestLifecycleCmd::Status { manifest } => {
                     let st = veh
                         .status(VehicleStatusRequest {
+                            run: None,
                             manifest: manifest_ref(&Some(manifest.clone())),
                         })
                         .await?
@@ -2018,6 +2021,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 } => {
                     let job = veh
                         .up(VehicleUpRequest {
+                            instance: String::new(),
                             manifest: manifest_ref(&Some(manifest.clone())),
                             stages: stages.iter().map(|s| s.as_proto()).collect(),
                             unlocked: *unlocked,
@@ -2029,6 +2033,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 ManifestLifecycleCmd::Down { manifest, stages } => {
                     let job = veh
                         .down(VehicleDownRequest {
+                            run: None,
                             manifest: manifest_ref(&Some(manifest.clone())),
                             stages: stages.iter().map(|s| s.as_proto()).collect(),
                         })
@@ -2107,6 +2112,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     ExperimentCmd::Status => {
                         let st = exp
                             .status(ExperimentStatusRequest {
+                                run: None,
                                 manifest: manifest_ref(&Some(workspace)),
                             })
                             .await?
@@ -2138,6 +2144,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     ExperimentCmd::Up { stages, unlocked } => {
                         let job = exp
                             .up(ExperimentUpRequest {
+                                instance: String::new(),
                                 manifest: manifest_ref(&Some(workspace)),
                                 stages: stages.iter().map(|s| s.as_proto()).collect(),
                                 unlocked: *unlocked,
@@ -2155,6 +2162,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         };
                         let job = exp
                             .down(ExperimentDownRequest {
+                                run: None,
                                 manifest: manifest_ref(&Some(workspace)),
                                 stages,
                             })

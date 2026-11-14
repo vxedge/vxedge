@@ -82,7 +82,10 @@ impl RunSvc {
             (None, _) => None,
             (Some(m), ResourceKind::Vehicle) => self
                 .vehicles
-                .status(Request::new(VehicleStatusRequest { manifest: Some(m) }))
+                .status(Request::new(VehicleStatusRequest {
+                    run: None,
+                    manifest: Some(m),
+                }))
                 .await
                 .ok()
                 .map(|r| {
@@ -91,7 +94,10 @@ impl RunSvc {
                 }),
             (Some(m), _) => self
                 .experiments
-                .status(Request::new(ExperimentStatusRequest { manifest: Some(m) }))
+                .status(Request::new(ExperimentStatusRequest {
+                    run: None,
+                    manifest: Some(m),
+                }))
                 .await
                 .ok()
                 .map(|r| {
@@ -129,6 +135,7 @@ impl RunSvc {
             self.observe(&record, kind).await?
         };
         Ok(Some(Run {
+            instance: String::new(),
             id: record.run_id().to_string(),
             kind: kind as i32,
             target_id,
