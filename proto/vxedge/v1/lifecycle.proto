@@ -30,7 +30,10 @@ message GatewayDownRequest {
   RunRef run = 2;
 }
 
-message GatewayStatusRequest {}
+message GatewayStatusRequest {
+  // The run whose gateway to report. Empty means the only run.
+  RunRef run = 1;
+}
 
 message GatewayStatus {
   ResourceStatus status = 1;

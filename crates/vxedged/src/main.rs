@@ -196,6 +196,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state: services::SharedState =
         Arc::new(tokio::sync::Mutex::new(services::EdgeState::default()));
+    // Every run the host still shows, from its record, so a restart picks up where it was.
+    services::restore_all(&state, &args.runtime_dir, &shell).await;
+    // A campaign's hold on its slot outlives a restart, so a retry resumes in it; a hold whose
+    // campaign has finished or is gone is released.
+    for instance in vxedge_core::instance::Instance::all() {
+        if let Some(c) = scope::reserved_by(&args.runtime_dir, instance)
+            && campaign_run::read(&args.runtime_dir, &c).is_none_or(|r| r.is_terminal())
+        {
+            scope::release(&args.runtime_dir, instance, &c);
+        }
+    }
     if let Some(metrics) = exporter::bind(&args.metrics_listen).await {
         info!(metrics = %exporter::targets().join(","), "metrics exporter listening");
         tokio::spawn(exporter::serve(
@@ -335,13 +346,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             gateway: plan_gateway.clone(),
             runtime_dir: args.runtime_dir.clone(),
             cache_dir: cache_dir.clone(),
-            engine: engine.clone(),
         }))
         .add_service(HostServiceServer::new(plan::PlanSvc {
             gateway: plan_gateway,
             runtime_dir: args.runtime_dir.clone(),
             cache_dir: cache_dir.clone(),
-            engine: engine.clone(),
         }))
         .add_service(ZoneServiceServer::from_arc(zones))
         .add_service(ComputeServiceServer::from_arc(compute))
@@ -358,6 +367,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 telemetry: telemetry.clone(),
                 svcs: svcs.clone(),
                 containers: containers.clone(),
+                runtime_dir: args.runtime_dir.clone(),
             },
             audit: audit.clone(),
             runtime_dir: args.runtime_dir.clone(),

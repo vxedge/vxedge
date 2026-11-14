@@ -97,10 +97,10 @@ async fn resolve_and_synthesize(mref: Option<&ManifestRef>) -> Result<Resolved, 
 fn plan_vehicle(
     model: &Experiment,
     dir: Option<&Path>,
+    instance: vxedge_core::instance::Instance,
 ) -> Result<(GatewayPlan, Vec<NodePlan>), Status> {
     let refuse = |e: String| crate::errors::precondition(crate::errors::R::WorkspaceInvalid, e);
-    let gateway = GatewayPlan::from_model(model, crate::services::RUN_SLOT)
-        .map_err(|e| refuse(e.to_string()))?;
+    let gateway = GatewayPlan::from_model(model, instance).map_err(|e| refuse(e.to_string()))?;
     let nodes = vxedge_core::zones::plan_nodes_from_model(
         model,
         &gateway,
@@ -133,8 +133,9 @@ impl VehicleSvc {
         model: &Experiment,
         dir: Option<&Path>,
         nodes: &[NodePlan],
+        scope: &crate::scope::RunScope,
     ) -> Result<(), Status> {
-        let active = self.handles.gateway.active_on_host().await;
+        let active = self.handles.gateway.active_on_host(scope).await;
         check_active_target(
             verb,
             active
@@ -143,9 +144,9 @@ impl VehicleSvc {
             &model.id,
             dir,
         )?;
-        let plans = nodes.to_vec();
+        let (plans, instance) = (nodes.to_vec(), scope.instance);
         let foreign = tokio::task::spawn_blocking(move || {
-            vxedge_core::zones::foreign_objects(crate::services::RUN_SLOT, &plans)
+            vxedge_core::zones::foreign_objects(instance, &plans)
         })
         .await
         .map_err(|e| Status::internal(format!("host scan panicked: {e}")))?;
@@ -184,9 +185,19 @@ impl VehicleService for VehicleSvc {
             model,
             id,
         } = resolve_and_synthesize(req.get_ref().manifest.as_ref()).await?;
+        // The run's slot: its own when the workspace already runs, else the one asked for or the
+        // lowest free one.
+        let root = self.handles.gateway.runtime_dir.clone();
+        let instance = crate::scope::choose(
+            &root,
+            dir.as_deref(),
+            crate::scope::requested(&req.get_ref().instance)?,
+            crate::scope::Asker::default(),
+        )?;
+        let scope = crate::scope::RunScope::new(&root, instance);
         // Every check `up` makes before touching the host, shared with `WorkspaceService.Plan` so
         // the two cannot disagree. Refusing here costs nothing; refusing halfway strands a gateway.
-        let (_, nodes) = plan_vehicle(&model, dir.as_deref())?;
+        let (_, nodes) = plan_vehicle(&model, dir.as_deref(), instance)?;
         let pf = crate::plan::preflight(
             "vehicle up",
             &id,
@@ -194,10 +205,9 @@ impl VehicleService for VehicleSvc {
             &nodes,
             dir.as_deref(),
             req.get_ref().unlocked,
-            &self.handles.zones.runtime_dir,
+            &scope,
             &self.handles.zones.cache_dir,
             &self.handles.gateway,
-            self.handles.engine.lifecycle_target().await,
         )
         .await;
         if let Some(refusal) = pf.refusal() {
@@ -223,45 +233,51 @@ impl VehicleService for VehicleSvc {
                 JobOpts::lifecycle(
                     &req,
                     crate::experiment::staged_target(format!("vehicle {id}"), &stages),
-                ),
+                )
+                .in_run(&scope.dir),
                 "vehicle.up",
                 move |p| async move {
+                    let mut run = crate::scope::RunCtx::new(scope);
                     let mut done: Vec<String> = Vec::new();
                     p.checkpoint()?;
                     if wants(&stages, ExperimentStage::Gateway) {
-                        svc.stage_gateway(&yaml, dir.as_deref(), Some(unlocked), &p)
+                        svc.stage_gateway(&yaml, dir.as_deref(), Some(unlocked), &p, &run)
                             .await?;
+                        run.refresh();
                         done.push("gateway".to_string());
                     }
                     p.checkpoint()?;
                     if wants(&stages, ExperimentStage::Zones) {
-                        done.push(svc.stage_nodes(NodeStage::Zones, &zones, true, &p).await?);
+                        done.push(
+                            svc.stage_nodes(NodeStage::Zones, &zones, true, &p, &run)
+                                .await?,
+                        );
                     }
                     p.checkpoint()?;
                     if wants(&stages, ExperimentStage::Compute) {
                         done.push(
-                            svc.stage_nodes(NodeStage::Compute, &compute, true, &p)
+                            svc.stage_nodes(NodeStage::Compute, &compute, true, &p, &run)
                                 .await?,
                         );
                     }
                     p.checkpoint()?;
                     if wants(&stages, ExperimentStage::TimeSync) {
                         done.push(
-                            svc.stage_time_sync(&model, dir.as_deref(), true, &p)
+                            svc.stage_time_sync(&model, dir.as_deref(), true, &p, &run)
                                 .await?,
                         );
                     }
                     p.checkpoint()?;
                     if wants(&stages, ExperimentStage::SignalPlane) {
                         done.push(
-                            svc.stage_signal_plane(&model, dir.as_deref(), true, &p)
+                            svc.stage_signal_plane(&model, dir.as_deref(), true, &p, &run)
                                 .await?,
                         );
                     }
                     p.checkpoint()?;
                     if wants(&stages, ExperimentStage::Services) {
                         done.push(
-                            svc.stage_services(&model, &yaml, dir.as_deref(), true, &p)
+                            svc.stage_services(&model, &yaml, dir.as_deref(), true, &p, &run)
                                 .await?,
                         );
                     }
@@ -288,8 +304,10 @@ impl VehicleService for VehicleSvc {
             model,
             id,
         } = resolve_and_synthesize(req.get_ref().manifest.as_ref()).await?;
-        let (gateway, nodes) = plan_vehicle(&model, dir.as_deref())?;
-        self.require_active("vehicle down", &model, dir.as_deref(), &nodes)
+        let root = self.handles.gateway.runtime_dir.clone();
+        let scope = crate::scope::resolve(&root, req.get_ref().run.as_ref(), dir.as_deref())?;
+        let (gateway, nodes) = plan_vehicle(&model, dir.as_deref(), scope.instance)?;
+        self.require_active("vehicle down", &model, dir.as_deref(), &nodes, &scope)
             .await?;
         self.audit.record(
             "VehicleService.Down",
@@ -311,45 +329,53 @@ impl VehicleService for VehicleSvc {
                 JobOpts::lifecycle(
                     &req,
                     crate::experiment::staged_target(format!("vehicle {id}"), &stages),
-                ),
+                )
+                .in_run(&scope.dir),
                 "vehicle.down",
                 move |p| async move {
+                    let run = crate::scope::RunCtx::new(scope);
                     // Reverse order, best-effort — same reasoning as `ExperimentSvc::down`: a
                     // teardown that stops at the first error strands whatever came after it.
                     let mut failures: Vec<JobFailure> = Vec::new();
                     if wants(&stages, ExperimentStage::Services)
                         && let Err(e) = svc
-                            .stage_services(&model, &yaml, dir.as_deref(), false, &p)
+                            .stage_services(&model, &yaml, dir.as_deref(), false, &p, &run)
                             .await
                     {
                         failures.push(e);
                     }
                     if wants(&stages, ExperimentStage::SignalPlane)
                         && let Err(e) = svc
-                            .stage_signal_plane(&model, dir.as_deref(), false, &p)
+                            .stage_signal_plane(&model, dir.as_deref(), false, &p, &run)
                             .await
                     {
                         failures.push(e);
                     }
                     if wants(&stages, ExperimentStage::TimeSync)
-                        && let Err(e) = svc.stage_time_sync(&model, dir.as_deref(), false, &p).await
+                        && let Err(e) = svc
+                            .stage_time_sync(&model, dir.as_deref(), false, &p, &run)
+                            .await
                     {
                         failures.push(e);
                     }
                     if wants(&stages, ExperimentStage::Compute)
                         && let Err(e) = svc
-                            .stage_nodes(NodeStage::Compute, &compute, false, &p)
+                            .stage_nodes(NodeStage::Compute, &compute, false, &p, &run)
                             .await
                     {
                         failures.push(e);
                     }
                     if wants(&stages, ExperimentStage::Zones)
-                        && let Err(e) = svc.stage_nodes(NodeStage::Zones, &zones, false, &p).await
+                        && let Err(e) = svc
+                            .stage_nodes(NodeStage::Zones, &zones, false, &p, &run)
+                            .await
                     {
                         failures.push(e);
                     }
                     if wants(&stages, ExperimentStage::Gateway)
-                        && let Err(e) = svc.stage_gateway(&yaml, dir.as_deref(), None, &p).await
+                        && let Err(e) = svc
+                            .stage_gateway(&yaml, dir.as_deref(), None, &p, &run)
+                            .await
                     {
                         failures.push(e);
                     }
@@ -383,13 +409,16 @@ impl VehicleService for VehicleSvc {
             id,
             ..
         } = resolve_and_synthesize(req.get_ref().manifest.as_ref()).await?;
-        let (gateway, nodes) = plan_vehicle(&model, dir.as_deref())?;
-        self.require_active("vehicle status", &model, dir.as_deref(), &nodes)
+        let root = self.handles.gateway.runtime_dir.clone();
+        let scope = crate::scope::resolve(&root, req.get_ref().run.as_ref(), dir.as_deref())?;
+        let (gateway, nodes) = plan_vehicle(&model, dir.as_deref(), scope.instance)?;
+        self.require_active("vehicle status", &model, dir.as_deref(), &nodes, &scope)
             .await?;
+        let run = crate::scope::RunCtx::new(scope);
 
         let unattached = unprovisioned(&model, &nodes);
         let shell = self.handles.zones.shell.clone();
-        let runtime_dir = self.handles.zones.runtime_dir.clone();
+        let runtime_dir = run.scope.dir.clone();
         // Every part is observed at once: the gateway, the nodes, the services and the signal
         // plane are independent reads, and doing them in turn made this call take seconds.
         let services = async {
@@ -401,7 +430,7 @@ impl VehicleService for VehicleSvc {
                     .status(Request::new(SvcStatusRequest {
                         service_type,
                         experiment: inline(&yaml, dir.as_deref()),
-                        ..Default::default()
+                        run: run.run.clone(),
                     }))
                     .await?;
                 out.push(observed.into_inner());
@@ -409,11 +438,15 @@ impl VehicleService for VehicleSvc {
             Ok::<_, Status>(out)
         };
         let (gw, typed, services, signal_plane, time_sync) = tokio::join!(
-            self.handles.gateway.observe(Some(gateway), None),
+            self.handles
+                .gateway
+                .observe(run.scope.instance, Some(gateway), None),
             crate::services::observed_nodes(shell, runtime_dir, nodes),
             services,
-            self.handles.signal_plane_component(&model, dir.as_deref()),
-            self.handles.time_sync_components(&model, dir.as_deref()),
+            self.handles
+                .signal_plane_component(&model, dir.as_deref(), &run),
+            self.handles
+                .time_sync_components(&model, dir.as_deref(), &run),
         );
         let (gw, typed) = (gw?, typed?);
         let gw_status = gw.status.clone().unwrap_or_default();
@@ -493,7 +526,7 @@ parts:
     #[test]
     fn hpc_devices_go_through_compute_and_the_rest_through_zones() {
         let m = model(WS);
-        let (_, nodes) = plan_vehicle(&m, None).unwrap();
+        let (_, nodes) = plan_vehicle(&m, None, vxedge_core::instance::Instance::FIRST).unwrap();
         assert_eq!(
             by_stage(&nodes),
             (vec!["ecu1".to_string()], vec!["hpc1".to_string()])
@@ -503,7 +536,8 @@ parts:
     #[test]
     fn an_attach_node_comes_last_both_ways() {
         let m = model(WS);
-        let (_, mut nodes) = plan_vehicle(&m, None).unwrap();
+        let (_, mut nodes) =
+            plan_vehicle(&m, None, vxedge_core::instance::Instance::FIRST).unwrap();
         let mut ivi = nodes.iter().find(|n| n.node_id == "ecu1").unwrap().clone();
         ivi.node_id = "ivi".into();
         ivi.backend = vxedge_core::model::Backend::Attach;
@@ -519,14 +553,14 @@ parts:
             "signal_plane:\n  kuksa:\n    image: { url: localhost/vxedge/kuksa:1, kind: container }\n    on: hpc1\n---\nkind: baseline",
         );
         let m = model(&yaml);
-        let (_, nodes) = plan_vehicle(&m, None).unwrap();
+        let (_, nodes) = plan_vehicle(&m, None, vxedge_core::instance::Instance::FIRST).unwrap();
         assert!(crate::plan::local_images(&m, &nodes).contains("localhost/vxedge/kuksa:1"));
     }
 
     #[test]
     fn local_images_cover_payloads_and_placed_services_once_each() {
         let m = model(WS);
-        let (_, nodes) = plan_vehicle(&m, None).unwrap();
+        let (_, nodes) = plan_vehicle(&m, None, vxedge_core::instance::Instance::FIRST).unwrap();
         assert_eq!(
             crate::plan::local_images(&m, &nodes)
                 .into_iter()
@@ -542,7 +576,8 @@ parts:
             "  - { id: l2,",
             "  - { id: l3, endpoints: [{ node: ecu1, port: eth1, ip: 10.2.0.2/24 }], slice: info }\n  - { id: l2,",
         );
-        let err = plan_vehicle(&model(&yaml), None).unwrap_err();
+        let err =
+            plan_vehicle(&model(&yaml), None, vxedge_core::instance::Instance::FIRST).unwrap_err();
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
         assert!(err.message().contains("ecu1"), "{err:?}");
     }
@@ -555,7 +590,7 @@ parts:
              spare: { role: ecu, zone: central, backend: container }",
         );
         let m = model(&yaml);
-        let (_, nodes) = plan_vehicle(&m, None).unwrap();
+        let (_, nodes) = plan_vehicle(&m, None, vxedge_core::instance::Instance::FIRST).unwrap();
         let listed = unprovisioned(&m, &nodes);
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].vxid, "spare");
@@ -576,7 +611,7 @@ parts:
     #[test]
     fn hpc_nodes_report_as_compute() {
         let m = model(WS);
-        let (_, nodes) = plan_vehicle(&m, None).unwrap();
+        let (_, nodes) = plan_vehicle(&m, None, vxedge_core::instance::Instance::FIRST).unwrap();
         let hpc = nodes.iter().find(|n| n.node_id == "hpc1").unwrap();
         let node =
             crate::status::observed_node(hpc, &vxedge_core::zones::backend::NodeState::Up, None);

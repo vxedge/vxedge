@@ -1670,7 +1670,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 )
             })?;
             let mut client = GatewayServiceClient::new(channel);
-            let status = client.status(GatewayStatusRequest {}).await?.into_inner();
+            let status = client
+                .status(GatewayStatusRequest { run: None })
+                .await?
+                .into_inner();
             if cli.json {
                 println!(
                     "{}",

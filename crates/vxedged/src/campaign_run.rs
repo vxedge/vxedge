@@ -31,12 +31,13 @@ use vxedge_api::v1::traffic_service_server::TrafficService;
 use vxedge_api::v1::{
     CampaignState, CampaignStatus, CampaignTrialStatus, CollectRequest, ExperimentDownRequest,
     ExperimentUpRequest, ManifestRef, MeasurementStartRequest, MeasurementStatusRequest,
-    MeasurementStopRequest, SvcDownRequest, TrafficDownRequest, TrafficUpRequest, TrialState,
+    MeasurementStopRequest, RunRef, SvcDownRequest, TrafficDownRequest, TrafficUpRequest,
+    TrialState,
 };
 use vxedge_core::campaign::Trial;
 
 use crate::experiment::{ExperimentSvc, await_job};
-use crate::jobs::{JobEngine, JobFailure, Progress, now_ms, stage};
+use crate::jobs::{JobEngine, JobFailure, Progress, now_ms, queued_stage, stage};
 use crate::measure::MeasurementSvc;
 use crate::services::{SvcSvc, TrafficSvc};
 use crate::telemetry::TelemetrySvc;
@@ -52,6 +53,8 @@ pub struct Steps {
     pub svcs: Arc<SvcSvc>,
     /// The Podman API a trial's functional checks run their tools through.
     pub containers: vxedge_core::containers::LazyClient,
+    /// The daemon's runtime directory, under which each run has its own.
+    pub runtime_dir: PathBuf,
 }
 
 /// One trial in `campaign.json`.
@@ -110,6 +113,10 @@ pub struct CampaignRecord {
     /// an experiment without criteria.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub verdict: String,
+    /// The instance slot every trial ran in (`ARCHITECTURE.md` §6.0.5), so two campaigns run at
+    /// once cannot be confused.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub instance: String,
 }
 
 fn trial_state(s: &str) -> TrialState {
@@ -225,6 +232,8 @@ pub struct Campaign {
     pub checks: Option<vxedge_core::checks::Checks>,
     pub checks_out: PathBuf,
     pub unlocked: bool,
+    /// The slot the campaign holds, which every trial runs in.
+    pub instance: vxedge_core::instance::Instance,
 }
 
 /// The trial's experiment document: its values bound, and the telemetry service's ingest window
@@ -294,9 +303,11 @@ async fn sleep_s(s: f64) {
 
 /// Start the measurements for `duration_s`, wait it out, then wait for the senders' last
 /// summary, a few seconds at most.
+#[allow(clippy::too_many_arguments)]
 async fn measure(
     steps: &Steps,
     c: &Campaign,
+    run: &Option<RunRef>,
     manifest: &Option<ManifestRef>,
     duration_s: f64,
     p: &Progress,
@@ -309,6 +320,7 @@ async fn measure(
             stage(
                 MeasurementStartRequest {
                     manifest: manifest.clone(),
+                    run: run.clone(),
                     duration_s: duration_s.ceil() as u32,
                     ..Default::default()
                 },
@@ -331,7 +343,7 @@ async fn measure(
                 &*steps.measure,
                 tonic::Request::new(MeasurementStatusRequest {
                     manifest: manifest.clone(),
-                    ..Default::default()
+                    run: run.clone(),
                 }),
             )
             .await
@@ -369,7 +381,7 @@ async fn run_checks(
         root: &c.root,
         out: &c.checks_out,
         budget: Duration::from_secs_f64(budget_s.max(0.0)),
-        instance: crate::services::RUN_SLOT,
+        instance: c.instance,
     };
     vxedge_core::checks::run::run(checks, &ctx)
         .await
@@ -407,6 +419,7 @@ async fn wait_ingested(ingest_dir: &Path, out: &Path, checks: &vxedge_core::chec
 
 async fn stop_measurements(
     steps: &Steps,
+    run: &Option<RunRef>,
     manifest: &Option<ManifestRef>,
     p: &Progress,
     parent: &str,
@@ -417,6 +430,7 @@ async fn stop_measurements(
         stage(
             MeasurementStopRequest {
                 manifest: manifest.clone(),
+                run: run.clone(),
                 ..Default::default()
             },
             parent,
@@ -457,22 +471,31 @@ pub async fn run_trial(
 
     set_phase("provision");
     mark("provision");
-    let up = ExperimentService::up(
-        &*steps.experiments,
-        stage(
-            ExperimentUpRequest {
-                manifest: manifest.clone(),
-                unlocked: c.unlocked,
-                ..Default::default()
-            },
-            &parent,
-        ),
-    )
-    .await
-    .map_err(|s| JobFailure::from_status(&s).context(format!("trial {}: up", t.id)))?
-    .into_inner();
+    // In the campaign's own slot, queued for the host's lifecycle claim: another run's `up` in
+    // flight delays the trial instead of failing it.
+    let mut up_req = queued_stage(
+        ExperimentUpRequest {
+            manifest: manifest.clone(),
+            unlocked: c.unlocked,
+            instance: c.instance.to_string(),
+            ..Default::default()
+        },
+        &parent,
+    );
+    up_req
+        .extensions_mut()
+        .insert(crate::scope::Campaign(campaign_id.to_string()));
+    let up = ExperimentService::up(&*steps.experiments, up_req)
+        .await
+        .map_err(|s| JobFailure::from_status(&s).context(format!("trial {}: up", t.id)))?
+        .into_inner();
+    let run_dir = crate::scope::run_dir(&steps.runtime_dir, c.instance);
     let result = async {
         await_job(&steps.engine, up, p, 10, &format!("{} provision", t.id)).await?;
+        // Every later step names this trial's run: the workspace may run elsewhere too.
+        let run = crate::services::read_active_record(&run_dir).map(|r| RunRef {
+            run_id: r.run_id().to_string(),
+        });
         set_phase("warmup");
         mark("warmup");
         let load_s = (t.warmup_s + t.duration_s).ceil() as u32 + 4;
@@ -483,6 +506,7 @@ pub async fn run_trial(
                     TrafficUpRequest {
                         manifest: manifest.clone(),
                         duration_s: load_s,
+                        run: run.clone(),
                         ..Default::default()
                     },
                     &parent,
@@ -497,7 +521,7 @@ pub async fn run_trial(
         set_phase("measure");
         if t.windows.is_empty() {
             mark("measure");
-            measure(steps, c, &manifest, t.duration_s, p, &parent, &t.id).await?;
+            measure(steps, c, &run, &manifest, t.duration_s, p, &parent, &t.id).await?;
         }
         // Each window runs the measurements afresh, with its own parameters, and stops them, so
         // the next window's senders start from nothing.
@@ -510,15 +534,15 @@ pub async fn run_trial(
                 ..Default::default()
             });
             let label = format!("{} {}", t.id, w.id);
-            measure(steps, c, &window, w.duration_s, p, &parent, &label).await?;
+            measure(steps, c, &run, &window, w.duration_s, p, &parent, &label).await?;
             if c.has_measurements {
-                stop_measurements(steps, &window, p, &parent, &label).await?;
+                stop_measurements(steps, &run, &window, p, &parent, &label).await?;
             }
         }
         set_phase("cooldown");
         mark("cooldown");
         if c.has_measurements {
-            stop_measurements(steps, &manifest, p, &parent, &t.id).await?;
+            stop_measurements(steps, &run, &manifest, p, &parent, &t.id).await?;
         }
         if c.has_traffic {
             let job = TrafficService::down(
@@ -526,6 +550,7 @@ pub async fn run_trial(
                 stage(
                     TrafficDownRequest {
                         manifest: manifest.clone(),
+                        run: run.clone(),
                         ..Default::default()
                     },
                     &parent,
@@ -545,7 +570,7 @@ pub async fn run_trial(
                 SvcDownRequest {
                     service_type: "telemetry".into(),
                     experiment: manifest.clone(),
-                    ..Default::default()
+                    run: run.clone(),
                 },
                 &parent,
             ),
@@ -570,6 +595,7 @@ pub async fn run_trial(
                 CollectRequest {
                     manifest: manifest.clone(),
                     out_path: archive.display().to_string(),
+                    instance: c.instance.to_string(),
                     ..Default::default()
                 },
                 &parent,
@@ -595,12 +621,17 @@ pub async fn run_trial(
     {
         vxedge_core::checks::run::remove_leftovers(client).await;
     }
-    // Down after every trial that got this far, whatever happened.
+    // Down after every trial that got this far, whatever happened: this trial's run, queued
+    // for the claim like its `up`.
+    let down_run = crate::services::read_active_record(&run_dir).map(|r| RunRef {
+        run_id: r.run_id().to_string(),
+    });
     let down = ExperimentService::down(
         &*steps.experiments,
-        stage(
+        queued_stage(
             ExperimentDownRequest {
                 manifest: manifest.clone(),
+                run: down_run,
                 ..Default::default()
             },
             &parent,

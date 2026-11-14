@@ -120,7 +120,19 @@ pub(crate) fn resolve_in(
         None => runs.to_vec(),
     };
     match matching.as_slice() {
-        [] => Ok(RunScope::new(root, Instance::FIRST)),
+        // Nothing up: the first slot, where a verb finds nothing, as before there were slots.
+        [] if runs.is_empty() => Ok(RunScope::new(root, Instance::FIRST)),
+        // Never another run's slot: a workspace with no run has nothing to act on here.
+        [] => Err(crate::errors::precondition(
+            R::NoActiveRun,
+            format!(
+                "`{}` has no run on this host; these do: {}",
+                workspace
+                    .map(|w| w.display().to_string())
+                    .unwrap_or_default(),
+                list(runs)
+            ),
+        )),
         [(i, _)] => Ok(RunScope::new(root, *i)),
         many => Err(crate::errors::precondition(
             R::RunAmbiguous,
@@ -266,6 +278,52 @@ pub(crate) fn choose_in(
         })
 }
 
+/// The run a composite verb (`experiment`, `vehicle`) stages: its slot and directory, and its run
+/// id once its gateway is up, which every later stage names.
+#[derive(Debug, Clone)]
+pub(crate) struct RunCtx {
+    pub scope: RunScope,
+    pub run: Option<RunRef>,
+}
+
+impl RunCtx {
+    pub(crate) fn new(scope: RunScope) -> Self {
+        let mut ctx = Self { scope, run: None };
+        ctx.refresh();
+        ctx
+    }
+
+    /// Read the run id from the run's record: after its gateway comes up, or for a run already up.
+    pub(crate) fn refresh(&mut self) {
+        self.run = crate::services::read_active_record(&self.scope.dir).map(|r| RunRef {
+            run_id: r.run_id().to_string(),
+        });
+    }
+}
+
+/// A campaign's id on a request it makes, so the slot it reserves is open to it.
+#[derive(Debug, Clone)]
+pub(crate) struct Campaign(pub String);
+
+/// What a lifecycle verb acts on: a run it may start, in the slot asked for if any, or a run
+/// that is already up, named or found by its workspace.
+#[derive(Debug, Clone)]
+pub(crate) enum Target {
+    Start(Option<Instance>),
+    Existing(Option<RunRef>),
+}
+
+impl Target {
+    /// The run this target is, for a request whose workspace is in `workspace`.
+    pub(crate) fn scope(&self, root: &Path, workspace: Option<&Path>) -> Result<RunScope, Status> {
+        match self {
+            Target::Start(requested) => choose(root, workspace, *requested, Asker::default())
+                .map(|i| RunScope::new(root, i)),
+            Target::Existing(run) => resolve(root, run.as_ref(), workspace),
+        }
+    }
+}
+
 /// The slot a request names, if it names one.
 pub(crate) fn requested(instance: &str) -> Result<Option<Instance>, Status> {
     if instance.is_empty() {
@@ -374,6 +432,15 @@ mod tests {
             resolve_in(root, &[], None, None).unwrap().instance,
             Instance::FIRST
         );
+    }
+
+    /// The danger the rule exists for: a `down` of a workspace with no run must not land on
+    /// another run's slot.
+    #[test]
+    fn a_workspace_with_no_run_never_resolves_to_another_runs_slot() {
+        let e = resolve_in(Path::new(ROOT), &runs(), None, Some(Path::new("/ws/c"))).unwrap_err();
+        assert_eq!(reason(&e), "ERROR_REASON_NO_ACTIVE_RUN");
+        assert!(e.message().contains("run-a"), "{}", e.message());
     }
 
     #[test]

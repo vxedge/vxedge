@@ -39,15 +39,22 @@ pub struct TelemetrySvc {
 pub(crate) fn entities(
     model: &vxedge_core::model::Experiment,
     runtime_dir: &Path,
+    instance: vxedge_core::instance::Instance,
 ) -> Vec<vxedge_core::entities::EntityRecord> {
-    let mut entities = vxedge_core::entities::entities_with(model, &crate::exporter::targets());
-    vxedge_core::entities::add_logs(&mut entities, model, runtime_dir, crate::services::RUN_SLOT);
+    let mut entities =
+        vxedge_core::entities::entities_with(model, &crate::exporter::targets_for(instance));
+    vxedge_core::entities::add_logs(&mut entities, model, runtime_dir, instance);
     entities
 }
 
 /// The `entities.json` of `model`: [`entities`], as the telemetry service reads it.
-pub(crate) fn entities_json(model: &vxedge_core::model::Experiment, runtime_dir: &Path) -> Vec<u8> {
-    serde_json::to_vec_pretty(&entities(model, runtime_dir)).expect("entities always serialize")
+pub(crate) fn entities_json(
+    model: &vxedge_core::model::Experiment,
+    runtime_dir: &Path,
+    instance: vxedge_core::instance::Instance,
+) -> Vec<u8> {
+    serde_json::to_vec_pretty(&entities(model, runtime_dir, instance))
+        .expect("entities always serialize")
 }
 
 /// `LogService`: the log lines the workspace's telemetry service reads, live.
@@ -96,12 +103,15 @@ impl TelemetrySvc {
 
 /// The ingest folder of the workspace `experiment` names, else of the live run's workspace, else
 /// this daemon's default one.
-async fn ingest_of(
-    runtime_dir: &Path,
-    experiment: Option<&ManifestRef>,
-) -> Result<PathBuf, Status> {
+async fn ingest_of(root: &Path, experiment: Option<&ManifestRef>) -> Result<PathBuf, Status> {
+    let dir = match experiment.filter(|m| m.source.is_some()) {
+        Some(m) => crate::services::resolve_manifest_dir(m).await,
+        None => None,
+    };
+    let scope = crate::scope::resolve(root, None, dir.as_deref())?;
+    let runtime_dir = scope.dir.as_path();
     let live = || {
-        crate::services::active_run(runtime_dir).map(|r| ManifestRef {
+        crate::services::read_active_record(runtime_dir).map(|r| ManifestRef {
             source: Some(vxedge_api::v1::manifest_ref::Source::Path(
                 r.dir.to_string_lossy().into_owned(),
             )),
@@ -194,10 +204,19 @@ impl TelemetryService for TelemetrySvc {
         })?;
         let model = vxedge_core::model::load_workspace_yaml(&yaml)
             .map_err(|e| errors::invalid(R::WorkspaceInvalid, e.to_string()))?;
+        // The run's own folder, whose ingest the telemetry service filled: the slot named, else
+        // the workspace's live run's, else the first.
+        let instance = match crate::scope::requested(&req.instance)? {
+            Some(i) => i,
+            None => crate::scope::run_of(&self.runtime_dir, &workspace)
+                .map(|s| s.instance)
+                .unwrap_or(vxedge_core::instance::Instance::FIRST),
+        };
+        let scope = crate::scope::RunScope::new(&self.runtime_dir, instance);
         let ingest = match vxedge_core::services::ServiceDef::find(&model, "telemetry") {
-            Some(def) => vxedge_core::services::telemetry_ingest_dir(def, &self.runtime_dir)
+            Some(def) => vxedge_core::services::telemetry_ingest_dir(def, &scope.dir)
                 .map_err(|e| errors::invalid(R::WorkspaceInvalid, e.to_string()))?,
-            None => self.runtime_dir.join("ingest"),
+            None => scope.dir.join("ingest"),
         };
         if !ingest.is_dir() {
             return Err(errors::precondition(
@@ -212,12 +231,14 @@ impl TelemetryService for TelemetrySvc {
         // The entity paths every record names, mapped once here from the model (§12), so the
         // archive carries them beside the samples that use them.
         let entities_file = ingest.join("entities.json");
-        std::fs::write(&entities_file, entities_json(&model, &self.runtime_dir)).map_err(|e| {
-            errors::invalid(
-                R::Unspecified,
-                format!("cannot write `{}`: {e}", entities_file.display()),
-            )
-        })?;
+        std::fs::write(&entities_file, entities_json(&model, &scope.dir, instance)).map_err(
+            |e| {
+                errors::invalid(
+                    R::Unspecified,
+                    format!("cannot write `{}`: {e}", entities_file.display()),
+                )
+            },
+        )?;
         // The binaries this daemon runs, which vxtelemetry records as `metadata.json`'s `tools`.
         self.tools.write(&ingest).await.map_err(|e| {
             errors::invalid(
@@ -263,7 +284,8 @@ impl TelemetryService for TelemetrySvc {
         // records what it is told and nothing when told nothing. Only the live run of this same
         // workspace counts. Passed in the environment, which an older vxtelemetry ignores.
         let same = |a: &Path, b: &Path| a.canonicalize().ok() == b.canonicalize().ok();
-        let run_package = crate::services::active_run(&self.runtime_dir)
+        let run_package = crate::services::read_active_record(&scope.dir)
+            .filter(|r| crate::scope::link_up(&r.bridge))
             .filter(|r| same(&r.dir, &workspace))
             .and_then(|r| r.package);
         let mut audit = serde_json::json!({
@@ -277,7 +299,7 @@ impl TelemetryService for TelemetrySvc {
         self.audit.record("TelemetryService.Collect", audit);
         let package_locked = run_package.map(|p| p.locked);
         let bin = self.vxtelemetry_bin.clone();
-        let log = self.runtime_dir.join("collect.log");
+        let log = scope.dir.join("collect.log");
         let job = self
             .engine
             .submit("telemetry.collect", move |p| async move {
@@ -300,6 +322,9 @@ impl TelemetryService for TelemetrySvc {
                 if let Some(locked) = package_locked {
                     cmd.env("VXTELEMETRY_PACKAGE_LOCKED", locked.to_string());
                 }
+                // The slot the run held, which vxtelemetry records as `metadata.json`'s
+                // `instance`, so two concurrent runs' archives cannot be confused.
+                cmd.env("VXTELEMETRY_INSTANCE", instance.to_string());
                 let output = cmd
                     .output()
                     .await

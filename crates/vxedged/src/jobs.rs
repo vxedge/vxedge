@@ -179,16 +179,6 @@ impl JobOpts {
         }
     }
 
-    /// A long verb that holds the lifecycle claim on `target` for its whole run and also takes a
-    /// request id: a campaign, whose trials are its stages.
-    pub fn claimed_request(target: impl Into<String>, request_id: &str) -> Self {
-        Self {
-            claim: Some(target.into()),
-            request_key: (!request_id.is_empty()).then(|| request_id.to_string()),
-            ..Default::default()
-        }
-    }
-
     /// A verb that runs a long time and takes no lifecycle claim of its own, with a request id:
     /// a campaign, whose trials each queue for the claim (`queued_stage`), so the host is free
     /// between them.
@@ -318,13 +308,6 @@ impl JobEngine {
     /// watch channel, not to a shared bus.
     pub fn events(&self) -> &EventBus {
         &self.inner.events
-    }
-
-    /// The target of the lifecycle job running now (`vehicle <id>`, `experiment <id> [stages]`,
-    /// `zone <vxid>`, …), if one is.
-    pub async fn lifecycle_target(&self) -> Option<String> {
-        let st = self.inner.state.lock().await;
-        st.lifecycle.as_ref().map(|(_, target, _)| target.clone())
     }
 
     #[cfg(test)]
@@ -773,10 +756,16 @@ mod tests {
                 .await
         });
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(!trial.is_finished(), "the trial waits while another run holds the claim");
+        assert!(
+            !trial.is_finished(),
+            "the trial waits while another run holds the claim"
+        );
         release.send(()).unwrap();
         wait_terminal(engine.watch(&other.id).await.unwrap()).await;
-        let job = trial.await.unwrap().expect("the queued trial is not refused as busy");
+        let job = trial
+            .await
+            .unwrap()
+            .expect("the queued trial is not refused as busy");
         assert_eq!(job.parent_job_id, "job-campaign");
         let done = wait_terminal(engine.watch(&job.id).await.unwrap()).await;
         assert_eq!(done.state, JobState::Succeeded as i32);

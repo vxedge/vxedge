@@ -25,29 +25,6 @@ use vxedge_core::zones::NodePlan;
 use crate::errors::{self, R};
 use crate::services::GatewaySvc;
 
-/// The workspace a lifecycle target acts on: `<id>` of `vehicle <id>` or `experiment <id> [stages]`.
-/// A zone, compute or service target acts on the active run and names none.
-fn workspace_of_lifecycle(target: &str) -> Option<&str> {
-    let rest = target
-        .strip_prefix("vehicle ")
-        .or_else(|| target.strip_prefix("experiment "))?;
-    rest.split(' ').next().filter(|id| !id.is_empty())
-}
-
-/// The workspace a running lifecycle job holds, when it is not this one. `vehicle` verbs name a
-/// run by its vehicle's id and `experiment` verbs by the model's, so either is this workspace, and
-/// its own duplicate is the job engine's to answer.
-fn held_by_another(
-    running: Option<&str>,
-    model_id: &str,
-    vehicle_id: Option<&str>,
-) -> Option<String> {
-    running
-        .and_then(workspace_of_lifecycle)
-        .filter(|id| *id != model_id && Some(*id) != vehicle_id)
-        .map(str::to_string)
-}
-
 /// What `up` found before touching the host.
 #[derive(Default)]
 pub(crate) struct Preflight {
@@ -192,11 +169,11 @@ pub(crate) async fn preflight(
     nodes: &[NodePlan],
     dir: Option<&Path>,
     unlocked: bool,
-    runtime_dir: &Path,
+    scope: &crate::scope::RunScope,
     cache_dir: &Path,
     gateway: &GatewaySvc,
-    running: Option<String>,
 ) -> Preflight {
+    let runtime_dir = scope.dir.as_path();
     let mut pf = Preflight::default();
     let workspace = dir.unwrap_or_else(|| Path::new("."));
 
@@ -336,45 +313,29 @@ pub(crate) async fn preflight(
     };
     pf.check("package lock", package);
 
-    let active = gateway.active_on_host().await;
-    // A run whose gateway is still being built is not on the host yet, but it already holds the
-    // host: refused by what is recorded, another workspace's `up` would be told it differently
-    // depending on how far that gateway had got.
-    let starting = held_by_another(
-        running.as_deref(),
+    // The run in this slot, if any, must be this workspace's own. Another workspace's run is in
+    // another slot, and one being brought up meanwhile holds the lifecycle claim, which refuses
+    // or queues this `up` before it starts.
+    let active = gateway.active_on_host(scope).await;
+    let target = crate::experiment::check_active_target(
+        verb,
+        active
+            .as_ref()
+            .map(|(id, dir)| (id.as_str(), dir.as_path())),
         &model.id,
-        model.entities.first().map(|e| e.id.as_str()),
-    );
-    let target = match (&active, starting) {
-        (None, Some(other)) => Some(crate::errors::precondition(
-            R::WrongWorkspace,
-            format!(
-                "`{other}` is being brought up or down on this host, not `{}`: `{verb}` only acts \
-                 on what is active — wait for it, then run it from that workspace or bring it down",
-                model.id
-            ),
-        )),
-        _ => crate::experiment::check_active_target(
-            verb,
-            active
-                .as_ref()
-                .map(|(id, dir)| (id.as_str(), dir.as_path())),
-            &model.id,
-            dir,
-        )
-        .err(),
-    };
+        dir,
+    )
+    .err();
     pf.check(
         "active workspace",
         target.map(|s| (R::WrongWorkspace, model.id.clone(), s.message().to_string())),
     );
 
-    let plans = nodes.to_vec();
-    let foreign = tokio::task::spawn_blocking(move || {
-        vxedge_core::zones::foreign_objects(crate::services::RUN_SLOT, &plans)
-    })
-    .await
-    .unwrap_or_default();
+    let (plans, instance) = (nodes.to_vec(), scope.instance);
+    let foreign =
+        tokio::task::spawn_blocking(move || vxedge_core::zones::foreign_objects(instance, &plans))
+            .await
+            .unwrap_or_default();
     pf.check(
         "other vehicles",
         (!foreign.is_empty()).then(|| {
@@ -712,8 +673,6 @@ pub struct PlanSvc {
     pub runtime_dir: PathBuf,
     /// The part cache, where a published artifact store would be fetched to.
     pub cache_dir: PathBuf,
-    /// Read for the lifecycle job running now, so `Plan` refuses what `up` would.
-    pub engine: crate::jobs::JobEngine,
 }
 
 fn on_path(binary: &str) -> bool {
@@ -829,7 +788,34 @@ impl WorkspaceService for PlanSvc {
             Ok(m) => m,
             Err(e) => return Ok(Response::new(invalid(e.to_string()))),
         };
-        let planned = GatewayPlan::from_model(&model, crate::services::RUN_SLOT)
+        // The slot `up` would take, so the plan names what `up` would create.
+        let instance = match crate::scope::choose(
+            &self.runtime_dir,
+            dir.as_deref(),
+            None,
+            crate::scope::Asker::default(),
+        ) {
+            Ok(i) => i,
+            Err(e) => {
+                use tonic_types::StatusExt;
+                let reason = e
+                    .get_error_details()
+                    .error_info()
+                    .and_then(|i| R::from_str_name(&i.reason))
+                    .unwrap_or(R::HeldByRun);
+                return Ok(Response::new(WorkspacePlan {
+                    valid: false,
+                    problems: vec![PlanProblem {
+                        reason: reason as i32,
+                        subject: "instance".to_string(),
+                        detail: e.message().to_string(),
+                    }],
+                    ..Default::default()
+                }));
+            }
+        };
+        let scope = crate::scope::RunScope::new(&self.runtime_dir, instance);
+        let planned = GatewayPlan::from_model(&model, instance)
             .map_err(|e| e.to_string())
             .and_then(|gw| {
                 vxedge_core::zones::plan_nodes_from_model(
@@ -855,10 +841,9 @@ impl WorkspaceService for PlanSvc {
             &nodes,
             dir.as_deref(),
             req.get_ref().unlocked,
-            &self.runtime_dir,
+            &scope,
             &self.cache_dir,
             &self.gateway,
-            self.engine.lifecycle_target().await,
         )
         .await;
         let probes = match pf.backends {
@@ -901,7 +886,7 @@ impl WorkspaceService for PlanSvc {
             services,
             images: all_images(&model, &nodes).into_iter().collect(),
             host_checks,
-            entities: crate::telemetry::entities(&model, &self.runtime_dir)
+            entities: crate::telemetry::entities(&model, &scope.dir, instance)
                 .into_iter()
                 .map(planned_entity)
                 .collect(),
@@ -941,50 +926,6 @@ impl HostService for PlanSvc {
                     .unwrap_or(false)
             },
         }))
-    }
-}
-
-#[cfg(test)]
-mod lifecycle_tests {
-    use super::{held_by_another, workspace_of_lifecycle};
-
-    #[test]
-    fn a_workspaces_own_running_job_is_not_another_workspace() {
-        let (model, vehicle) = ("vehicle-sedan", Some("sedan"));
-        assert_eq!(held_by_another(Some("vehicle sedan"), model, vehicle), None);
-        assert_eq!(
-            held_by_another(Some("experiment vehicle-sedan"), model, vehicle),
-            None
-        );
-        assert_eq!(held_by_another(None, model, vehicle), None);
-        assert_eq!(held_by_another(Some("zone ecu1"), model, vehicle), None);
-        assert_eq!(
-            held_by_another(
-                Some("vehicle other [EXPERIMENT_STAGE_GATEWAY]"),
-                model,
-                vehicle
-            ),
-            Some("other".to_string())
-        );
-        assert_eq!(
-            held_by_another(Some("experiment exp-002"), model, vehicle),
-            Some("exp-002".to_string())
-        );
-    }
-
-    #[test]
-    fn a_lifecycle_target_names_its_workspace_only_for_a_whole_run() {
-        assert_eq!(
-            workspace_of_lifecycle("vehicle vehicle-x"),
-            Some("vehicle-x")
-        );
-        assert_eq!(
-            workspace_of_lifecycle("experiment exp-002 [EXPERIMENT_STAGE_GATEWAY]"),
-            Some("exp-002")
-        );
-        assert_eq!(workspace_of_lifecycle("zone ecu1"), None);
-        assert_eq!(workspace_of_lifecycle("vxgateway"), None);
-        assert_eq!(workspace_of_lifecycle("vehicle "), None);
     }
 }
 

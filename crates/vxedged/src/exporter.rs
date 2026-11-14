@@ -46,6 +46,25 @@ pub fn targets() -> Vec<String> {
     BOUND.get().cloned().into_iter().collect()
 }
 
+/// The scrape targets of the run in slot `instance`: its own page of the exporter,
+/// `<addr>/runs/<s>`, which a scraper reads at `<addr>/runs/<s>/metrics`. Several runs share the
+/// exporter, and one page per run keeps one run's series out of another's archive.
+pub fn targets_for(instance: vxedge_core::instance::Instance) -> Vec<String> {
+    targets()
+        .into_iter()
+        .map(|addr| format!("{addr}/runs/{instance}"))
+        .collect()
+}
+
+/// The slot a request path names: `/runs/<s>/metrics`. `/metrics` is the only run's page.
+fn page_of(path: &str) -> Option<Option<vxedge_core::instance::Instance>> {
+    if path == "/metrics" {
+        return Some(None);
+    }
+    let slot = path.strip_prefix("/runs/")?.strip_suffix("/metrics")?;
+    vxedge_core::instance::Instance::parse(slot).ok().map(Some)
+}
+
 /// Bind `listen` (`host:port`; port 0 picks one). A failure is logged and the daemon runs
 /// without an exporter: its experiments then have no host-side series, and nothing else changes.
 pub async fn bind(listen: &str) -> Option<TcpListener> {
@@ -104,20 +123,40 @@ async fn answer(
     let line = String::from_utf8_lossy(&head);
     let mut parts = line.split_whitespace();
     let (method, path) = (parts.next(), parts.next());
-    let (status, body) = if method == Some("GET") && path == Some("/metrics") {
+    let page = path.and_then(page_of).filter(|_| method == Some("GET"));
+    let (status, body) = if let Some(page) = page {
         let snapshot = {
             let s = state.lock().await;
-            match (&s.active, &s.gateway) {
-                (Some(a), gw) => Some((a.model.clone(), a.dir.clone(), gw.clone())),
-                (None, _) => None,
-            }
+            // `/metrics` is the page of the only run; with several, each has its own.
+            let instance = page.or_else(|| match s.runs.len() {
+                1 => s.runs.keys().next().copied(),
+                _ => None,
+            });
+            instance.and_then(|i| {
+                let run = s.run(i);
+                run.active
+                    .as_ref()
+                    .map(|a| (i, (a.model.clone(), a.dir.clone(), run.gateway.clone())))
+            })
         };
-        let body = tokio::task::spawn_blocking(move || render(snapshot, &shell, &runtime_dir))
-            .await
-            .unwrap_or_default();
+        let run_dir = match &snapshot {
+            Some((i, _)) => crate::scope::run_dir(&runtime_dir, *i),
+            None => runtime_dir.clone(),
+        };
+        let instance = snapshot
+            .as_ref()
+            .map_or(vxedge_core::instance::Instance::FIRST, |(i, _)| *i);
+        let snapshot = snapshot.map(|(_, s)| s);
+        let body =
+            tokio::task::spawn_blocking(move || render(snapshot, &shell, &run_dir, instance))
+                .await
+                .unwrap_or_default();
         ("200 OK", body)
     } else {
-        ("404 Not Found", "only GET /metrics is served\n".to_string())
+        (
+            "404 Not Found",
+            "only GET /metrics and /runs/<slot>/metrics are served\n".to_string(),
+        )
     };
     let response = format!(
         "HTTP/1.1 {status}\r\ncontent-type: text/plain; version=0.0.4\r\ncontent-length: {}\r\n\
@@ -162,6 +201,7 @@ fn render(
     active: Option<(Experiment, PathBuf, Option<GatewayPlan>)>,
     sh: &Shell,
     runtime_dir: &std::path::Path,
+    instance: vxedge_core::instance::Instance,
 ) -> String {
     let mut cpu = Family::new(
         "vxedge_node_cpu_seconds_total",
@@ -291,9 +331,7 @@ fn render(
     families.extend(slice.into_iter().map(|(f, _)| f));
     families.extend([own_cpu, own_mem]);
     let gptp = match &active {
-        Some((model, _, Some(_))) => {
-            vxedge_core::gptp::metrics(model, runtime_dir, crate::services::RUN_SLOT)
-        }
+        Some((model, _, Some(_))) => vxedge_core::gptp::metrics(model, runtime_dir, instance),
         _ => String::new(),
     };
     // Each running measurement's sender, read inside its own namespace (`measurements/<id>`).
@@ -408,7 +446,12 @@ mod tests {
             netns: None,
             escalate: false,
         };
-        let page = render(None, &sh, std::path::Path::new("/nonexistent"));
+        let page = render(
+            None,
+            &sh,
+            std::path::Path::new("/nonexistent"),
+            vxedge_core::instance::Instance::FIRST,
+        );
         assert!(
             page.contains("vxedge_process_cpu_seconds_total{entity=\"host\",process=\"vxedged\"}")
         );
