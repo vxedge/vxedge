@@ -202,7 +202,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // campaign has finished or is gone is released.
     for instance in vxedge_core::instance::Instance::all() {
         if let Some(c) = scope::reserved_by(&args.runtime_dir, instance)
-            && campaign_run::read(&args.runtime_dir, &c).is_none_or(|r| r.is_terminal())
+            && (!scope::resumable(&args.runtime_dir, instance)
+                || campaign_run::read(&args.runtime_dir, &c).is_none_or(|r| r.is_terminal()))
         {
             scope::release(&args.runtime_dir, instance, &c);
         }

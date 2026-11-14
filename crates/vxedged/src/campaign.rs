@@ -273,9 +273,16 @@ impl CampaignService for CampaignSvc {
         // The slot every trial runs in: the one asked for, or the one this campaign already holds
         // (a retry after a restart), or the lowest free one. Never the workspace's own live run's,
         // which a campaign does not take over.
+        let in_flight = self.steps.engine.claimed_run_dir().await;
         let instance = crate::scope::choose_in(
             &crate::scope::recorded(&self.runtime_dir),
-            |i| crate::scope::reserved_by(&self.runtime_dir, i),
+            |i| {
+                crate::scope::reserved_by(&self.runtime_dir, i).or_else(|| {
+                    (in_flight.as_deref()
+                        == Some(crate::scope::run_dir(&self.runtime_dir, i).as_path()))
+                    .then(|| "a run being brought up".to_string())
+                })
+            },
             None,
             crate::scope::requested(&req.instance)?,
             crate::scope::Asker {
@@ -468,12 +475,13 @@ impl CampaignService for CampaignSvc {
         }));
         // Held from here to the campaign's end: its trials down and up the vehicle each time, and
         // another `up` in that gap must not take the slot.
-        crate::scope::reserve(&self.runtime_dir, instance, &id).map_err(|e| {
-            errors::invalid(
-                R::Unspecified,
-                format!("cannot reserve slot {instance}: {e}"),
-            )
-        })?;
+        crate::scope::reserve(&self.runtime_dir, instance, &id, !req.request_id.is_empty())
+            .map_err(|e| {
+                errors::invalid(
+                    R::Unspecified,
+                    format!("cannot reserve slot {instance}: {e}"),
+                )
+            })?;
         let (steps, runtime_dir) = (self.steps.clone(), self.runtime_dir.clone());
         let rec = record.clone();
         let release_id = id.clone();

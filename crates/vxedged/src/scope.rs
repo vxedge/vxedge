@@ -203,12 +203,28 @@ pub(crate) fn reserved_by(root: &Path, instance: Instance) -> Option<String> {
     v["campaign"].as_str().map(str::to_owned)
 }
 
-pub(crate) fn reserve(root: &Path, instance: Instance, campaign: &str) -> std::io::Result<()> {
+/// `resumable`: the campaign has a request id, so a retry after a restart resumes it in this
+/// slot. A hold that cannot be resumed is released when the daemon starts.
+pub(crate) fn reserve(
+    root: &Path,
+    instance: Instance,
+    campaign: &str,
+    resumable: bool,
+) -> std::io::Result<()> {
     std::fs::create_dir_all(run_dir(root, instance))?;
     std::fs::write(
         reservation_file(root, instance),
-        serde_json::json!({ "campaign": campaign }).to_string(),
+        serde_json::json!({ "campaign": campaign, "resumable": resumable }).to_string(),
     )
+}
+
+/// Whether the hold on slot `instance` can be resumed by a retry.
+pub(crate) fn resumable(root: &Path, instance: Instance) -> bool {
+    std::fs::read_to_string(reservation_file(root, instance))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v["resumable"].as_bool())
+        .unwrap_or(false)
 }
 
 /// Ends a campaign's hold. A hold that is already gone is fine: release runs on every exit path.
@@ -662,7 +678,8 @@ mod tests {
     fn a_reservation_is_kept_on_disk_and_released_only_by_its_campaign() {
         let root = std::env::temp_dir().join(format!("vxscope-{}", std::process::id()));
         let i = slot("4");
-        reserve(&root, i, "camp-1").unwrap();
+        reserve(&root, i, "camp-1", true).unwrap();
+        assert!(resumable(&root, i));
         assert_eq!(reserved_by(&root, i).as_deref(), Some("camp-1"));
         release(&root, i, "camp-2");
         assert_eq!(reserved_by(&root, i).as_deref(), Some("camp-1"));

@@ -262,6 +262,8 @@ struct State {
     jobs: HashMap<String, Entry>,
     /// `(kind, target, job id)` of the lifecycle job running now.
     lifecycle: Option<(String, String, String)>,
+    /// The run directory of that job, when it acts on a run.
+    lifecycle_run: Option<PathBuf>,
     /// `kind:request_id` to the job it started.
     requests: HashMap<String, String>,
 }
@@ -308,6 +310,12 @@ impl JobEngine {
     /// watch channel, not to a shared bus.
     pub fn events(&self) -> &EventBus {
         &self.inner.events
+    }
+
+    /// The run directory of the lifecycle job running now: a run being brought up has no record
+    /// yet, and its slot is not free.
+    pub async fn claimed_run_dir(&self) -> Option<PathBuf> {
+        self.inner.state.lock().await.lifecycle_run.clone()
     }
 
     #[cfg(test)]
@@ -433,6 +441,7 @@ impl JobEngine {
         );
         if let Some(target) = opts.claim {
             st.lifecycle = Some((kind.to_string(), target, id.clone()));
+            st.lifecycle_run = opts.run_dir.clone();
         }
         if let Some(key) = request_key {
             st.requests.insert(key, id.clone());
@@ -499,6 +508,7 @@ impl JobEngine {
                 .is_some_and(|(_, _, held)| *held == id)
             {
                 st.lifecycle = None;
+                st.lifecycle_run = None;
             }
         });
 

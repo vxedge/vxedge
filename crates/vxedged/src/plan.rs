@@ -171,6 +171,8 @@ pub(crate) enum HostWide {
         port: u16,
     },
     Adopted(String),
+    /// A port a host-process service (no `on:`) listens on.
+    HostPort(u16),
     /// A host-side address's subnet: `(network, prefix)`.
     Subnet(u32, u8),
 }
@@ -197,6 +199,7 @@ impl HostWide {
             HostWide::ListenPort(p) => format!("WireGuard listen port {p}"),
             HostWide::Vxlan { vni, port } => format!("VXLAN VNI {vni} on port {port}"),
             HostWide::Adopted(i) => format!("host interface `{i}`"),
+            HostWide::HostPort(p) => format!("host port {p}, which a service listens on"),
             HostWide::Subnet(n, p) => format!(
                 "host-side addresses in {}/{p}",
                 std::net::Ipv4Addr::from(*n)
@@ -244,6 +247,23 @@ pub(crate) fn host_wide(
                     port: t.dstport.unwrap_or(4789),
                 }));
             }
+        }
+    }
+    // A service that runs as a host process listens in the host's namespace.
+    for def in model.services.values().filter(|d| d.on.is_none()) {
+        if def.service_type == vxedge_core::services::ServiceType::Ota {
+            let listen = def
+                .config
+                .as_ref()
+                .and_then(|c| c.get("listen"))
+                .and_then(|l| l.as_str())
+                .unwrap_or("0.0.0.0:9900");
+            held.extend(
+                listen
+                    .rsplit_once(':')
+                    .and_then(|(_, p)| p.parse().ok())
+                    .map(HostWide::HostPort),
+            );
         }
     }
     let Ok(gateway) = GatewayPlan::from_model(model, instance) else {
@@ -510,7 +530,7 @@ pub(crate) async fn preflight(
             })
             .collect()
     };
-    let theirs: Vec<(String, Vec<HostWide>)> = others
+    let mut theirs: Vec<(String, Vec<HostWide>)> = others
         .iter()
         .map(|(i, id, m, n)| {
             (
@@ -519,6 +539,34 @@ pub(crate) async fn preflight(
             )
         })
         .collect();
+    // A campaign between two trials has no run up, and still holds what its next trial needs.
+    let root = gateway.runtime_dir.clone();
+    for i in vxedge_core::instance::Instance::all() {
+        if i == scope.instance || others.iter().any(|(o, ..)| *o == i) {
+            continue;
+        }
+        let Some(campaign) = crate::scope::reserved_by(&root, i) else {
+            continue;
+        };
+        let Some(record) = crate::campaign_run::read(&root, &campaign) else {
+            continue;
+        };
+        let dir = PathBuf::from(&record.workspace);
+        let Ok(text) = vxedge_core::Workspace::read_text(&dir) else {
+            continue;
+        };
+        let Ok(m) = vxedge_core::model::load_yaml(&text) else {
+            continue;
+        };
+        let nodes = GatewayPlan::from_model(&m, i)
+            .ok()
+            .and_then(|g| vxedge_core::zones::plan_nodes_from_model(&m, &g, &dir).ok())
+            .unwrap_or_default();
+        theirs.push((
+            format!("campaign `{campaign}` in slot {i}"),
+            host_wide(&m, i, &nodes, cache_dir),
+        ));
+    }
     let mine = host_wide(model, scope.instance, nodes, cache_dir);
     pf.check(
         "host-wide resources",

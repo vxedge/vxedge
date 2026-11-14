@@ -1808,6 +1808,77 @@ fn fake_vxtelemetry(exit: i32) -> PathBuf {
 
 /// Two runs on one host: each `Collect` archives its own run's ingest folder, in its own slot, so
 /// one run's samples never reach the other's archive (`ARCHITECTURE.md` §6.0.5).
+/// Two runs on one host: both are listed with their slots, a verb that names neither is refused
+/// as ambiguous instead of picking one, and a `RunRef` or a workspace reaches the right one.
+#[tokio::test]
+async fn two_runs_are_listed_and_a_bare_verb_never_picks_one() {
+    let ws_a = vehicle_workspace();
+    let ws_b = vehicle_workspace();
+    let daemon = Daemon::start_with(|run| {
+        for (slot, ws, run_id) in [("0", &ws_a, "run-a"), ("1", &ws_b, "run-b")] {
+            let dir = run.join("runs").join(slot);
+            std::fs::create_dir_all(&dir).unwrap();
+            let record = serde_json::json!({
+                "id": vehicle_id(), "dir": ws, "bridge": "lo", "run_id": run_id,
+                "sha256": vxedge_core::Workspace::identity(ws).unwrap().value,
+                "identity_algorithm": "vxws/2",
+            });
+            std::fs::write(dir.join("active.json"), record.to_string()).unwrap();
+        }
+    });
+    let channel = daemon.channel().await;
+    let runs = RunServiceClient::new(channel.clone())
+        .list(RunListRequest::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .runs;
+    let listed: Vec<(String, String)> = runs
+        .iter()
+        .map(|r| (r.instance.clone(), r.id.clone()))
+        .collect();
+    assert_eq!(
+        listed,
+        [("0".into(), "run-a".into()), ("1".into(), "run-b".into())]
+    );
+    let bare = ZoneServiceClient::new(channel.clone())
+        .list(ZoneListRequest::default())
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&bare), "ERROR_REASON_RUN_AMBIGUOUS");
+    assert!(bare.message().contains("run-a") && bare.message().contains("run-b"));
+    let named = ZoneServiceClient::new(channel.clone())
+        .list(ZoneListRequest {
+            run: Some(RunRef {
+                run_id: "run-b".into(),
+            }),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let ports: Vec<String> = named
+        .nodes
+        .iter()
+        .filter_map(|n| n.spec.as_ref().map(|s| s.port.clone()))
+        .collect();
+    assert!(
+        !ports.is_empty() && ports.iter().all(|p| p.starts_with("vz1-")),
+        "run-b's nodes carry slot 1: {ports:?}"
+    );
+    let by_workspace = VehicleServiceClient::new(channel.clone())
+        .status(VehicleStatusRequest {
+            manifest: path_ref(&ws_a),
+            run: None,
+        })
+        .await;
+    assert!(by_workspace.is_ok(), "{by_workspace:?}");
+    let get = RunServiceClient::new(channel)
+        .get(RunGetRequest { run: None })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&get), "ERROR_REASON_RUN_AMBIGUOUS");
+}
+
 #[tokio::test]
 async fn two_runs_collect_two_archives_each_from_its_own_ingest() {
     let (ws_a, id_a) = experiment_workspace();
