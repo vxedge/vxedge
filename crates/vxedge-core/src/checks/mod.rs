@@ -294,6 +294,16 @@ impl Case {
     }
 }
 
+/// The images an experiment's check tools run, as each tool names it: digest-pinned, or a
+/// `localhost/` image. The package lock pins the published ones, and an archive records their
+/// digests, as for a zone's payload.
+pub fn tool_images(exp: &crate::model::Experiment) -> Vec<String> {
+    exp.checks
+        .iter()
+        .flat_map(|c| c.tools.values().map(|t| t.image.clone()))
+        .collect()
+}
+
 /// The `checks` block.
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
