@@ -31,7 +31,7 @@ fn main() -> ExitCode {
 
 fn run(manifest_path: &str, trunk_port: &str) -> Result<(), Box<dyn std::error::Error>> {
     let model = load_workspace(manifest_path)?;
-    let gateway_plan = GatewayPlan::from_model(&model)?;
+    let gateway_plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST)?;
     let sonic_plan = SonicPlan::from_gateway_plan(&gateway_plan, trunk_port);
     println!("{}", render_json(&sonic_plan)?);
     Ok(())

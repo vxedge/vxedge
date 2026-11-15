@@ -67,6 +67,8 @@ pub enum ZonePlanError {
 pub struct NodePlan {
     pub zone_id: String,
     pub node_id: String,
+    /// The slot of the run this node belongs to. Its runtime name and its ports carry it.
+    pub instance: crate::instance::Instance,
     /// The device's declared role. `ZoneService` and `ComputeService` share this one plan and
     /// this one lifecycle (`zones::node_up`/`node_down`/`node_status`) — the two RPC surfaces
     /// differ only in which role they address, matching the OEM vocabulary split between zone
@@ -113,21 +115,22 @@ pub struct NodePlan {
     pub qemu: QemuOptions,
 }
 
-/// The runtime name of node `node_id`: `vx-` and the id, each character that is not ASCII
-/// alphanumeric replaced by `-`, cut to 48.
-pub fn runtime_name_of(node_id: &str) -> String {
+/// The runtime name of node `node_id` in the run in slot `instance`: `vx<s>-` and the id, each
+/// character that is not ASCII alphanumeric replaced by `-`, cut to 48. The netns, container
+/// group, VM domain, pidfile and VMM socket of a node all take this name.
+pub fn runtime_name_of(instance: crate::instance::Instance, node_id: &str) -> String {
     let mut s: String = node_id
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
     s.truncate(48);
-    format!("vx-{s}")
+    format!("vx{instance}-{s}")
 }
 
 impl NodePlan {
     /// Stable, IFNAMSIZ-safe-ish runtime name (netns / domain / pidfile).
     pub fn runtime_name(&self) -> String {
-        runtime_name_of(&self.node_id)
+        runtime_name_of(self.instance, &self.node_id)
     }
 
     /// A stable, locally administered unicast MAC for this node's guest NIC. Left unset, QEMU
@@ -188,7 +191,11 @@ pub fn plan_nodes_from_model(
                 // platform's own name; every other port is named from the device id.
                 let iface = match (device.backend, &endpoint.host_interface) {
                     (Some(crate::model::Backend::Attach), Some(adopted)) => adopted.clone(),
-                    _ => crate::gateway::ifnames::access_port(&device.id, endpoint.port.as_deref()),
+                    _ => crate::gateway::ifnames::access_port(
+                        gateway.instance,
+                        &device.id,
+                        endpoint.port.as_deref(),
+                    ),
                 };
                 let Some(ep) = gateway.endpoints.iter().find(|e| e.name == iface) else {
                     return Err(ZonePlanError::NoSuchEndpoint {
@@ -355,6 +362,7 @@ pub fn plan_nodes_from_model(
                 plans.push(NodePlan {
                     zone_id: device.zone.clone().unwrap_or_else(|| device.id.clone()),
                     node_id: device.id.clone(),
+                    instance: gateway.instance,
                     role: device.role,
                     backend,
                     endpoint: ep.name.clone(),
@@ -512,7 +520,7 @@ parts:
 
     fn plans(ws: &str) -> Vec<NodePlan> {
         let model = crate::model::load_yaml(ws).expect("valid test workspace");
-        let gw = GatewayPlan::from_model(&model).unwrap();
+        let gw = GatewayPlan::from_model(&model, crate::instance::Instance::FIRST).unwrap();
         plan_nodes_from_model(&model, &gw, Path::new("/manifests")).unwrap()
     }
 
@@ -541,7 +549,7 @@ parts:
         assert_eq!(plans[0].node_id, "node-a");
         assert_eq!(plans[0].backend, Backend::QemuMicrovm);
         assert_eq!(plans[0].kind, EndpointKind::Tap);
-        assert_eq!(plans[0].endpoint, "vz-node-a");
+        assert_eq!(plans[0].endpoint, "vz0-node-a");
         assert_eq!(
             plans[0].bundle.as_deref(),
             Some(Path::new("/manifests/./images/linux-probe/bundle"))
@@ -549,8 +557,8 @@ parts:
         assert_eq!(plans[0].ip_cidr.as_deref(), Some("10.101.0.2/24"));
         assert_eq!(plans[1].backend, Backend::Container);
         assert_eq!(plans[1].kind, EndpointKind::Veth);
-        assert_eq!(plans[1].peer, "vzp-node-b");
-        assert_eq!(plans[1].runtime_name(), "vx-node-b");
+        assert_eq!(plans[1].peer, "vp0-node-b");
+        assert_eq!(plans[1].runtime_name(), "vx0-node-b");
         // Both devices in this fixture are `role: ecu` — the role a plan reports is not
         // guessed or defaulted, it comes straight from the device declaration.
         assert_eq!(plans[0].role, crate::model::DeviceRole::Ecu);
@@ -586,7 +594,7 @@ parts:
                 "  node-b: { role: ecu, zone: front-left, backend: qemu-microvm }",
             );
         let model = crate::model::load_yaml(&ws).expect("valid test workspace");
-        let gw = GatewayPlan::from_model(&model).unwrap();
+        let gw = GatewayPlan::from_model(&model, crate::instance::Instance::FIRST).unwrap();
         assert!(matches!(
             plan_nodes_from_model(&model, &gw, Path::new("/x")),
             Err(ZonePlanError::MissingBundle(id, _)) if id == "node-b"
@@ -607,7 +615,7 @@ parts:
                 "  - { ref: 'local/vxprobe:host-process', target_ids: fn-b }\n  - { ref: ./other, kind: bundle, target_ids: fn-a2 }",
             );
         let model = crate::model::load_yaml(&ws).expect("valid test workspace");
-        let gw = GatewayPlan::from_model(&model).unwrap();
+        let gw = GatewayPlan::from_model(&model, crate::instance::Instance::FIRST).unwrap();
         assert!(matches!(
             plan_nodes_from_model(&model, &gw, Path::new("/x")),
             Err(ZonePlanError::AmbiguousBundle { device, count: 2 }) if device == "node-a"
@@ -691,7 +699,7 @@ parts:
                  - { id: lc, endpoints: [{ node: node-b, port: eth1, ip: 10.102.0.3/24 }], slice: info }",
             );
         let model = crate::model::load_yaml(&ws).expect("valid test workspace");
-        let gw = GatewayPlan::from_model(&model).unwrap();
+        let gw = GatewayPlan::from_model(&model, crate::instance::Instance::FIRST).unwrap();
         assert!(matches!(
             plan_nodes_from_model(&model, &gw, Path::new("/x")),
             Err(ZonePlanError::MultiHomed { device, .. }) if device == "node-b"
@@ -718,7 +726,7 @@ parts:
                 &format!("{}\n{}", pinned("b", '3'), pinned("c", '4')),
             );
         let model = crate::model::load_yaml(&ws).expect("valid test workspace");
-        let gw = GatewayPlan::from_model(&model).unwrap();
+        let gw = GatewayPlan::from_model(&model, crate::instance::Instance::FIRST).unwrap();
         assert!(matches!(
             plan_nodes_from_model(&model, &gw, Path::new("/x")),
             Err(ZonePlanError::AmbiguousImage { device, count: 2 }) if device == "node-b"
@@ -751,7 +759,7 @@ parts:
 
     fn capsule_plan(part: &str) -> Result<NodePlan, ZonePlanError> {
         let model = crate::model::load_yaml(&CAPSULE_WS.replace("PART", part)).unwrap();
-        let gateway = GatewayPlan::from_model(&model).unwrap();
+        let gateway = GatewayPlan::from_model(&model, crate::instance::Instance::FIRST).unwrap();
         plan_nodes_from_model(&model, &gateway, Path::new("/ws")).map(|mut p| p.remove(0))
     }
 

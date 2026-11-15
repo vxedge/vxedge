@@ -62,6 +62,10 @@ pub struct ActiveExperiment {
     pub sha256: String,
 }
 
+/// The slot every run of this daemon takes (`ARCHITECTURE.md` §6.0.5). One run at a time still:
+/// choosing a free slot per run, and holding several, is the next step (Track F, F1).
+pub(crate) const RUN_SLOT: vxedge_core::instance::Instance = vxedge_core::instance::Instance::FIRST;
+
 /// Daemon-wide view of the active experiment: set by a successful
 /// `gateway up`, consumed by zone verbs, cleared by `gateway down`.
 #[derive(Default)]
@@ -568,7 +572,8 @@ pub(crate) async fn restore_active(
     if model.id != record.id {
         return Err(refuse(format!("it now declares `{}`", model.id)));
     }
-    let plan = GatewayPlan::from_model(&model).map_err(|e| refuse(e.to_string()))?;
+    let plan = GatewayPlan::from_model(&model, crate::services::RUN_SLOT)
+        .map_err(|e| refuse(e.to_string()))?;
     let fiveg = if plan.snssai_slice_ids.is_empty() {
         None
     } else {
@@ -691,7 +696,8 @@ impl GatewaySvc {
                 // Built once, here, and kept: every verb downstream reads the model rather
                 // than re-deriving it from the document.
                 let model = parse_to_model(&yaml)?;
-                let plan = GatewayPlan::from_model(&model).map_err(|e| e.to_string())?;
+                let plan = GatewayPlan::from_model(&model, crate::services::RUN_SLOT)
+                    .map_err(|e| e.to_string())?;
                 p.update(30, &format!("plan: {}", plan.summary()));
                 match verb {
                     Verb::Apply => Ok(format!(
@@ -802,14 +808,14 @@ impl GatewaySvc {
                             p.update(93, "provisioning 5G core (fiveg)");
                             let fp = parse_and_fiveg_plan(&yaml)?;
                             let client = containers.get().await.map_err(|e| e.to_string())?;
-                            let cfg = FiveGLifecycleConfig::default();
+                            let cfg = FiveGLifecycleConfig::for_instance(crate::services::RUN_SLOT);
                             fiveg::fiveg_up(client, &fp, &runtime_dir, &cfg)
                                 .await
                                 .map_err(|e| e.to_string())?;
 
-                            p.update(97, "attaching 5G core to vxbr0");
-                            let sh = shell.clone();
                             let bridge = plan.bridge.clone();
+                            p.update(97, &format!("attaching 5G core to {bridge}"));
+                            let sh = shell.clone();
                             let ue_subnets: Vec<String> =
                                 fp.sessions.iter().map(|s| s.ue_subnet.clone()).collect();
                             let slice_qos: Vec<gateway::provision::FiveGSliceQos> = fp
@@ -966,7 +972,7 @@ impl GatewaySvc {
                             p.update(45, "removing UE pods");
                             let fp = parse_and_fiveg_plan(&yaml)?;
                             let client = containers.get().await.map_err(|e| e.to_string())?;
-                            let cfg = FiveGLifecycleConfig::default();
+                            let cfg = FiveGLifecycleConfig::for_instance(crate::services::RUN_SLOT);
                             for session in &fp.sessions {
                                 // Best-effort: an already-absent UE pod
                                 // isn't a teardown failure (ue_down
@@ -1251,15 +1257,18 @@ impl GatewaySvc {
                 // No plan in memory. If a bridge exists anyway, say so
                 // honestly (daemon restarted after an up?).
                 let shell = self.shell.clone();
-                let orphan = tokio::task::spawn_blocking(move || shell.link_exists("vxbr0"))
+                let bridge = vxedge_core::gateway::plan::bridge_name(RUN_SLOT);
+                let orphan = tokio::task::spawn_blocking(move || shell.link_exists(&bridge))
                     .await
                     .unwrap_or(false);
                 if orphan {
                     (
                         ResourceState::Degraded,
-                        "bridge vxbr0 exists but no plan in memory (daemon restarted?) — \
-                         run `vxedge up --manifest ...` to reconcile or `vxedge down` to remove"
-                            .to_string(),
+                        format!(
+                            "bridge {} exists but no plan in memory (daemon restarted?) — \
+                             run `vxedge up --manifest ...` to reconcile or `vxedge down` to remove",
+                            vxedge_core::gateway::plan::bridge_name(RUN_SLOT)
+                        ),
                         vec![],
                         vec![],
                         vec![],
@@ -1284,9 +1293,12 @@ impl GatewaySvc {
             let client = self.containers.get().await.map_err(|e| {
                 crate::errors::unavailable(crate::errors::R::BackendUnavailable, e.to_string())
             })?;
-            let fstatus = fiveg::fiveg_status(client, &FiveGLifecycleConfig::default())
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+            let fstatus = fiveg::fiveg_status(
+                client,
+                &FiveGLifecycleConfig::for_instance(crate::services::RUN_SLOT),
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
             let fiveg_state = if fstatus.all_running() {
                 ResourceState::Up
             } else {
@@ -2072,7 +2084,8 @@ impl SvcSvc {
             Some(on) => {
                 let refuse =
                     |e: String| crate::errors::precondition(crate::errors::R::WorkspaceInvalid, e);
-                let gateway = GatewayPlan::from_model(&model).map_err(|e| refuse(e.to_string()))?;
+                let gateway = GatewayPlan::from_model(&model, crate::services::RUN_SLOT)
+                    .map_err(|e| refuse(e.to_string()))?;
                 let plans = zones::plan_nodes_from_model(&model, &gateway, &workspace_dir)
                     .map_err(|e| refuse(e.to_string()))?;
                 let node = plans.into_iter().find(|p| &p.node_id == on);
@@ -2398,12 +2411,13 @@ impl TrafficSvc {
                 format!("manifest invalid: {e}"),
             )
         })?;
-        let gateway_plan = GatewayPlan::from_model(&model).map_err(|e| {
-            crate::errors::invalid(
-                crate::errors::R::WorkspaceInvalid,
-                format!("gateway plan: {e}"),
-            )
-        })?;
+        let gateway_plan =
+            GatewayPlan::from_model(&model, crate::services::RUN_SLOT).map_err(|e| {
+                crate::errors::invalid(
+                    crate::errors::R::WorkspaceInvalid,
+                    format!("gateway plan: {e}"),
+                )
+            })?;
         let five_g_plan = match FiveGPlan::from_model(&model) {
             Ok(p) => Some(p),
             Err(fiveg::FiveGPlanError::NoSnssaiSlices) => None,
@@ -2541,7 +2555,8 @@ impl TrafficService for TrafficSvc {
             let refuse =
                 |e: String| crate::errors::precondition(crate::errors::R::EndpointNotOnHost, e);
             let model = parse_to_model(&yaml).map_err(refuse)?;
-            let gateway = GatewayPlan::from_model(&model).map_err(|e| refuse(e.to_string()))?;
+            let gateway = GatewayPlan::from_model(&model, crate::services::RUN_SLOT)
+                .map_err(|e| refuse(e.to_string()))?;
             let workspace = dir.unwrap_or_else(|| PathBuf::from("."));
             let nodes = vxedge_core::zones::plan_nodes_from_model(&model, &gateway, &workspace)
                 .map_err(|e| refuse(e.to_string()))?;
@@ -2576,7 +2591,7 @@ impl TrafficService for TrafficSvc {
                     let msg = traffic::profile_up(
                         &containers,
                         &shell,
-                        &FiveGLifecycleConfig::default(),
+                        &FiveGLifecycleConfig::for_instance(crate::services::RUN_SLOT),
                         five_g_plan.as_ref(),
                         &runtime_dir,
                         &vxprobe_bin,
@@ -2968,12 +2983,14 @@ impl NosCheckService for NosCheckSvc {
             "NosCheckService.Verify",
             serde_json::json!({ "manifest_sha256": sha256, "experiment": model.id }),
         );
-        let gateway_plan = vxedge_core::gateway::GatewayPlan::from_model(&model).map_err(|e| {
-            crate::errors::invalid(
-                crate::errors::R::WorkspaceInvalid,
-                format!("gateway plan: {e}"),
-            )
-        })?;
+        let gateway_plan =
+            vxedge_core::gateway::GatewayPlan::from_model(&model, crate::services::RUN_SLOT)
+                .map_err(|e| {
+                    crate::errors::invalid(
+                        crate::errors::R::WorkspaceInvalid,
+                        format!("gateway plan: {e}"),
+                    )
+                })?;
         let trunk_port = model
             .nos_check
             .as_ref()

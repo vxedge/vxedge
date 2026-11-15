@@ -93,7 +93,7 @@ fn gateway_and_container_zone_cycle_in_netns() {
     };
 
     let model = vxedge_core::model::load_yaml(WORKSPACE).expect("workspace loads");
-    let plan = GatewayPlan::from_model(&model).unwrap();
+    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST).unwrap();
 
     // --- gateway: apply, observe, idempotency -------------------------------
     apply(&sh, &plan).unwrap();
@@ -231,7 +231,7 @@ fn impairments_install_both_directions_and_survive_reapply() {
     };
 
     let model = vxedge_core::model::load_yaml(IMPAIRED_WORKSPACE).expect("workspace loads");
-    let plan = GatewayPlan::from_model(&model).unwrap();
+    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST).unwrap();
     let ep = &plan.endpoints[0];
     let imp = ep.impairment.as_ref().expect("the link is impaired");
 
@@ -372,7 +372,7 @@ fn zone_traffic_reaches_the_access_port_not_loopback() {
     };
 
     let model = vxedge_core::model::load_yaml(LOCALITY_WORKSPACE).expect("workspace loads");
-    let plan = GatewayPlan::from_model(&model).unwrap();
+    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST).unwrap();
     apply(&sh, &plan).unwrap();
 
     let runtime =
@@ -554,7 +554,7 @@ fn ingress_filter_drops_spoofed_source_but_allows_declared_one() {
     };
 
     let model = vxedge_core::model::load_yaml(ANTISPOOF_WORKSPACE).expect("workspace loads");
-    let plan = GatewayPlan::from_model(&model).unwrap();
+    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST).unwrap();
     let endpoint = plan
         .endpoints
         .iter()
@@ -844,6 +844,7 @@ fn tunnel_completes_a_real_handshake_between_two_simulated_hosts() {
             1,
         ))
         .unwrap(),
+        vxedge_core::instance::Instance::FIRST,
     )
     .unwrap();
     let plan_b = GatewayPlan::from_model(
@@ -853,6 +854,7 @@ fn tunnel_completes_a_real_handshake_between_two_simulated_hosts() {
             1,
         ))
         .unwrap(),
+        vxedge_core::instance::Instance::FIRST,
     )
     .unwrap();
 
@@ -884,6 +886,7 @@ fn tunnel_completes_a_real_handshake_between_two_simulated_hosts() {
             1,
         ))
         .unwrap(),
+        vxedge_core::instance::Instance::FIRST,
     )
     .unwrap();
     let plan_b = GatewayPlan::from_model(
@@ -893,6 +896,7 @@ fn tunnel_completes_a_real_handshake_between_two_simulated_hosts() {
             1,
         ))
         .unwrap(),
+        vxedge_core::instance::Instance::FIRST,
     )
     .unwrap();
     apply(&sh_a, &plan_a).unwrap();
@@ -1034,8 +1038,8 @@ fn vxlan_tunnel_carries_slice_traffic_between_two_simulated_hosts() {
 
     let model_a = vxedge_core::model::load_yaml(VXLAN_SITE_A_WORKSPACE).unwrap();
     let model_b = vxedge_core::model::load_yaml(VXLAN_SITE_B_WORKSPACE).unwrap();
-    let plan_a = GatewayPlan::from_model(&model_a).unwrap();
-    let plan_b = GatewayPlan::from_model(&model_b).unwrap();
+    let plan_a = GatewayPlan::from_model(&model_a, vxedge_core::instance::Instance::FIRST).unwrap();
+    let plan_b = GatewayPlan::from_model(&model_b, vxedge_core::instance::Instance::FIRST).unwrap();
 
     apply(&sh_a, &plan_a).unwrap();
     apply(&sh_b, &plan_b).unwrap();
@@ -1135,7 +1139,7 @@ fn fiveg_uplink_creates_a_real_vlan_subinterface_and_routes_a_ue_subnet() {
     };
 
     let model = vxedge_core::model::load_yaml(WORKSPACE).expect("workspace loads");
-    let plan = GatewayPlan::from_model(&model).unwrap();
+    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST).unwrap();
     apply(&sh, &plan).unwrap();
 
     // A throwaway veth pair standing in for the CN pod's own bridge-attached leg.
@@ -1285,7 +1289,7 @@ fn a_closed_gate_delays_a_slices_frames() {
     };
 
     let model = vxedge_core::model::load_yaml(SHAPED_WORKSPACE).expect("workspace loads");
-    let plan = GatewayPlan::from_model(&model).unwrap();
+    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST).unwrap();
     let shaping = plan.shaping.as_ref().expect("a gate schedule is planned");
 
     // --- gateway: apply, observe, idempotency -------------------------------
@@ -1411,8 +1415,11 @@ fn a_closed_gate_delays_a_slices_frames() {
             "      - { id: rest, open: [infotainment, default], duration_us: 90000 }\n",
             "",
         );
-    let control_plan =
-        GatewayPlan::from_model(&vxedge_core::model::load_yaml(&control).unwrap()).unwrap();
+    let control_plan = GatewayPlan::from_model(
+        &vxedge_core::model::load_yaml(&control).unwrap(),
+        vxedge_core::instance::Instance::FIRST,
+    )
+    .unwrap();
     apply(&sh, &control_plan).unwrap();
     assert!(observe(&sh, &control_plan).unwrap().fully_up());
     // The new schedule takes over at a cycle boundary.
@@ -1487,7 +1494,11 @@ fn switching_a_running_gateway_between_htb_and_a_gate_schedule_is_refused() {
     };
     let plan = |shaping: &str| {
         let ws = SWITCH_WORKSPACE.replace("SHAPING", shaping);
-        GatewayPlan::from_model(&vxedge_core::model::load_yaml(&ws).unwrap()).unwrap()
+        GatewayPlan::from_model(
+            &vxedge_core::model::load_yaml(&ws).unwrap(),
+            vxedge_core::instance::Instance::FIRST,
+        )
+        .unwrap()
     };
     let htb = plan("");
     let gates = plan(

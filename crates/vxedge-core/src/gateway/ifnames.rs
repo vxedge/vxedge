@@ -1,4 +1,5 @@
-//! Host interface names for a device's slice attachments, derived from the device id.
+//! Host interface names for a device's slice attachments, derived from the device id and the
+//! run's instance slot ([`Instance`], `ARCHITECTURE.md` §6.0.5).
 //!
 //! # Why this module exists
 //!
@@ -18,8 +19,8 @@
 //! # The length budget
 //!
 //! Linux caps an interface name at `IFNAMSIZ - 1` = 15 bytes, and a veth pair needs *two* names
-//! from the same stem (`vz-` for the access port, `vzp-` for its peer), so the stem gets 11
-//! characters.
+//! from the same stem (`vz<s>-` for the access port, `vp<s>-` for its peer, where `<s>` is the
+//! run's slot), so the stem gets 11 characters.
 //! Real device ids are longer than that (`node-adas-probe-01` is 18), so shortening has to be
 //! part of the scheme rather than an error — the ids in the frozen manifests are the ones the
 //! results are recorded against, and renaming them to fit a kernel constant would be the tail
@@ -31,21 +32,28 @@
 //! device's `port=` and `peer=` — so "which interface is this arm" is always answerable without
 //! recomputing a hash by hand.
 
+use crate::instance::Instance;
+
 /// `IFNAMSIZ` is 16 bytes *including* the NUL terminator.
 pub const IFNAME_MAX: usize = 15;
 
-/// Bridge access port: the veth host side, or the tap itself.
-const ACCESS_PREFIX: &str = "vz-";
-/// Veth peer, the end that moves into the device's namespace.
-const PEER_PREFIX: &str = "vzp-";
+/// Bridge access port: the veth host side, or the tap itself. `vz<s>-`.
+pub const ACCESS_LEAD: &str = "vz";
+/// Veth peer, the end that moves into the device's namespace. `vp<s>-`.
+const PEER_LEAD: &str = "vp";
 /// Ingress-impairment IFB, the device the access port's *inbound* traffic is redirected onto.
-/// Four bytes like [`PEER_PREFIX`], so it costs the stem budget nothing extra.
-const IFB_PREFIX: &str = "vxi-";
+/// `vi<s>-`.
+const IFB_LEAD: &str = "vi";
 
-/// Longest stem that fits under *both* prefixes. The peer prefix is the longer one, so it sets
-/// the budget for the pair — a stem that fitted only the access port would produce a veth whose
-/// two ends could not both be named.
-const STEM_MAX: usize = IFNAME_MAX - PEER_PREFIX.len();
+/// The prefix a two-letter lead makes with a slot: `vz` and slot `0` make `vz0-`.
+fn prefix(lead: &str, instance: Instance) -> String {
+    format!("{lead}{instance}-")
+}
+
+/// Every prefix here is a two-letter lead, the slot and a dash, so the three names of an
+/// attachment share one budget: the stem gets what the 15 bytes leave.
+const PREFIX_LEN: usize = 4;
+const STEM_MAX: usize = IFNAME_MAX - PREFIX_LEN;
 
 /// The port name elided from a stem.
 ///
@@ -121,45 +129,53 @@ pub fn stem(device: &str, port: Option<&str>) -> String {
 /// setup"), derived from the tunnel's own id — the same pure-function contract as
 /// [`access_port`]: nothing but the id itself (declaration order, tunnel count) can move it.
 /// Its own prefix and budget, not `stem`'s: a tunnel has no `(device, port)` pair, only one id,
-/// and no peer name to share a budget with the way `vz-`/`vzp-` do.
-const WIREGUARD_PREFIX: &str = "vxwg-";
-const WG_STEM_MAX: usize = IFNAME_MAX - WIREGUARD_PREFIX.len();
+/// and no peer name to share a budget with the way `vz<s>-`/`vp<s>-` do.
+const WIREGUARD_LEAD: &str = "vxwg";
+/// `vxwg<s>-`: the lead, the slot and a dash.
+const TUNNEL_STEM_MAX: usize = IFNAME_MAX - 6;
 
-pub fn wireguard_tunnel(id: &str) -> String {
+pub fn wireguard_tunnel(instance: Instance, id: &str) -> String {
     let key = sanitize(id);
     let key = if key.is_empty() {
         "tun".to_string()
     } else {
         key
     };
-    format!("{WIREGUARD_PREFIX}{}", shorten_to_budget(key, WG_STEM_MAX))
+    format!(
+        "{}{}",
+        prefix(WIREGUARD_LEAD, instance),
+        shorten_to_budget(key, TUNNEL_STEM_MAX)
+    )
 }
 
 /// Gateway-side VXLAN tunnel interface (`docs/ROADMAP.md` #16, VXLAN provisioning), derived from
 /// the tunnel's own id — same pure-function contract, own prefix and budget, for the same
 /// reason [`wireguard_tunnel`]'s own doc comment gives.
-const VXLAN_PREFIX: &str = "vxln-";
-const VXLAN_STEM_MAX: usize = IFNAME_MAX - VXLAN_PREFIX.len();
+const VXLAN_LEAD: &str = "vxln";
 
-pub fn vxlan_tunnel(id: &str) -> String {
+pub fn vxlan_tunnel(instance: Instance, id: &str) -> String {
     let key = sanitize(id);
     let key = if key.is_empty() {
         "tun".to_string()
     } else {
         key
     };
-    format!("{VXLAN_PREFIX}{}", shorten_to_budget(key, VXLAN_STEM_MAX))
+    format!(
+        "{}{}",
+        prefix(VXLAN_LEAD, instance),
+        shorten_to_budget(key, TUNNEL_STEM_MAX)
+    )
 }
 
 /// The bridge access port for an attachment (veth host side, or the tap itself).
-pub fn access_port(device: &str, port: Option<&str>) -> String {
-    format!("{ACCESS_PREFIX}{}", stem(device, port))
+pub fn access_port(instance: Instance, device: &str, port: Option<&str>) -> String {
+    format!("{}{}", prefix(ACCESS_LEAD, instance), stem(device, port))
 }
 
 /// The veth peer for an attachment — the end that moves into the device's namespace. Taps have
 /// no peer: the hypervisor opens the access port directly, and the plan sets `peer == name`.
-pub fn veth_peer(device: &str, port: Option<&str>) -> String {
-    format!("{PEER_PREFIX}{}", stem(device, port))
+pub fn veth_peer(instance: Instance, device: &str, port: Option<&str>) -> String {
+    format!("{}{}", prefix(PEER_LEAD, instance), stem(device, port))
 }
 
 /// The IFB device carrying an access port's *ingress* impairment.
@@ -175,36 +191,62 @@ pub fn veth_peer(device: &str, port: Option<&str>) -> String {
 /// did not come from [`access_port`] keeps its own text and would overrun `IFNAMSIZ`, which the
 /// kernel refuses loudly — but no such name reaches here: the plan carries only what
 /// [`access_port`] produced.
-pub fn ingress_ifb(access_port: &str) -> String {
-    let stem = access_port
-        .strip_prefix(ACCESS_PREFIX)
-        .unwrap_or(access_port);
-    format!("{IFB_PREFIX}{stem}")
+/// An adopted interface (an `attach` device's platform-named tap) did not come from
+/// [`access_port`], so its IFB takes the run's slot and a stem shortened from the whole name.
+pub fn ingress_ifb(instance: Instance, access_port: &str) -> String {
+    match access_port_instance(access_port) {
+        Some(Some(_)) => {
+            let rest = access_port.strip_prefix(ACCESS_LEAD).unwrap_or(access_port);
+            format!("{IFB_LEAD}{rest}")
+        }
+        _ => format!(
+            "{}{}",
+            prefix(IFB_LEAD, instance),
+            shorten_to_budget(sanitize(access_port), STEM_MAX)
+        ),
+    }
+}
+
+/// The slot an access port name carries: `Some(Some(slot))` for `vz<s>-…`, `Some(None)` for a
+/// `vz` port that carries no slot (a name from before slots), and `None` for any other link.
+pub fn access_port_instance(name: &str) -> Option<Option<Instance>> {
+    let rest = name.strip_prefix(ACCESS_LEAD)?;
+    let mut chars = rest.chars();
+    match (chars.next(), chars.next()) {
+        (Some('-'), _) => Some(None),
+        (Some(c), Some('-')) => Instance::from_char(c).map(Some),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const I0: Instance = Instance::FIRST;
+
     /// The property the positional scheme could not have: a name depends on its own device and
     /// nothing else. Adding, removing or reordering devices cannot move it.
     #[test]
     fn a_name_depends_on_its_device_alone() {
-        let before = access_port("node-b", Some("eth0"));
+        let before = access_port(I0, "node-b", Some("eth0"));
         // Whatever else the experiment grows, `node-b` keeps its interface.
         for neighbour in ["node-a", "aaa", "zzz", "node-b-extra"] {
-            assert_ne!(access_port(neighbour, Some("eth0")), before);
+            assert_ne!(access_port(I0, neighbour, Some("eth0")), before);
         }
-        assert_eq!(access_port("node-b", Some("eth0")), before);
+        assert_eq!(access_port(I0, "node-b", Some("eth0")), before);
     }
 
     #[test]
     fn short_ids_are_spelled_out() {
-        assert_eq!(access_port("node-a", Some("eth0")), "vz-node-a");
-        assert_eq!(veth_peer("node-a", Some("eth0")), "vzp-node-a");
-        assert_eq!(access_port("zonefl", None), "vz-zonefl");
+        assert_eq!(access_port(I0, "node-a", Some("eth0")), "vz0-node-a");
+        assert_eq!(veth_peer(I0, "node-a", Some("eth0")), "vp0-node-a");
+        assert_eq!(access_port(I0, "zonefl", None), "vz0-zonefl");
         // Exactly at the budget.
-        assert_eq!(access_port("node-cont-1", Some("eth0")), "vz-node-cont-1");
+        assert_eq!(
+            access_port(I0, "node-cont-1", Some("eth0")),
+            "vz0-node-cont-1"
+        );
     }
 
     /// The frozen manifests' ids are all longer than the budget, so this path is the common one,
@@ -220,23 +262,23 @@ mod tests {
             "node-mvm-mmio-01",
             "node-q35-vhost-01",
         ] {
-            let name = access_port(id, Some("eth0"));
-            let peer = veth_peer(id, Some("eth0"));
-            let ifb = ingress_ifb(&name);
+            let name = access_port(I0, id, Some("eth0"));
+            let peer = veth_peer(I0, id, Some("eth0"));
+            let ifb = ingress_ifb(I0, &name);
             assert!(name.len() <= IFNAME_MAX, "{name} is {} bytes", name.len());
             assert!(peer.len() <= IFNAME_MAX, "{peer} is {} bytes", peer.len());
             assert!(ifb.len() <= IFNAME_MAX, "{ifb} is {} bytes", ifb.len());
-            assert_eq!(name, access_port(id, Some("eth0")), "not deterministic");
+            assert_eq!(name, access_port(I0, id, Some("eth0")), "not deterministic");
         }
         // Pinned, because these are the names campaign scripts and results metadata carry: a
         // silent change here is a silent change to which interface a run measured.
         assert_eq!(
-            access_port("node-adas-probe-01", Some("eth0")),
-            "vz-node-a-c06a"
+            access_port(I0, "node-adas-probe-01", Some("eth0")),
+            "vz0-node-a-c06a"
         );
         assert_eq!(
-            veth_peer("node-infot-load-01", Some("eth0")),
-            "vzp-node-i-2921"
+            veth_peer(I0, "node-infot-load-01", Some("eth0")),
+            "vp0-node-i-2921"
         );
     }
 
@@ -244,8 +286,8 @@ mod tests {
     /// `node-mvm-pci-01` are two arms of the same experiment.
     #[test]
     fn ids_sharing_a_head_do_not_share_a_name() {
-        let a = access_port("node-mvm-mmio-01", Some("eth0"));
-        let b = access_port("node-mvm-pci-01", Some("eth0"));
+        let a = access_port(I0, "node-mvm-mmio-01", Some("eth0"));
+        let b = access_port(I0, "node-mvm-pci-01", Some("eth0"));
         assert_ne!(a, b, "two arms would have shared one interface");
     }
 
@@ -253,22 +295,25 @@ mod tests {
     /// the first.
     #[test]
     fn a_non_primary_port_extends_the_stem_without_moving_the_primary_one() {
-        assert_eq!(access_port("gw1", Some("eth0")), "vz-gw1");
-        assert_eq!(access_port("gw1", None), "vz-gw1");
-        assert_eq!(access_port("gw1", Some("eth1")), "vz-gw1-eth1");
-        assert_ne!(access_port("gw1", Some("eth1")), access_port("gw1", None));
+        assert_eq!(access_port(I0, "gw1", Some("eth0")), "vz0-gw1");
+        assert_eq!(access_port(I0, "gw1", None), "vz0-gw1");
+        assert_eq!(access_port(I0, "gw1", Some("eth1")), "vz0-gw1-eth1");
+        assert_ne!(
+            access_port(I0, "gw1", Some("eth1")),
+            access_port(I0, "gw1", None)
+        );
     }
 
-    /// An attachment's three names are distinct but share a stem, so `vz-`/`vzp-`/`vxi-` read as
+    /// An attachment's three names are distinct but share a stem, so `vz<s>-`/`vp<s>-`/`vi<s>-` read as
     /// one set. Distinctness is not cosmetic: the IFB is created as a real link, and a name
     /// clashing with the port it serves would delete that port on teardown.
     #[test]
     fn the_ingress_ifb_shares_the_stem_but_not_the_name() {
         for id in ["node-a", "node-adas-probe-01"] {
-            let port = access_port(id, Some("eth0"));
-            let peer = veth_peer(id, Some("eth0"));
-            let ifb = ingress_ifb(&port);
-            assert_eq!(ifb, format!("vxi-{}", stem(id, Some("eth0"))));
+            let port = access_port(I0, id, Some("eth0"));
+            let peer = veth_peer(I0, id, Some("eth0"));
+            let ifb = ingress_ifb(I0, &port);
+            assert_eq!(ifb, format!("vi0-{}", stem(id, Some("eth0"))));
             assert_ne!(ifb, port);
             assert_ne!(ifb, peer);
         }
@@ -276,7 +321,7 @@ mod tests {
 
     #[test]
     fn characters_the_kernel_will_not_take_are_folded_out() {
-        let name = access_port("node/a b:c", Some("eth0"));
+        let name = access_port(I0, "node/a b:c", Some("eth0"));
         assert!(
             name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
             "{name}"
@@ -286,34 +331,98 @@ mod tests {
 
     #[test]
     fn wireguard_tunnel_names_are_deterministic_and_fit_ifnamsiz() {
-        assert_eq!(wireguard_tunnel("ota-uplink"), "vxwg-ota-uplink");
+        // A tunnel's stem is 9 characters: the slot takes the byte the old prefix left free.
+        assert_eq!(wireguard_tunnel(I0, "ota-upl"), "vxwg0-ota-upl");
+        assert_eq!(wireguard_tunnel(I0, "ota-uplink"), "vxwg0-ota-3cb1");
         // Same pure-function contract as `access_port`: depends on its own id alone.
-        let before = wireguard_tunnel("tun-b");
+        let before = wireguard_tunnel(I0, "tun-b");
         for neighbour in ["tun-a", "aaa", "zzz"] {
-            assert_ne!(wireguard_tunnel(neighbour), before);
+            assert_ne!(wireguard_tunnel(I0, neighbour), before);
         }
-        assert_eq!(wireguard_tunnel("tun-b"), before);
+        assert_eq!(wireguard_tunnel(I0, "tun-b"), before);
         // Long ids shorten deterministically, same scheme as `stem`.
-        let long = wireguard_tunnel("ota-uplink-to-central-compute-site-2");
+        let long = wireguard_tunnel(I0, "ota-uplink-to-central-compute-site-2");
         assert!(long.len() <= IFNAME_MAX, "{long} is {} bytes", long.len());
         assert_eq!(
             long,
-            wireguard_tunnel("ota-uplink-to-central-compute-site-2")
+            wireguard_tunnel(I0, "ota-uplink-to-central-compute-site-2")
         );
     }
 
     #[test]
     fn vxlan_tunnel_names_are_deterministic_and_fit_ifnamsiz() {
-        assert_eq!(vxlan_tunnel("site-b"), "vxln-site-b");
-        let before = vxlan_tunnel("tun-b");
+        assert_eq!(vxlan_tunnel(I0, "site-b"), "vxln0-site-b");
+        let before = vxlan_tunnel(I0, "tun-b");
         for neighbour in ["tun-a", "aaa", "zzz"] {
-            assert_ne!(vxlan_tunnel(neighbour), before);
+            assert_ne!(vxlan_tunnel(I0, neighbour), before);
         }
-        assert_eq!(vxlan_tunnel("tun-b"), before);
-        let long = vxlan_tunnel("ota-uplink-to-central-compute-site-2");
+        assert_eq!(vxlan_tunnel(I0, "tun-b"), before);
+        let long = vxlan_tunnel(I0, "ota-uplink-to-central-compute-site-2");
         assert!(long.len() <= IFNAME_MAX, "{long} is {} bytes", long.len());
-        assert_eq!(long, vxlan_tunnel("ota-uplink-to-central-compute-site-2"));
+        assert_eq!(
+            long,
+            vxlan_tunnel(I0, "ota-uplink-to-central-compute-site-2")
+        );
         // Distinct prefixes keep the two tunnel kinds' names from colliding even on the same id.
-        assert_ne!(vxlan_tunnel("ota-uplink"), wireguard_tunnel("ota-uplink"));
+        assert_ne!(
+            vxlan_tunnel(I0, "ota-uplink"),
+            wireguard_tunnel(I0, "ota-uplink")
+        );
+    }
+
+    /// Two runs of one vehicle share a host, so the slot is part of every name: the same device
+    /// in two slots has two names, and the stem is the same in both.
+    #[test]
+    fn the_slot_separates_two_runs_of_one_device() {
+        let i1 = Instance::parse("1").unwrap();
+        assert_eq!(
+            access_port(I0, "node-adas-probe-01", None),
+            "vz0-node-a-c06a"
+        );
+        assert_eq!(
+            access_port(i1, "node-adas-probe-01", None),
+            "vz1-node-a-c06a"
+        );
+        assert_eq!(veth_peer(i1, "node-adas-probe-01", None), "vp1-node-a-c06a");
+        assert_eq!(
+            ingress_ifb(i1, &access_port(i1, "node-adas-probe-01", None)),
+            "vi1-node-a-c06a"
+        );
+        assert_ne!(wireguard_tunnel(I0, "t"), wireguard_tunnel(i1, "t"));
+        assert_ne!(vxlan_tunnel(I0, "t"), vxlan_tunnel(i1, "t"));
+    }
+
+    #[test]
+    fn an_access_port_name_says_its_slot() {
+        let z = Instance::parse("z").unwrap();
+        assert_eq!(access_port_instance("vz0-node-a"), Some(Some(I0)));
+        assert_eq!(
+            access_port_instance(&access_port(z, "x", None)),
+            Some(Some(z))
+        );
+        assert_eq!(access_port_instance("vz-node-a"), Some(None));
+        for other in [
+            "vxbr0",
+            "vp0-node-a",
+            "vi0-node-a",
+            "vzA-node",
+            "eth0",
+            "vz",
+        ] {
+            assert_eq!(access_port_instance(other), None, "{other}");
+        }
+    }
+
+    /// An adopted interface keeps its platform's name, so its IFB is named from the whole name in
+    /// the run's slot.
+    #[test]
+    fn an_adopted_ports_ifb_carries_the_slot() {
+        let i1 = Instance::parse("1").unwrap();
+        assert_eq!(ingress_ifb(i1, "cvd-etap-01"), "vi1-cvd-etap-01");
+        let long = ingress_ifb(I0, "enp3s0f1np1-tap");
+        assert!(
+            long.starts_with("vi0-") && long.len() <= IFNAME_MAX,
+            "{long}"
+        );
     }
 }

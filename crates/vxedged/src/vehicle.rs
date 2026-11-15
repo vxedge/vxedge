@@ -99,7 +99,8 @@ fn plan_vehicle(
     dir: Option<&Path>,
 ) -> Result<(GatewayPlan, Vec<NodePlan>), Status> {
     let refuse = |e: String| crate::errors::precondition(crate::errors::R::WorkspaceInvalid, e);
-    let gateway = GatewayPlan::from_model(model).map_err(|e| refuse(e.to_string()))?;
+    let gateway = GatewayPlan::from_model(model, crate::services::RUN_SLOT)
+        .map_err(|e| refuse(e.to_string()))?;
     let nodes = vxedge_core::zones::plan_nodes_from_model(
         model,
         &gateway,
@@ -143,10 +144,11 @@ impl VehicleSvc {
             dir,
         )?;
         let plans = nodes.to_vec();
-        let foreign =
-            tokio::task::spawn_blocking(move || vxedge_core::zones::foreign_objects(&plans))
-                .await
-                .map_err(|e| Status::internal(format!("host scan panicked: {e}")))?;
+        let foreign = tokio::task::spawn_blocking(move || {
+            vxedge_core::zones::foreign_objects(crate::services::RUN_SLOT, &plans)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("host scan panicked: {e}")))?;
         refuse_foreign(verb, &model.id, &foreign)
     }
 }

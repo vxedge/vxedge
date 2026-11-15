@@ -340,8 +340,10 @@ fn kernel_cmdline_for(np: &NodePlan, arch: GuestArch) -> String {
         GuestArch::Aarch64 | GuestArch::Armv7m => "ttyAMA0",
     };
     format!(
-        "console={console} reboot=t panic=-1 quiet vx.ip={ip} vx.node={}",
-        np.node_id
+        "console={console} reboot=t panic=-1 quiet vx.ip={ip} vx.node={} {}{}",
+        np.node_id,
+        super::foreign::SLOT_MARKER,
+        np.instance
     )
 }
 
@@ -918,26 +920,30 @@ fn read_pid(np: &NodePlan, runtime_dir: &Path) -> Option<i32> {
 fn guest_pid(np: &NodePlan, runtime_dir: &Path) -> Option<i32> {
     let from_pidfile = read_pid(np, runtime_dir).filter(|pid| {
         std::fs::read(format!("/proc/{pid}/cmdline"))
-            .is_ok_and(|cmdline| is_guest_of(&cmdline, &np.node_id))
+            .is_ok_and(|cmdline| is_guest_of(&cmdline, &np.node_id, np.instance))
     });
     // The pidfile belongs to the runtime dir of the daemon that booted the guest. Another daemon
     // has none, and reading that as "down" removed the gateway from under a running guest.
     from_pidfile.or_else(|| {
         super::foreign::guests()
-            .find(|(_, node)| node == &np.node_id)
-            .map(|(pid, _)| pid)
+            .find(|g| g.node == np.node_id && g.instance == Some(np.instance))
+            .map(|g| g.pid)
     })
 }
 
-/// Whether a NUL-separated `/proc/<pid>/cmdline` is QEMU booting `node`, which
-/// [`kernel_cmdline`] marks with `vx.node=`, and a `qemu-mcu` guest with `arg=vx.node=` in
-/// `-semihosting-config`.
-fn is_guest_of(cmdline: &[u8], node: &str) -> bool {
+/// Whether a NUL-separated `/proc/<pid>/cmdline` is QEMU booting `node` in slot `instance`,
+/// which [`kernel_cmdline`] marks with `vx.node=` and `vx.slot=`, and a `qemu-mcu` guest with
+/// `arg=vx.node=` and `arg=vx.slot=` in `-semihosting-config`.
+fn is_guest_of(cmdline: &[u8], node: &str, instance: crate::instance::Instance) -> bool {
     let cmdline = String::from_utf8_lossy(cmdline);
     let mut args = cmdline.split('\0');
-    let marker = format!("vx.node={node}");
-    args.next().is_some_and(|bin| bin.contains("qemu"))
-        && args.any(|arg| super::foreign::guest_words(arg).any(|word| word == marker))
+    let node_marker = format!("vx.node={node}");
+    let slot_marker = format!("{}{instance}", super::foreign::SLOT_MARKER);
+    if !args.next().is_some_and(|bin| bin.contains("qemu")) {
+        return false;
+    }
+    let words: Vec<&str> = args.flat_map(super::foreign::guest_words).collect();
+    words.contains(&node_marker.as_str()) && words.contains(&slot_marker.as_str())
 }
 
 fn microvm_down(np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneBackendError> {
@@ -1461,6 +1467,7 @@ mod tests {
 
     fn image_node() -> NodePlan {
         NodePlan {
+            instance: crate::instance::Instance::FIRST,
             zone_id: "front-left".into(),
             node_id: format!("node-never-{}", std::process::id()),
             role: crate::model::DeviceRole::Ecu,
@@ -2144,19 +2151,31 @@ mod tests {
 
     #[test]
     fn a_reused_pid_is_not_mistaken_for_the_guest() {
-        let qemu = b"qemu-system-x86_64\0-append\0console=ttyS0 vx.node=zone-fl\0";
-        assert!(is_guest_of(qemu, "zone-fl"));
-        assert!(!is_guest_of(qemu, "zone-f"), "another node's id");
-        let mcu = b"qemu-system-arm\0-semihosting-config\0enable=on,target=native,arg=vx.ip=10.0.0.5/24,arg=vx.node=ecu-m3\0";
+        use crate::instance::Instance;
+        let (i0, i1) = (Instance::FIRST, Instance::parse("1").unwrap());
+        let qemu = b"qemu-system-x86_64\0-append\0console=ttyS0 vx.node=zone-fl vx.slot=0\0";
+        assert!(is_guest_of(qemu, "zone-fl", i0));
+        assert!(!is_guest_of(qemu, "zone-f", i0), "another node's id");
         assert!(
-            is_guest_of(mcu, "ecu-m3"),
+            !is_guest_of(qemu, "zone-fl", i1),
+            "the same node in another run"
+        );
+        let mcu = b"qemu-system-arm\0-semihosting-config\0enable=on,target=native,arg=vx.ip=10.0.0.5/24,arg=vx.node=ecu-m3,arg=vx.slot=0\0";
+        assert!(
+            is_guest_of(mcu, "ecu-m3", i0),
             "a qemu-mcu guest's marker is a semihosting arg"
         );
-        assert!(!is_guest_of(mcu, "ecu-m"));
+        assert!(!is_guest_of(mcu, "ecu-m", i0));
         assert!(!is_guest_of(
-            b"/usr/bin/bash\0-c\0vx.node=zone-fl\0",
-            "zone-fl"
+            b"/usr/bin/bash\0-c\0vx.node=zone-fl vx.slot=0\0",
+            "zone-fl",
+            i0
         ));
+        let unslotted = b"qemu-system-x86_64\0-append\0console=ttyS0 vx.node=zone-fl\0";
+        assert!(
+            !is_guest_of(unslotted, "zone-fl", i0),
+            "a guest with no slot is no run's"
+        );
     }
 
     /// The seam's two calling contexts: no runtime at all (a plain test, a CLI), and a

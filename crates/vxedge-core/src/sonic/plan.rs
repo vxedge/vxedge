@@ -69,7 +69,7 @@ links:
 
     #[test]
     fn reduces_a_gateway_plan_to_its_vlan_ids_and_the_given_trunk_port() {
-        let plan = GatewayPlan::from_model(&model(BASE)).unwrap();
+        let plan = GatewayPlan::from_model(&model(BASE), crate::instance::Instance::FIRST).unwrap();
         let sonic = SonicPlan::from_gateway_plan(&plan, "Ethernet0");
         assert_eq!(
             sonic.vlans,
@@ -92,7 +92,7 @@ kind: vehicle
 id: veh
 devices: {}
 "#;
-        let plan = GatewayPlan::from_model(&model(ws)).unwrap();
+        let plan = GatewayPlan::from_model(&model(ws), crate::instance::Instance::FIRST).unwrap();
         let sonic = SonicPlan::from_gateway_plan(&plan, "Ethernet0");
         assert!(
             sonic.vlans.is_empty(),

@@ -159,7 +159,7 @@ fn gateway_for(yaml: &str) -> (Shell, GatewayPlan, NodePlan, PathBuf) {
         escalate: true,
     };
     let model = vxedge_core::model::load_yaml(yaml).expect("workspace loads");
-    let plan = GatewayPlan::from_model(&model).unwrap();
+    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST).unwrap();
     apply(&sh, &plan).unwrap();
     let nodes = plan_nodes_from_model(&model, &plan, Path::new("/")).unwrap();
     let node = nodes[0].clone();
@@ -245,7 +245,8 @@ fn a_capsule_answers_across_the_gateway_and_stops_while_idle() {
 
     // The host check sees it, so another workspace is refused.
     assert!(
-        foreign_objects(&[]).contains(&format!("guest {NODE}")),
+        foreign_objects(vxedge_core::instance::Instance::FIRST, &[])
+            .contains(&format!("guest {NODE}")),
         "the host check must name a running capsule"
     );
 
