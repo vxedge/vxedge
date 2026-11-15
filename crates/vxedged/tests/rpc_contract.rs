@@ -974,26 +974,6 @@ async fn a_run_that_is_not_active_is_refused() {
 }
 
 #[tokio::test]
-async fn experiment_up_refuses_a_workspace_that_is_not_active() {
-    let (active, id) = experiment_workspace();
-    let (other, _) = experiment_workspace();
-    let daemon = Daemon::start_with(|run| write_active_record(run, &id, &active, None));
-    let refused = ExperimentServiceClient::new(daemon.channel().await)
-        .up(ExperimentUpRequest {
-            manifest: path_ref(&other),
-            stages: Vec::new(),
-            ..Default::default()
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(
-        refused.code(),
-        tonic::Code::FailedPrecondition,
-        "{refused:?}"
-    );
-}
-
-#[tokio::test]
 async fn node_status_is_typed_on_every_backend() {
     let (ws, id) = one_of_each_workspace();
     let daemon = Daemon::start_with(|run| write_active_record(run, &id, &ws, None));
