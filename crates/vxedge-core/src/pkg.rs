@@ -559,7 +559,9 @@ pub fn lock(root: &Path, locked_with: &str) -> Result<Lock, PkgError> {
         let fiveg = crate::fiveg::fiveg_images(model)
             .into_iter()
             .chain(crate::gptp::gptp_images(model))
-            .map(str::to_string);
+            .map(str::to_string)
+            // A check tool is no placement either: its step runs it by the reference it names.
+            .chain(crate::checks::tool_images(model));
         for url in model.placements().map(|p| p.image.url.clone()).chain(fiveg) {
             let url = &url;
             if url.starts_with("localhost/") || url.starts_with("local/") {
@@ -1532,6 +1534,41 @@ mod tests {
 
     /// An `s-nssai` slice starts the 5G core and RAN, which are no placement: the lock pins their
     /// images by digest all the same, and drops them when no slice is `s-nssai`.
+    /// A check tool's image is no placement, but its step runs it: the lock pins a published one
+    /// by digest and leaves a `localhost/` one to `files`.
+    #[test]
+    fn a_lock_pins_a_published_check_tools_image() {
+        let root = locked_workspace("check-tool");
+        let main = fs::read_to_string(root.join("main.yaml")).unwrap();
+        fs::write(
+            root.join("main.yaml"),
+            format!(
+                "{main}checks:\n  tools:\n    pub: {{ image: \"ghcr.io/vxedge/parts/svc/x/tool:0.1.0@{PINNED}\" }}\n    \
+                 own: {{ image: \"localhost/vxperiments/own:1\" }}\n  steps:\n    - {{ id: a, tool: pub, on: zonefl }}\n    \
+                 - {{ id: b, tool: own, on: zonefl }}\n"
+            ),
+        )
+        .unwrap();
+        let locked = lock(&root, "0.8.0").unwrap();
+        assert!(
+            locked.images.contains(&LockedRef {
+                reference: "ghcr.io/vxedge/parts/svc/x/tool:0.1.0".into(),
+                digest: Some(PINNED.into()),
+            }),
+            "{:?}",
+            locked.images
+        );
+        assert!(
+            !locked
+                .images
+                .iter()
+                .any(|r| r.reference.starts_with("localhost/")),
+            "{:?}",
+            locked.images
+        );
+        fs::remove_dir_all(root.parent().unwrap()).ok();
+    }
+
     #[test]
     fn an_snssai_slice_locks_the_5g_images() {
         let root = locked_workspace("fiveg");

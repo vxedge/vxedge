@@ -6,6 +6,13 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- `pkg lock` pins the image of every check tool (`checks.tools.<id>.image`) that is published, and
+  `TelemetryService.Collect` records the digests of all of them. A check tool is no placement, so
+  neither listed it: a package whose checks run a published client locked nothing for it, and an
+  offline copy could not run its checks.
+
 ### Changed
 
 - Every host object a run creates carries its instance slot, as `ARCHITECTURE.md` §6.0.5 specifies (Track F,

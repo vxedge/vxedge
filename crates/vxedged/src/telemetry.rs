@@ -256,6 +256,7 @@ impl TelemetryService for TelemetrySvc {
                 .chain(vxedge_core::gptp::gptp_images(&model))
                 .map(str::to_string),
         );
+        images.extend(vxedge_core::checks::tool_images(&model));
         images.sort();
         images.dedup();
         // Whether the run being archived checked its lock is the daemon's to say: vxtelemetry
