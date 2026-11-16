@@ -1085,8 +1085,8 @@ impl GatewayService for GatewaySvc {
             "gateway.apply",
             req.get_ref().manifest.as_ref(),
             Verb::Apply,
-            crate::scope::Target::Start(None),
-            crate::scope::Caller::default(),
+            crate::scope::start_of(&req, "")?,
+            crate::scope::Caller::of(&req),
         )
         .await
     }
@@ -1100,7 +1100,7 @@ impl GatewayService for GatewaySvc {
             Verb::Up {
                 unlocked: req.get_ref().unlocked,
             },
-            crate::scope::Target::Start(crate::scope::requested(&req.get_ref().instance)?),
+            crate::scope::start_of(&req, &req.get_ref().instance)?,
             crate::scope::Caller::of(&req),
         )
         .await

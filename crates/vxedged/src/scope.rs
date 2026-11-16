@@ -454,6 +454,15 @@ impl Target {
     }
 }
 
+/// What an `up` or `apply` starts: the slot an internal request names (its parent chose it, a
+/// campaign's trial in the slot its campaign holds), else the slot `instance` asks for, if any.
+pub(crate) fn start_of<T>(req: &tonic::Request<T>, instance: &str) -> Result<Target, Status> {
+    match req.extensions().get::<Slot>() {
+        Some(Slot(i)) => Ok(Target::At(*i)),
+        None => requested(instance).map(Target::Start),
+    }
+}
+
 /// The slot a request names, if it names one.
 pub(crate) fn requested(instance: &str) -> Result<Option<Instance>, Status> {
     if instance.is_empty() {
@@ -738,6 +747,26 @@ mod tests {
         let found = recorded_with(&root, |b| b == "vxbr3");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].0, slot("3"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A campaign's trial asks its stages for the slot its campaign holds: the stage starts
+    /// there, while an outside `up` naming that slot is refused.
+    #[test]
+    fn a_stage_starts_in_the_slot_its_parent_chose_even_when_a_campaign_holds_it() {
+        let root = std::env::temp_dir().join(format!("vxscope-stage-{}", std::process::id()));
+        reserve(&root, Instance::FIRST, "c-1", true).unwrap();
+        let stage = with_slot(tonic::Request::new(()), Instance::FIRST);
+        let target = start_of(&stage, "").unwrap();
+        assert_eq!(
+            target.scope(&root, None, None).unwrap().instance,
+            Instance::FIRST
+        );
+        let outside = start_of(&tonic::Request::new(()), "0").unwrap();
+        assert_eq!(
+            reason(&outside.scope(&root, None, None).unwrap_err()),
+            "ERROR_REASON_HELD_BY_RUN"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
