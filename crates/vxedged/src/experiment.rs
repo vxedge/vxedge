@@ -215,6 +215,7 @@ impl Handles {
         dir: Option<&std::path::Path>,
         up: Option<bool>,
         p: &Progress,
+        run: &crate::scope::RunCtx,
     ) -> Result<String, JobFailure> {
         p.update(
             10,
@@ -226,21 +227,29 @@ impl Handles {
         );
         let job = if let Some(unlocked) = up {
             self.gateway
-                .up(stage(
-                    GatewayUpRequest {
-                        manifest: inline(yaml, dir),
-                        unlocked,
-                    },
-                    p.job_id(),
+                .up(crate::scope::with_slot(
+                    stage(
+                        GatewayUpRequest {
+                            instance: run.scope.instance.to_string(),
+                            manifest: inline(yaml, dir),
+                            unlocked,
+                        },
+                        p.job_id(),
+                    ),
+                    run.scope.instance,
                 ))
                 .await
         } else {
             self.gateway
-                .down(stage(
-                    GatewayDownRequest {
-                        manifest: inline(yaml, dir),
-                    },
-                    p.job_id(),
+                .down(crate::scope::with_slot(
+                    stage(
+                        GatewayDownRequest {
+                            run: run.run.clone(),
+                            manifest: inline(yaml, dir),
+                        },
+                        p.job_id(),
+                    ),
+                    run.scope.instance,
                 ))
                 .await
         }
@@ -264,10 +273,14 @@ impl Handles {
         up: bool,
         only: Option<&str>,
         p: &Progress,
+        run: &crate::scope::RunCtx,
     ) -> Result<String, JobFailure> {
         let listed = match self
             .zones
-            .list(Request::new(ZoneListRequest::default()))
+            .list(crate::scope::with_slot(
+                Request::new(ZoneListRequest::default()),
+                run.scope.instance,
+            ))
             .await
         {
             Ok(r) => {
@@ -307,7 +320,7 @@ impl Handles {
         if ids.is_empty() {
             return Ok("no zones in the isolated device".into());
         }
-        self.stage_nodes(NodeStage::Zones, &ids, up, p).await
+        self.stage_nodes(NodeStage::Zones, &ids, up, p, run).await
     }
 
     /// Bring every compute device up or down, listed the way [`Self::stage_zones`] lists zones,
@@ -317,8 +330,12 @@ impl Handles {
         up: bool,
         only: Option<&str>,
         p: &Progress,
+        run: &crate::scope::RunCtx,
     ) -> Result<String, JobFailure> {
-        let request = Request::new(ComputeListRequest::default());
+        let request = crate::scope::with_slot(
+            Request::new(ComputeListRequest::default()),
+            run.scope.instance,
+        );
         let listed = match self.compute.list(request).await {
             Ok(r) => r.into_inner().nodes,
             Err(e) if e.code() == tonic::Code::Internal => {
@@ -337,7 +354,7 @@ impl Handles {
         if ids.is_empty() {
             return Ok("no compute in the isolated device".into());
         }
-        self.stage_nodes(NodeStage::Compute, &ids, up, p).await
+        self.stage_nodes(NodeStage::Compute, &ids, up, p, run).await
     }
 
     /// Bring these nodes up or down, one RPC each. `up` stops at the first failure. `down` tries
@@ -348,6 +365,7 @@ impl Handles {
         ids: &[String],
         up: bool,
         p: &Progress,
+        run: &crate::scope::RunCtx,
     ) -> Result<String, JobFailure> {
         let total = ids.len();
         let (label, base, span) = match stage {
@@ -364,7 +382,7 @@ impl Handles {
                 &format!("{label} {}/{total}: {id} ({verb})", i + 1),
             );
             let step = format!("{label} {id}");
-            let result = match self.submit_node(stage, id, up, p.job_id()).await {
+            let result = match self.submit_node(stage, id, up, p.job_id(), run).await {
                 Ok(job) => await_job(&self.engine, job, p, percent, &step).await,
                 Err(status) => Err(JobFailure::from_status(&status)),
             };
@@ -389,6 +407,7 @@ impl Handles {
         id: &str,
         up: bool,
         parent: &str,
+        run: &crate::scope::RunCtx,
     ) -> Result<Job, Status> {
         let r#ref = Some(VxidRef {
             vxid: id.to_string(),
@@ -396,45 +415,57 @@ impl Handles {
         let job = match (stage, up) {
             (NodeStage::Zones, true) => {
                 self.zones
-                    .up(crate::jobs::stage(
-                        ZoneUpRequest {
-                            r#ref,
-                            ..Default::default()
-                        },
-                        parent,
+                    .up(crate::scope::with_slot(
+                        crate::jobs::stage(
+                            ZoneUpRequest {
+                                r#ref,
+                                run: run.run.clone(),
+                            },
+                            parent,
+                        ),
+                        run.scope.instance,
                     ))
                     .await
             }
             (NodeStage::Zones, false) => {
                 self.zones
-                    .down(crate::jobs::stage(
-                        ZoneDownRequest {
-                            r#ref,
-                            ..Default::default()
-                        },
-                        parent,
+                    .down(crate::scope::with_slot(
+                        crate::jobs::stage(
+                            ZoneDownRequest {
+                                r#ref,
+                                run: run.run.clone(),
+                            },
+                            parent,
+                        ),
+                        run.scope.instance,
                     ))
                     .await
             }
             (NodeStage::Compute, true) => {
                 self.compute
-                    .up(crate::jobs::stage(
-                        ComputeUpRequest {
-                            r#ref,
-                            ..Default::default()
-                        },
-                        parent,
+                    .up(crate::scope::with_slot(
+                        crate::jobs::stage(
+                            ComputeUpRequest {
+                                r#ref,
+                                run: run.run.clone(),
+                            },
+                            parent,
+                        ),
+                        run.scope.instance,
                     ))
                     .await
             }
             (NodeStage::Compute, false) => {
                 self.compute
-                    .down(crate::jobs::stage(
-                        ComputeDownRequest {
-                            r#ref,
-                            ..Default::default()
-                        },
-                        parent,
+                    .down(crate::scope::with_slot(
+                        crate::jobs::stage(
+                            ComputeDownRequest {
+                                r#ref,
+                                run: run.run.clone(),
+                            },
+                            parent,
+                        ),
+                        run.scope.instance,
                     ))
                     .await
             }
@@ -451,9 +482,12 @@ impl Handles {
         dir: Option<&Path>,
         up: bool,
         p: &Progress,
+        run: &crate::scope::RunCtx,
     ) -> Result<String, JobFailure> {
         let fail = |e: String| JobFailure::from(format!("signal plane `{KUKSA_MEMBER}`: {e}"));
-        let Some((node, spec)) = signal_plane_member(model, dir).map_err(fail)? else {
+        let Some((node, spec)) =
+            signal_plane_member(model, dir, run.scope.instance).map_err(fail)?
+        else {
             return Ok("no signal plane declared".into());
         };
         let on = node.node_id.clone();
@@ -471,7 +505,7 @@ impl Handles {
             serde_json::json!({ "member": KUKSA_MEMBER, "on": on, "image": spec.image }),
         );
         let shell = self.zones.shell.clone();
-        let runtime_dir = self.zones.runtime_dir.clone();
+        let runtime_dir = run.scope.dir.clone();
         let (probe_node, probe_spec) = (node.clone(), spec.clone());
         let change = async move {
             tokio::task::spawn_blocking(move || {
@@ -528,9 +562,10 @@ impl Handles {
         dir: Option<&Path>,
         up: bool,
         p: &Progress,
+        run: &crate::scope::RunCtx,
     ) -> Result<String, JobFailure> {
         let fail = |e: String| JobFailure::from(format!("time sync: {e}"));
-        let followers = time_sync_members(model, dir, &self.zones.runtime_dir).map_err(fail)?;
+        let followers = time_sync_members(model, dir, &run.scope).map_err(fail)?;
         if followers.is_empty() {
             return Ok("no time sync declared".into());
         }
@@ -544,7 +579,7 @@ impl Handles {
                 serde_json::json!({ "member": spec.name, "on": on, "image": spec.image }),
             );
             let shell = self.zones.shell.clone();
-            let runtime_dir = self.zones.runtime_dir.clone();
+            let runtime_dir = run.scope.dir.clone();
             let (probe_node, probe_spec) = (node.clone(), spec.clone());
             let change = async move {
                 tokio::task::spawn_blocking(move || {
@@ -609,8 +644,9 @@ impl Handles {
         &self,
         model: &vxedge_core::model::Experiment,
         dir: Option<&Path>,
+        run: &crate::scope::RunCtx,
     ) -> Result<Vec<ResourceStatus>, Status> {
-        let followers = time_sync_members(model, dir, &self.zones.runtime_dir)
+        let followers = time_sync_members(model, dir, &run.scope)
             .map_err(|e| crate::errors::precondition(crate::errors::R::WorkspaceInvalid, e))?;
         let mut components = Vec::new();
         for (node, spec) in followers {
@@ -637,8 +673,9 @@ impl Handles {
         &self,
         model: &vxedge_core::model::Experiment,
         dir: Option<&Path>,
+        run: &crate::scope::RunCtx,
     ) -> Result<Option<ResourceStatus>, Status> {
-        let member = signal_plane_member(model, dir)
+        let member = signal_plane_member(model, dir, run.scope.instance)
             .map_err(|e| crate::errors::precondition(crate::errors::R::WorkspaceInvalid, e))?;
         let Some((node, spec)) = member else {
             return Ok(None);
@@ -664,6 +701,7 @@ impl Handles {
         dir: Option<&std::path::Path>,
         up: bool,
         p: &Progress,
+        run: &crate::scope::RunCtx,
     ) -> Result<String, JobFailure> {
         // Keyed by service *type* because that is what SvcService dispatches on.
         let types = vxedge_core::services::ServiceDef::declared_types(model);
@@ -677,24 +715,30 @@ impl Handles {
             );
             let job = if up {
                 self.svcs
-                    .up(stage(
-                        SvcUpRequest {
-                            service_type: ty.clone(),
-                            experiment: inline(yaml, dir),
-                            ..Default::default()
-                        },
-                        p.job_id(),
+                    .up(crate::scope::with_slot(
+                        stage(
+                            SvcUpRequest {
+                                service_type: ty.clone(),
+                                experiment: inline(yaml, dir),
+                                run: run.run.clone(),
+                            },
+                            p.job_id(),
+                        ),
+                        run.scope.instance,
                     ))
                     .await
             } else {
                 self.svcs
-                    .down(stage(
-                        SvcDownRequest {
-                            service_type: ty.clone(),
-                            experiment: inline(yaml, dir),
-                            ..Default::default()
-                        },
-                        p.job_id(),
+                    .down(crate::scope::with_slot(
+                        stage(
+                            SvcDownRequest {
+                                service_type: ty.clone(),
+                                experiment: inline(yaml, dir),
+                                run: run.run.clone(),
+                            },
+                            p.job_id(),
+                        ),
+                        run.scope.instance,
                     ))
                     .await
             }
@@ -717,13 +761,13 @@ impl Handles {
 fn time_sync_members(
     model: &vxedge_core::model::Experiment,
     dir: Option<&Path>,
-    runtime_dir: &Path,
+    scope: &crate::scope::RunScope,
 ) -> Result<Vec<(NodePlan, ContainerSpec)>, String> {
+    let runtime_dir = scope.dir.as_path();
     let Some(time_sync) = &model.time_sync else {
         return Ok(Vec::new());
     };
-    let gateway =
-        GatewayPlan::from_model(model, crate::services::RUN_SLOT).map_err(|e| e.to_string())?;
+    let gateway = GatewayPlan::from_model(model, scope.instance).map_err(|e| e.to_string())?;
     let nodes = vxedge_core::zones::plan_nodes_from_model(
         model,
         &gateway,
@@ -754,13 +798,13 @@ fn time_sync_members(
 fn signal_plane_member(
     model: &vxedge_core::model::Experiment,
     dir: Option<&Path>,
+    instance: vxedge_core::instance::Instance,
 ) -> Result<Option<(NodePlan, ContainerSpec)>, String> {
     let Some(plane) = &model.signal_plane else {
         return Ok(None);
     };
     let spec = vxedge_core::services::kuksa_spec(&plane.kuksa).map_err(|e| e.to_string())?;
-    let gateway =
-        GatewayPlan::from_model(model, crate::services::RUN_SLOT).map_err(|e| e.to_string())?;
+    let gateway = GatewayPlan::from_model(model, instance).map_err(|e| e.to_string())?;
     let nodes = vxedge_core::zones::plan_nodes_from_model(
         model,
         &gateway,
@@ -836,9 +880,26 @@ impl ExperimentService for ExperimentSvc {
         let model = vxedge_core::model::load_yaml(&yaml).map_err(|e| {
             crate::errors::invalid(crate::errors::R::WorkspaceInvalid, e.to_string())
         })?;
+        // The run's slot: its own when the workspace already runs, else the one asked for or the
+        // lowest free one. A campaign's trial may use the slot its campaign reserves.
+        let root = self.handles.gateway.runtime_dir.clone();
+        let campaign = req
+            .extensions()
+            .get::<crate::scope::Campaign>()
+            .map(|c| c.0.clone());
+        let instance = crate::scope::choose(
+            &root,
+            dir.as_deref(),
+            crate::scope::requested(&req.get_ref().instance)?,
+            crate::scope::Asker {
+                campaign: campaign.as_deref(),
+                id: Some(&model.id),
+            },
+        )?;
+        let scope = crate::scope::RunScope::new(&root, instance);
         // Every check `up` makes before touching the host, shared with `vehicle up` and
         // `WorkspaceService.Plan`.
-        let nodes = GatewayPlan::from_model(&model, crate::services::RUN_SLOT)
+        let nodes = GatewayPlan::from_model(&model, instance)
             .map_err(|e| e.to_string())
             .and_then(|gw| {
                 vxedge_core::zones::plan_nodes_from_model(
@@ -856,10 +917,9 @@ impl ExperimentService for ExperimentSvc {
             &nodes,
             dir.as_deref(),
             req.get_ref().unlocked,
-            &self.handles.zones.runtime_dir,
+            &scope,
             &self.handles.zones.cache_dir,
             &self.handles.gateway,
-            self.handles.engine.lifecycle_target().await,
         )
         .await;
         if let Some(refusal) = pf.refusal() {
@@ -883,42 +943,48 @@ impl ExperimentService for ExperimentSvc {
             .handles
             .engine
             .submit_with(
-                JobOpts::lifecycle(&req, staged_target(format!("experiment {id}"), &stages)),
+                JobOpts::lifecycle(&req, staged_target(format!("experiment {id}"), &stages))
+                    .in_run(&scope.dir),
                 "experiment.up",
                 move |p| async move {
+                    let mut run = crate::scope::RunCtx::new(scope);
                     let mut done: Vec<String> = Vec::new();
                     p.checkpoint()?;
                     if wants(&stages, ExperimentStage::Gateway) {
-                        svc.stage_gateway(&yaml, dir.as_deref(), Some(unlocked), &p)
+                        svc.stage_gateway(&yaml, dir.as_deref(), Some(unlocked), &p, &run)
                             .await?;
+                        run.refresh();
                         done.push("gateway".to_string());
                     }
                     p.checkpoint()?;
                     if wants(&stages, ExperimentStage::Zones) {
-                        done.push(svc.stage_zones(true, isolate.as_deref(), &p).await?);
+                        done.push(svc.stage_zones(true, isolate.as_deref(), &p, &run).await?);
                     }
                     p.checkpoint()?;
                     if wants(&stages, ExperimentStage::Compute) {
-                        done.push(svc.stage_compute(true, isolate.as_deref(), &p).await?);
+                        done.push(
+                            svc.stage_compute(true, isolate.as_deref(), &p, &run)
+                                .await?,
+                        );
                     }
                     p.checkpoint()?;
                     if wants(&stages, ExperimentStage::TimeSync) {
                         done.push(
-                            svc.stage_time_sync(&model, dir.as_deref(), true, &p)
+                            svc.stage_time_sync(&model, dir.as_deref(), true, &p, &run)
                                 .await?,
                         );
                     }
                     p.checkpoint()?;
                     if wants(&stages, ExperimentStage::SignalPlane) {
                         done.push(
-                            svc.stage_signal_plane(&model, dir.as_deref(), true, &p)
+                            svc.stage_signal_plane(&model, dir.as_deref(), true, &p, &run)
                                 .await?,
                         );
                     }
                     p.checkpoint()?;
                     if wants(&stages, ExperimentStage::Services) {
                         done.push(
-                            svc.stage_services(&model, &yaml, dir.as_deref(), true, &p)
+                            svc.stage_services(&model, &yaml, dir.as_deref(), true, &p, &run)
                                 .await?,
                         );
                     }
@@ -948,7 +1014,10 @@ impl ExperimentService for ExperimentSvc {
         let model = vxedge_core::model::load_yaml(&yaml).map_err(|e| {
             crate::errors::invalid(crate::errors::R::WorkspaceInvalid, e.to_string())
         })?;
-        let active = self.handles.gateway.active_on_host().await;
+        let root = self.handles.gateway.runtime_dir.clone();
+        let scope = crate::scope::of(&req, &root, req.get_ref().run.as_ref(), dir.as_deref())?;
+        crate::scope::guard(&req, &root, &scope)?;
+        let active = self.handles.gateway.active_on_host(&scope).await;
         check_active_target(
             "experiment down",
             active
@@ -968,16 +1037,18 @@ impl ExperimentService for ExperimentSvc {
             .handles
             .engine
             .submit_with(
-                JobOpts::lifecycle(&req, staged_target(format!("experiment {id}"), &stages)),
+                JobOpts::lifecycle(&req, staged_target(format!("experiment {id}"), &stages))
+                    .in_run(&scope.dir),
                 "experiment.down",
                 move |p| async move {
+                    let run = crate::scope::RunCtx::new(scope);
                     // Reverse order, and **best-effort**: a teardown that stops at the first error
                     // strands whatever came after it. Collect failures, tear the rest down anyway,
                     // and report everything that went wrong.
                     let mut failures: Vec<JobFailure> = Vec::new();
                     // Measurements run inside the nodes, so they stop before the nodes do.
                     if wants(&stages, ExperimentStage::Zones) {
-                        let (sh, rt) = (svc.gateway.shell.clone(), svc.gateway.runtime_dir.clone());
+                        let (sh, rt) = (svc.gateway.shell.clone(), run.scope.dir.clone());
                         let _ = tokio::task::spawn_blocking(move || {
                             for s in vxedge_core::measurements::run::started(&rt) {
                                 vxedge_core::measurements::run::stop(&sh, &rt, &s.id);
@@ -987,35 +1058,39 @@ impl ExperimentService for ExperimentSvc {
                     }
                     if wants(&stages, ExperimentStage::Services)
                         && let Err(e) = svc
-                            .stage_services(&model, &yaml, dir.as_deref(), false, &p)
+                            .stage_services(&model, &yaml, dir.as_deref(), false, &p, &run)
                             .await
                     {
                         failures.push(e);
                     }
                     if wants(&stages, ExperimentStage::SignalPlane)
                         && let Err(e) = svc
-                            .stage_signal_plane(&model, dir.as_deref(), false, &p)
+                            .stage_signal_plane(&model, dir.as_deref(), false, &p, &run)
                             .await
                     {
                         failures.push(e);
                     }
                     if wants(&stages, ExperimentStage::TimeSync)
-                        && let Err(e) = svc.stage_time_sync(&model, dir.as_deref(), false, &p).await
+                        && let Err(e) = svc
+                            .stage_time_sync(&model, dir.as_deref(), false, &p, &run)
+                            .await
                     {
                         failures.push(e);
                     }
                     if wants(&stages, ExperimentStage::Compute)
-                        && let Err(e) = svc.stage_compute(false, None, &p).await
+                        && let Err(e) = svc.stage_compute(false, None, &p, &run).await
                     {
                         failures.push(e);
                     }
                     if wants(&stages, ExperimentStage::Zones)
-                        && let Err(e) = svc.stage_zones(false, None, &p).await
+                        && let Err(e) = svc.stage_zones(false, None, &p, &run).await
                     {
                         failures.push(e);
                     }
                     if wants(&stages, ExperimentStage::Gateway)
-                        && let Err(e) = svc.stage_gateway(&yaml, dir.as_deref(), None, &p).await
+                        && let Err(e) = svc
+                            .stage_gateway(&yaml, dir.as_deref(), None, &p, &run)
+                            .await
                     {
                         failures.push(e);
                     }
@@ -1048,8 +1123,11 @@ impl ExperimentService for ExperimentSvc {
         let model = vxedge_core::model::load_yaml(&yaml).map_err(|e| {
             crate::errors::invalid(crate::errors::R::WorkspaceInvalid, e.to_string())
         })?;
-        // The components below describe what is active, so this must be what the caller named.
-        let active = self.handles.gateway.active_on_host().await;
+        // The components below describe the run the caller named, or its workspace's run.
+        let root = self.handles.gateway.runtime_dir.clone();
+        let scope = crate::scope::of(&req, &root, req.get_ref().run.as_ref(), dir.as_deref())?;
+        let run = crate::scope::RunCtx::new(scope);
+        let active = self.handles.gateway.active_on_host(&run.scope).await;
         check_active_target(
             "experiment status",
             active
@@ -1062,7 +1140,12 @@ impl ExperimentService for ExperimentSvc {
         let gw = self
             .handles
             .gateway
-            .status(Request::new(GatewayStatusRequest {}))
+            .status(crate::scope::with_slot(
+                Request::new(GatewayStatusRequest {
+                    run: run.run.clone(),
+                }),
+                run.scope.instance,
+            ))
             .await?
             .into_inner();
         let gw_status = gw.status.clone().unwrap_or_default();
@@ -1070,14 +1153,24 @@ impl ExperimentService for ExperimentSvc {
         let mut nodes = self
             .handles
             .zones
-            .list(Request::new(vxedge_api::v1::ZoneListRequest::default()))
+            .list(crate::scope::with_slot(
+                Request::new(vxedge_api::v1::ZoneListRequest {
+                    run: run.run.clone(),
+                }),
+                run.scope.instance,
+            ))
             .await
             .map(|r| r.into_inner().nodes)
             .unwrap_or_default();
         nodes.extend(
             self.handles
                 .compute
-                .list(Request::new(ComputeListRequest::default()))
+                .list(crate::scope::with_slot(
+                    Request::new(ComputeListRequest {
+                        run: run.run.clone(),
+                    }),
+                    run.scope.instance,
+                ))
                 .await
                 .map(|r| r.into_inner().node_status)
                 .unwrap_or_default(),
@@ -1088,22 +1181,25 @@ impl ExperimentService for ExperimentSvc {
             let observed = self
                 .handles
                 .svcs
-                .status(Request::new(vxedge_api::v1::SvcStatusRequest {
-                    service_type,
-                    experiment: inline(&yaml, dir.as_deref()),
-                    ..Default::default()
-                }))
+                .status(crate::scope::with_slot(
+                    Request::new(vxedge_api::v1::SvcStatusRequest {
+                        service_type,
+                        experiment: inline(&yaml, dir.as_deref()),
+                        run: run.run.clone(),
+                    }),
+                    run.scope.instance,
+                ))
                 .await?;
             components.push(observed.into_inner());
         }
         components.extend(
             self.handles
-                .signal_plane_component(&model, dir.as_deref())
+                .signal_plane_component(&model, dir.as_deref(), &run)
                 .await?,
         );
         components.extend(
             self.handles
-                .time_sync_components(&model, dir.as_deref())
+                .time_sync_components(&model, dir.as_deref(), &run)
                 .await?,
         );
 

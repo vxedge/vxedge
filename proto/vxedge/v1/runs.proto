@@ -39,6 +39,8 @@ message Run {
   // 802.1AS domain, which runs on software timestamps with free-running followers; empty for a
   // run without one, or recorded before time sync was.
   string time_sync = 12;
+  // The instance slot the run holds on its host (`ARCHITECTURE.md` §6.0.5).
+  string instance = 13;
 }
 
 // A `vxp/1` package as a result cites it.

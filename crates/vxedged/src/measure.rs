@@ -19,7 +19,7 @@ use vxedge_core::measurements::run::{self, Placement};
 use crate::audit::Audit;
 use crate::errors::{self, R};
 use crate::jobs::JobEngine;
-use crate::services::{require_run, resolve_manifest};
+use crate::services::resolve_manifest;
 
 pub struct MeasurementSvc {
     pub engine: JobEngine,
@@ -40,25 +40,37 @@ struct Resolved {
 }
 
 impl MeasurementSvc {
-    async fn resolve(&self, mref: Option<&ManifestRef>) -> Result<Resolved, Status> {
+    async fn resolve(
+        &self,
+        mref: Option<&ManifestRef>,
+        run: Option<&vxedge_api::v1::RunRef>,
+        slot: Option<crate::scope::Slot>,
+    ) -> Result<(Resolved, crate::scope::RunScope), Status> {
         let (yaml, sha256, dir) = resolve_manifest(mref).await?;
+        let scope = match slot {
+            Some(crate::scope::Slot(i)) => crate::scope::RunScope::new(&self.runtime_dir, i),
+            None => crate::scope::resolve(&self.runtime_dir, run, dir.as_deref())?,
+        };
         let invalid = |e: String| errors::invalid(R::WorkspaceInvalid, e);
         let model = vxedge_core::model::load_yaml(&yaml).map_err(|e| invalid(e.to_string()))?;
         if let Some(p) = vxedge_core::measurements::problems(&model).first() {
             return Err(errors::invalid(R::MeasurementInvalid, p.to_string()));
         }
-        let gateway = GatewayPlan::from_model(&model, crate::services::RUN_SLOT)
+        let gateway = GatewayPlan::from_model(&model, scope.instance)
             .map_err(|e| invalid(format!("gateway plan: {e}")))?;
         let workspace = dir.unwrap_or_else(|| PathBuf::from("."));
         let nodes = vxedge_core::zones::plan_nodes_from_model(&model, &gateway, &workspace)
             .map_err(|e| invalid(format!("node plan: {e}")))?;
         let placements = run::plan(&model, &gateway, &nodes, &self.cache_dir)
             .map_err(|e| errors::invalid(R::MeasurementInvalid, e))?;
-        Ok(Resolved {
-            model,
-            placements,
-            sha256,
-        })
+        Ok((
+            Resolved {
+                model,
+                placements,
+                sha256,
+            },
+            scope,
+        ))
     }
 }
 
@@ -82,10 +94,14 @@ fn select(placements: Vec<Placement>, ids: &[String]) -> Result<Vec<Placement>, 
 #[tonic::async_trait]
 impl MeasurementService for MeasurementSvc {
     async fn start(&self, req: Request<MeasurementStartRequest>) -> Result<Response<Job>, Status> {
-        require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
         let opts = crate::jobs::JobOpts::request(&req, &req.get_ref().request_id);
+        let slot = req.extensions().get::<crate::scope::Slot>().copied();
+        let caller = crate::scope::Caller::of(&req);
         let req = req.into_inner();
-        let resolved = self.resolve(req.manifest.as_ref()).await?;
+        let (resolved, scope) = self
+            .resolve(req.manifest.as_ref(), req.run.as_ref(), slot)
+            .await?;
+        caller.check(&self.runtime_dir, &scope)?;
         self.audit.record(
             "MeasurementService.Start",
             serde_json::json!({ "manifest_sha256": resolved.sha256, "ids": req.ids }),
@@ -98,7 +114,7 @@ impl MeasurementService for MeasurementSvc {
         let (shell, containers, runtime_dir, bin) = (
             self.shell.clone(),
             self.containers.clone(),
-            self.runtime_dir.clone(),
+            scope.dir.clone(),
             self.vxprobe_bin.clone(),
         );
         let events = self.engine.events().clone();
@@ -136,9 +152,13 @@ impl MeasurementService for MeasurementSvc {
     }
 
     async fn stop(&self, req: Request<MeasurementStopRequest>) -> Result<Response<Job>, Status> {
-        require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
+        let slot = req.extensions().get::<crate::scope::Slot>().copied();
+        let caller = crate::scope::Caller::of(&req);
         let req = req.into_inner();
-        let resolved = self.resolve(req.manifest.as_ref()).await?;
+        let (resolved, scope) = self
+            .resolve(req.manifest.as_ref(), req.run.as_ref(), slot)
+            .await?;
+        caller.check(&self.runtime_dir, &scope)?;
         self.audit.record(
             "MeasurementService.Stop",
             serde_json::json!({ "manifest_sha256": resolved.sha256, "ids": req.ids }),
@@ -147,7 +167,7 @@ impl MeasurementService for MeasurementSvc {
             .into_iter()
             .map(|p| p.id)
             .collect();
-        let (shell, runtime_dir) = (self.shell.clone(), self.runtime_dir.clone());
+        let (shell, runtime_dir) = (self.shell.clone(), scope.dir.clone());
         let events = self.engine.events().clone();
         let job = self
             .engine
@@ -175,8 +195,13 @@ impl MeasurementService for MeasurementSvc {
         &self,
         req: Request<MeasurementStatusRequest>,
     ) -> Result<Response<MeasurementStatusResponse>, Status> {
-        require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
-        let resolved = self.resolve(req.get_ref().manifest.as_ref()).await?;
+        let (resolved, scope) = self
+            .resolve(
+                req.get_ref().manifest.as_ref(),
+                req.get_ref().run.as_ref(),
+                req.extensions().get::<crate::scope::Slot>().copied(),
+            )
+            .await?;
         let kinds: Vec<(String, String)> = resolved
             .model
             .measurements
@@ -188,7 +213,7 @@ impl MeasurementService for MeasurementSvc {
             .into_iter()
             .map(|p| {
                 use run::State as S;
-                let (state, detail) = match run::status(&self.runtime_dir, &p.id) {
+                let (state, detail) = match run::status(&scope.dir, &p.id) {
                     S::NotStarted => (MeasurementState::Unspecified, "not started".to_string()),
                     S::Running => (MeasurementState::Running, String::new()),
                     S::Finished => (MeasurementState::Finished, String::new()),

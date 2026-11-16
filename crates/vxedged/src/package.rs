@@ -545,10 +545,14 @@ pub(crate) fn inspect(
                         detail: p.to_string(),
                     }),
             );
-            info.entities = crate::telemetry::entities(&model, runtime_dir)
-                .into_iter()
-                .map(crate::plan::planned_entity)
-                .collect();
+            info.entities = crate::telemetry::entities(
+                &model,
+                &crate::scope::run_dir(runtime_dir, vxedge_core::instance::Instance::FIRST),
+                vxedge_core::instance::Instance::FIRST,
+            )
+            .into_iter()
+            .map(crate::plan::planned_entity)
+            .collect();
         }
         Err(e) => problems.push(PlanProblem {
             reason: R::WorkspaceInvalid as i32,

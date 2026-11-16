@@ -304,6 +304,7 @@ async fn down(channel: &Channel, dir: &Path) -> Result<Job, tonic::Status> {
 async fn status(channel: &Channel, dir: &Path) -> Result<VehicleStatus, tonic::Status> {
     Ok(VehicleServiceClient::new(channel.clone())
         .status(VehicleStatusRequest {
+            run: None,
             manifest: path_ref(dir),
         })
         .await?

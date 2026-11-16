@@ -62,20 +62,39 @@ pub struct ActiveExperiment {
     pub sha256: String,
 }
 
-/// The slot every run of this daemon takes (`ARCHITECTURE.md` §6.0.5). One run at a time still:
-/// choosing a free slot per run, and holding several, is the next step (Track F, F1).
-pub(crate) const RUN_SLOT: vxedge_core::instance::Instance = vxedge_core::instance::Instance::FIRST;
-
-/// Daemon-wide view of the active experiment: set by a successful
-/// `gateway up`, consumed by zone verbs, cleared by `gateway down`.
+/// One run's view of its experiment: set by a successful `gateway up`, consumed by zone verbs,
+/// cleared by `gateway down`.
 #[derive(Default)]
-pub struct EdgeState {
+pub struct RunState {
     pub gateway: Option<GatewayPlan>,
     pub active: Option<ActiveExperiment>,
     /// Set alongside `gateway` whenever the experiment's `network.slices`
     /// include any `mode: s-nssai` — the fiveg CN/RAN pods' desired state,
     /// for `down`/`status` to act on without re-planning.
     pub fiveg: Option<FiveGPlan>,
+}
+
+static NO_RUN: RunState = RunState {
+    gateway: None,
+    active: None,
+    fiveg: None,
+};
+
+/// Daemon-wide view: every run on the host, by its instance slot (`ARCHITECTURE.md` §6.0.5).
+#[derive(Default)]
+pub struct EdgeState {
+    pub runs: std::collections::BTreeMap<vxedge_core::instance::Instance, RunState>,
+}
+
+impl EdgeState {
+    /// The run in slot `instance`, empty when there is none.
+    pub fn run(&self, instance: vxedge_core::instance::Instance) -> &RunState {
+        self.runs.get(&instance).unwrap_or(&NO_RUN)
+    }
+
+    pub fn run_mut(&mut self, instance: vxedge_core::instance::Instance) -> &mut RunState {
+        self.runs.entry(instance).or_default()
+    }
 }
 
 pub type SharedState = Arc<tokio::sync::Mutex<EdgeState>>;
@@ -314,7 +333,7 @@ fn active_record(runtime_dir: &Path) -> PathBuf {
 /// What `active.json` says. A record from before 0.4.1 has no `sha256`, one from before 0.5.0
 /// has no `run_id` or `started_unix_ms`, and one from before `vxws/2` has no
 /// `identity_algorithm`.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ActiveRecord {
     pub id: String,
     pub dir: PathBuf,
@@ -418,29 +437,6 @@ pub(crate) fn active_run(runtime_dir: &Path) -> Option<ActiveRecord> {
         .then_some(record)
 }
 
-/// Refuse a call that names a run other than the active one. Naming no run means the only run, so
-/// a caller that predates runs keeps working.
-pub(crate) fn require_run(run: Option<&RunRef>, runtime_dir: &Path) -> Result<(), Status> {
-    let Some(wanted) = run.filter(|r| !r.run_id.is_empty()) else {
-        return Ok(());
-    };
-    match active_run(runtime_dir) {
-        Some(record) if record.run_id() == wanted.run_id => Ok(()),
-        Some(record) => Err(crate::errors::precondition(
-            crate::errors::R::RunMismatch,
-            format!(
-                "run `{}` is not the active one, `{}`",
-                wanted.run_id,
-                record.run_id()
-            ),
-        )),
-        None => Err(crate::errors::precondition(
-            crate::errors::R::NoActiveRun,
-            format!("run `{}` is not active: nothing is", wanted.run_id),
-        )),
-    }
-}
-
 /// A run's id, unique across repeated runs of the same workspace.
 fn new_run_id(workspace_sha256: &str) -> String {
     let seed = format!("{workspace_sha256}-{}", now_ms());
@@ -479,7 +475,7 @@ pub(crate) async fn observed_nodes(
 }
 
 /// The record, if it is there and reads.
-fn read_active_record(runtime_dir: &Path) -> Option<ActiveRecord> {
+pub(crate) fn read_active_record(runtime_dir: &Path) -> Option<ActiveRecord> {
     let text = std::fs::read_to_string(active_record(runtime_dir)).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
     let (package, kernel) = provenance_of(&v);
@@ -504,13 +500,13 @@ fn read_active_record(runtime_dir: &Path) -> Option<ActiveRecord> {
 /// A workspace edited since `up` is refused: its plans would not describe what is running.
 pub(crate) async fn restore_active(
     state: &SharedState,
-    runtime_dir: &Path,
+    scope: &crate::scope::RunScope,
     shell: &Shell,
 ) -> Result<(), Status> {
-    if state.lock().await.active.is_some() {
+    if state.lock().await.run(scope.instance).active.is_some() {
         return Ok(());
     }
-    let Some(record) = read_active_record(runtime_dir) else {
+    let Some(record) = read_active_record(&scope.dir) else {
         return Ok(());
     };
     if record.dir == Path::new(".") {
@@ -572,18 +568,19 @@ pub(crate) async fn restore_active(
     if model.id != record.id {
         return Err(refuse(format!("it now declares `{}`", model.id)));
     }
-    let plan = GatewayPlan::from_model(&model, crate::services::RUN_SLOT)
-        .map_err(|e| refuse(e.to_string()))?;
+    let plan =
+        GatewayPlan::from_model(&model, scope.instance).map_err(|e| refuse(e.to_string()))?;
     let fiveg = if plan.snssai_slice_ids.is_empty() {
         None
     } else {
         Some(FiveGPlan::from_model(&model).map_err(|e| refuse(e.to_string()))?)
     };
     let mut st = state.lock().await;
-    if st.active.is_none() {
-        st.gateway = Some(plan);
-        st.fiveg = fiveg;
-        st.active = Some(ActiveExperiment {
+    let run = st.run_mut(scope.instance);
+    if run.active.is_none() {
+        run.gateway = Some(plan);
+        run.fiveg = fiveg;
+        run.active = Some(ActiveExperiment {
             model,
             dir: record.dir,
             sha256,
@@ -592,15 +589,29 @@ pub(crate) async fn restore_active(
     Ok(())
 }
 
+/// Rebuild every run on the host from its record, after a daemon restart. A run that cannot be
+/// restored is logged and left for a verb that names it to report.
+pub(crate) async fn restore_all(state: &SharedState, root: &Path, shell: &Shell) {
+    for (instance, _) in crate::scope::recorded(root) {
+        let scope = crate::scope::RunScope::new(root, instance);
+        if let Err(e) = restore_active(state, &scope, shell).await {
+            tracing::warn!(slot = %instance, error = %e.message(), "run not restored");
+        }
+    }
+}
+
 impl GatewaySvc {
     /// The workspace that owns the gateway on this host: `(id, workspace dir)`. Memory first, then
     /// the record, which only counts while its bridge exists. A record that outlived its bridge
     /// (a host reboot under a kept runtime dir) must not refuse every later `up`.
-    pub(crate) async fn active_on_host(&self) -> Option<(String, PathBuf)> {
-        if let Some(a) = &self.state.lock().await.active {
+    pub(crate) async fn active_on_host(
+        &self,
+        scope: &crate::scope::RunScope,
+    ) -> Option<(String, PathBuf)> {
+        if let Some(a) = &self.state.lock().await.run(scope.instance).active {
             return Some((a.model.id.clone(), a.dir.clone()));
         }
-        let record = read_active_record(&self.runtime_dir)?;
+        let record = read_active_record(&scope.dir)?;
         let shell = self.shell.clone();
         let bridge = record.bridge;
         let present = tokio::task::spawn_blocking(move || shell.link_exists(&bridge))
@@ -620,9 +631,10 @@ impl GatewaySvc {
         sha256: String,
     ) {
         let mut st = self.state.lock().await;
-        if st.active.is_none() {
-            st.gateway = Some(plan);
-            st.active = Some(ActiveExperiment {
+        let run = st.run_mut(plan.instance);
+        if run.active.is_none() {
+            run.gateway = Some(plan);
+            run.active = Some(ActiveExperiment {
                 model,
                 dir: dir.unwrap_or_else(|| PathBuf::from(".")),
                 sha256,
@@ -630,6 +642,7 @@ impl GatewaySvc {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn lifecycle_job(
         &self,
         opts: crate::jobs::JobOpts,
@@ -637,8 +650,20 @@ impl GatewaySvc {
         kind: &'static str,
         mref: Option<&ManifestRef>,
         verb: Verb,
+        target: crate::scope::Target,
+        caller: crate::scope::Caller,
     ) -> Result<Response<Job>, Status> {
         let (yaml, sha256, manifest_dir) = resolve_manifest(mref).await?;
+        let model_id = parse_to_model(&yaml).ok().map(|m| m.id);
+        let scope = target.scope(
+            &self.runtime_dir,
+            manifest_dir.as_deref(),
+            model_id.as_deref(),
+        )?;
+        if !matches!(verb, Verb::Apply) {
+            caller.check(&self.runtime_dir, &scope)?;
+        }
+        let opts = opts.in_run(&scope.dir);
         // `up` checks the package itself, not only through `experiment up`'s preflight: a
         // `GatewayService.Up` call is an `up` too. What passes is what the run records.
         let (package, kernel) = match verb {
@@ -686,7 +711,10 @@ impl GatewaySvc {
         self.audit.record(rpc, serde_json::Value::Object(fields));
         let shell = self.shell.clone();
         let state = self.state.clone();
-        let runtime_dir = self.runtime_dir.clone();
+        // This run's own directory: its record, manifest, 5G and gPTP files.
+        let runtime_dir = scope.dir.clone();
+        let root = self.runtime_dir.clone();
+        let instance = scope.instance;
         let containers = self.containers.clone();
         let events = self.engine.events().clone();
         let job = self
@@ -696,8 +724,12 @@ impl GatewaySvc {
                 // Built once, here, and kept: every verb downstream reads the model rather
                 // than re-deriving it from the document.
                 let model = parse_to_model(&yaml)?;
-                let plan = GatewayPlan::from_model(&model, crate::services::RUN_SLOT)
-                    .map_err(|e| e.to_string())?;
+                let plan = GatewayPlan::from_model(&model, instance).map_err(|e| e.to_string())?;
+                if matches!(verb, Verb::Up { .. }) {
+                    tokio::fs::create_dir_all(&runtime_dir)
+                        .await
+                        .map_err(|e| format!("cannot create the run's directory: {e}"))?;
+                }
                 p.update(30, &format!("plan: {}", plan.summary()));
                 match verb {
                     Verb::Apply => Ok(format!(
@@ -808,7 +840,7 @@ impl GatewaySvc {
                             p.update(93, "provisioning 5G core (fiveg)");
                             let fp = parse_and_fiveg_plan(&yaml)?;
                             let client = containers.get().await.map_err(|e| e.to_string())?;
-                            let cfg = FiveGLifecycleConfig::for_instance(crate::services::RUN_SLOT);
+                            let cfg = FiveGLifecycleConfig::for_instance(instance);
                             fiveg::fiveg_up(client, &fp, &runtime_dir, &cfg)
                                 .await
                                 .map_err(|e| e.to_string())?;
@@ -928,6 +960,7 @@ impl GatewaySvc {
                         tokio::fs::write(active_record(&runtime_dir), record.to_string())
                             .await
                             .map_err(|e| format!("cannot record the active workspace: {e}"))?;
+                        crate::scope::remember_workspace(&root, instance, &dir);
                         if fresh && let Some(record) = read_active_record(&runtime_dir) {
                             let (kind, target) = crate::runs::target(&record).await;
                             events.emit_run(
@@ -940,13 +973,14 @@ impl GatewaySvc {
 
                         let summary = plan.summary();
                         let mut st = state.lock().await;
-                        st.gateway = Some(plan.clone());
-                        st.active = Some(ActiveExperiment {
+                        let run = st.run_mut(instance);
+                        run.gateway = Some(plan.clone());
+                        run.active = Some(ActiveExperiment {
                             model: model.clone(),
                             dir: manifest_dir.clone().unwrap_or_else(|| PathBuf::from(".")),
                             sha256: sha256.clone(),
                         });
-                        st.fiveg = five_g_plan;
+                        run.fiveg = five_g_plan;
                         drop(st);
 
                         // Emitted after the state is durable, never before: a subscriber told of
@@ -972,7 +1006,7 @@ impl GatewaySvc {
                             p.update(45, "removing UE pods");
                             let fp = parse_and_fiveg_plan(&yaml)?;
                             let client = containers.get().await.map_err(|e| e.to_string())?;
-                            let cfg = FiveGLifecycleConfig::for_instance(crate::services::RUN_SLOT);
+                            let cfg = FiveGLifecycleConfig::for_instance(instance);
                             for session in &fp.sessions {
                                 // Best-effort: an already-absent UE pod
                                 // isn't a teardown failure (ue_down
@@ -1011,7 +1045,7 @@ impl GatewaySvc {
                                 .map_err(|e| e.to_string())
                         })
                         .await?;
-                        *state.lock().await = EdgeState::default();
+                        state.lock().await.runs.remove(&instance);
                         let ended = read_active_record(&runtime_dir);
                         match tokio::fs::remove_file(active_record(&runtime_dir)).await {
                             Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
@@ -1051,6 +1085,8 @@ impl GatewayService for GatewaySvc {
             "gateway.apply",
             req.get_ref().manifest.as_ref(),
             Verb::Apply,
+            crate::scope::start_of(&req, "")?,
+            crate::scope::Caller::of(&req),
         )
         .await
     }
@@ -1064,6 +1100,8 @@ impl GatewayService for GatewaySvc {
             Verb::Up {
                 unlocked: req.get_ref().unlocked,
             },
+            crate::scope::start_of(&req, &req.get_ref().instance)?,
+            crate::scope::Caller::of(&req),
         )
         .await
     }
@@ -1075,23 +1113,32 @@ impl GatewayService for GatewaySvc {
             "gateway.down",
             req.get_ref().manifest.as_ref(),
             Verb::Down,
+            match req.extensions().get::<crate::scope::Slot>() {
+                Some(crate::scope::Slot(i)) => crate::scope::Target::At(*i),
+                None => crate::scope::Target::Existing(req.get_ref().run.clone()),
+            },
+            crate::scope::Caller::of(&req),
         )
         .await
     }
 
     async fn status(
         &self,
-        _: Request<GatewayStatusRequest>,
+        req: Request<GatewayStatusRequest>,
     ) -> Result<Response<GatewayStatus>, Status> {
+        let scope = crate::scope::of(&req, &self.runtime_dir, req.get_ref().run.as_ref(), None)?;
         // Best effort: a workspace that cannot be restored still has a gateway to report.
-        if let Err(e) = restore_active(&self.state, &self.runtime_dir, &self.shell).await {
+        if let Err(e) = restore_active(&self.state, &scope, &self.shell).await {
             tracing::warn!(error = %e.message(), "active workspace not restored");
         }
         let (plan, fiveg_plan) = {
             let st = self.state.lock().await;
-            (st.gateway.clone(), st.fiveg.clone())
+            let run = st.run(scope.instance);
+            (run.gateway.clone(), run.fiveg.clone())
         };
-        self.observe(plan, fiveg_plan).await.map(Response::new)
+        self.observe(scope.instance, plan, fiveg_plan)
+            .await
+            .map(Response::new)
     }
 }
 
@@ -1100,6 +1147,7 @@ impl GatewaySvc {
     /// has to notice a bridge left by a daemon that restarted.
     pub(crate) async fn observe(
         &self,
+        instance: vxedge_core::instance::Instance,
         plan: Option<GatewayPlan>,
         fiveg_plan: Option<FiveGPlan>,
     ) -> Result<GatewayStatus, Status> {
@@ -1257,7 +1305,7 @@ impl GatewaySvc {
                 // No plan in memory. If a bridge exists anyway, say so
                 // honestly (daemon restarted after an up?).
                 let shell = self.shell.clone();
-                let bridge = vxedge_core::gateway::plan::bridge_name(RUN_SLOT);
+                let bridge = vxedge_core::gateway::plan::bridge_name(instance);
                 let orphan = tokio::task::spawn_blocking(move || shell.link_exists(&bridge))
                     .await
                     .unwrap_or(false);
@@ -1267,7 +1315,7 @@ impl GatewaySvc {
                         format!(
                             "bridge {} exists but no plan in memory (daemon restarted?) — \
                              run `vxedge up --manifest ...` to reconcile or `vxedge down` to remove",
-                            vxedge_core::gateway::plan::bridge_name(RUN_SLOT)
+                            vxedge_core::gateway::plan::bridge_name(instance)
                         ),
                         vec![],
                         vec![],
@@ -1293,12 +1341,10 @@ impl GatewaySvc {
             let client = self.containers.get().await.map_err(|e| {
                 crate::errors::unavailable(crate::errors::R::BackendUnavailable, e.to_string())
             })?;
-            let fstatus = fiveg::fiveg_status(
-                client,
-                &FiveGLifecycleConfig::for_instance(crate::services::RUN_SLOT),
-            )
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            let fstatus =
+                fiveg::fiveg_status(client, &FiveGLifecycleConfig::for_instance(instance))
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
             let fiveg_state = if fstatus.all_running() {
                 ResourceState::Up
             } else {
@@ -1541,10 +1587,15 @@ pub struct ZoneSvc {
 
 impl ZoneSvc {
     /// Node plans for the active experiment, optionally filtered to one zone.
-    async fn plans_for(&self, zone_vxid: Option<&str>) -> Result<Vec<NodePlan>, Status> {
-        restore_active(&self.state, &self.runtime_dir, &self.shell).await?;
+    async fn plans_for(
+        &self,
+        scope: &crate::scope::RunScope,
+        zone_vxid: Option<&str>,
+    ) -> Result<Vec<NodePlan>, Status> {
+        restore_active(&self.state, scope, &self.shell).await?;
         let st = self.state.lock().await;
-        let (model, dir, gateway) = match (&st.active, &st.gateway) {
+        let run = st.run(scope.instance);
+        let (model, dir, gateway) = match (&run.active, &run.gateway) {
             (Some(a), Some(g)) => (a.model.clone(), a.dir.clone(), g.clone()),
             _ => {
                 return Err(crate::errors::precondition(
@@ -1591,14 +1642,17 @@ impl ZoneSvc {
         kind: &'static str,
         vxid: String,
         up: bool,
+        scope: crate::scope::RunScope,
     ) -> Result<Response<Job>, Status> {
-        let plans = self.plans_for(Some(&vxid)).await?;
+        let opts = opts.in_run(&scope.dir);
+        let plans = self.plans_for(&scope, Some(&vxid)).await?;
         // The workspace checksum rides along: an audit line saying a zone came up is only
         // provenance if it says which topology it came up in.
         let workspace = self
             .state
             .lock()
             .await
+            .run(scope.instance)
             .active
             .as_ref()
             .map(|a| (a.sha256.clone(), active_identity_algorithm(a)))
@@ -1611,7 +1665,7 @@ impl ZoneSvc {
             }),
         );
         let shell = self.shell.clone();
-        let runtime_dir = self.runtime_dir.clone();
+        let runtime_dir = scope.dir.clone();
         let cache_dir = self.cache_dir.clone();
         let events = self.engine.events().clone();
         let job = self
@@ -1697,7 +1751,7 @@ impl ZoneService for ZoneSvc {
     }
 
     async fn up(&self, req: Request<ZoneUpRequest>) -> Result<Response<Job>, Status> {
-        require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
+        let scope = crate::scope::of(&req, &self.runtime_dir, req.get_ref().run.as_ref(), None)?;
         let vxid = req
             .get_ref()
             .r#ref
@@ -1710,13 +1764,14 @@ impl ZoneService for ZoneSvc {
                     "--vxid <zone id> is required",
                 )
             })?;
+        crate::scope::guard(&req, &self.runtime_dir, &scope)?;
         let opts = crate::jobs::JobOpts::lifecycle(&req, format!("zone {vxid}"));
-        self.lifecycle(opts, "ZoneService.Up", "zone.up", vxid, true)
+        self.lifecycle(opts, "ZoneService.Up", "zone.up", vxid, true, scope)
             .await
     }
 
     async fn down(&self, req: Request<ZoneDownRequest>) -> Result<Response<Job>, Status> {
-        require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
+        let scope = crate::scope::of(&req, &self.runtime_dir, req.get_ref().run.as_ref(), None)?;
         let vxid = req
             .get_ref()
             .r#ref
@@ -1729,8 +1784,9 @@ impl ZoneService for ZoneSvc {
                     "--vxid <zone id> is required",
                 )
             })?;
+        crate::scope::guard(&req, &self.runtime_dir, &scope)?;
         let opts = crate::jobs::JobOpts::lifecycle(&req, format!("zone {vxid}"));
-        self.lifecycle(opts, "ZoneService.Down", "zone.down", vxid, false)
+        self.lifecycle(opts, "ZoneService.Down", "zone.down", vxid, false, scope)
             .await
     }
 
@@ -1738,9 +1794,9 @@ impl ZoneService for ZoneSvc {
         &self,
         req: Request<ZoneListRequest>,
     ) -> Result<Response<ZoneListResponse>, Status> {
-        require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
-        let plans = self.plans_for(None).await?;
-        let nodes = observed_nodes(self.shell.clone(), self.runtime_dir.clone(), plans).await?;
+        let scope = crate::scope::of(&req, &self.runtime_dir, req.get_ref().run.as_ref(), None)?;
+        let plans = self.plans_for(&scope, None).await?;
+        let nodes = observed_nodes(self.shell.clone(), scope.dir.clone(), plans).await?;
         let zones = nodes.iter().filter_map(|n| n.status.clone()).collect();
         Ok(Response::new(ZoneListResponse { zones, nodes }))
     }
@@ -1799,10 +1855,15 @@ impl ComputeSvc {
     /// copy rather than shared with `ZoneSvc`, since `ZoneSvc` is load-bearing for H1/H3/H4 and a
     /// shared helper would put a second caller's requirements on code those frozen results
     /// depend on.
-    async fn plans_for(&self, vxid: Option<&str>) -> Result<Vec<NodePlan>, Status> {
-        restore_active(&self.state, &self.runtime_dir, &self.shell).await?;
+    async fn plans_for(
+        &self,
+        scope: &crate::scope::RunScope,
+        vxid: Option<&str>,
+    ) -> Result<Vec<NodePlan>, Status> {
+        restore_active(&self.state, scope, &self.shell).await?;
         let st = self.state.lock().await;
-        let (model, dir, gateway) = match (&st.active, &st.gateway) {
+        let run = st.run(scope.instance);
+        let (model, dir, gateway) = match (&run.active, &run.gateway) {
             (Some(a), Some(g)) => (a.model.clone(), a.dir.clone(), g.clone()),
             _ => {
                 return Err(crate::errors::precondition(
@@ -1838,12 +1899,15 @@ impl ComputeSvc {
         kind: &'static str,
         vxid: String,
         up: bool,
+        scope: crate::scope::RunScope,
     ) -> Result<Response<Job>, Status> {
-        let plans = self.plans_for(Some(&vxid)).await?;
+        let opts = opts.in_run(&scope.dir);
+        let plans = self.plans_for(&scope, Some(&vxid)).await?;
         let workspace = self
             .state
             .lock()
             .await
+            .run(scope.instance)
             .active
             .as_ref()
             .map(|a| (a.sha256.clone(), active_identity_algorithm(a)))
@@ -1856,7 +1920,7 @@ impl ComputeSvc {
             }),
         );
         let shell = self.shell.clone();
-        let runtime_dir = self.runtime_dir.clone();
+        let runtime_dir = scope.dir.clone();
         let cache_dir = self.cache_dir.clone();
         let events = self.engine.events().clone();
         let job = self
@@ -1939,7 +2003,7 @@ impl ComputeService for ComputeSvc {
     }
 
     async fn up(&self, req: Request<ComputeUpRequest>) -> Result<Response<Job>, Status> {
-        require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
+        let scope = crate::scope::of(&req, &self.runtime_dir, req.get_ref().run.as_ref(), None)?;
         let vxid = req
             .get_ref()
             .r#ref
@@ -1952,13 +2016,14 @@ impl ComputeService for ComputeSvc {
                     "--vxid <compute node id> is required",
                 )
             })?;
+        crate::scope::guard(&req, &self.runtime_dir, &scope)?;
         let opts = crate::jobs::JobOpts::lifecycle(&req, format!("compute {vxid}"));
-        self.lifecycle(opts, "ComputeService.Up", "compute.up", vxid, true)
+        self.lifecycle(opts, "ComputeService.Up", "compute.up", vxid, true, scope)
             .await
     }
 
     async fn down(&self, req: Request<ComputeDownRequest>) -> Result<Response<Job>, Status> {
-        require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
+        let scope = crate::scope::of(&req, &self.runtime_dir, req.get_ref().run.as_ref(), None)?;
         let vxid = req
             .get_ref()
             .r#ref
@@ -1971,19 +2036,26 @@ impl ComputeService for ComputeSvc {
                     "--vxid <compute node id> is required",
                 )
             })?;
+        crate::scope::guard(&req, &self.runtime_dir, &scope)?;
         let opts = crate::jobs::JobOpts::lifecycle(&req, format!("compute {vxid}"));
-        self.lifecycle(opts, "ComputeService.Down", "compute.down", vxid, false)
-            .await
+        self.lifecycle(
+            opts,
+            "ComputeService.Down",
+            "compute.down",
+            vxid,
+            false,
+            scope,
+        )
+        .await
     }
 
     async fn list(
         &self,
         req: Request<ComputeListRequest>,
     ) -> Result<Response<ComputeListResponse>, Status> {
-        require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
-        let plans = self.plans_for(None).await?;
-        let node_status =
-            observed_nodes(self.shell.clone(), self.runtime_dir.clone(), plans).await?;
+        let scope = crate::scope::of(&req, &self.runtime_dir, req.get_ref().run.as_ref(), None)?;
+        let plans = self.plans_for(&scope, None).await?;
+        let node_status = observed_nodes(self.shell.clone(), scope.dir.clone(), plans).await?;
         let nodes = node_status
             .iter()
             .filter_map(|n| n.status.clone())
@@ -2048,10 +2120,28 @@ pub struct SvcSvc {
 }
 
 impl SvcSvc {
+    /// The run a service verb acts on: the run it names, or its workspace's run, or the only one.
+    async fn scope_of(
+        &self,
+        slot: Option<&crate::scope::Slot>,
+        run: Option<&RunRef>,
+        experiment: Option<&ManifestRef>,
+    ) -> Result<crate::scope::RunScope, Status> {
+        let dir = match experiment {
+            Some(m) => resolve_manifest_dir(m).await,
+            None => None,
+        };
+        match slot {
+            Some(crate::scope::Slot(i)) => Ok(crate::scope::RunScope::new(&self.runtime_dir, *i)),
+            None => crate::scope::resolve(&self.runtime_dir, run, dir.as_deref()),
+        }
+    }
+
     async fn service_def(
         &self,
         service_type: &str,
         experiment: Option<&ManifestRef>,
+        scope: &crate::scope::RunScope,
     ) -> Result<DeclaredService, Status> {
         // Before the manifest: a typo'd type is the caller's mistake whatever the experiment
         // declares, and saying so beats "no `bogus` service declared" or "a manifest is required".
@@ -2078,13 +2168,13 @@ impl SvcSvc {
         // which one is active. An inline manifest has no directory; the runtime dir stands in,
         // and telemetry will fail honestly there rather than scrape a workspace that is not on
         // this host.
-        let workspace_dir = dir.unwrap_or_else(|| self.runtime_dir.clone());
+        let workspace_dir = dir.unwrap_or_else(|| scope.dir.clone());
         let node = match &def.on {
             None => None,
             Some(on) => {
                 let refuse =
                     |e: String| crate::errors::precondition(crate::errors::R::WorkspaceInvalid, e);
-                let gateway = GatewayPlan::from_model(&model, crate::services::RUN_SLOT)
+                let gateway = GatewayPlan::from_model(&model, scope.instance)
                     .map_err(|e| refuse(e.to_string()))?;
                 let plans = zones::plan_nodes_from_model(&model, &gateway, &workspace_dir)
                     .map_err(|e| refuse(e.to_string()))?;
@@ -2098,12 +2188,12 @@ impl SvcSvc {
         // for the entity each target belongs to and the daemon's own exporter target (§12).
         let entities = match (&node, def.service_type) {
             (None, vxedge_core::services::ServiceType::Telemetry) => {
-                vxedge_core::services::telemetry_ingest_dir(&def, &self.runtime_dir)
+                vxedge_core::services::telemetry_ingest_dir(&def, &scope.dir)
                     .ok()
                     .map(|dir| {
                         (
                             dir,
-                            crate::telemetry::entities_json(&model, &self.runtime_dir),
+                            crate::telemetry::entities_json(&model, &scope.dir, scope.instance),
                         )
                     })
             }
@@ -2120,12 +2210,10 @@ impl SvcSvc {
 
     /// The active workspace, for a call that names none. `None` when nothing is active, or when
     /// it has no directory to read.
-    async fn active_workspace(&self) -> Option<ManifestRef> {
-        restore_active(&self.state, &self.runtime_dir, &self.shell)
-            .await
-            .ok()?;
+    async fn active_workspace(&self, scope: &crate::scope::RunScope) -> Option<ManifestRef> {
+        restore_active(&self.state, scope, &self.shell).await.ok()?;
         let st = self.state.lock().await;
-        let dir = &st.active.as_ref()?.dir;
+        let dir = &st.run(scope.instance).active.as_ref()?.dir;
         (dir != Path::new(".")).then(|| ManifestRef {
             source: Some(Source::Path(dir.display().to_string())),
             ..Default::default()
@@ -2137,17 +2225,18 @@ impl SvcSvc {
         &self,
         service_type: &str,
         experiment: Option<&ManifestRef>,
+        scope: &crate::scope::RunScope,
     ) -> Option<(NodePlan, vxedge_core::containers::ContainerSpec)> {
         let active;
         let experiment = match experiment {
             Some(named) => named,
             None => {
-                active = self.active_workspace().await?;
+                active = self.active_workspace(scope).await?;
                 &active
             }
         };
         let declared = self
-            .service_def(service_type, Some(experiment))
+            .service_def(service_type, Some(experiment), scope)
             .await
             .ok()?;
         let spec = vxedge_core::services::placed_spec(
@@ -2174,19 +2263,26 @@ struct DeclaredService {
 #[tonic::async_trait]
 impl SvcService for SvcSvc {
     async fn up(&self, req: Request<SvcUpRequest>) -> Result<Response<Job>, Status> {
-        require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
+        let scope = self
+            .scope_of(
+                req.extensions().get(),
+                req.get_ref().run.as_ref(),
+                req.get_ref().experiment.as_ref(),
+            )
+            .await?;
+        crate::scope::guard(&req, &self.runtime_dir, &scope)?;
         let opts =
             crate::jobs::JobOpts::lifecycle(&req, format!("svc {}", req.get_ref().service_type));
         let req = req.into_inner();
         let declared = self
-            .service_def(&req.service_type, req.experiment.as_ref())
+            .service_def(&req.service_type, req.experiment.as_ref(), &scope)
             .await?;
         self.audit.record(
             "SvcService.Up",
             serde_json::json!({ "service_type": req.service_type, "manifest_sha256": declared.sha256 }),
         );
         let bins = self.bins.clone();
-        let runtime_dir = self.runtime_dir.clone();
+        let runtime_dir = scope.dir.clone();
         let cache_dir = self.cache_dir.clone();
         let shell = self.shell.clone();
         let service_type = req.service_type.clone();
@@ -2281,7 +2377,14 @@ impl SvcService for SvcSvc {
     }
 
     async fn down(&self, req: Request<SvcDownRequest>) -> Result<Response<Job>, Status> {
-        require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
+        let scope = self
+            .scope_of(
+                req.extensions().get(),
+                req.get_ref().run.as_ref(),
+                req.get_ref().experiment.as_ref(),
+            )
+            .await?;
+        crate::scope::guard(&req, &self.runtime_dir, &scope)?;
         let opts =
             crate::jobs::JobOpts::lifecycle(&req, format!("svc {}", req.get_ref().service_type));
         let req = req.into_inner();
@@ -2289,13 +2392,13 @@ impl SvcService for SvcSvc {
         // A workspace that no longer reads, or declares no such service, leaves the host path:
         // `down` has to stay idempotent, and the node's own teardown removes a placed member.
         let placed = self
-            .placed(&req.service_type, req.experiment.as_ref())
+            .placed(&req.service_type, req.experiment.as_ref(), &scope)
             .await;
         self.audit.record(
             "SvcService.Down",
             serde_json::json!({ "service_type": req.service_type }),
         );
-        let runtime_dir = self.runtime_dir.clone();
+        let runtime_dir = scope.dir.clone();
         let service_type = req.service_type.clone();
         let events = self.engine.events().clone();
         let service_type_for_event = service_type.clone();
@@ -2331,10 +2434,19 @@ impl SvcService for SvcSvc {
         &self,
         req: Request<SvcStatusRequest>,
     ) -> Result<Response<ResourceStatus>, Status> {
-        require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
+        let scope = self
+            .scope_of(
+                req.extensions().get(),
+                req.get_ref().run.as_ref(),
+                req.get_ref().experiment.as_ref(),
+            )
+            .await?;
         let req = req.into_inner();
         let service_type = parse_service_type(&req.service_type)?.as_str().to_string();
-        if let Some((np, spec)) = self.placed(&service_type, req.experiment.as_ref()).await {
+        if let Some((np, spec)) = self
+            .placed(&service_type, req.experiment.as_ref(), &scope)
+            .await
+        {
             let member = np.clone();
             let state = tokio::task::spawn_blocking(move || zones::member_status(&member, &spec))
                 .await
@@ -2347,7 +2459,7 @@ impl SvcService for SvcSvc {
                 format!("{service_type} service on `{on}`: container {state:?}"),
             )));
         }
-        let runtime_dir = self.runtime_dir.clone();
+        let runtime_dir = scope.dir.clone();
         let st_for_task = service_type.clone();
         let state = tokio::task::spawn_blocking(move || {
             vxedge_core::services::svc_status(&runtime_dir, &st_for_task)
@@ -2392,6 +2504,23 @@ pub struct TrafficSvc {
 }
 
 impl TrafficSvc {
+    /// The run a traffic verb acts on: the run it names, or its workspace's run, or the only one.
+    async fn scope_of(
+        &self,
+        slot: Option<&crate::scope::Slot>,
+        run: Option<&RunRef>,
+        manifest: Option<&ManifestRef>,
+    ) -> Result<crate::scope::RunScope, Status> {
+        let dir = match manifest {
+            Some(m) => resolve_manifest_dir(m).await,
+            None => None,
+        };
+        match slot {
+            Some(crate::scope::Slot(i)) => Ok(crate::scope::RunScope::new(&self.runtime_dir, *i)),
+            None => crate::scope::resolve(&self.runtime_dir, run, dir.as_deref()),
+        }
+    }
+
     /// Resolve a manifest into everything `TrafficPlan::from_manifest`
     /// needs. Builds a fresh `GatewayPlan`/`FiveGPlan` from the manifest
     /// alone rather than reading `GatewaySvc`'s shared `EdgeState` — both
@@ -2403,6 +2532,7 @@ impl TrafficSvc {
     async fn resolve_plans(
         &self,
         mref: Option<&ManifestRef>,
+        scope: &crate::scope::RunScope,
     ) -> Result<(TrafficPlan, Option<FiveGPlan>, String, u64), Status> {
         let (yaml, sha256, _dir) = resolve_manifest(mref).await?;
         let model = parse_to_model(&yaml).map_err(|e| {
@@ -2411,13 +2541,12 @@ impl TrafficSvc {
                 format!("manifest invalid: {e}"),
             )
         })?;
-        let gateway_plan =
-            GatewayPlan::from_model(&model, crate::services::RUN_SLOT).map_err(|e| {
-                crate::errors::invalid(
-                    crate::errors::R::WorkspaceInvalid,
-                    format!("gateway plan: {e}"),
-                )
-            })?;
+        let gateway_plan = GatewayPlan::from_model(&model, scope.instance).map_err(|e| {
+            crate::errors::invalid(
+                crate::errors::R::WorkspaceInvalid,
+                format!("gateway plan: {e}"),
+            )
+        })?;
         let five_g_plan = match FiveGPlan::from_model(&model) {
             Ok(p) => Some(p),
             Err(fiveg::FiveGPlanError::NoSnssaiSlices) => None,
@@ -2491,9 +2620,17 @@ impl TrafficService for TrafficSvc {
         &self,
         req: Request<TrafficStatusRequest>,
     ) -> Result<Response<TrafficStatus>, Status> {
-        require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
-        let (plan, _, _, _) = self.resolve_plans(req.get_ref().manifest.as_ref()).await?;
-        let runtime_dir = self.runtime_dir.clone();
+        let scope = self
+            .scope_of(
+                req.extensions().get(),
+                req.get_ref().run.as_ref(),
+                req.get_ref().manifest.as_ref(),
+            )
+            .await?;
+        let (plan, _, _, _) = self
+            .resolve_plans(req.get_ref().manifest.as_ref(), &scope)
+            .await?;
+        let runtime_dir = scope.dir.clone();
         let profiles = tokio::task::spawn_blocking(move || {
             use vxedge_api::v1::TrafficProfileState as S;
             use vxedge_core::traffic::ProfileState as P;
@@ -2527,11 +2664,18 @@ impl TrafficService for TrafficSvc {
     }
 
     async fn up(&self, req: Request<TrafficUpRequest>) -> Result<Response<Job>, Status> {
-        require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
+        let scope = self
+            .scope_of(
+                req.extensions().get(),
+                req.get_ref().run.as_ref(),
+                req.get_ref().manifest.as_ref(),
+            )
+            .await?;
+        crate::scope::guard(&req, &self.runtime_dir, &scope)?;
         let opts = crate::jobs::JobOpts::request(&req, &req.get_ref().request_id);
         let req = req.into_inner();
         let (traffic_plan, five_g_plan, sha256, method_duration_s) =
-            self.resolve_plans(req.manifest.as_ref()).await?;
+            self.resolve_plans(req.manifest.as_ref(), &scope).await?;
         let duration_s = match req.duration_s {
             0 => method_duration_s,
             d => u64::from(d),
@@ -2541,7 +2685,10 @@ impl TrafficService for TrafficSvc {
             serde_json::json!({ "manifest_sha256": sha256, "profiles": req.profiles }),
         );
         let selected = select_profiles(traffic_plan, &req.profiles)?;
-        let inside = if active_run(&self.runtime_dir).is_some() {
+        let inside = if crate::scope::recorded(&self.runtime_dir)
+            .iter()
+            .any(|(i, _)| *i == scope.instance)
+        {
             inside_nodes(&selected, Path::new("/sys/class/net"))
         } else {
             Vec::new()
@@ -2555,7 +2702,7 @@ impl TrafficService for TrafficSvc {
             let refuse =
                 |e: String| crate::errors::precondition(crate::errors::R::EndpointNotOnHost, e);
             let model = parse_to_model(&yaml).map_err(refuse)?;
-            let gateway = GatewayPlan::from_model(&model, crate::services::RUN_SLOT)
+            let gateway = GatewayPlan::from_model(&model, scope.instance)
                 .map_err(|e| refuse(e.to_string()))?;
             let workspace = dir.unwrap_or_else(|| PathBuf::from("."));
             let nodes = vxedge_core::zones::plan_nodes_from_model(&model, &gateway, &workspace)
@@ -2571,7 +2718,7 @@ impl TrafficService for TrafficSvc {
             .collect();
 
         let shell = self.shell.clone();
-        let runtime_dir = self.runtime_dir.clone();
+        let runtime_dir = scope.dir.clone();
         let vxprobe_bin = self.vxprobe_bin.clone();
         let vxtraffic_bin = self.vxtraffic_bin.clone();
         let containers = self.containers.clone();
@@ -2591,7 +2738,7 @@ impl TrafficService for TrafficSvc {
                     let msg = traffic::profile_up(
                         &containers,
                         &shell,
-                        &FiveGLifecycleConfig::for_instance(crate::services::RUN_SLOT),
+                        &FiveGLifecycleConfig::for_instance(scope.instance),
                         five_g_plan.as_ref(),
                         &runtime_dir,
                         &vxprobe_bin,
@@ -2631,17 +2778,24 @@ impl TrafficService for TrafficSvc {
     }
 
     async fn down(&self, req: Request<TrafficDownRequest>) -> Result<Response<Job>, Status> {
-        require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
+        let scope = self
+            .scope_of(
+                req.extensions().get(),
+                req.get_ref().run.as_ref(),
+                req.get_ref().manifest.as_ref(),
+            )
+            .await?;
+        crate::scope::guard(&req, &self.runtime_dir, &scope)?;
         let req = req.into_inner();
         let (traffic_plan, _five_g_plan, sha256, _duration_s) =
-            self.resolve_plans(req.manifest.as_ref()).await?;
+            self.resolve_plans(req.manifest.as_ref(), &scope).await?;
         self.audit.record(
             "TrafficService.Down",
             serde_json::json!({ "manifest_sha256": sha256, "profiles": req.profiles }),
         );
         let selected = select_profiles(traffic_plan, &req.profiles)?;
 
-        let runtime_dir = self.runtime_dir.clone();
+        let runtime_dir = scope.dir.clone();
         let events = self.engine.events().clone();
         let job = self
             .engine
@@ -2819,8 +2973,8 @@ impl NosCheckSvc {
         Ok((model, image, sha256))
     }
 
-    fn instance_dir(&self, experiment_id: &str) -> PathBuf {
-        self.runtime_dir.join(format!("nos-check-{experiment_id}"))
+    fn instance_dir(&self, scope: &crate::scope::RunScope, experiment_id: &str) -> PathBuf {
+        scope.dir.join(format!("nos-check-{experiment_id}"))
     }
 }
 
@@ -2851,7 +3005,8 @@ fn boot_disposable_copy(
 #[tonic::async_trait]
 impl NosCheckService for NosCheckSvc {
     async fn up(&self, req: Request<NosCheckUpRequest>) -> Result<Response<Job>, Status> {
-        require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
+        let scope = crate::scope::of(&req, &self.runtime_dir, req.get_ref().run.as_ref(), None)?;
+        crate::scope::guard(&req, &self.runtime_dir, &scope)?;
         let req = req.into_inner();
         let (model, image, sha256) = self.resolve(req.experiment.as_ref()).await?;
         self.audit.record(
@@ -2859,7 +3014,7 @@ impl NosCheckService for NosCheckSvc {
             serde_json::json!({ "manifest_sha256": sha256, "experiment": model.id }),
         );
         let name = format!("nos-check-{}", model.id);
-        let instance_dir = self.instance_dir(&model.id);
+        let instance_dir = self.instance_dir(&scope, &model.id);
         let experiment_id = model.id.clone();
         let events = self.engine.events().clone();
         let job = self
@@ -2877,7 +3032,8 @@ impl NosCheckService for NosCheckSvc {
     }
 
     async fn down(&self, req: Request<NosCheckDownRequest>) -> Result<Response<Job>, Status> {
-        require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
+        let scope = crate::scope::of(&req, &self.runtime_dir, req.get_ref().run.as_ref(), None)?;
+        crate::scope::guard(&req, &self.runtime_dir, &scope)?;
         let req = req.into_inner();
         let (yaml, sha256, _dir) = resolve_manifest(req.experiment.as_ref()).await?;
         let model = parse_to_model(&yaml).map_err(|e| {
@@ -2891,7 +3047,7 @@ impl NosCheckService for NosCheckSvc {
             serde_json::json!({ "manifest_sha256": sha256, "experiment": model.id }),
         );
         let name = format!("nos-check-{}", model.id);
-        let instance_dir = self.instance_dir(&model.id);
+        let instance_dir = self.instance_dir(&scope, &model.id);
         let experiment_id = model.id.clone();
         let events = self.engine.events().clone();
         let job = self
@@ -2926,7 +3082,7 @@ impl NosCheckService for NosCheckSvc {
         &self,
         req: Request<NosCheckStatusRequest>,
     ) -> Result<Response<NosCheckStatus>, Status> {
-        require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
+        let scope = crate::scope::of(&req, &self.runtime_dir, req.get_ref().run.as_ref(), None)?;
         let req = req.into_inner();
         let (yaml, _sha256, _dir) = resolve_manifest(req.experiment.as_ref()).await?;
         let model = parse_to_model(&yaml).map_err(|e| {
@@ -2947,7 +3103,7 @@ impl NosCheckService for NosCheckSvc {
             ));
         }
         let name = format!("nos-check-{}", model.id);
-        let instance_dir = self.instance_dir(&model.id);
+        let instance_dir = self.instance_dir(&scope, &model.id);
         let observation = tokio::task::spawn_blocking(move || {
             let plan = vxedge_core::sonic::lifecycle::NosCheckLifecyclePlan {
                 name,
@@ -2975,7 +3131,7 @@ impl NosCheckService for NosCheckSvc {
     }
 
     async fn verify(&self, req: Request<NosCheckVerifyRequest>) -> Result<Response<Job>, Status> {
-        require_run(req.get_ref().run.as_ref(), &self.runtime_dir)?;
+        let scope = crate::scope::of(&req, &self.runtime_dir, req.get_ref().run.as_ref(), None)?;
         let opts = crate::jobs::JobOpts::request(&req, &req.get_ref().request_id);
         let req = req.into_inner();
         let (model, image, sha256) = self.resolve(req.experiment.as_ref()).await?;
@@ -2983,14 +3139,13 @@ impl NosCheckService for NosCheckSvc {
             "NosCheckService.Verify",
             serde_json::json!({ "manifest_sha256": sha256, "experiment": model.id }),
         );
-        let gateway_plan =
-            vxedge_core::gateway::GatewayPlan::from_model(&model, crate::services::RUN_SLOT)
-                .map_err(|e| {
-                    crate::errors::invalid(
-                        crate::errors::R::WorkspaceInvalid,
-                        format!("gateway plan: {e}"),
-                    )
-                })?;
+        let gateway_plan = vxedge_core::gateway::GatewayPlan::from_model(&model, scope.instance)
+            .map_err(|e| {
+                crate::errors::invalid(
+                    crate::errors::R::WorkspaceInvalid,
+                    format!("gateway plan: {e}"),
+                )
+            })?;
         let trunk_port = model
             .nos_check
             .as_ref()
@@ -3006,9 +3161,7 @@ impl NosCheckService for NosCheckSvc {
         // — or reuse — an instance a separate `Up` call left running. Reusing one would hang:
         // a second console connection to an already-logged-in guest never sees `login:` again.
         let name = format!("nos-check-verify-{}-{}", model.id, std::process::id());
-        let instance_dir = self
-            .runtime_dir
-            .join(format!("nos-check-verify-{}", model.id));
+        let instance_dir = scope.dir.join(format!("nos-check-verify-{}", model.id));
         let experiment_id = model.id.clone();
         let events = self.engine.events().clone();
         let job = self

@@ -235,13 +235,32 @@ impl Drop for Daemon {
     }
 }
 
+/// The directory of the run in slot 0, where a daemon keeps a run's record, manifest and ingest
+/// (`ARCHITECTURE.md` §6.0.5). Created, so a test can write into it.
+fn slot0(runtime: &Path) -> PathBuf {
+    let dir = runtime.join("runs").join("0");
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// A run in slot 0 of the workspace in `ws` that is down: its ingest folder is there, and the
+/// slot remembers the workspace, as a daemon leaves them after `down`.
+fn ingested_in_slot0(runtime: &Path, ws: &Path) {
+    std::fs::create_dir_all(slot0(runtime).join("ingest")).unwrap();
+    std::fs::write(
+        slot0(runtime).join("workspace.json"),
+        serde_json::json!({ "dir": ws }).to_string(),
+    )
+    .unwrap();
+}
+
 /// What a daemon leaves behind for a workspace that is still up.
 fn write_active_record(runtime: &Path, id: &str, dir: &Path, sha256: Option<&str>) {
     let mut record = serde_json::json!({ "id": id, "dir": dir, "bridge": "lo" });
     if let Some(sha) = sha256 {
         record["sha256"] = sha.into();
     }
-    std::fs::write(runtime.join("active.json"), record.to_string()).unwrap();
+    std::fs::write(slot0(runtime).join("active.json"), record.to_string()).unwrap();
 }
 
 /// How long a test job may take. Generous because a loaded host (parallel test binaries, another
@@ -338,6 +357,7 @@ async fn experiment_status_refuses_a_workspace_that_is_not_active() {
     let daemon = Daemon::start_with(|run| write_active_record(run, &id, &active, None));
     let refused = ExperimentServiceClient::new(daemon.channel().await)
         .status(ExperimentStatusRequest {
+            run: None,
             manifest: path_ref(&other),
         })
         .await
@@ -355,6 +375,7 @@ async fn experiment_status_reports_services() {
     let daemon = Daemon::start_with(|run| write_active_record(run, &id, &active, None));
     let status = ExperimentServiceClient::new(daemon.channel().await)
         .status(ExperimentStatusRequest {
+            run: None,
             manifest: path_ref(&active),
         })
         .await
@@ -511,6 +532,7 @@ async fn vehicle_status_reports_a_declared_signal_plane() {
     let ws = signal_plane_workspace();
     let status = VehicleServiceClient::new(daemon.channel().await)
         .status(VehicleStatusRequest {
+            run: None,
             manifest: path_ref(&ws),
         })
         .await
@@ -532,6 +554,7 @@ async fn experiment_status_reports_a_declared_signal_plane() {
     let ws = signal_plane_experiment();
     let status = ExperimentServiceClient::new(daemon.channel().await)
         .status(ExperimentStatusRequest {
+            run: None,
             manifest: path_ref(&ws),
         })
         .await
@@ -834,7 +857,7 @@ fn write_run_record(runtime: &Path, id: &str, dir: &Path, run_id: &str) {
         "started_unix_ms": 1234, "sha256": vxedge_core::Workspace::identity(dir).unwrap().value,
         "identity_algorithm": "vxws/2",
     });
-    std::fs::write(runtime.join("active.json"), record.to_string()).unwrap();
+    std::fs::write(slot0(runtime).join("active.json"), record.to_string()).unwrap();
 }
 
 #[tokio::test]
@@ -951,26 +974,6 @@ async fn a_run_that_is_not_active_is_refused() {
 }
 
 #[tokio::test]
-async fn experiment_up_refuses_a_workspace_that_is_not_active() {
-    let (active, id) = experiment_workspace();
-    let (other, _) = experiment_workspace();
-    let daemon = Daemon::start_with(|run| write_active_record(run, &id, &active, None));
-    let refused = ExperimentServiceClient::new(daemon.channel().await)
-        .up(ExperimentUpRequest {
-            manifest: path_ref(&other),
-            stages: Vec::new(),
-            ..Default::default()
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(
-        refused.code(),
-        tonic::Code::FailedPrecondition,
-        "{refused:?}"
-    );
-}
-
-#[tokio::test]
 async fn node_status_is_typed_on_every_backend() {
     let (ws, id) = one_of_each_workspace();
     let daemon = Daemon::start_with(|run| write_active_record(run, &id, &ws, None));
@@ -1054,6 +1057,7 @@ async fn a_declared_device_nothing_provisions_is_unprovisioned() {
     let daemon = Daemon::start_with(|run| write_active_record(run, &id, &ws, None));
     let status = VehicleServiceClient::new(daemon.channel().await)
         .status(VehicleStatusRequest {
+            run: None,
             manifest: path_ref(&ws),
         })
         .await
@@ -1070,6 +1074,7 @@ async fn experiment_status_carries_the_gateway_and_typed_nodes() {
     let daemon = Daemon::start_with(|run| write_active_record(run, &id, &ws, None));
     let status = ExperimentServiceClient::new(daemon.channel().await)
         .status(ExperimentStatusRequest {
+            run: None,
             manifest: path_ref(&ws),
         })
         .await
@@ -1166,11 +1171,13 @@ async fn refusals_carry_a_reason_an_agent_can_branch_on() {
     let channel = daemon.channel().await;
     let wrong = ExperimentServiceClient::new(channel.clone())
         .status(ExperimentStatusRequest {
+            run: None,
             manifest: path_ref(&other),
         })
         .await
         .unwrap_err();
-    assert_eq!(reason(&wrong), "ERROR_REASON_WRONG_WORKSPACE");
+    // Another workspace has no run here; the run that is up is never answered for it.
+    assert_eq!(reason(&wrong), "ERROR_REASON_NO_ACTIVE_RUN");
     let unknown = SvcServiceClient::new(channel.clone())
         .status(SvcStatusRequest {
             service_type: "bogus".into(),
@@ -1547,26 +1554,35 @@ async fn soft_host_requirements_plan_on_any_host() {
     );
 }
 
+/// Several runs share a host (`ARCHITECTURE.md` §6.0.5): another workspace's `up` is planned in
+/// the next free slot instead of being refused for the run already up.
 #[tokio::test]
-async fn plan_and_up_agree_on_the_wrong_workspace() {
+async fn another_workspace_plans_in_the_next_slot_instead_of_being_refused() {
     let (active, id) = experiment_workspace();
     let daemon = Daemon::start_with(|run| write_active_record(run, &id, &active, None));
     let channel = daemon.channel().await;
     let other = workspace_of(PROCESS_ONLY);
     let plan = plan_of(&channel, &other).await;
-    let first = plan.problems.first().expect("refused");
-    assert_eq!(
-        first.reason,
-        vxedge_api::v1::ErrorReason::WrongWorkspace as i32
+    assert!(
+        !plan.problems.iter().any(|p| {
+            p.reason == vxedge_api::v1::ErrorReason::WrongWorkspace as i32
+                || p.reason == vxedge_api::v1::ErrorReason::ForeignWorkload as i32
+        }),
+        "{:?}",
+        plan.problems
     );
-    let refused = VehicleServiceClient::new(channel)
-        .up(VehicleUpRequest {
-            manifest: path_ref(&other),
-            ..Default::default()
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(reason(&refused), "ERROR_REASON_WRONG_WORKSPACE");
+    let host = plan
+        .entities
+        .iter()
+        .find(|e| e.path == "host")
+        .expect("host entity");
+    assert!(
+        host.scrape_targets
+            .iter()
+            .all(|t| !t.starts_with("127.0.0.1:") || t.ends_with("/runs/1")),
+        "the second run's exporter page is its own: {:?}",
+        host.scrape_targets
+    );
 }
 
 #[tokio::test]
@@ -1760,7 +1776,7 @@ fn fake_vxtelemetry(exit: i32) -> PathBuf {
         &bin,
         format!(
             "#!/bin/sh\necho \"$@\" > \"{0}/args\"\necho \"${{VXTELEMETRY_PACKAGE_LOCKED-unset}}\" > \
-             \"{0}/locked\"\nwhile [ $# -gt 0 ]; do [ \"$1\" = --out ] && printf archive > \"$2\"; \
+             \"{0}/locked\"\necho \"${{VXTELEMETRY_INSTANCE-unset}}\" > \"{0}/instance\"\nwhile [ $# -gt 0 ]; do [ \"$1\" = --out ] && printf archive > \"$2\"; \
              shift; done\nexit {exit}\n",
             dir.display()
         ),
@@ -1770,12 +1786,148 @@ fn fake_vxtelemetry(exit: i32) -> PathBuf {
     bin
 }
 
+/// Two runs on one host: each `Collect` archives its own run's ingest folder, in its own slot, so
+/// one run's samples never reach the other's archive (`ARCHITECTURE.md` §6.0.5).
+/// Two runs on one host: both are listed with their slots, a verb that names neither is refused
+/// as ambiguous instead of picking one, and a `RunRef` or a workspace reaches the right one.
+#[tokio::test]
+async fn two_runs_are_listed_and_a_bare_verb_never_picks_one() {
+    let ws_a = vehicle_workspace();
+    let ws_b = vehicle_workspace();
+    let daemon = Daemon::start_with(|run| {
+        for (slot, ws, run_id) in [("0", &ws_a, "run-a"), ("1", &ws_b, "run-b")] {
+            let dir = run.join("runs").join(slot);
+            std::fs::create_dir_all(&dir).unwrap();
+            let record = serde_json::json!({
+                "id": vehicle_id(), "dir": ws, "bridge": "lo", "run_id": run_id,
+                "sha256": vxedge_core::Workspace::identity(ws).unwrap().value,
+                "identity_algorithm": "vxws/2",
+            });
+            std::fs::write(dir.join("active.json"), record.to_string()).unwrap();
+        }
+    });
+    let channel = daemon.channel().await;
+    let runs = RunServiceClient::new(channel.clone())
+        .list(RunListRequest::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .runs;
+    let listed: Vec<(String, String)> = runs
+        .iter()
+        .map(|r| (r.instance.clone(), r.id.clone()))
+        .collect();
+    assert_eq!(
+        listed,
+        [("0".into(), "run-a".into()), ("1".into(), "run-b".into())]
+    );
+    let bare = ZoneServiceClient::new(channel.clone())
+        .list(ZoneListRequest::default())
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&bare), "ERROR_REASON_RUN_AMBIGUOUS");
+    assert!(bare.message().contains("run-a") && bare.message().contains("run-b"));
+    let named = ZoneServiceClient::new(channel.clone())
+        .list(ZoneListRequest {
+            run: Some(RunRef {
+                run_id: "run-b".into(),
+            }),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let ports: Vec<String> = named
+        .nodes
+        .iter()
+        .filter_map(|n| n.spec.as_ref().map(|s| s.port.clone()))
+        .collect();
+    assert!(
+        !ports.is_empty() && ports.iter().all(|p| p.starts_with("vz1-")),
+        "run-b's nodes carry slot 1: {ports:?}"
+    );
+    let by_workspace = VehicleServiceClient::new(channel.clone())
+        .status(VehicleStatusRequest {
+            manifest: path_ref(&ws_a),
+            run: None,
+        })
+        .await;
+    assert!(by_workspace.is_ok(), "{by_workspace:?}");
+    let get = RunServiceClient::new(channel)
+        .get(RunGetRequest { run: None })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&get), "ERROR_REASON_RUN_AMBIGUOUS");
+}
+
+#[tokio::test]
+async fn two_runs_collect_two_archives_each_from_its_own_ingest() {
+    let (ws_a, id_a) = experiment_workspace();
+    let (ws_b, id_b) = experiment_workspace();
+    let bin = fake_vxtelemetry(0);
+    let daemon = Daemon::start_env(
+        |run| {
+            for (slot, id, ws, run_id) in
+                [("0", &id_a, &ws_a, "run-a"), ("1", &id_b, &ws_b, "run-b")]
+            {
+                let dir = run.join("runs").join(slot);
+                std::fs::create_dir_all(dir.join("ingest")).unwrap();
+                std::fs::write(
+                    dir.join("ingest/records.jsonl"),
+                    format!("{{\"run\":\"{run_id}\"}}\n"),
+                )
+                .unwrap();
+                let record = serde_json::json!({
+                    "id": id, "dir": ws, "bridge": "lo", "run_id": run_id,
+                });
+                std::fs::write(dir.join("active.json"), record.to_string()).unwrap();
+            }
+        },
+        &[("VXEDGE_VXTELEMETRY_BIN", &bin)],
+    );
+    let channel = daemon.channel().await;
+    let fake = bin.parent().unwrap().to_path_buf();
+    for (slot, ws) in [("0", &ws_a), ("1", &ws_b)] {
+        let job =
+            vxedge_api::v1::telemetry_service_client::TelemetryServiceClient::new(channel.clone())
+                .collect(vxedge_api::v1::CollectRequest {
+                    manifest: path_ref(ws),
+                    out_path: "results/run.zip".into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .into_inner();
+        assert_eq!(
+            wait_for_job(channel.clone(), job.id.clone()).await,
+            JobState::Succeeded as i32
+        );
+        let args = std::fs::read_to_string(fake.join("args")).unwrap();
+        let ingest = daemon.root.join("run/runs").join(slot).join("ingest");
+        assert!(
+            args.contains(&format!("--ingest-dir {}", ingest.display())),
+            "slot {slot} archives its own ingest: {args}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fake.join("instance"))
+                .unwrap()
+                .trim(),
+            slot,
+            "vxtelemetry is told the slot"
+        );
+        let entities = std::fs::read_to_string(ingest.join("entities.json")).unwrap();
+        assert!(
+            entities.contains(&format!("/runs/{slot}\"")) || !entities.contains("127.0.0.1:"),
+            "the run's exporter target is its own page: {entities}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn collect_returns_the_archive_and_its_digest() {
     let (ws, _) = experiment_workspace();
     let bin = fake_vxtelemetry(0);
     let daemon = Daemon::start_env(
-        |run| std::fs::create_dir_all(run.join("ingest")).unwrap(),
+        |run| ingested_in_slot0(run, &ws),
         &[("VXEDGE_VXTELEMETRY_BIN", &bin)],
     );
     let channel = daemon.channel().await;
@@ -1819,9 +1971,10 @@ async fn collect_returns_the_archive_and_its_digest() {
     assert_eq!(locked.trim(), "unset", "no run, so nothing to say");
     // The binaries the daemon runs, beside what vxtelemetry archives: every tool flag, the
     // daemon first.
-    let tools: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(daemon.root.join("run/ingest/tools.json")).unwrap())
-            .unwrap();
+    let tools: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(daemon.root.join("run/runs/0/ingest/tools.json")).unwrap(),
+    )
+    .unwrap();
     let names: Vec<&str> = tools
         .as_array()
         .unwrap()
@@ -1859,14 +2012,14 @@ async fn collect_passes_on_whether_the_run_was_locked() {
     let bin = fake_vxtelemetry(0);
     let daemon = Daemon::start_env(
         |run| {
-            std::fs::create_dir_all(run.join("ingest")).unwrap();
+            std::fs::create_dir_all(slot0(run).join("ingest")).unwrap();
             let record = serde_json::json!({
                 "id": id, "dir": ws, "bridge": "lo", "run_id": "run-l",
                 "package_id": "vxedge/x", "package_version": "1.0.0",
                 "package_digest": "sha256:abc", "package_locked": false,
                 "kernel_release": "6.1.0", "kernel_preempt_rt": false,
             });
-            std::fs::write(run.join("active.json"), record.to_string()).unwrap();
+            std::fs::write(slot0(run).join("active.json"), record.to_string()).unwrap();
         },
         &[("VXEDGE_VXTELEMETRY_BIN", &bin)],
     );
@@ -1894,7 +2047,7 @@ async fn a_failed_collect_fails_its_job_and_nothing_ingested_is_refused() {
     let (ws, _) = experiment_workspace();
     let bin = fake_vxtelemetry(3);
     let daemon = Daemon::start_env(
-        |run| std::fs::create_dir_all(run.join("ingest")).unwrap(),
+        |run| ingested_in_slot0(run, &ws),
         &[("VXEDGE_VXTELEMETRY_BIN", &bin)],
     );
     let channel = daemon.channel().await;
@@ -2001,6 +2154,7 @@ async fn plan_and_up_refuse_a_package_that_does_not_match_its_lock() {
     let refused =
         vxedge_api::v1::gateway_service_client::GatewayServiceClient::new(channel.clone())
             .up(vxedge_api::v1::GatewayUpRequest {
+                instance: String::new(),
                 manifest: path_ref(&dir),
                 unlocked: false,
             })
@@ -2060,7 +2214,7 @@ async fn run_service_reports_the_package_and_kernel_a_run_recorded() {
     let ws = vehicle_workspace();
     let daemon = Daemon::start_with(|run| {
         write_run_record(run, &vehicle_id(), &ws, "run-p");
-        let path = run.join("active.json");
+        let path = slot0(run).join("active.json");
         let mut record: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         for (k, v) in [
@@ -2974,7 +3128,7 @@ async fn a_campaign_records_each_trial_and_keeps_going_past_a_failure() {
     }
     let results = std::path::PathBuf::from(&status.results_dir);
     assert!(results.starts_with(&dir) && results.join("campaign.json").is_file());
-    let ingest = daemon.root.join("run/ingest");
+    let ingest = daemon.root.join("run/runs/0/ingest");
     let trial: serde_json::Value =
         serde_json::from_slice(&std::fs::read(ingest.join("trial.json")).unwrap()).unwrap();
     assert_eq!(
@@ -3830,7 +3984,7 @@ async fn plan_and_collect_name_the_entities_records_use() {
     let (ws, _) = experiment_workspace();
     let bin = fake_vxtelemetry(0);
     let daemon = Daemon::start_env(
-        |run| std::fs::create_dir_all(run.join("ingest")).unwrap(),
+        |run| ingested_in_slot0(run, &ws),
         &[("VXEDGE_VXTELEMETRY_BIN", &bin)],
     );
     let channel = daemon.channel().await;
@@ -3863,7 +4017,8 @@ async fn plan_and_collect_name_the_entities_records_use() {
         wait_for_job(channel, job.id).await,
         JobState::Succeeded as i32
     );
-    let written = std::fs::read_to_string(daemon.root.join("run/ingest/entities.json")).unwrap();
+    let written =
+        std::fs::read_to_string(daemon.root.join("run/runs/0/ingest/entities.json")).unwrap();
     let listed: serde_json::Value = serde_json::from_str(&written).unwrap();
     let listed: Vec<&str> = listed
         .as_array()
@@ -3883,7 +4038,7 @@ async fn plan_and_collect_name_the_entities_records_use() {
             .collect()
     };
     let written: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(daemon.root.join("run/ingest/entities.json")).unwrap(),
+        &std::fs::read_to_string(daemon.root.join("run/runs/0/ingest/entities.json")).unwrap(),
     )
     .unwrap();
     for e in written.as_array().unwrap() {
@@ -3917,8 +4072,8 @@ async fn follow_carries_the_ingest_log_lines() {
         + &line("host/services/telemetry", "stdout", "ingest starting")
         + &line("car/_/hpc1", "vmm", "vcpu 0 up");
     let daemon = Daemon::start_with(|run| {
-        std::fs::create_dir_all(run.join("ingest")).unwrap();
-        std::fs::write(run.join("ingest/logs.jsonl"), &first).unwrap();
+        std::fs::create_dir_all(slot0(run).join("ingest")).unwrap();
+        std::fs::write(slot0(run).join("ingest/logs.jsonl"), &first).unwrap();
     });
     let mut client =
         vxedge_api::v1::log_service_client::LogServiceClient::new(daemon.channel().await);
@@ -3957,7 +4112,7 @@ async fn follow_carries_the_ingest_log_lines() {
     use std::io::Write;
     std::fs::OpenOptions::new()
         .append(true)
-        .open(daemon.root.join("run/ingest/logs.jsonl"))
+        .open(daemon.root.join("run/runs/0/ingest/logs.jsonl"))
         .unwrap()
         .write_all(line("car/_/hpc1", "serial", "root@hpc1:~#").as_bytes())
         .unwrap();
@@ -3976,9 +4131,9 @@ async fn live_streams_carry_the_ingest_records() {
     use tokio_stream::StreamExt;
     use vxedge_api::v1::{StreamMetricsRequest, StreamRecordsRequest, record};
     let daemon = Daemon::start_with(|run| {
-        std::fs::create_dir_all(run.join("ingest")).unwrap();
+        std::fs::create_dir_all(slot0(run).join("ingest")).unwrap();
         std::fs::write(
-            run.join("ingest/records.jsonl"),
+            slot0(run).join("ingest/records.jsonl"),
             concat!(
                 r#"{"record":"phase","ts_ns":1,"trial":"t1","phase":"measure"}"#, "\n",
                 r#"{"record":"sample","ts_ns":2000000,"entity":"car/front/ecu1","metric":"rtt_seconds","labels":{"quantile":"0.99"},"value":0.5}"#, "\n",
@@ -4055,6 +4210,10 @@ async fn the_daemon_exporter_is_a_host_target_serving_entity_series() {
         .find(|t| t.starts_with("127.0.0.1:"))
         .expect("the exporter is bound to host")
         .clone();
+    // A run's target is its own page of the exporter: `<addr>/runs/<slot>`.
+    let (target, page_path) = target.split_once('/').expect("a run's page");
+    assert_eq!(page_path, "runs/0");
+    let target = target.to_string();
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let get = |path: &'static str| {
@@ -4069,8 +4228,9 @@ async fn the_daemon_exporter_is_a_host_target_serving_entity_series() {
             out
         }
     };
-    let page = get("/metrics").await;
+    let page = get("/runs/0/metrics").await;
     assert!(page.starts_with("HTTP/1.1 200 OK\r\n"), "{page}");
+    assert!(get("/metrics").await.starts_with("HTTP/1.1 200 OK\r\n"));
     assert!(
         page.contains("# TYPE vxedge_process_cpu_seconds_total counter\n")
             && page.contains("vxedge_process_memory_bytes{entity=\"host\",process=\"vxedged\"}"),

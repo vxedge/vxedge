@@ -83,6 +83,9 @@ message CampaignStartRequest {
   // a later `Verdict` or `Compare` that names none, read the references from it. Unset: this
   // host's campaigns, then the campaign's own workspace's `results/`.
   ManifestRef reference_workspace = 7;
+  // The instance slot every trial runs in. Empty takes the lowest free slot at start. The
+  // campaign holds it until it ends, so the trials' names stay the same.
+  string instance = 8;
 }
 
 enum CampaignState {

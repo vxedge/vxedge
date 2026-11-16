@@ -19,13 +19,21 @@ message GatewayUpRequest {
   // unlocked (`Run.package_locked`), so its result is never mistaken for a locked one. Ignored
   // for an inline manifest or a directory without a `vxp.yaml`, which are never lock-checked.
   bool unlocked = 2;
+  // The instance slot to run in (`ARCHITECTURE.md` §6.0.5): one character, 0-9 or a-z. Empty
+  // keeps the workspace's own run's slot, or takes the lowest free one.
+  string instance = 3;
 }
 
 message GatewayDownRequest {
   ManifestRef manifest = 1;
+  // The run to act on. Empty means the run of the workspace `manifest` names, or the only run.
+  RunRef run = 2;
 }
 
-message GatewayStatusRequest {}
+message GatewayStatusRequest {
+  // The run whose gateway to report. Empty means the only run.
+  RunRef run = 1;
+}
 
 message GatewayStatus {
   ResourceStatus status = 1;
@@ -277,16 +285,23 @@ message VehicleUpRequest {
   // unlocked (`Run.package_locked`), so its result is never mistaken for a locked one. Ignored
   // for an inline manifest or a directory without a `vxp.yaml`, which are never lock-checked.
   bool unlocked = 3;
+  // The instance slot to run in (`ARCHITECTURE.md` §6.0.5): one character, 0-9 or a-z. Empty
+  // keeps the workspace's own run's slot, or takes the lowest free one.
+  string instance = 4;
 }
 
 message VehicleDownRequest {
   ManifestRef manifest = 1;
   // Restrict to specific stages (empty = all, in reverse dependency order).
   repeated ExperimentStage stages = 2;
+  // The run to act on. Empty means the run of the workspace `manifest` names, or the only run.
+  RunRef run = 3;
 }
 
 message VehicleStatusRequest {
   ManifestRef manifest = 1;
+  // The run to act on. Empty means the run of the workspace `manifest` names, or the only run.
+  RunRef run = 2;
 }
 
 message VehicleStatus {
@@ -335,6 +350,9 @@ message ExperimentUpRequest {
   // unlocked (`Run.package_locked`), so its result is never mistaken for a locked one. Ignored
   // for an inline manifest or a directory without a `vxp.yaml`, which are never lock-checked.
   bool unlocked = 3;
+  // The instance slot to run in (`ARCHITECTURE.md` §6.0.5): one character, 0-9 or a-z. Empty
+  // keeps the workspace's own run's slot, or takes the lowest free one.
+  string instance = 4;
 }
 
 message ExperimentDownRequest {
@@ -345,10 +363,14 @@ message ExperimentDownRequest {
   ManifestRef manifest = 1;
   // Restrict to specific stages (empty = all, in reverse dependency order).
   repeated ExperimentStage stages = 2;
+  // The run to act on. Empty means the run of the workspace `manifest` names, or the only run.
+  RunRef run = 3;
 }
 
 message ExperimentStatusRequest {
   ManifestRef manifest = 1;
+  // The run to act on. Empty means the run of the workspace `manifest` names, or the only run.
+  RunRef run = 2;
 }
 
 message ExperimentStatus {

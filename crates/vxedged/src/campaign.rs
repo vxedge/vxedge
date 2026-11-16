@@ -269,8 +269,29 @@ impl CampaignService for CampaignSvc {
             )
         })?;
         let profile = (!req.profile.is_empty()).then(|| req.profile.clone());
-        let runtime_dir = self.runtime_dir.clone();
-        let (r, p) = (root.clone(), profile.clone());
+        let id = campaign_id(&req.request_id, &root);
+        // The slot every trial runs in: the one asked for, or the one this campaign already holds
+        // (a retry after a restart), or the lowest free one. Never the workspace's own live run's,
+        // which a campaign does not take over.
+        let in_flight = self.steps.engine.claimed_run_dir().await;
+        let instance = crate::scope::choose_in(
+            &crate::scope::recorded(&self.runtime_dir),
+            |i| {
+                crate::scope::reserved_by(&self.runtime_dir, i).or_else(|| {
+                    (in_flight.as_deref()
+                        == Some(crate::scope::run_dir(&self.runtime_dir, i).as_path()))
+                    .then(|| "a run being brought up".to_string())
+                })
+            },
+            None,
+            crate::scope::requested(&req.instance)?,
+            crate::scope::Asker {
+                campaign: Some(&id),
+                id: None,
+            },
+        )?;
+        let runtime_dir = crate::scope::run_dir(&self.runtime_dir, instance);
+        let (r, p, rd) = (root.clone(), profile.clone(), runtime_dir.clone());
         let prepared = tokio::task::spawn_blocking(move || -> Result<_, Status> {
             let plan = plan_of(&r, p.as_deref())?;
             if let Some(first) = plan.problems.first() {
@@ -293,7 +314,7 @@ impl CampaignService for CampaignSvc {
             let trials = campaign::plan(&intent, method, p.as_deref())
                 .map_err(|e| errors::precondition(R::ParameterInvalid, e))?
                 .trials;
-            let (telemetry_key, ingest_dir) = telemetry_service(&model, &runtime_dir)
+            let (telemetry_key, ingest_dir) = telemetry_service(&model, &rd)
                 .expect("plan_of refuses a campaign without a telemetry service");
             let digest = match &ws.package {
                 Some(_) => vxedge_core::pkg::package_digest(&r).unwrap_or_default(),
@@ -311,8 +332,9 @@ impl CampaignService for CampaignSvc {
                     has_traffic: !model.traffic.is_empty(),
                     has_measurements: !model.measurements.is_empty(),
                     checks: model.checks.clone(),
-                    checks_out: runtime_dir.join(vxedge_core::checks::DIR),
+                    checks_out: rd.join(vxedge_core::checks::DIR),
                     unlocked: false,
+                    instance,
                 },
                 model.id,
                 digest,
@@ -323,7 +345,6 @@ impl CampaignService for CampaignSvc {
         let (mut campaign, experiment_id, package_digest) = prepared;
         campaign.unlocked = req.unlocked;
 
-        let id = campaign_id(&req.request_id, &root);
         // A retry names the campaign it retries, with the same profile, or it is refused: a
         // resumed campaign is never merged with another (ARCHITECTURE.md §6.0.3).
         if let Some(previous) =
@@ -450,14 +471,29 @@ impl CampaignService for CampaignSvc {
             started_unix_ms: now_ms(),
             finished_unix_ms: 0,
             verdict: String::new(),
+            instance: instance.to_string(),
         }));
+        // Held from here to the campaign's end: its trials down and up the vehicle each time, and
+        // another `up` in that gap must not take the slot.
+        crate::scope::reserve(&self.runtime_dir, instance, &id, !req.request_id.is_empty())
+            .map_err(|e| {
+                errors::invalid(
+                    R::Unspecified,
+                    format!("cannot reserve slot {instance}: {e}"),
+                )
+            })?;
         let (steps, runtime_dir) = (self.steps.clone(), self.runtime_dir.clone());
         let rec = record.clone();
-        let job = self
+        let release_id = id.clone();
+        let release_root = self.runtime_dir.clone();
+        let reserved_by = id.clone();
+        let submitted = self
             .steps
             .engine
             .submit_with(
-                JobOpts::claimed_request(format!("campaign {id}"), &req.request_id),
+                // No claim of its own: each trial's up and down queue for the host's claim, so
+                // the host is free between trials.
+                JobOpts::unclaimed_request(&req.request_id),
                 "campaign.run",
                 move |p| async move {
                     let save = |r: &CampaignRecord| run::write(&runtime_dir, r);
@@ -549,6 +585,7 @@ impl CampaignService for CampaignSvc {
                     };
                     r.finished_unix_ms = now_ms();
                     save(&r);
+                    crate::scope::release(&release_root, instance, &release_id);
                     let done = r.trials.len() - failed;
                     if cancelled {
                         Err(JobFailure::cancelled())
@@ -565,7 +602,14 @@ impl CampaignService for CampaignSvc {
                     }
                 },
             )
-            .await?;
+            .await;
+        let job = match submitted {
+            Ok(job) => job,
+            Err(e) => {
+                crate::scope::release(&self.runtime_dir, instance, &reserved_by);
+                return Err(e);
+            }
+        };
         Ok(Response::new(job))
     }
 

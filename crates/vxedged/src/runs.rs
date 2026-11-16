@@ -19,11 +19,12 @@ use vxedge_api::v1::run_service_server::RunService;
 use vxedge_api::v1::vehicle_service_server::VehicleService;
 use vxedge_api::v1::{
     ExperimentStatusRequest, GatewayStatusRequest, Kernel, ManifestRef, PackageRef, ResourceKind,
-    ResourceState, Run, RunGetRequest, RunListRequest, RunListResponse, VehicleStatusRequest,
+    ResourceState, Run, RunGetRequest, RunListRequest, RunListResponse, RunRef,
+    VehicleStatusRequest,
 };
 
 use crate::experiment::ExperimentSvc;
-use crate::services::{ActiveRecord, GatewaySvc, active_run, read_workspace};
+use crate::services::{ActiveRecord, GatewaySvc, read_workspace};
 use crate::vehicle::VehicleSvc;
 
 /// The run's state from what is observed. `STAGING` while a lifecycle job holds the host; the
@@ -74,6 +75,9 @@ impl RunSvc {
         record: &ActiveRecord,
         kind: ResourceKind,
     ) -> Result<(i32, Option<i32>), Status> {
+        let run_ref = RunRef {
+            run_id: record.run_id().to_string(),
+        };
         let manifest = (record.dir != Path::new(".")).then(|| ManifestRef {
             source: Some(Source::Path(record.dir.display().to_string())),
             ..Default::default()
@@ -82,7 +86,10 @@ impl RunSvc {
             (None, _) => None,
             (Some(m), ResourceKind::Vehicle) => self
                 .vehicles
-                .status(Request::new(VehicleStatusRequest { manifest: Some(m) }))
+                .status(Request::new(VehicleStatusRequest {
+                    run: Some(run_ref.clone()),
+                    manifest: Some(m),
+                }))
                 .await
                 .ok()
                 .map(|r| {
@@ -91,7 +98,10 @@ impl RunSvc {
                 }),
             (Some(m), _) => self
                 .experiments
-                .status(Request::new(ExperimentStatusRequest { manifest: Some(m) }))
+                .status(Request::new(ExperimentStatusRequest {
+                    run: Some(run_ref.clone()),
+                    manifest: Some(m),
+                }))
                 .await
                 .ok()
                 .map(|r| {
@@ -104,7 +114,7 @@ impl RunSvc {
             Some(g) => g.state,
             None => {
                 self.gateway
-                    .status(Request::new(GatewayStatusRequest {}))
+                    .status(Request::new(GatewayStatusRequest { run: Some(run_ref) }))
                     .await?
                     .into_inner()
                     .status
@@ -115,10 +125,20 @@ impl RunSvc {
         Ok((gateway, workspace.map(|s| s.state)))
     }
 
-    async fn current(&self) -> Result<Option<Run>, Status> {
-        let Some(record) = active_run(&self.runtime_dir) else {
-            return Ok(None);
-        };
+    /// Every run on the host, lowest slot first.
+    async fn all(&self) -> Result<Vec<Run>, Status> {
+        let mut runs = Vec::new();
+        for (instance, record) in crate::scope::recorded(&self.runtime_dir) {
+            runs.push(self.read(instance, record).await?);
+        }
+        Ok(runs)
+    }
+
+    async fn read(
+        &self,
+        instance: vxedge_core::instance::Instance,
+        record: ActiveRecord,
+    ) -> Result<Run, Status> {
         let (kind, target_id) = target(&record).await;
         let busy = self.gateway.engine.lifecycle_running().await;
         // While a job holds the host the answer is `STAGING` whatever is observed, so skip the
@@ -128,7 +148,8 @@ impl RunSvc {
         } else {
             self.observe(&record, kind).await?
         };
-        Ok(Some(Run {
+        Ok(Run {
+            instance: instance.to_string(),
             id: record.run_id().to_string(),
             kind: kind as i32,
             target_id,
@@ -148,7 +169,7 @@ impl RunSvc {
             workspace_sha256: record.sha256.unwrap_or_default(),
             state: run_state(gateway_state, workspace, busy),
             started_unix_ms: record.started_unix_ms.unwrap_or_default(),
-        }))
+        })
     }
 }
 
@@ -156,21 +177,42 @@ impl RunSvc {
 impl RunService for RunSvc {
     async fn get(&self, req: Request<RunGetRequest>) -> Result<Response<Run>, Status> {
         let wanted = req.into_inner().run.map(|r| r.run_id).unwrap_or_default();
-        match self.current().await? {
-            Some(run) if wanted.is_empty() || run.id == wanted => Ok(Response::new(run)),
-            Some(_) => Err(crate::errors::not_found(
-                crate::errors::R::RunMismatch,
-                format!("no run `{wanted}` on this host"),
-            )),
-            None => Err(crate::errors::not_found(
+        let runs = self.all().await?;
+        if runs.is_empty() {
+            return Err(crate::errors::not_found(
                 crate::errors::R::NoActiveRun,
                 "no run is active on this host",
-            )),
+            ));
         }
+        if wanted.is_empty() {
+            return match <[Run; 1]>::try_from(runs) {
+                Ok([run]) => Ok(Response::new(run)),
+                Err(runs) => Err(crate::errors::precondition(
+                    crate::errors::R::RunAmbiguous,
+                    format!(
+                        "{} runs are up, so name one: {}",
+                        runs.len(),
+                        runs.iter()
+                            .map(|r| format!("`{}` (slot {})", r.id, r.instance))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                )),
+            };
+        }
+        runs.into_iter()
+            .find(|r| r.id == wanted)
+            .map(Response::new)
+            .ok_or_else(|| {
+                crate::errors::not_found(
+                    crate::errors::R::RunMismatch,
+                    format!("no run `{wanted}` on this host"),
+                )
+            })
     }
 
     async fn list(&self, _: Request<RunListRequest>) -> Result<Response<RunListResponse>, Status> {
-        let runs = self.current().await?.into_iter().collect();
+        let runs = self.all().await?;
         Ok(Response::new(RunListResponse { runs }))
     }
 }

@@ -25,29 +25,6 @@ use vxedge_core::zones::NodePlan;
 use crate::errors::{self, R};
 use crate::services::GatewaySvc;
 
-/// The workspace a lifecycle target acts on: `<id>` of `vehicle <id>` or `experiment <id> [stages]`.
-/// A zone, compute or service target acts on the active run and names none.
-fn workspace_of_lifecycle(target: &str) -> Option<&str> {
-    let rest = target
-        .strip_prefix("vehicle ")
-        .or_else(|| target.strip_prefix("experiment "))?;
-    rest.split(' ').next().filter(|id| !id.is_empty())
-}
-
-/// The workspace a running lifecycle job holds, when it is not this one. `vehicle` verbs name a
-/// run by its vehicle's id and `experiment` verbs by the model's, so either is this workspace, and
-/// its own duplicate is the job engine's to answer.
-fn held_by_another(
-    running: Option<&str>,
-    model_id: &str,
-    vehicle_id: Option<&str>,
-) -> Option<String> {
-    running
-        .and_then(workspace_of_lifecycle)
-        .filter(|id| *id != model_id && Some(*id) != vehicle_id)
-        .map(str::to_string)
-}
-
 /// What `up` found before touching the host.
 #[derive(Default)]
 pub(crate) struct Preflight {
@@ -183,6 +160,163 @@ fn intent_reason(kind: vxedge_core::intent::ProblemKind) -> R {
     }
 }
 
+/// Something one host has once, whatever the slot (`ARCHITECTURE.md` §6.0.5): what it is, for
+/// the message, and the value two runs must not share.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HostWide {
+    FiveG,
+    ListenPort(u16),
+    Vxlan {
+        vni: u32,
+        port: u16,
+    },
+    Adopted(String),
+    /// A port a host-process service (no `on:`) listens on.
+    HostPort(u16),
+    /// A host-side address's subnet: `(network, prefix)`.
+    Subnet(u32, u8),
+}
+
+impl HostWide {
+    fn clashes(&self, other: &HostWide) -> bool {
+        match (self, other) {
+            (HostWide::Subnet(a, pa), HostWide::Subnet(b, pb)) => {
+                let p = (*pa).min(*pb);
+                let mask = if p == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - u32::from(p))
+                };
+                a & mask == b & mask
+            }
+            _ => self == other,
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            HostWide::FiveG => "`s-nssai` slices (the host has one 5G core)".into(),
+            HostWide::ListenPort(p) => format!("WireGuard listen port {p}"),
+            HostWide::Vxlan { vni, port } => format!("VXLAN VNI {vni} on port {port}"),
+            HostWide::Adopted(i) => format!("host interface `{i}`"),
+            HostWide::HostPort(p) => format!("host port {p}, which a service listens on"),
+            HostWide::Subnet(n, p) => format!(
+                "host-side addresses in {}/{p}",
+                std::net::Ipv4Addr::from(*n)
+            ),
+        }
+    }
+}
+
+fn subnet(cidr: &str) -> Option<HostWide> {
+    let (ip, prefix) = cidr.split_once('/').unwrap_or((cidr, "24"));
+    let ip: std::net::Ipv4Addr = ip.parse().ok()?;
+    let prefix: u8 = prefix.parse().ok().filter(|p| *p <= 32)?;
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(prefix))
+    };
+    Some(HostWide::Subnet(u32::from(ip) & mask, prefix))
+}
+
+/// What `model`, run in slot `instance`, holds that one host has once.
+pub(crate) fn host_wide(
+    model: &Experiment,
+    instance: vxedge_core::instance::Instance,
+    nodes: &[NodePlan],
+    cache_dir: &Path,
+) -> Vec<HostWide> {
+    use vxedge_core::traffic::ProfileEndpoint as E;
+    let mut held = Vec::new();
+    if model
+        .slices
+        .iter()
+        .any(|s| s.mode == vxedge_core::model::SliceMode::SNssai)
+    {
+        held.push(HostWide::FiveG);
+    }
+    for t in &model.tunnels {
+        match t.kind {
+            vxedge_core::model::TunnelKind::Wireguard => {
+                held.extend(t.listen_port.map(HostWide::ListenPort));
+            }
+            vxedge_core::model::TunnelKind::Vxlan => {
+                held.extend(t.vni.map(|vni| HostWide::Vxlan {
+                    vni,
+                    port: t.dstport.unwrap_or(4789),
+                }));
+            }
+        }
+    }
+    // A service that runs as a host process listens in the host's namespace.
+    for def in model.services.values().filter(|d| d.on.is_none()) {
+        if def.service_type == vxedge_core::services::ServiceType::Ota {
+            let listen = def
+                .config
+                .as_ref()
+                .and_then(|c| c.get("listen"))
+                .and_then(|l| l.as_str())
+                .unwrap_or("0.0.0.0:9900");
+            held.extend(
+                listen
+                    .rsplit_once(':')
+                    .and_then(|(_, p)| p.parse().ok())
+                    .map(HostWide::HostPort),
+            );
+        }
+    }
+    let Ok(gateway) = GatewayPlan::from_model(model, instance) else {
+        return held;
+    };
+    held.extend(
+        gateway
+            .endpoints
+            .iter()
+            .filter(|e| e.kind == vxedge_core::gateway::plan::EndpointKind::Adopted)
+            .map(|e| HostWide::Adopted(e.name.clone())),
+    );
+    // Addresses on the host's side: traffic far sides and host-side peers, and measurement far
+    // sides. They sit in the host's routing table, so two runs' must not overlap.
+    if let Ok(traffic) = vxedge_core::traffic::TrafficPlan::from_model(model, &gateway) {
+        for p in &traffic.profiles {
+            for end in [&p.source, &p.target] {
+                if let E::VlanUplinkFarSide { addr, .. } | E::VlanNodePeer { addr, .. } = end {
+                    held.extend(subnet(&format!("{addr}/24")));
+                }
+            }
+        }
+    }
+    if let Ok(placements) = vxedge_core::measurements::run::plan(model, &gateway, nodes, cache_dir)
+    {
+        use vxedge_core::measurements::run::{Reflector, Sender};
+        for p in &placements {
+            if let Sender::Host(f) = &p.sender {
+                held.extend(subnet(&f.cidr));
+            }
+            if let Reflector::FarSide(f) = &p.reflector {
+                held.extend(subnet(&f.cidr));
+            }
+        }
+    }
+    held
+}
+
+/// The first thing `mine` holds that another run's `theirs` already does: what it is, and the
+/// run that holds it.
+pub(crate) fn held_by_other_run(
+    mine: &[HostWide],
+    theirs: &[(String, Vec<HostWide>)],
+) -> Option<(String, String)> {
+    mine.iter().find_map(|m| {
+        theirs.iter().find_map(|(run, held)| {
+            held.iter()
+                .any(|h| h.clashes(m))
+                .then(|| (m.describe(), run.clone()))
+        })
+    })
+}
+
 /// Every check `up` makes before it touches the host, in the order it makes them.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn preflight(
@@ -192,11 +326,11 @@ pub(crate) async fn preflight(
     nodes: &[NodePlan],
     dir: Option<&Path>,
     unlocked: bool,
-    runtime_dir: &Path,
+    scope: &crate::scope::RunScope,
     cache_dir: &Path,
     gateway: &GatewaySvc,
-    running: Option<String>,
 ) -> Preflight {
+    let runtime_dir = scope.dir.as_path();
     let mut pf = Preflight::default();
     let workspace = dir.unwrap_or_else(|| Path::new("."));
 
@@ -336,45 +470,29 @@ pub(crate) async fn preflight(
     };
     pf.check("package lock", package);
 
-    let active = gateway.active_on_host().await;
-    // A run whose gateway is still being built is not on the host yet, but it already holds the
-    // host: refused by what is recorded, another workspace's `up` would be told it differently
-    // depending on how far that gateway had got.
-    let starting = held_by_another(
-        running.as_deref(),
+    // The run in this slot, if any, must be this workspace's own. Another workspace's run is in
+    // another slot, and one being brought up meanwhile holds the lifecycle claim, which refuses
+    // or queues this `up` before it starts.
+    let active = gateway.active_on_host(scope).await;
+    let target = crate::experiment::check_active_target(
+        verb,
+        active
+            .as_ref()
+            .map(|(id, dir)| (id.as_str(), dir.as_path())),
         &model.id,
-        model.entities.first().map(|e| e.id.as_str()),
-    );
-    let target = match (&active, starting) {
-        (None, Some(other)) => Some(crate::errors::precondition(
-            R::WrongWorkspace,
-            format!(
-                "`{other}` is being brought up or down on this host, not `{}`: `{verb}` only acts \
-                 on what is active — wait for it, then run it from that workspace or bring it down",
-                model.id
-            ),
-        )),
-        _ => crate::experiment::check_active_target(
-            verb,
-            active
-                .as_ref()
-                .map(|(id, dir)| (id.as_str(), dir.as_path())),
-            &model.id,
-            dir,
-        )
-        .err(),
-    };
+        dir,
+    )
+    .err();
     pf.check(
         "active workspace",
         target.map(|s| (R::WrongWorkspace, model.id.clone(), s.message().to_string())),
     );
 
-    let plans = nodes.to_vec();
-    let foreign = tokio::task::spawn_blocking(move || {
-        vxedge_core::zones::foreign_objects(crate::services::RUN_SLOT, &plans)
-    })
-    .await
-    .unwrap_or_default();
+    let (plans, instance) = (nodes.to_vec(), scope.instance);
+    let foreign =
+        tokio::task::spawn_blocking(move || vxedge_core::zones::foreign_objects(instance, &plans))
+            .await
+            .unwrap_or_default();
     pf.check(
         "other vehicles",
         (!foreign.is_empty()).then(|| {
@@ -388,6 +506,75 @@ pub(crate) async fn preflight(
                     who,
                     foreign.join(", ")
                 ),
+            )
+        }),
+    );
+
+    // What one host has once, held by another run, refuses this one (`ARCHITECTURE.md` §6.0.5).
+    let others: Vec<(
+        vxedge_core::instance::Instance,
+        String,
+        Experiment,
+        Vec<NodePlan>,
+    )> = {
+        let st = gateway.state.lock().await;
+        st.runs
+            .iter()
+            .filter(|(i, _)| **i != scope.instance)
+            .filter_map(|(i, r)| {
+                let a = r.active.as_ref()?;
+                let g = r.gateway.as_ref()?;
+                let nodes = vxedge_core::zones::plan_nodes_from_model(&a.model, g, &a.dir)
+                    .unwrap_or_default();
+                Some((*i, a.model.id.clone(), a.model.clone(), nodes))
+            })
+            .collect()
+    };
+    let mut theirs: Vec<(String, Vec<HostWide>)> = others
+        .iter()
+        .map(|(i, id, m, n)| {
+            (
+                format!("`{id}` in slot {i}"),
+                host_wide(m, *i, n, cache_dir),
+            )
+        })
+        .collect();
+    // A campaign between two trials has no run up, and still holds what its next trial needs.
+    let root = gateway.runtime_dir.clone();
+    for i in vxedge_core::instance::Instance::all() {
+        if i == scope.instance || others.iter().any(|(o, ..)| *o == i) {
+            continue;
+        }
+        let Some(campaign) = crate::scope::reserved_by(&root, i) else {
+            continue;
+        };
+        let Some(record) = crate::campaign_run::read(&root, &campaign) else {
+            continue;
+        };
+        let dir = PathBuf::from(&record.workspace);
+        let Ok(text) = vxedge_core::Workspace::read_text(&dir) else {
+            continue;
+        };
+        let Ok(m) = vxedge_core::model::load_yaml(&text) else {
+            continue;
+        };
+        let nodes = GatewayPlan::from_model(&m, i)
+            .ok()
+            .and_then(|g| vxedge_core::zones::plan_nodes_from_model(&m, &g, &dir).ok())
+            .unwrap_or_default();
+        theirs.push((
+            format!("campaign `{campaign}` in slot {i}"),
+            host_wide(&m, i, &nodes, cache_dir),
+        ));
+    }
+    let mine = host_wide(model, scope.instance, nodes, cache_dir);
+    pf.check(
+        "host-wide resources",
+        held_by_other_run(&mine, &theirs).map(|(what, run)| {
+            (
+                R::HeldByRun,
+                model.id.clone(),
+                format!("{what} is held by run {run}; one host has it once"),
             )
         }),
     );
@@ -712,8 +899,6 @@ pub struct PlanSvc {
     pub runtime_dir: PathBuf,
     /// The part cache, where a published artifact store would be fetched to.
     pub cache_dir: PathBuf,
-    /// Read for the lifecycle job running now, so `Plan` refuses what `up` would.
-    pub engine: crate::jobs::JobEngine,
 }
 
 fn on_path(binary: &str) -> bool {
@@ -829,7 +1014,34 @@ impl WorkspaceService for PlanSvc {
             Ok(m) => m,
             Err(e) => return Ok(Response::new(invalid(e.to_string()))),
         };
-        let planned = GatewayPlan::from_model(&model, crate::services::RUN_SLOT)
+        // The slot `up` would take, so the plan names what `up` would create.
+        let instance = match crate::scope::choose(
+            &self.runtime_dir,
+            dir.as_deref(),
+            None,
+            crate::scope::Asker::default(),
+        ) {
+            Ok(i) => i,
+            Err(e) => {
+                use tonic_types::StatusExt;
+                let reason = e
+                    .get_error_details()
+                    .error_info()
+                    .and_then(|i| R::from_str_name(&i.reason))
+                    .unwrap_or(R::HeldByRun);
+                return Ok(Response::new(WorkspacePlan {
+                    valid: false,
+                    problems: vec![PlanProblem {
+                        reason: reason as i32,
+                        subject: "instance".to_string(),
+                        detail: e.message().to_string(),
+                    }],
+                    ..Default::default()
+                }));
+            }
+        };
+        let scope = crate::scope::RunScope::new(&self.runtime_dir, instance);
+        let planned = GatewayPlan::from_model(&model, instance)
             .map_err(|e| e.to_string())
             .and_then(|gw| {
                 vxedge_core::zones::plan_nodes_from_model(
@@ -855,10 +1067,9 @@ impl WorkspaceService for PlanSvc {
             &nodes,
             dir.as_deref(),
             req.get_ref().unlocked,
-            &self.runtime_dir,
+            &scope,
             &self.cache_dir,
             &self.gateway,
-            self.engine.lifecycle_target().await,
         )
         .await;
         let probes = match pf.backends {
@@ -901,7 +1112,7 @@ impl WorkspaceService for PlanSvc {
             services,
             images: all_images(&model, &nodes).into_iter().collect(),
             host_checks,
-            entities: crate::telemetry::entities(&model, &self.runtime_dir)
+            entities: crate::telemetry::entities(&model, &scope.dir, instance)
                 .into_iter()
                 .map(planned_entity)
                 .collect(),
@@ -941,50 +1152,6 @@ impl HostService for PlanSvc {
                     .unwrap_or(false)
             },
         }))
-    }
-}
-
-#[cfg(test)]
-mod lifecycle_tests {
-    use super::{held_by_another, workspace_of_lifecycle};
-
-    #[test]
-    fn a_workspaces_own_running_job_is_not_another_workspace() {
-        let (model, vehicle) = ("vehicle-sedan", Some("sedan"));
-        assert_eq!(held_by_another(Some("vehicle sedan"), model, vehicle), None);
-        assert_eq!(
-            held_by_another(Some("experiment vehicle-sedan"), model, vehicle),
-            None
-        );
-        assert_eq!(held_by_another(None, model, vehicle), None);
-        assert_eq!(held_by_another(Some("zone ecu1"), model, vehicle), None);
-        assert_eq!(
-            held_by_another(
-                Some("vehicle other [EXPERIMENT_STAGE_GATEWAY]"),
-                model,
-                vehicle
-            ),
-            Some("other".to_string())
-        );
-        assert_eq!(
-            held_by_another(Some("experiment exp-002"), model, vehicle),
-            Some("exp-002".to_string())
-        );
-    }
-
-    #[test]
-    fn a_lifecycle_target_names_its_workspace_only_for_a_whole_run() {
-        assert_eq!(
-            workspace_of_lifecycle("vehicle vehicle-x"),
-            Some("vehicle-x")
-        );
-        assert_eq!(
-            workspace_of_lifecycle("experiment exp-002 [EXPERIMENT_STAGE_GATEWAY]"),
-            Some("exp-002")
-        );
-        assert_eq!(workspace_of_lifecycle("zone ecu1"), None);
-        assert_eq!(workspace_of_lifecycle("vxgateway"), None);
-        assert_eq!(workspace_of_lifecycle("vehicle "), None);
     }
 }
 
@@ -1194,5 +1361,51 @@ parts:
         let mut plain = synced.clone();
         plain.time_sync = None;
         assert!(!all_images(&plain, &[]).contains(vxedge_core::gptp::LINUXPTP_IMAGE));
+    }
+}
+
+#[cfg(test)]
+mod host_wide_tests {
+    use super::*;
+
+    #[test]
+    fn overlapping_host_side_subnets_clash_and_disjoint_ones_do_not() {
+        let a = subnet("10.101.0.1/24").unwrap();
+        assert!(a.clashes(&subnet("10.101.0.200/24").unwrap()));
+        assert!(
+            a.clashes(&subnet("10.101.0.0/16").unwrap()),
+            "one inside the other"
+        );
+        assert!(!a.clashes(&subnet("10.102.0.1/24").unwrap()));
+    }
+
+    #[test]
+    fn what_one_host_has_once_is_named_with_the_run_that_holds_it() {
+        let theirs = vec![(
+            "`car` in slot 0".to_string(),
+            vec![HostWide::FiveG, HostWide::ListenPort(51820)],
+        )];
+        let (what, run) = held_by_other_run(&[HostWide::ListenPort(51820)], &theirs).expect("held");
+        assert!(
+            what.contains("51820") && run.contains("slot 0"),
+            "{what} {run}"
+        );
+        assert!(held_by_other_run(&[HostWide::ListenPort(51821)], &theirs).is_none());
+        assert!(held_by_other_run(&[HostWide::FiveG], &theirs).is_some());
+        assert!(
+            held_by_other_run(
+                &[HostWide::Vxlan { vni: 7, port: 4789 }],
+                &[("x".into(), vec![HostWide::Vxlan { vni: 7, port: 4790 }])]
+            )
+            .is_none(),
+            "a VNI on another port is another tunnel"
+        );
+        assert!(
+            held_by_other_run(
+                &[HostWide::Adopted("cvd-etap-01".into())],
+                &[("aaos".into(), vec![HostWide::Adopted("cvd-etap-01".into())])]
+            )
+            .is_some()
+        );
     }
 }
