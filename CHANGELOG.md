@@ -6,6 +6,17 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.31.0] - 2026-11-16
+
+Several runs on one host. Each run holds an instance slot, `0`–`9` then `a`–`z`, that every host object it
+creates carries, and keeps its files in `<runtime-dir>/runs/<s>/`. Another workspace's `up` takes the next
+free slot instead of being refused, a verb that names no run acts on its workspace's run, and a campaign
+holds its slot from start to end while its trials wait their turn for the lifecycle claim. vxAPI stays
+`vxedge.v1`, with `instance` and `RunRef run` fields and two new error reasons, `ERROR_REASON_RUN_AMBIGUOUS`
+and `ERROR_REASON_HELD_BY_RUN`. Host object names change, so scripts that address them directly need the
+new names (listed under Changed). `pkg lock` now pins published check tool images. Pairs with vxtelemetry
+0.11.0, which scrapes each run's own exporter page and records the slot in `metadata.json`.
+
 ### Added
 
 - Several runs on one host (`ARCHITECTURE.md` §5.2, §6.0.5). Each run holds an instance slot, `0`–`9` then
