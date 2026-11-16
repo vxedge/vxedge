@@ -4,7 +4,7 @@
 [![CI](https://github.com/vxedge/vxedge/actions/workflows/ci.yml/badge.svg)](https://github.com/vxedge/vxedge/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/tag/vxedge/vxedge?label=release)](https://github.com/vxedge/vxedge/tags)
 
-vxedge is an open, all-software testbed that maps 5G network slices onto software-defined-vehicle (SDV) E/E architectures on a single Linux machine. This repository is its control plane: the `vxedged` daemon, the **vxAPI** gRPC/Protobuf contract, the thin `vxedge` command-line client, and vxgateway, the software edge gateway (bridge or Open vSwitch, VLAN, `tc` HTB shaping, WireGuard, VXLAN, and the Open5GS and UERANSIM 5G lifecycle). Everything is declared in YAML manifests, the CLI only wraps vxAPI calls, and every published number ships with the manifest and image digests that produced it. Acronyms are defined in [`ACRONYMS.md`](https://github.com/vxedge/docs/blob/main/ACRONYMS.md).
+vxedge is a virtual vehicle with environmental parity, for packaged, measured software-defined-vehicle (SDV) experiments on a single Linux machine. This repository is its control plane: the `vxedged` daemon, the **vxAPI** gRPC/Protobuf contract, the thin `vxedge` command-line client, and vxgateway, the software edge gateway (bridge or Open vSwitch, VLAN, `tc` HTB shaping, WireGuard, VXLAN, and the Open5GS and UERANSIM 5G lifecycle). Everything is declared in YAML manifests, the CLI only wraps vxAPI calls, and every published number ships with the manifest and image digests that produced it. Acronyms are defined in [`ACRONYMS.md`](https://github.com/vxedge/docs/blob/main/ACRONYMS.md).
 
 ## Install
 

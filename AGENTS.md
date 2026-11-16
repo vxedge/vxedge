@@ -17,6 +17,14 @@ crates/
 
 ## Hard rules
 
+- **Branch names use the `vx/` prefix**, for example `vx/fix-probe-drift`. Never name a branch after a
+  tool or vendor. Delete a branch once its PR is merged.
+- **Merge only after formal checks.** Before a PR is merged: its CI is green on the PR head; the Build/test commands below and
+  `cargo deny check`
+  ran clean locally; and the diff was re-read for claims beyond `docs/FACTS.md`, host details and
+  personal or private material. A failing check blocks the merge; never skip, weaken or disable one.
+- **Describe vxedge with `project.summary` from `docs/FACTS.md`** (the README's first lines quote it).
+  Do not write another description of vxedge; 5G slicing is one family of its measured cases.
 - **No orchestration logic in any frontend.** The CLI is a 1:1 wrapper over vxAPI RPCs.
 - **Manifests are the sole source of truth.** Mutating RPCs carry manifest documents/refs;
   daemon state lives only in ephemeral runtime dirs + logs. No database.

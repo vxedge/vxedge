@@ -1,6 +1,6 @@
 cff-version: 1.2.0
 message: "If you use this software or its results, please cite it as below."
-title: "vxedge: control plane, vxAPI, and virtual edge gateway for an all-software SDV testbed"
+title: "vxedge: control plane, vxAPI, and virtual edge gateway of a virtual vehicle with environmental parity"
 type: software
 authors:
   - family-names: "Djaafri"
@@ -15,6 +15,10 @@ license: "Apache-2.0"
 keywords:
   - sdv
   - software-defined-vehicle
+  - environmental-parity
+  - virtual-ecu
+  - xil
+  - ota
   - network-slicing
   - 5g
   - open5gs
@@ -23,6 +27,6 @@ keywords:
   - testbed
   - reproducible-research
 abstract: >-
-  vxedge maps 5G network slices onto zonal and central software-defined-vehicle E/E
-  architectures, entirely in software, on one machine. Every published number ships with the
-  manifest and image digests that produced it.
+  vxedge is a virtual zonal vehicle for OEM and Tier 1 engineers. Software updates, new functions
+  and faults run as packaged experiments on one machine, and every result ships with its digests.
+  5G network slicing onto zonal and central E/E architectures is one family of its measured cases.
