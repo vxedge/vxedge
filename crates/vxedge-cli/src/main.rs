@@ -105,8 +105,12 @@ enum Command {
     },
     /// Show gateway status.
     Status,
-    /// List the runs on this host, each with its instance slot and run id.
-    Runs,
+    /// List the runs on this host, each with its instance slot and run id. `runs status` and
+    /// `runs down` act on several runs, or every run, at once.
+    Runs {
+        #[command(subcommand)]
+        cmd: Option<RunsCmd>,
+    },
     /// Zone lifecycle (vxzones).
     Zone {
         #[command(subcommand)]
@@ -201,6 +205,24 @@ enum Command {
         /// tier phase 1 experiments need.
         #[arg(long, default_value_t = 1)]
         tier: u8,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum RunsCmd {
+    /// Every run's status in one call, or the named runs'.
+    Status {
+        /// Run ids, from `vxedge runs`. None means every run.
+        runs: Vec<String>,
+    },
+    /// Take the named runs down, or every run with `--all`, as one job.
+    Down {
+        /// Run ids, from `vxedge runs`.
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        runs: Vec<String>,
+        /// Every run on the host.
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -1695,7 +1717,51 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     match &cli.command {
-        Command::Runs => {
+        Command::Runs {
+            cmd: Some(RunsCmd::Status { runs }),
+        } => {
+            let channel = connect(&cli.endpoint).await?;
+            let mut client = vxedge_api::v1::run_service_client::RunServiceClient::new(channel);
+            let runs = client
+                .status(vxedge_api::v1::RunStatusRequest {
+                    runs: runs
+                        .iter()
+                        .map(|id| vxedge_api::v1::RunRef { run_id: id.clone() })
+                        .collect(),
+                })
+                .await?
+                .into_inner()
+                .runs;
+            if cli.json {
+                let rows: Vec<JsonRunStatus> = runs.iter().map(JsonRunStatus::from).collect();
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else if runs.is_empty() {
+                println!("no runs on this host");
+            } else {
+                for r in &runs {
+                    print_run_status(r);
+                }
+            }
+        }
+        Command::Runs {
+            cmd: Some(RunsCmd::Down { runs, all }),
+        } => {
+            let channel = connect(&cli.endpoint).await?;
+            let mut client =
+                vxedge_api::v1::run_service_client::RunServiceClient::new(channel.clone());
+            let job = client
+                .down(vxedge_api::v1::RunDownRequest {
+                    runs: runs
+                        .iter()
+                        .map(|id| vxedge_api::v1::RunRef { run_id: id.clone() })
+                        .collect(),
+                    all: *all,
+                })
+                .await?
+                .into_inner();
+            watch_job(channel, job, cli.json).await?;
+        }
+        Command::Runs { cmd: None } => {
             let channel = connect(&cli.endpoint).await?;
             let mut client = vxedge_api::v1::run_service_client::RunServiceClient::new(channel);
             let runs = client
@@ -2747,7 +2813,45 @@ fn print_vehicle_status(st: &vxedge_api::v1::VehicleStatus) {
         resource_state_name(top.state),
         top.detail
     );
-    for c in &st.components {
+    print_parts(&st.components, st.gateway.as_ref());
+}
+
+/// One run of `vxedge runs status`: its line, then its workspace's parts, or why there are none.
+fn print_run_status(r: &vxedge_api::v1::RunStatus) {
+    let run = r.run.clone().unwrap_or_default();
+    if run.instance.is_empty() {
+        println!("{}  not up", run.id);
+    } else {
+        println!(
+            "slot {}  {}  {}  {}",
+            run.instance,
+            run.id,
+            run.target_id,
+            resource_state_name(run.state)
+        );
+    }
+    if r.error_reason != 0 || !r.error_message.is_empty() {
+        println!("  reason: {}", reason_name(r.error_reason));
+        println!("  {}", r.error_message);
+    }
+    if let Some(top) = &r.status {
+        println!(
+            "  {} {}: {} ({})",
+            kind_name(run.kind),
+            top.vxid,
+            resource_state_name(top.state),
+            top.detail
+        );
+    }
+    print_parts(&r.components, r.gateway.as_ref());
+}
+
+/// A workspace's components and gateway, one line each.
+fn print_parts(
+    components: &[vxedge_api::v1::ResourceStatus],
+    gateway: Option<&vxedge_api::v1::GatewayStatus>,
+) {
+    for c in components {
         println!(
             "  {:<12} {:<16} {:<16} {}",
             kind_name(c.kind),
@@ -2756,7 +2860,7 @@ fn print_vehicle_status(st: &vxedge_api::v1::VehicleStatus) {
             c.detail
         );
     }
-    let Some(gw) = &st.gateway else { return };
+    let Some(gw) = gateway else { return };
     for s in &gw.slices {
         println!(
             "  slice        {:<16} {:<16} {}",
@@ -2912,6 +3016,38 @@ impl From<&vxedge_api::v1::ResourceStatus> for JsonResource {
             kind: kind_name(s.kind),
             state: resource_state_name(s.state),
             detail: s.detail.clone(),
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct JsonRunStatus {
+    instance: String,
+    run_id: String,
+    target: String,
+    state: &'static str,
+    status: Option<JsonResource>,
+    components: Vec<JsonResource>,
+    gateway: Option<JsonStatus>,
+    error_reason: &'static str,
+    error_message: String,
+}
+
+impl From<&vxedge_api::v1::RunStatus> for JsonRunStatus {
+    fn from(r: &vxedge_api::v1::RunStatus) -> Self {
+        let run = r.run.clone().unwrap_or_default();
+        Self {
+            instance: run.instance,
+            run_id: run.id,
+            target: run.target_id,
+            state: vxedge_api::v1::ResourceState::try_from(run.state)
+                .map(|s| s.as_str_name())
+                .unwrap_or_default(),
+            status: r.status.as_ref().map(JsonResource::from),
+            components: r.components.iter().map(JsonResource::from).collect(),
+            gateway: r.gateway.as_ref().map(JsonStatus::from),
+            error_reason: reason_name(r.error_reason),
+            error_message: r.error_message.clone(),
         }
     }
 }

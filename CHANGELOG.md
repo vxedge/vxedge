@@ -6,6 +6,23 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **The fleet view (Track F, `ARCHITECTURE.md` §5).** `RunService` gains two RPCs:
+  - `Status` returns every run's status in one call, or the named runs'. Each `RunStatus` holds the run, its
+    rollup, components, gateway and typed nodes. A named run that is not up, or a run whose status cannot be read,
+    is an entry with `error_reason` and `error_message`, not a refusal.
+  - `Down` takes the named runs, or every run with `all`, down as one `run.down` job, one after another and best
+    effort. Each run's own `experiment.down` or `vehicle.down` is a child job carrying its `run_id`, so
+    `JobService.List` with the parent's id gives each run's outcome. A slot a running campaign holds refuses the
+    whole call with `ERROR_REASON_HELD_BY_RUN`, naming every such slot, before anything is touched.
+  - The CLI adds `vxedge runs status [RUN…]` and `vxedge runs down (--all | RUN…)`.
+
+### Changed
+
+- Only the run a lifecycle job acts on reads `STAGING` in `RunService.Get` and `List`. Until now, any lifecycle
+  job made every run read `STAGING`. A job that names no single run, such as `run.down`, still does.
+
 ### Fixed
 
 - A gateway `apply` that finds the access port's ingress qdisc already gone no longer fails: `tc` reports that
