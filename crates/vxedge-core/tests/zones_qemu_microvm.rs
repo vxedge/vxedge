@@ -133,6 +133,9 @@ impl Drop for Guard {
             let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
         }
         let _ = Command::new("ip").args(["netns", "del", &self.ns]).output();
+        let _ = Command::new("ip")
+            .args(["netns", "del", &format!("{}-h", self.ns)])
+            .output();
         let _ = std::fs::remove_dir_all(&self.runtime);
     }
 }
@@ -200,7 +203,9 @@ fn a_probe_guest_boots_on_the_gateway_tap_and_its_reflector_answers_at_the_pinne
 
     let model =
         vxedge_core::model::load_yaml(&workspace(&bundle, &arm.block)).expect("workspace loads");
-    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST).unwrap();
+    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST)
+        .unwrap()
+        .uplink_side_beside(&sh);
     apply(&sh, &plan).unwrap();
     let nodes = plan_nodes_from_model(&model, &plan, Path::new("/")).unwrap();
     let node = &nodes[0];
@@ -208,7 +213,12 @@ fn a_probe_guest_boots_on_the_gateway_tap_and_its_reflector_answers_at_the_pinne
 
     // The far side, on the guest's slice and subnet, the same shape as `gateway_netns.rs`.
     let far_dev = format!("{}.101", plan.uplink_peer);
-    sh.run(
+    // The uplink peer lives in the run's uplink-side namespace, and so does its far side.
+    let side = Shell {
+        netns: Some(plan.uplink_ns.clone()),
+        escalate: sh.escalate,
+    };
+    side.run(
         "ip",
         &[
             "link",
@@ -224,10 +234,10 @@ fn a_probe_guest_boots_on_the_gateway_tap_and_its_reflector_answers_at_the_pinne
         ],
     )
     .unwrap();
-    sh.run("ip", &["addr", "add", FAR_SIDE_CIDR, "dev", &far_dev])
+    side.run("ip", &["addr", "add", FAR_SIDE_CIDR, "dev", &far_dev])
         .unwrap();
-    sh.run("ip", &["link", "set", &far_dev, "up"]).unwrap();
-    sh.run("ip", &["link", "set", &plan.uplink_peer, "up"])
+    side.run("ip", &["link", "set", &far_dev, "up"]).unwrap();
+    side.run("ip", &["link", "set", &plan.uplink_peer, "up"])
         .unwrap();
 
     // --- boot -----------------------------------------------------------------
@@ -262,7 +272,7 @@ fn a_probe_guest_boots_on_the_gateway_tap_and_its_reflector_answers_at_the_pinne
         Acceleration::Kvm => Duration::from_secs(30),
         Acceleration::Tcg => Duration::from_secs(120),
     };
-    wait_for_reflector(&ns, &serial, within);
+    wait_for_reflector(&plan.uplink_ns, &serial, within);
 
     // --- idempotent up --------------------------------------------------------
     let first = guest(&runtime).expect("the guest is running");
@@ -286,7 +296,7 @@ fn a_probe_guest_boots_on_the_gateway_tap_and_its_reflector_answers_at_the_pinne
     );
     node_down(&sh, node, &runtime).unwrap();
     node_up(&sh, node, &runtime, &runtime).unwrap();
-    wait_for_reflector(&ns, &serial, within);
+    wait_for_reflector(&plan.uplink_ns, &serial, within);
     node_down(&sh, node, &runtime).unwrap();
 
     teardown(&sh, &plan).unwrap();

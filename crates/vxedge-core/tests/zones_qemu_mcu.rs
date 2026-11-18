@@ -76,6 +76,9 @@ impl Drop for Guard {
             let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
         }
         let _ = Command::new("ip").args(["netns", "del", &self.ns]).output();
+        let _ = Command::new("ip")
+            .args(["netns", "del", &format!("{}-h", self.ns)])
+            .output();
         let _ = std::fs::remove_dir_all(&self.runtime);
     }
 }
@@ -138,7 +141,9 @@ fn firmware_boots_on_the_gateway_tap_reads_its_address_and_answers() {
     };
 
     let model = vxedge_core::model::load_yaml(&workspace(&bundle)).expect("workspace loads");
-    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST).unwrap();
+    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST)
+        .unwrap()
+        .uplink_side_beside(&sh);
     apply(&sh, &plan).unwrap();
     let nodes = plan_nodes_from_model(&model, &plan, Path::new("/")).unwrap();
     let node = &nodes[0];
@@ -146,7 +151,12 @@ fn firmware_boots_on_the_gateway_tap_reads_its_address_and_answers() {
 
     // The far side, on the guest's slice and subnet, the same shape as `gateway_netns.rs`.
     let far_dev = format!("{}.101", plan.uplink_peer);
-    sh.run(
+    // The uplink peer lives in the run's uplink-side namespace, and so does its far side.
+    let side = Shell {
+        netns: Some(plan.uplink_ns.clone()),
+        escalate: sh.escalate,
+    };
+    side.run(
         "ip",
         &[
             "link",
@@ -162,17 +172,17 @@ fn firmware_boots_on_the_gateway_tap_reads_its_address_and_answers() {
         ],
     )
     .unwrap();
-    sh.run("ip", &["addr", "add", FAR_SIDE_CIDR, "dev", &far_dev])
+    side.run("ip", &["addr", "add", FAR_SIDE_CIDR, "dev", &far_dev])
         .unwrap();
-    sh.run("ip", &["link", "set", &far_dev, "up"]).unwrap();
-    sh.run("ip", &["link", "set", &plan.uplink_peer, "up"])
+    side.run("ip", &["link", "set", &far_dev, "up"]).unwrap();
+    side.run("ip", &["link", "set", &plan.uplink_peer, "up"])
         .unwrap();
 
     // --- boot -----------------------------------------------------------------
     assert_eq!(node_status(&sh, node, &runtime), NodeState::Down);
     node_up(&sh, node, &runtime, &runtime).unwrap();
     assert_eq!(node_status(&sh, node, &runtime), NodeState::Up);
-    wait_for_reflector(&ns, &serial);
+    wait_for_reflector(&plan.uplink_ns, &serial);
     let log = std::fs::read_to_string(&serial).unwrap();
     assert!(
         log.contains(&format!("vx.ip={GUEST_IP}/24")) && log.contains("vx.node=ecu-m3"),
@@ -204,7 +214,7 @@ fn firmware_boots_on_the_gateway_tap_reads_its_address_and_answers() {
     );
     node_down(&sh, node, &runtime).unwrap();
     node_up(&sh, node, &runtime, &runtime).unwrap();
-    wait_for_reflector(&ns, &serial);
+    wait_for_reflector(&plan.uplink_ns, &serial);
     node_down(&sh, node, &runtime).unwrap();
 
     teardown(&sh, &plan).unwrap();

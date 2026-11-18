@@ -25,6 +25,7 @@ fn test_plan() -> GatewayPlan {
         bridge: "vxovstest".into(),
         uplink: "vxovsup".into(),
         uplink_peer: "vxovsupp".into(),
+        uplink_ns: "vxovsh".into(),
         root_rate_mbps: 500,
         slices: vec![SlicePlan {
             id: "adas".into(),

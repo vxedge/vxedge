@@ -62,6 +62,9 @@ impl Drop for Guard {
     fn drop(&mut self) {
         kill_vmm(&self.runtime);
         let _ = Command::new("ip").args(["netns", "del", &self.ns]).output();
+        let _ = Command::new("ip")
+            .args(["netns", "del", &format!("{}-h", self.ns)])
+            .output();
         let _ = std::fs::remove_dir_all(&self.runtime);
     }
 }
@@ -152,7 +155,9 @@ fn a_guest_boots_on_the_gateway_tap_answers_and_survives_its_vmm_dying() {
     };
 
     let model = vxedge_core::model::load_yaml(&workspace(&bundle)).expect("workspace loads");
-    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST).unwrap();
+    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST)
+        .unwrap()
+        .uplink_side_beside(&sh);
     apply(&sh, &plan).unwrap();
     let nodes = plan_nodes_from_model(&model, &plan, Path::new("/")).unwrap();
     let node = &nodes[0];
@@ -161,7 +166,12 @@ fn a_guest_boots_on_the_gateway_tap_answers_and_survives_its_vmm_dying() {
 
     // The far side, on the guest's slice and subnet, the same shape as `gateway_netns.rs`.
     let far_dev = format!("{}.101", plan.uplink_peer);
-    sh.run(
+    // The uplink peer lives in the run's uplink-side namespace, and so does its far side.
+    let side = Shell {
+        netns: Some(plan.uplink_ns.clone()),
+        escalate: sh.escalate,
+    };
+    side.run(
         "ip",
         &[
             "link",
@@ -177,17 +187,17 @@ fn a_guest_boots_on_the_gateway_tap_answers_and_survives_its_vmm_dying() {
         ],
     )
     .unwrap();
-    sh.run("ip", &["addr", "add", FAR_SIDE_CIDR, "dev", &far_dev])
+    side.run("ip", &["addr", "add", FAR_SIDE_CIDR, "dev", &far_dev])
         .unwrap();
-    sh.run("ip", &["link", "set", &far_dev, "up"]).unwrap();
-    sh.run("ip", &["link", "set", &plan.uplink_peer, "up"])
+    side.run("ip", &["link", "set", &far_dev, "up"]).unwrap();
+    side.run("ip", &["link", "set", &plan.uplink_peer, "up"])
         .unwrap();
 
     // --- boot -----------------------------------------------------------------
     assert_eq!(node_status(&sh, node, &runtime), NodeState::Down);
     node_up(&sh, node, &runtime, &runtime).unwrap();
     assert_eq!(node_status(&sh, node, &runtime), NodeState::Up);
-    wait_for_reflector(&ns, &serial);
+    wait_for_reflector(&plan.uplink_ns, &serial);
 
     // Adopting the tap changed nothing about it: still a bridge port, still no address.
     let link = sh
@@ -213,7 +223,7 @@ fn a_guest_boots_on_the_gateway_tap_answers_and_survives_its_vmm_dying() {
     assert_eq!(node_status(&sh, node, &runtime), NodeState::Down);
     node_up(&sh, node, &runtime, &runtime).unwrap();
     assert_eq!(node_status(&sh, node, &runtime), NodeState::Up);
-    wait_for_reflector(&ns, &serial);
+    wait_for_reflector(&plan.uplink_ns, &serial);
 
     // --- down, twice, then a fresh boot -----------------------------------------
     node_down(&sh, node, &runtime).unwrap();
@@ -223,7 +233,7 @@ fn a_guest_boots_on_the_gateway_tap_answers_and_survives_its_vmm_dying() {
     node_down(&sh, node, &runtime).unwrap();
 
     node_up(&sh, node, &runtime, &runtime).unwrap();
-    wait_for_reflector(&ns, &serial);
+    wait_for_reflector(&plan.uplink_ns, &serial);
 
     // --- a daemon with another runtime dir sees the same guest ---------------------
     let other = std::env::temp_dir().join(format!("vxchb{}", std::process::id()));

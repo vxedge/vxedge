@@ -287,11 +287,26 @@ where
 
 /// A zone backend error as a job failure, keeping the reason an agent can act on.
 fn zone_failure(e: zones::backend::ZoneBackendError) -> crate::jobs::JobFailure {
-    let reason = match e {
+    let reason = match &e {
         zones::backend::ZoneBackendError::PortGone { .. } => crate::errors::R::NodePortGone,
+        zones::backend::ZoneBackendError::NetOps(n) => host_requirement(n),
         _ => crate::errors::R::Unspecified,
     };
     crate::jobs::JobFailure::new(reason, e.to_string())
+}
+
+/// A gateway stage's error as a job failure. What the host lacks (a sudo rule, or the
+/// capability to enter the run's uplink-side namespace) is `HOST_REQUIREMENT_UNMET`.
+fn gateway_failure(e: gateway::netops::NetOpsError) -> crate::jobs::JobFailure {
+    crate::jobs::JobFailure::new(host_requirement(&e), e.to_string())
+}
+
+fn host_requirement(e: &gateway::netops::NetOpsError) -> crate::errors::R {
+    use gateway::netops::NetOpsError as E;
+    match e {
+        E::NoSudo { .. } | E::CannotEnterNetns { .. } => crate::errors::R::HostRequirementUnmet,
+        _ => crate::errors::R::Unspecified,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -719,7 +734,7 @@ impl GatewaySvc {
         let events = self.engine.events().clone();
         let job = self
             .engine
-            .submit_with(opts, kind, move |p| async move {
+            .submit_with::<_, _, crate::jobs::JobFailure>(opts, kind, move |p| async move {
                 p.update(10, "parsing workspace");
                 // Built once, here, and kept: every verb downstream reads the model rather
                 // than re-deriving it from the document.
@@ -763,7 +778,7 @@ impl GatewaySvc {
                             blocking(move || {
                                 gateway::data_plane(pl.data_plane)
                                     .apply_links(&sh, &pl)
-                                    .map_err(|e| e.to_string())
+                                    .map_err(gateway_failure)
                             })
                             .await?;
                             p.update(65, &format!("applying slice VLANs + HTB queue tree{note}"));
@@ -772,7 +787,7 @@ impl GatewaySvc {
                             blocking(move || {
                                 gateway::data_plane(pl.data_plane)
                                     .apply_slices(&sh, &pl)
-                                    .map_err(|e| e.to_string())
+                                    .map_err(gateway_failure)
                             })
                             .await?;
                             p.update(80, &format!("attaching zone endpoints{note}"));
@@ -781,7 +796,7 @@ impl GatewaySvc {
                             blocking(move || {
                                 gateway::data_plane(pl.data_plane)
                                     .apply_endpoints(&sh, &pl)
-                                    .map_err(|e| e.to_string())
+                                    .map_err(gateway_failure)
                             })
                             .await?;
                             // Found live 2026-08-04, testing VXLAN provisioning end to end
@@ -801,7 +816,7 @@ impl GatewaySvc {
                             blocking(move || {
                                 gateway::data_plane(pl.data_plane)
                                     .apply_tunnels(&sh, &pl)
-                                    .map_err(|e| e.to_string())
+                                    .map_err(gateway_failure)
                             })
                             .await?;
                             p.update(90, "verifying observed state");
@@ -824,14 +839,14 @@ impl GatewaySvc {
                         }
                         let obs = last_obs.expect("loop runs at least once");
                         if !obs.fully_up() {
-                            return Err(format!(
+                            return Err(crate::jobs::JobFailure::from(format!(
                                 "provisioning incomplete after {MAX_ATTEMPTS} attempts (idempotent \
                                  re-apply did not converge): bridge={} uplink={} endpoints={}/{}",
                                 obs.bridge_present,
                                 obs.uplink_present,
                                 obs.endpoints_present,
                                 obs.endpoints_expected
-                            ));
+                            )));
                         }
 
                         let five_g_plan = if plan.snssai_slice_ids.is_empty() {
@@ -1042,14 +1057,16 @@ impl GatewaySvc {
                         blocking(move || {
                             gateway::data_plane(pl.data_plane)
                                 .teardown(&sh, &pl)
-                                .map_err(|e| e.to_string())
+                                .map_err(gateway_failure)
                         })
                         .await?;
                         state.lock().await.runs.remove(&instance);
                         let ended = read_active_record(&runtime_dir);
                         match tokio::fs::remove_file(active_record(&runtime_dir)).await {
                             Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                                return Err(format!("cannot clear the active workspace: {e}"));
+                                return Err(crate::jobs::JobFailure::from(format!(
+                                    "cannot clear the active workspace: {e}"
+                                )));
                             }
                             _ => {}
                         }
@@ -2575,6 +2592,58 @@ impl TrafficSvc {
     }
 }
 
+/// Every IPv4 address in the daemon's namespace (`netns`, else its own), as `(interface, cidr)`.
+fn host_addresses(netns: Option<&str>) -> Vec<(String, String)> {
+    let mut cmd = std::process::Command::new("ip");
+    if let Some(ns) = netns {
+        cmd.args(["-n", ns]);
+    }
+    let Ok(out) = cmd.args(["-o", "-4", "addr", "show"]).output() else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let at = f.iter().position(|w| *w == "inet")?;
+            Some((f.get(1)?.to_string(), f.get(at + 1)?.to_string()))
+        })
+        .collect()
+}
+
+/// Why `profile` cannot put its device end's address on the host: another interface there
+/// already has an address in that end's /24, which is another run's device whose zone is down.
+fn host_subnet_held(
+    profile: &vxedge_core::traffic::ResolvedProfile,
+    addrs: &[(String, String)],
+) -> Option<String> {
+    use vxedge_core::traffic::ProfileEndpoint;
+    let net24 = |a: &str| {
+        a.split('/')
+            .next()?
+            .rsplit_once('.')
+            .map(|(n, _)| n.to_string())
+    };
+    [&profile.source, &profile.target].into_iter().find_map(|ep| {
+        let ProfileEndpoint::VlanNodePeer {
+            peer_iface, addr, ..
+        } = ep
+        else {
+            return None;
+        };
+        let mine = net24(addr)?;
+        let (iface, cidr) = addrs
+            .iter()
+            .find(|(i, c)| i != peer_iface && net24(c).as_deref() == Some(mine.as_str()))?;
+        Some(format!(
+            "traffic profile `{}`: its device end `{peer_iface}` would take {addr}/24 on the host, \
+             and `{iface}` already has {cidr} there, the end of another run's device whose zone \
+             is down. Bring that zone up, or this device's, so the traffic runs inside its node",
+            profile.id
+        ))
+    })
+}
+
 /// The profiles whose node-side endpoint is not on the host: a node whose zone is up holds its
 /// gateway-side veth in its own namespace, so its generator runs inside the node
 /// (`traffic::in_node`) instead of on the host.
@@ -2716,6 +2785,17 @@ impl TrafficService for TrafficSvc {
             .into_iter()
             .filter(|p| !inside.contains(&p.id))
             .collect();
+        // What stays on the host: a device end whose zone is down takes its address in the host's
+        // routing table, which another run's may already hold (`ARCHITECTURE.md` §6.0.5).
+        let addrs = host_addresses(self.shell.netns.as_deref());
+        for profile in &selected {
+            if let Some(why) = host_subnet_held(profile, &addrs) {
+                return Err(crate::errors::precondition(
+                    crate::errors::R::HeldByRun,
+                    why,
+                ));
+            }
+        }
 
         let shell = self.shell.clone();
         let runtime_dir = scope.dir.clone();
@@ -3259,6 +3339,7 @@ mod tests {
                 uplink_peer: "vxup0p".into(),
                 vlan: 103,
                 addr: "10.103.0.1".into(),
+                netns: "vxh0".into(),
             },
             pps: None,
             bandwidth_mbps: Some(10),
@@ -3267,6 +3348,36 @@ mod tests {
         assert!(inside_nodes(&[profile("vzp-present")], &net).is_empty());
         assert_eq!(inside_nodes(&[profile("vzp-gone")], &net), ["load"]);
         let _ = std::fs::remove_dir_all(&net);
+    }
+
+    #[test]
+    fn a_device_end_on_the_host_is_refused_when_another_runs_end_holds_its_subnet() {
+        use vxedge_core::traffic::{ProfileEndpoint, ResolvedProfile};
+        let profile = ResolvedProfile {
+            id: "load".into(),
+            source: ProfileEndpoint::VlanNodePeer {
+                peer_iface: "vp1-node-a".into(),
+                vlan: 103,
+                addr: "10.103.0.2".into(),
+            },
+            target: ProfileEndpoint::VlanUplinkFarSide {
+                uplink_peer: "vxup1p".into(),
+                vlan: 103,
+                addr: "10.103.0.1".into(),
+                netns: "vxh1".into(),
+            },
+            pps: None,
+            bandwidth_mbps: Some(10),
+            payload_bytes: 64,
+        };
+        let held = [("vp0-node-a".to_string(), "10.103.0.2/24".to_string())];
+        let why = host_subnet_held(&profile, &held).expect("another run's end holds the subnet");
+        assert!(why.contains("vp0-node-a"), "{why}");
+        // Its own interface, or another subnet, is no clash; far sides are never on the host.
+        let own = [("vp1-node-a".to_string(), "10.103.0.2/24".to_string())];
+        assert!(host_subnet_held(&profile, &own).is_none());
+        let other = [("vp0-node-b".to_string(), "10.104.0.2/24".to_string())];
+        assert!(host_subnet_held(&profile, &other).is_none());
     }
 
     use super::*;

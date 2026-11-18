@@ -110,6 +110,7 @@ impl Drop for Cleanup {
             .args(&names)
             .output();
         let _ = sudo(&["ip", "netns", "del", &self.ns]);
+        let _ = sudo(&["ip", "netns", "del", &format!("{}-h", self.ns)]);
         let _ = std::fs::remove_dir_all(&self.runtime);
     }
 }
@@ -168,7 +169,9 @@ fn followers_sync_to_the_gateway_grandmaster_and_the_exporter_serves_them() {
         escalate: true,
     };
     let model = vxedge_core::model::load_yaml(&workspace()).expect("workspace loads");
-    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST).unwrap();
+    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST)
+        .unwrap()
+        .uplink_side_beside(&sh);
     let _cleanup = Cleanup {
         ns: ns.clone(),
         runtime: runtime.clone(),

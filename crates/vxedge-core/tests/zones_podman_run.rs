@@ -85,6 +85,7 @@ struct NetnsGuard(String);
 impl Drop for NetnsGuard {
     fn drop(&mut self) {
         let _ = sudo(&["ip", "netns", "del", &self.0]);
+        let _ = sudo(&["ip", "netns", "del", &format!("{}-h", self.0)]);
     }
 }
 
@@ -260,7 +261,9 @@ fn a_parts_run_starts_its_payload_and_multicast_crosses_the_slice() {
 
     let run_b = "{ args: [--listen, '0.0.0.0:9811'], env: { VX_ROLE: reflector } }";
     let model = vxedge_core::model::load_yaml(&workspace(run_b)).expect("workspace loads");
-    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST).unwrap();
+    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST)
+        .unwrap()
+        .uplink_side_beside(&sh);
     apply(&sh, &plan).unwrap();
     let runtime = std::env::temp_dir().join(format!("vxzones-run-{}", std::process::id()));
     std::fs::create_dir_all(&runtime).unwrap();

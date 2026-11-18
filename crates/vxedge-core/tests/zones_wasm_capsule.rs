@@ -96,8 +96,12 @@ fn own_uid() -> u32 {
     std::fs::metadata("/proc/self").unwrap().uid()
 }
 
-fn wait_for_reflector() -> UdpSocket {
-    let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+/// A socket on the far side, in the run's uplink-side namespace `ns`, once the capsule's
+/// reflector answers it. A socket stays in the namespace it was made in.
+fn wait_for_reflector(ns: &str) -> UdpSocket {
+    let socket = vxedge_core::gateway::netlink::in_netns(ns, || UdpSocket::bind("0.0.0.0:0"))
+        .expect("enters the uplink-side namespace")
+        .unwrap();
     socket.connect(REFLECTOR).unwrap();
     socket
         .set_read_timeout(Some(Duration::from_millis(50)))
@@ -159,14 +163,21 @@ fn gateway_for(yaml: &str) -> (Shell, GatewayPlan, NodePlan, PathBuf) {
         escalate: true,
     };
     let model = vxedge_core::model::load_yaml(yaml).expect("workspace loads");
-    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST).unwrap();
+    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST)
+        .unwrap()
+        .uplink_side_beside(&sh);
     apply(&sh, &plan).unwrap();
     let nodes = plan_nodes_from_model(&model, &plan, Path::new("/")).unwrap();
     let node = nodes[0].clone();
 
     // The far side, on the sensor's slice and subnet.
     let far_dev = format!("{}.102", plan.uplink_peer);
-    sh.run(
+    // The uplink peer lives in the run's uplink-side namespace, and so does its far side.
+    let side = Shell {
+        netns: Some(plan.uplink_ns.clone()),
+        escalate: sh.escalate,
+    };
+    side.run(
         "ip",
         &[
             "link",
@@ -182,10 +193,10 @@ fn gateway_for(yaml: &str) -> (Shell, GatewayPlan, NodePlan, PathBuf) {
         ],
     )
     .unwrap();
-    sh.run("ip", &["addr", "add", FAR_SIDE_CIDR, "dev", &far_dev])
+    side.run("ip", &["addr", "add", FAR_SIDE_CIDR, "dev", &far_dev])
         .unwrap();
-    sh.run("ip", &["link", "set", &far_dev, "up"]).unwrap();
-    sh.run("ip", &["link", "set", &plan.uplink_peer, "up"])
+    side.run("ip", &["link", "set", &far_dev, "up"]).unwrap();
+    side.run("ip", &["link", "set", &plan.uplink_peer, "up"])
         .unwrap();
     (sh, plan, node, runtime)
 }
@@ -209,7 +220,7 @@ fn a_capsule_answers_across_the_gateway_and_stops_while_idle() {
     // --- start ----------------------------------------------------------------
     let started = Instant::now();
     node_up(&sh, &node, &runtime, &runtime).unwrap();
-    let socket = wait_for_reflector();
+    let socket = wait_for_reflector(&plan.uplink_ns);
     let up_to_echo = started.elapsed();
     assert_eq!(node_status(&sh, &node, &runtime), NodeState::Up);
 
@@ -265,7 +276,7 @@ fn a_capsule_answers_across_the_gateway_and_stops_while_idle() {
     }
     assert_eq!(node_status(&sh, &node, &runtime), NodeState::Down);
     node_up(&sh, &node, &runtime, &runtime).unwrap();
-    wait_for_reflector();
+    wait_for_reflector(&plan.uplink_ns);
 
     // --- down while idle: the case that decided this is a process -------------------
     std::thread::sleep(Duration::from_millis(200));
@@ -285,10 +296,8 @@ fn a_capsule_answers_across_the_gateway_and_stops_while_idle() {
 
     // --- the port died with the namespace; a re-apply and a fresh start restore it ----
     apply(&sh, &plan).unwrap();
-    sh.run("ip", &["link", "set", &plan.uplink_peer, "up"])
-        .unwrap();
     node_up(&sh, &node, &runtime, &runtime).unwrap();
-    wait_for_reflector();
+    wait_for_reflector(&plan.uplink_ns);
 }
 
 /// The whole runner stays on the node's CPUs, every thread of it, wasmtime's included.
@@ -305,7 +314,7 @@ fn a_pinned_capsule_keeps_every_thread_on_its_cpu() {
     };
     assert_eq!(node.pinned_cpus, [1]);
     node_up(&sh, &node, &runtime, &runtime).unwrap();
-    wait_for_reflector();
+    wait_for_reflector(&plan.uplink_ns);
 
     let pids = runner_pids();
     assert_eq!(pids.len(), 1, "one runner: {pids:?}");
@@ -338,6 +347,6 @@ fn a_published_capsule_is_fetched_by_digest() {
     };
     assert_eq!(node.module, None);
     node_up(&sh, &node, &runtime, &runtime).unwrap();
-    wait_for_reflector();
+    wait_for_reflector(&plan.uplink_ns);
     assert_eq!(node_status(&sh, &node, &runtime), NodeState::Up);
 }

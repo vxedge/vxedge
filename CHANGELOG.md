@@ -12,6 +12,25 @@ All notable changes to this repo are documented here. Format follows
   5G slicing is one family of its measured cases. `README.md`, the `CITATION.cff` title, abstract and keywords,
   and the `vxedge --help` description use the wording registered in `docs/FACTS.md` (`project.summary`,
   `project.description`). No identifier, API or result changes.
+- Each run's uplink side lives in a network namespace of its own, `vxh<s>` (`ARCHITECTURE.md` §6.0.5). It holds
+  the uplink peer `vxup<s>p`, its VLAN subinterfaces, every far side on them (a `to: internet` reflector, a
+  `from: host` sender, a traffic profile's far side) and the processes on those far sides. The uplink `vxup<s>`
+  stays on the bridge, so a slice's queue still shapes everything that crosses it.
+  - Two runs may use the same far-side subnets, so two copies of one measuring experiment run at once. Far sides
+    leave the host-wide resources, and two runs' probe senders no longer share a metrics port on the host's
+    loopback.
+  - The host no longer reaches a far side directly: scripts enter it with `ip netns exec vxh<s>`, and leak checks
+    should list `vxh` names.
+  - Every `up` enters the namespace. A daemon without `CAP_SYS_ADMIN` is refused before anything is created, and
+    a missing sudo rule for `ip netns add` fails the same way. Both carry `ERROR_REASON_HOST_REQUIREMENT_UNMET`
+    and name what is missing.
+  - A measurement whose metrics cannot be read is logged with the reason instead of being left out silently.
+- A traffic profile whose end is a VM's tap is refused with `ERROR_REASON_WORKSPACE_INVALID`. A tap is the
+  bridge port itself, so an address on it sent into the guest, and vxedge runs no generator inside a guest.
+- A traffic profile whose container device's zone is down still puts that end's address on the host. Its traffic
+  now crosses the bridge, the access port and the uplink to the far side. Until now both ends were host addresses,
+  so that traffic went over loopback. `TrafficService.Up` refuses the profile with `ERROR_REASON_HELD_BY_RUN`
+  when another run's end holds an address in that /24.
 
 ## [0.31.0] - 2026-11-16
 

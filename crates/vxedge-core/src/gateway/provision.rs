@@ -33,6 +33,7 @@ const DEFAULT_CLASS: &str = "fffe";
 
 /// Phase 1 of apply: bridge + trunk uplink.
 pub fn apply_links(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
+    refuse_without_netns_entry(plan)?;
     let ns = sh.netns.as_deref();
     netlink::ensure_bridge(ns, &plan.bridge).map_err(nl)?;
     netlink::link_up(ns, &plan.bridge).map_err(nl)?;
@@ -41,8 +42,70 @@ pub fn apply_links(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
     ensure_uplink(sh, plan)?;
     netlink::set_master(ns, &plan.uplink, &plan.bridge).map_err(nl)?;
     netlink::link_up(ns, &plan.uplink).map_err(nl)?;
-    netlink::link_up(ns, &plan.uplink_peer).map_err(nl)?;
+    ensure_uplink_side(sh, plan)
+}
+
+/// The run's uplink side (`ARCHITECTURE.md` §6.0.5): the namespace `vxh<s>`, its loopback up
+/// (senders serve their metrics there), and the uplink peer moved into it and up. A repeated
+/// `up`, or one after a daemon restart, finds the peer already there.
+fn ensure_uplink_side(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
+    super::netops::ensure_named_netns(sh, &plan.uplink_ns)?;
+    let ns = sh.netns.as_deref();
+    if netlink::link_exists(ns, &plan.uplink_peer) {
+        netlink::move_to_netns(ns, &plan.uplink_peer, &plan.uplink_ns).map_err(nl)?;
+    }
+    let side = Some(plan.uplink_ns.as_str());
+    netlink::link_up(side, "lo").map_err(nl)?;
+    netlink::link_up(side, &plan.uplink_peer).map_err(nl)?;
     Ok(())
+}
+
+/// Every `up` enters the run's uplink-side namespace, so a process that cannot is refused before
+/// anything is created rather than halfway.
+fn refuse_without_netns_entry(plan: &GatewayPlan) -> Result<(), NetOpsError> {
+    if super::netops::can_enter_netns() {
+        Ok(())
+    } else {
+        Err(NetOpsError::CannotEnterNetns {
+            netns: plan.uplink_ns.clone(),
+        })
+    }
+}
+
+/// Remove the run's uplink side: whatever still runs in it is stopped first, since a process
+/// inside keeps a deleted namespace alive, then the namespace goes, and the uplink peer and its
+/// VLAN subinterfaces with it.
+fn teardown_uplink_side(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
+    if !netlink::netns_exists(&plan.uplink_ns) {
+        return Ok(());
+    }
+    for pid in pids_in_netns(&plan.uplink_ns) {
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
+    }
+    super::netops::delete_named_netns(sh, &plan.uplink_ns)
+}
+
+/// The processes whose network namespace is the named one, `/run/netns/<name>`: those whose
+/// `/proc/<pid>/ns/net` is the same inode. Only processes this one may inspect are seen, which
+/// are the only ones it started.
+fn pids_in_netns(name: &str) -> Vec<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(target) = std::fs::metadata(format!("/run/netns/{name}")) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            std::fs::metadata(format!("/proc/{pid}/ns/net"))
+                .is_ok_and(|m| m.ino() == target.ino() && m.dev() == target.dev())
+        })
+        .collect()
 }
 
 /// A running gateway's uplink shapes with one mechanism, and a plan that asks for the other is
@@ -1279,6 +1342,7 @@ impl DataPlane for KernelBridge {
 /// `ovs-vsctl`'s own idempotent-create idiom for the OVSDB half, which stays a shell-out —
 /// OVSDB is a different protocol entirely, not something the rtnetlink port covers.
 fn ovs_apply_links(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
+    refuse_without_netns_entry(plan)?;
     let ns = sh.netns.as_deref();
     sh.run("ovs-vsctl", &["--may-exist", "add-br", &plan.bridge])?;
     netlink::link_up(ns, &plan.bridge).map_err(nl)?;
@@ -1289,8 +1353,7 @@ fn ovs_apply_links(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
         &["--may-exist", "add-port", &plan.bridge, &plan.uplink],
     )?;
     netlink::link_up(ns, &plan.uplink).map_err(nl)?;
-    netlink::link_up(ns, &plan.uplink_peer).map_err(nl)?;
-    Ok(())
+    ensure_uplink_side(sh, plan)
 }
 
 /// Per-slice VLANs on the trunk (OVS's own `trunks` port column) + the same HTB queue tree the
@@ -1387,6 +1450,7 @@ fn ovs_teardown(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
         "ovs-vsctl",
         &["--if-exists", "del-port", &plan.bridge, &plan.uplink],
     )?;
+    teardown_uplink_side(sh, plan)?;
     netlink::delete_link(ns, &plan.uplink).map_err(nl)?;
     sh.run("ovs-vsctl", &["--if-exists", "del-br", &plan.bridge])?;
     Ok(())
@@ -1810,6 +1874,7 @@ pub fn teardown(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsError> {
         }
     }
     teardown_tunnels(sh, plan)?;
+    teardown_uplink_side(sh, plan)?;
     netlink::delete_link(ns, &plan.uplink).map_err(nl)?;
     netlink::delete_link(ns, &plan.bridge).map_err(nl)?;
     Ok(())

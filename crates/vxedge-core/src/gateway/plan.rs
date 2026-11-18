@@ -357,6 +357,13 @@ pub fn bridge_name(instance: crate::instance::Instance) -> String {
     format!("vxbr{instance}")
 }
 
+/// The namespace holding the uplink side of the run in `instance`: `vxh<s>` (`ARCHITECTURE.md`
+/// §6.0.5). The uplink peer, its VLAN subinterfaces, the far sides on them and their processes
+/// live there, so a far side's address is the run's alone.
+pub fn uplink_side_name(instance: crate::instance::Instance) -> String {
+    format!("vxh{instance}")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayPlan {
     /// The run's slot on its host. Every host name below carries it (`ARCHITECTURE.md` §6.0.5).
@@ -365,8 +372,11 @@ pub struct GatewayPlan {
     /// Trunk uplink (bridge side); the HTB queue tree lives on its egress —
     /// the shared bottleneck where slice contention is measured.
     pub uplink: String,
-    /// Peer end of the uplink; traffic sinks/cloud side attach here.
+    /// Peer end of the uplink; traffic sinks/cloud side attach here. It lives in `uplink_ns`.
     pub uplink_peer: String,
+    /// The run's uplink-side namespace, [`uplink_side_name`]. A field rather than derived where
+    /// used, so a test running several gateways at once can give each its own.
+    pub uplink_ns: String,
     /// Aggregate root rate for the HTB tree (from network.defaults.bandwidth,
     /// else 1000 mbit).
     pub root_rate_mbps: u64,
@@ -722,6 +732,7 @@ impl GatewayPlan {
             bridge: bridge_name(instance),
             uplink: format!("vxup{instance}"),
             uplink_peer: format!("vxup{instance}p"),
+            uplink_ns: uplink_side_name(instance),
             root_rate_mbps: exp
                 .uplink_bandwidth_bps
                 .map(|bps| (bps / 1_000_000).max(1))
@@ -734,6 +745,16 @@ impl GatewayPlan {
             shaping,
             time_sync,
         })
+    }
+
+    /// This plan with its uplink side beside `sh`'s namespace, `<ns>-h`, when `sh` runs in one.
+    /// Gateways built inside test namespaces run side by side, and the uplink-side namespace is
+    /// host-global, so each needs its own.
+    pub fn uplink_side_beside(mut self, sh: &crate::gateway::netops::Shell) -> Self {
+        if let Some(ns) = &sh.netns {
+            self.uplink_ns = format!("{ns}-h");
+        }
+        self
     }
 
     /// The uplink's transmit queues: one per class under a gate schedule, the kernel's default

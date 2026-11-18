@@ -59,6 +59,14 @@ pub enum TrafficPlanError {
     #[error("traffic_profiles.{0} has neither `pps` nor `bandwidth_mbps` set")]
     NoRateSpecified(String),
     #[error(
+        "traffic_profiles.{profile}.{field} is `{reference}`, a VM whose port is its tap: vxedge runs no traffic generator inside a guest, and an address on the tap would send into the guest, not across the slice"
+    )]
+    EndOnTap {
+        profile: String,
+        field: &'static str,
+        reference: String,
+    },
+    #[error(
         "vlan {0} can't be embedded in the `10.<vlan>.0.x` addressing convention (max 255) — \
          out of range for every experiment manifest today, but a real limit worth knowing about"
     )]
@@ -112,6 +120,9 @@ pub enum ProfileEndpoint {
         uplink_peer: String,
         vlan: u16,
         addr: String,
+        /// The run's uplink-side namespace, `vxh<s>`, which holds the uplink peer, this
+        /// subinterface and whatever runs on it (`ARCHITECTURE.md` §6.0.5).
+        netns: String,
     },
     /// `mode: s-nssai` — this slice's UE. Its PDU-session address isn't
     /// known at plan time (assigned only once registration completes); the
@@ -320,6 +331,13 @@ fn endpoint_for(
                     field,
                     reference: reference.to_string(),
                 })?;
+            if ep.kind == crate::gateway::plan::EndpointKind::Tap {
+                return Err(TrafficPlanError::EndOnTap {
+                    profile: profile.to_string(),
+                    field,
+                    reference: reference.to_string(),
+                });
+            }
             Ok(ProfileEndpoint::VlanNodePeer {
                 peer_iface: ep.peer.clone(),
                 vlan: ep.vlan,
@@ -360,6 +378,7 @@ fn far_side_for(
                 uplink_peer: gateway_plan.uplink_peer.clone(),
                 vlan: ep.vlan,
                 addr: vlan_endpoint_addr(ep.vlan, true)?,
+                netns: gateway_plan.uplink_ns.clone(),
             })
         }
         SliceMode::SNssai => Ok(ProfileEndpoint::SnssaiFarSide),
@@ -423,6 +442,17 @@ links:
     }
 
     #[test]
+    fn a_profile_whose_end_is_a_vm_tap_is_refused() {
+        let (m, mut gw) = plans(BASE);
+        for ep in &mut gw.endpoints {
+            ep.kind = crate::gateway::plan::EndpointKind::Tap;
+            ep.peer = ep.name.clone();
+        }
+        let e = TrafficPlan::from_model(&m, &gw).expect_err("a tap end runs no generator");
+        assert!(matches!(e, TrafficPlanError::EndOnTap { .. }), "{e}");
+    }
+
+    #[test]
     fn vlan_profile_resolves_to_node_peer_and_uplink_far_side() {
         let (m, gw) = plans(BASE);
         let plan = TrafficPlan::from_model(&m, &gw).expect("traffic plans");
@@ -445,6 +475,7 @@ links:
                 uplink_peer: gw.uplink_peer.clone(),
                 vlan: 101,
                 addr: "10.101.0.1".to_string(),
+                netns: "vxh0".to_string(),
             }
         );
         assert_eq!(p.pps, Some(1000));

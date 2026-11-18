@@ -149,37 +149,35 @@ pub async fn up(
                 "`{node}` runs a guest, which an in-node profile does not reach"
             )));
         }
-        Reflector::FarSide(crate::measurements::run::FarSide {
-            parent,
-            vlan,
-            iface,
-            cidr,
-            addr,
-        }) => {
+        Reflector::FarSide(f) => {
             // A load needs the far-side address too: the source resolves it on its own subnet.
             let reflect = p.pps.is_some() && !running(runtime_dir, &p.id, "reflect");
-            let (sh, parent, iface_c, cidr, vlan, addr_c) = (
-                sh.clone(),
-                parent.clone(),
-                iface.clone(),
-                cidr.clone(),
-                *vlan,
-                addr.clone(),
-            );
+            let (sh, f_c) = (sh.clone(), f.clone());
+            let (addr_c, iface) = (f.addr.clone(), f.iface.clone());
+            let addr = &f.addr;
             let (rt, id, bin) = (
                 runtime_dir.to_path_buf(),
                 p.id.clone(),
                 vxprobe_bin.to_string(),
             );
             tokio::task::spawn_blocking(move || -> Result<(), String> {
-                ensure_far_side(&sh, &parent, vlan, &iface_c, &cidr)?;
+                ensure_far_side(&sh, &f_c)?;
                 if reflect {
                     let args = vec![
                         "reflect".into(),
                         "--listen".into(),
                         format!("{addr_c}:{PORT}"),
                     ];
-                    spawn_as(TRAFFIC, &rt, &id, "reflect", None, &bin, args, None)?;
+                    spawn_as(
+                        TRAFFIC,
+                        &rt,
+                        &id,
+                        "reflect",
+                        Some(&f_c.netns),
+                        &bin,
+                        args,
+                        None,
+                    )?;
                 }
                 Ok(())
             })

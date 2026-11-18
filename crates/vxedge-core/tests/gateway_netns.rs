@@ -67,9 +67,12 @@ struct NetnsGuard(String);
 
 impl Drop for NetnsGuard {
     fn drop(&mut self) {
-        let _ = std::process::Command::new("ip")
-            .args(["netns", "del", &self.0])
-            .output();
+        // The gateway's uplink side lives beside the test namespace (`uplink_side_beside`).
+        for ns in [self.0.clone(), format!("{}-h", self.0)] {
+            let _ = std::process::Command::new("ip")
+                .args(["netns", "del", &ns])
+                .output();
+        }
     }
 }
 
@@ -93,7 +96,9 @@ fn gateway_and_container_zone_cycle_in_netns() {
     };
 
     let model = vxedge_core::model::load_yaml(WORKSPACE).expect("workspace loads");
-    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST).unwrap();
+    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST)
+        .unwrap()
+        .uplink_side_beside(&sh);
 
     // --- gateway: apply, observe, idempotency -------------------------------
     apply(&sh, &plan).unwrap();
@@ -231,7 +236,9 @@ fn impairments_install_both_directions_and_survive_reapply() {
     };
 
     let model = vxedge_core::model::load_yaml(IMPAIRED_WORKSPACE).expect("workspace loads");
-    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST).unwrap();
+    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST)
+        .unwrap()
+        .uplink_side_beside(&sh);
     let ep = &plan.endpoints[0];
     let imp = ep.impairment.as_ref().expect("the link is impaired");
 
@@ -372,7 +379,9 @@ fn zone_traffic_reaches_the_access_port_not_loopback() {
     };
 
     let model = vxedge_core::model::load_yaml(LOCALITY_WORKSPACE).expect("workspace loads");
-    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST).unwrap();
+    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST)
+        .unwrap()
+        .uplink_side_beside(&sh);
     apply(&sh, &plan).unwrap();
 
     let runtime =
@@ -409,7 +418,12 @@ fn zone_traffic_reaches_the_access_port_not_loopback() {
         .expect("the device has a declared ip_cidr");
     let (far_side_addr, prefix_len) = sibling_address(node_cidr);
     let far_side_dev = format!("{}.{}", plan.uplink_peer, slice.vlan);
-    sh.run(
+    // The uplink peer lives in the run's uplink-side namespace, and so does its far side.
+    let side = Shell {
+        netns: Some(plan.uplink_ns.clone()),
+        escalate: sh.escalate,
+    };
+    side.run(
         "ip",
         &[
             "link",
@@ -425,7 +439,7 @@ fn zone_traffic_reaches_the_access_port_not_loopback() {
         ],
     )
     .unwrap();
-    sh.run(
+    side.run(
         "ip",
         &[
             "addr",
@@ -436,8 +450,9 @@ fn zone_traffic_reaches_the_access_port_not_loopback() {
         ],
     )
     .unwrap();
-    sh.run("ip", &["link", "set", &far_side_dev, "up"]).unwrap();
-    sh.run("ip", &["link", "set", &plan.uplink_peer, "up"])
+    side.run("ip", &["link", "set", &far_side_dev, "up"])
+        .unwrap();
+    side.run("ip", &["link", "set", &plan.uplink_peer, "up"])
         .unwrap();
 
     // Named netns are host-wide, not nested under `sh.netns` — reaching the container's own
@@ -554,7 +569,9 @@ fn ingress_filter_drops_spoofed_source_but_allows_declared_one() {
     };
 
     let model = vxedge_core::model::load_yaml(ANTISPOOF_WORKSPACE).expect("workspace loads");
-    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST).unwrap();
+    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST)
+        .unwrap()
+        .uplink_side_beside(&sh);
     let endpoint = plan
         .endpoints
         .iter()
@@ -593,7 +610,12 @@ fn ingress_filter_drops_spoofed_source_but_allows_declared_one() {
         .expect("the device has a declared ip_cidr");
     let (far_side_addr, prefix_len) = sibling_address(node_cidr);
     let far_side_dev = format!("{}.{}", plan.uplink_peer, slice.vlan);
-    sh.run(
+    // The uplink peer lives in the run's uplink-side namespace, and so does its far side.
+    let side = Shell {
+        netns: Some(plan.uplink_ns.clone()),
+        escalate: sh.escalate,
+    };
+    side.run(
         "ip",
         &[
             "link",
@@ -609,7 +631,7 @@ fn ingress_filter_drops_spoofed_source_but_allows_declared_one() {
         ],
     )
     .unwrap();
-    sh.run(
+    side.run(
         "ip",
         &[
             "addr",
@@ -620,8 +642,9 @@ fn ingress_filter_drops_spoofed_source_but_allows_declared_one() {
         ],
     )
     .unwrap();
-    sh.run("ip", &["link", "set", &far_side_dev, "up"]).unwrap();
-    sh.run("ip", &["link", "set", &plan.uplink_peer, "up"])
+    side.run("ip", &["link", "set", &far_side_dev, "up"])
+        .unwrap();
+    side.run("ip", &["link", "set", &plan.uplink_peer, "up"])
         .unwrap();
 
     let container_ns = container.runtime_name();
@@ -846,7 +869,8 @@ fn tunnel_completes_a_real_handshake_between_two_simulated_hosts() {
         .unwrap(),
         vxedge_core::instance::Instance::FIRST,
     )
-    .unwrap();
+    .unwrap()
+    .uplink_side_beside(&sh_a);
     let plan_b = GatewayPlan::from_model(
         &vxedge_core::model::load_yaml(&TUNNEL_SITE_B_WORKSPACE.replacen(
             "PLACEHOLDER_PEER_KEY",
@@ -856,7 +880,8 @@ fn tunnel_completes_a_real_handshake_between_two_simulated_hosts() {
         .unwrap(),
         vxedge_core::instance::Instance::FIRST,
     )
-    .unwrap();
+    .unwrap()
+    .uplink_side_beside(&sh_b);
 
     // First apply: each side mints its own identity. Still carrying the placeholder peer key —
     // no handshake is possible yet, which is expected: `apply` itself doesn't require one (see
@@ -888,7 +913,8 @@ fn tunnel_completes_a_real_handshake_between_two_simulated_hosts() {
         .unwrap(),
         vxedge_core::instance::Instance::FIRST,
     )
-    .unwrap();
+    .unwrap()
+    .uplink_side_beside(&sh_a);
     let plan_b = GatewayPlan::from_model(
         &vxedge_core::model::load_yaml(&TUNNEL_SITE_B_WORKSPACE.replacen(
             "PLACEHOLDER_PEER_KEY",
@@ -898,7 +924,8 @@ fn tunnel_completes_a_real_handshake_between_two_simulated_hosts() {
         .unwrap(),
         vxedge_core::instance::Instance::FIRST,
     )
-    .unwrap();
+    .unwrap()
+    .uplink_side_beside(&sh_b);
     apply(&sh_a, &plan_a).unwrap();
     apply(&sh_b, &plan_b).unwrap();
 
@@ -1038,8 +1065,12 @@ fn vxlan_tunnel_carries_slice_traffic_between_two_simulated_hosts() {
 
     let model_a = vxedge_core::model::load_yaml(VXLAN_SITE_A_WORKSPACE).unwrap();
     let model_b = vxedge_core::model::load_yaml(VXLAN_SITE_B_WORKSPACE).unwrap();
-    let plan_a = GatewayPlan::from_model(&model_a, vxedge_core::instance::Instance::FIRST).unwrap();
-    let plan_b = GatewayPlan::from_model(&model_b, vxedge_core::instance::Instance::FIRST).unwrap();
+    let plan_a = GatewayPlan::from_model(&model_a, vxedge_core::instance::Instance::FIRST)
+        .unwrap()
+        .uplink_side_beside(&sh_a);
+    let plan_b = GatewayPlan::from_model(&model_b, vxedge_core::instance::Instance::FIRST)
+        .unwrap()
+        .uplink_side_beside(&sh_b);
 
     apply(&sh_a, &plan_a).unwrap();
     apply(&sh_b, &plan_b).unwrap();
@@ -1139,7 +1170,9 @@ fn fiveg_uplink_creates_a_real_vlan_subinterface_and_routes_a_ue_subnet() {
     };
 
     let model = vxedge_core::model::load_yaml(WORKSPACE).expect("workspace loads");
-    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST).unwrap();
+    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST)
+        .unwrap()
+        .uplink_side_beside(&sh);
     apply(&sh, &plan).unwrap();
 
     // A throwaway veth pair standing in for the CN pod's own bridge-attached leg.
@@ -1289,7 +1322,9 @@ fn a_closed_gate_delays_a_slices_frames() {
     };
 
     let model = vxedge_core::model::load_yaml(SHAPED_WORKSPACE).expect("workspace loads");
-    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST).unwrap();
+    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST)
+        .unwrap()
+        .uplink_side_beside(&sh);
     let shaping = plan.shaping.as_ref().expect("a gate schedule is planned");
 
     // --- gateway: apply, observe, idempotency -------------------------------
@@ -1419,7 +1454,8 @@ fn a_closed_gate_delays_a_slices_frames() {
         &vxedge_core::model::load_yaml(&control).unwrap(),
         vxedge_core::instance::Instance::FIRST,
     )
-    .unwrap();
+    .unwrap()
+    .uplink_side_beside(&sh);
     apply(&sh, &control_plan).unwrap();
     assert!(observe(&sh, &control_plan).unwrap().fully_up());
     // The new schedule takes over at a cycle boundary.
@@ -1499,6 +1535,7 @@ fn switching_a_running_gateway_between_htb_and_a_gate_schedule_is_refused() {
             vxedge_core::instance::Instance::FIRST,
         )
         .unwrap()
+        .uplink_side_beside(&sh)
     };
     let htb = plan("");
     let gates = plan(
