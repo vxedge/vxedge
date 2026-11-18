@@ -65,8 +65,8 @@ pub struct End {
     pub addr: String,
 }
 
-/// A VLAN subinterface of the uplink's peer, in the run's uplink-side namespace, addressed in a node's
-/// subnet: the far side of the shared uplink for that node's slice.
+/// A VLAN subinterface of the uplink's peer, in the run's uplink-side namespace, addressed in a
+/// node's subnet: the far side of the shared uplink for that node's slice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FarSide {
     pub parent: String,
