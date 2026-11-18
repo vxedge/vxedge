@@ -6,6 +6,15 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.33.0] - 2026-11-18
+
+The fleet view: `RunService.Status` reads every run on the host in one call, or the named ones, and
+`RunService.Down` takes several runs down as one `run.down` job, with each run's teardown as a child job. A run
+that is not up comes back as an entry with `error_reason` rather than failing the call, and a slot a campaign holds
+refuses the whole teardown before anything is touched. The CLI adds `vxedge runs status` and `vxedge runs down`.
+Only the run a lifecycle job acts on now reads `STAGING`, and a gateway `apply` no longer fails when the access
+port's ingress qdisc is already gone. vxAPI gains the two RPCs and their messages; no existing RPC or message changes.
+
 ### Added
 
 - **The fleet view (Track F, `ARCHITECTURE.md` §5).** `RunService` gains two RPCs:
