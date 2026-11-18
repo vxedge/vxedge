@@ -32,6 +32,11 @@ All notable changes to this repo are documented here. Format follows
   so that traffic went over loopback. `TrafficService.Up` refuses the profile with `ERROR_REASON_HELD_BY_RUN`
   when another run's end holds an address in that /24.
 
+### Fixed
+
+- `vxedge --json` prints a failed job's `error_reason`, and the human output adds a `reason:` line. Both were
+  dropped, so a job that failed after it started showed only its sentence.
+
 ## [0.31.0] - 2026-11-16
 
 Several runs on one host. Each run holds an instance slot, `0`–`9` then `a`–`z`, that every host object it

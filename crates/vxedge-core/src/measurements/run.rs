@@ -65,7 +65,7 @@ pub struct End {
     pub addr: String,
 }
 
-/// A VLAN subinterface of the uplink's peer, in the host's namespace, addressed in a node's
+/// A VLAN subinterface of the uplink's peer, in the run's uplink-side namespace, addressed in a node's
 /// subnet: the far side of the shared uplink for that node's slice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FarSide {
@@ -110,7 +110,7 @@ pub enum Reflector {
     Node(End),
     /// The slice's UE, bound to its PDU-session address, which is learned when it starts.
     Ue(Box<crate::fiveg::SliceSession>),
-    /// A VLAN subinterface of the uplink's peer, in the host's namespace.
+    /// A VLAN subinterface of the uplink's peer, in the run's uplink-side namespace.
     FarSide(FarSide),
     /// The reflector a node's guest runs, declared by its part in the bundle's `meta.json`.
     Guest {

@@ -893,6 +893,10 @@ async fn watch_job(
         Some(job) => {
             if !json {
                 eprintln!("{}: {} — {}", job.kind, state_name(job.state), job.error);
+                let reason = reason_name(job.error_reason);
+                if !reason.is_empty() {
+                    eprintln!("  reason: {reason}");
+                }
             }
             std::process::exit(1);
         }
@@ -3010,6 +3014,17 @@ struct JsonJob {
     progress_percent: u32,
     message: String,
     error: String,
+    /// The typed reason a failed job carries (`Job.error_reason`), as the refusal's
+    /// `ErrorInfo.reason` spells it; empty when there is none.
+    error_reason: &'static str,
+}
+
+/// `ERROR_REASON_*`, as a refusal's `ErrorInfo.reason` spells it, or empty for none.
+fn reason_name(r: i32) -> &'static str {
+    match vxedge_api::v1::ErrorReason::try_from(r) {
+        Ok(vxedge_api::v1::ErrorReason::Unspecified) | Err(_) => "",
+        Ok(reason) => reason.as_str_name(),
+    }
 }
 
 impl From<&Job> for JsonJob {
@@ -3021,6 +3036,7 @@ impl From<&Job> for JsonJob {
             progress_percent: j.progress_percent,
             message: j.message.clone(),
             error: j.error.clone(),
+            error_reason: reason_name(j.error_reason),
         }
     }
 }
