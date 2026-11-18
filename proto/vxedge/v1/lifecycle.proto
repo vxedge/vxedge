@@ -290,6 +290,10 @@ message VehicleUpRequest {
   string instance = 4;
 }
 
+// Down and Status act on the run as its `up` recorded it, from the manifest kept beside the run:
+// a workspace edited, moved or deleted since still comes down as what is running, and `manifest`
+// only finds the run when `run` is empty. A run that is an experiment's, not a bare vehicle's,
+// answers FAILED_PRECONDITION with ERROR_REASON_WRONG_WORKSPACE. With no run up, `manifest` is read.
 message VehicleDownRequest {
   ManifestRef manifest = 1;
   // Restrict to specific stages (empty = all, in reverse dependency order).
@@ -355,11 +359,12 @@ message ExperimentUpRequest {
   string instance = 4;
 }
 
+// Down and Status act on the run as its `up` recorded it, from the manifest kept beside the run:
+// a workspace edited, moved or deleted since, or an inline manifest, still comes down as what is
+// running. A bare vehicle's run answers FAILED_PRECONDITION with ERROR_REASON_WRONG_WORKSPACE.
 message ExperimentDownRequest {
-  // Must name the experiment active on this host (same id, and same workspace directory when
-  // both are known): any other answers FAILED_PRECONDITION naming the active one, since the
-  // zones and gateway stages act on the active experiment, not on this manifest. With nothing
-  // active, Down proceeds (idempotent).
+  // Finds the run when `run` is empty: the run of the workspace it names. It is read only when no
+  // run is up there, where Down proceeds (idempotent).
   ManifestRef manifest = 1;
   // Restrict to specific stages (empty = all, in reverse dependency order).
   repeated ExperimentStage stages = 2;

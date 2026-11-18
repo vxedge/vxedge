@@ -262,6 +262,25 @@ fn write_active_record(runtime: &Path, id: &str, dir: &Path, sha256: Option<&str
         record["sha256"] = sha.into();
     }
     std::fs::write(slot0(runtime).join("active.json"), record.to_string()).unwrap();
+    write_snapshot(&slot0(runtime), dir);
+}
+
+/// What `up` records beside `active.json`: the manifest the gateway was handed, which for a bare
+/// vehicle is the experiment synthesized from it, and in the record the vehicle's own id.
+fn write_snapshot(run_dir: &Path, workspace: &Path) {
+    let text = vxedge_core::Workspace::read_text(workspace).unwrap();
+    let ws = vxedge_core::Workspace::from_yaml(&text).unwrap();
+    let yaml = if ws.experiments.is_empty() {
+        let record_path = run_dir.join("active.json");
+        let mut record: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&record_path).unwrap()).unwrap();
+        record["vehicle"] = ws.vehicles[0].id.clone().into();
+        std::fs::write(&record_path, record.to_string()).unwrap();
+        vxedge_core::model::synthesize_vehicle_workspace(&text).unwrap()
+    } else {
+        text
+    };
+    std::fs::write(run_dir.join("manifest.yaml"), yaml).unwrap();
 }
 
 /// How long a test job may take. Generous because a loaded host (parallel test binaries, another
@@ -415,21 +434,84 @@ async fn zone_and_compute_verbs_work_after_a_daemon_restart() {
     assert_eq!(nodes[0].vxid, "hpc1");
 }
 
+/// A restarted daemon rebuilds a run from the manifest its `up` recorded, not from its workspace:
+/// one edited since, or removed, still reads as what is running.
 #[tokio::test]
-async fn a_workspace_edited_since_up_is_not_restored() {
+async fn a_run_is_restored_from_its_recorded_manifest() {
     let ws = vehicle_workspace();
-    let daemon =
-        Daemon::start_with(|run| write_active_record(run, &vehicle_id(), &ws, Some("stale")));
-    let refused = ZoneServiceClient::new(daemon.channel().await)
+    let daemon = Daemon::start_with(|run| {
+        write_active_record(run, &vehicle_id(), &ws, Some("stale"));
+        std::fs::remove_dir_all(&ws).unwrap();
+    });
+    let channel = daemon.channel().await;
+    let zones = ZoneServiceClient::new(channel.clone())
         .list(ZoneListRequest::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .zones;
+    let ids: Vec<&str> = zones.iter().map(|z| z.vxid.as_str()).collect();
+    assert_eq!(ids, ["ecu1"]);
+    // Status reads it the same way: the run, as a vehicle, with no workspace to read.
+    let runs = RunServiceClient::new(channel)
+        .status(RunStatusRequest::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .runs;
+    assert_eq!(runs.len(), 1);
+    assert_eq!(
+        runs[0].error_reason,
+        ErrorReason::Unspecified as i32,
+        "{:?}",
+        runs[0]
+    );
+    assert_eq!(
+        runs[0].run.clone().unwrap().kind,
+        ResourceKind::Vehicle as i32
+    );
+}
+
+/// A bare vehicle's run is the vehicle verbs': its recorded manifest is the experiment synthesized
+/// from it, and the experiment verbs refuse it rather than act on that.
+#[tokio::test]
+async fn the_experiment_verbs_refuse_a_vehicles_run() {
+    let ws = vehicle_workspace();
+    let daemon = Daemon::start_with(|run| write_run_record(run, &vehicle_id(), &ws, "run-v"));
+    let refused = ExperimentServiceClient::new(daemon.channel().await)
+        .status(ExperimentStatusRequest {
+            run: Some(RunRef {
+                run_id: "run-v".into(),
+            }),
+            manifest: None,
+        })
         .await
         .unwrap_err();
     assert_eq!(
-        refused.code(),
-        tonic::Code::FailedPrecondition,
+        reason(&refused),
+        "ERROR_REASON_WRONG_WORKSPACE",
         "{refused:?}"
     );
-    assert!(refused.message().contains("changed"), "{refused:?}");
+}
+
+/// A slot whose `active.json` is there without the manifest `up` records beside it is not
+/// restored: there is nothing to say what is running.
+#[tokio::test]
+async fn a_run_without_its_recorded_manifest_is_not_restored() {
+    let ws = vehicle_workspace();
+    let daemon = Daemon::start_with(|run| {
+        write_active_record(run, &vehicle_id(), &ws, None);
+        std::fs::remove_file(slot0(run).join("manifest.yaml")).unwrap();
+    });
+    let zones = ZoneServiceClient::new(daemon.channel().await)
+        .list(ZoneListRequest::default())
+        .await;
+    assert!(
+        zones
+            .as_ref()
+            .map_or(true, |z| z.get_ref().zones.is_empty()),
+        "{zones:?}"
+    );
 }
 
 /// A run recorded by a daemon from before `vxws/2` holds a `vxws/1` identity and names no
@@ -859,6 +941,7 @@ fn write_run_record(runtime: &Path, id: &str, dir: &Path, run_id: &str) {
         "identity_algorithm": "vxws/2",
     });
     std::fs::write(slot0(runtime).join("active.json"), record.to_string()).unwrap();
+    write_snapshot(&slot0(runtime), dir);
 }
 
 #[tokio::test]
@@ -2003,6 +2086,7 @@ async fn two_runs_are_listed_and_a_bare_verb_never_picks_one() {
                 "identity_algorithm": "vxws/2",
             });
             std::fs::write(dir.join("active.json"), record.to_string()).unwrap();
+            write_snapshot(&dir, ws);
         }
     });
     let channel = daemon.channel().await;
@@ -2079,6 +2163,7 @@ async fn two_runs_collect_two_archives_each_from_its_own_ingest() {
                     "id": id, "dir": ws, "bridge": "lo", "run_id": run_id,
                 });
                 std::fs::write(dir.join("active.json"), record.to_string()).unwrap();
+                write_snapshot(&dir, ws);
             }
         },
         &[("VXEDGE_VXTELEMETRY_BIN", &bin)],
@@ -2219,6 +2304,7 @@ async fn collect_passes_on_whether_the_run_was_locked() {
                 "kernel_release": "6.1.0", "kernel_preempt_rt": false,
             });
             std::fs::write(slot0(run).join("active.json"), record.to_string()).unwrap();
+            write_snapshot(&slot0(run), &ws);
         },
         &[("VXEDGE_VXTELEMETRY_BIN", &bin)],
     );

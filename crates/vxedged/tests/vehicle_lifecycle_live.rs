@@ -7,6 +7,8 @@
 //!   nothing, before and after a daemon restart;
 //! - a restarted daemon still reports the vehicle up, signal plane included, and brings it down;
 //! - `down` twice succeeds, and leaves nothing behind;
+//! - `down` takes down what `up` brought up, from the manifest the run recorded: after the
+//!   workspace was edited, and, through `RunService.Down` across a daemon restart, after it moved;
 //! - after an `up` that fails, `down` leaves nothing behind;
 //! - a databroker that exits straight after it starts fails the job, naming the databroker.
 //!
@@ -42,10 +44,12 @@ use tokio::net::UnixStream;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 use vxedge_api::v1::job_service_client::JobServiceClient;
+use vxedge_api::v1::run_service_client::RunServiceClient;
 use vxedge_api::v1::vehicle_service_client::VehicleServiceClient;
 use vxedge_api::v1::{
-    GetJobRequest, Job, JobState, ManifestRef, ResourceKind, ResourceState, VehicleDownRequest,
-    VehicleStatus, VehicleStatusRequest, VehicleUpRequest, manifest_ref::Source,
+    GetJobRequest, Job, JobListRequest, JobState, ManifestRef, ResourceKind, ResourceState,
+    RunDownRequest, VehicleDownRequest, VehicleStatus, VehicleStatusRequest, VehicleUpRequest,
+    manifest_ref::Source,
 };
 use vxedge_core::containers::PAUSE_IMAGE;
 use vxedge_core::services::KUKSA_MEMBER;
@@ -677,4 +681,63 @@ async fn a_databroker_that_exits_at_once_fails_the_job() {
         "down after the failed up",
     );
     assert_host_clean("after down");
+}
+
+#[tokio::test]
+#[ignore = "provisions the host gateway; needs file capabilities on vxedged, a cached sudo \
+            credential and the user Podman socket (see module docs)"]
+async fn down_reads_the_run_not_its_workspace() {
+    assert_host_clean("before the test");
+    let scratch = Scratch::new("snapshot");
+    let yaml = vehicle("veh-life", "0.0.0.0:55555");
+    let ws = scratch.workspace("veh-life", &yaml);
+    let mut daemon = Daemon::start(&scratch.0);
+    let _down = DownOnPanic {
+        socket: daemon.socket(),
+        workspace: ws.clone(),
+    };
+    let channel = daemon.channel().await;
+
+    // Edited: the workspace now declares another vehicle, which `down` used to read and refuse.
+    assert_succeeded(&up(&channel, &ws).await.expect("up accepted"), "up");
+    std::fs::write(
+        ws.join("vehicle.yaml"),
+        vehicle("veh-other", "0.0.0.0:55556"),
+    )
+    .unwrap();
+    assert_succeeded(
+        &down(&channel, &ws).await.expect("down accepted"),
+        "down after the workspace was edited",
+    );
+    assert_host_clean("after down of an edited workspace");
+
+    // Moved, then the daemon restarted: the fleet view still reads the run, and takes it down.
+    std::fs::write(ws.join("vehicle.yaml"), &yaml).unwrap();
+    assert_succeeded(&up(&channel, &ws).await.expect("up accepted"), "second up");
+    let moved = scratch.0.join("veh-life-moved");
+    std::fs::rename(&ws, &moved).unwrap();
+    daemon.restart();
+    let channel = daemon.channel().await;
+    let job = RunServiceClient::new(channel.clone())
+        .down(RunDownRequest {
+            all: true,
+            ..Default::default()
+        })
+        .await
+        .expect("run down accepted")
+        .into_inner();
+    let job = wait_for_job(channel.clone(), job.id).await;
+    let children = JobServiceClient::new(channel)
+        .list(JobListRequest {
+            parent_job_id: job.id.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .jobs;
+    assert_succeeded(&job, "run down after the workspace moved");
+    assert_eq!(children.len(), 1, "{children:?}");
+    assert_eq!(children[0].kind, "vehicle.down", "{children:?}");
+    assert_host_clean("after run down of a moved workspace");
 }

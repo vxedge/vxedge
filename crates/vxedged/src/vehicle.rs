@@ -93,6 +93,48 @@ async fn resolve_and_synthesize(mref: Option<&ManifestRef>) -> Result<Resolved, 
     })
 }
 
+/// The workspace a request names, when it names one that is there.
+async fn asked_dir(mref: Option<&ManifestRef>) -> Option<PathBuf> {
+    match mref {
+        Some(mref) => crate::services::resolve_manifest_dir(mref).await,
+        None => None,
+    }
+}
+
+/// The vehicle a `down` or status acts on: the run's own snapshot when the slot has a run, so a
+/// workspace edited, moved or deleted since `up` reads as what is running; otherwise the
+/// request's workspace, for a slot with nothing up. A run that is an experiment's is refused:
+/// `ExperimentService` acts on it.
+async fn resolve_run(
+    verb: &str,
+    scope: &crate::scope::RunScope,
+    mref: Option<&ManifestRef>,
+) -> Result<Resolved, Status> {
+    let Some(run) = crate::services::RunManifest::read(&scope.dir) else {
+        return resolve_and_synthesize(mref).await;
+    };
+    let Some(id) = run.vehicle() else {
+        return Err(crate::errors::precondition(
+            crate::errors::R::WrongWorkspace,
+            format!(
+                "run `{}` is experiment `{}`'s, not a vehicle's: `{verb}` does not act on it; \
+                 use the experiment verbs",
+                run.record.run_id(),
+                run.record.id
+            ),
+        ));
+    };
+    let model = vxedge_core::model::load_yaml(&run.yaml)
+        .map_err(|e| crate::errors::invalid(crate::errors::R::WorkspaceInvalid, e.to_string()))?;
+    Ok(Resolved {
+        dir: run.dir(),
+        sha256: run.sha256(),
+        yaml: run.yaml,
+        model,
+        id,
+    })
+}
+
 /// Every plan the vehicle needs, computed without touching the host.
 fn plan_vehicle(
     model: &Experiment,
@@ -240,7 +282,7 @@ impl VehicleService for VehicleSvc {
                 .in_run(&scope.dir),
                 "vehicle.up",
                 move |p| async move {
-                    let mut run = crate::scope::RunCtx::new(scope);
+                    let mut run = crate::scope::RunCtx::new(scope).of_vehicle(&id);
                     let mut done: Vec<String> = Vec::new();
                     p.checkpoint()?;
                     if wants(&stages, ExperimentStage::Gateway) {
@@ -300,16 +342,17 @@ impl VehicleService for VehicleSvc {
     ) -> Result<Response<vxedge_api::v1::Job>, Status> {
         check_stages(&req.get_ref().stages)?;
         let stages = req.get_ref().stages.clone();
+        let root = self.handles.gateway.runtime_dir.clone();
+        let asked = asked_dir(req.get_ref().manifest.as_ref()).await;
+        let scope = crate::scope::of(&req, &root, req.get_ref().run.as_ref(), asked.as_deref())?;
+        crate::scope::guard(&req, &root, &scope)?;
         let Resolved {
             yaml,
             dir,
             sha256,
             model,
             id,
-        } = resolve_and_synthesize(req.get_ref().manifest.as_ref()).await?;
-        let root = self.handles.gateway.runtime_dir.clone();
-        let scope = crate::scope::of(&req, &root, req.get_ref().run.as_ref(), dir.as_deref())?;
-        crate::scope::guard(&req, &root, &scope)?;
+        } = resolve_run("vehicle down", &scope, req.get_ref().manifest.as_ref()).await?;
         let (gateway, nodes) = plan_vehicle(&model, dir.as_deref(), scope.instance)?;
         self.require_active("vehicle down", &model, dir.as_deref(), &nodes, &scope)
             .await?;
@@ -412,15 +455,16 @@ impl VehicleService for VehicleSvc {
         &self,
         req: Request<VehicleStatusRequest>,
     ) -> Result<Response<VehicleStatus>, Status> {
+        let root = self.handles.gateway.runtime_dir.clone();
+        let asked = asked_dir(req.get_ref().manifest.as_ref()).await;
+        let scope = crate::scope::of(&req, &root, req.get_ref().run.as_ref(), asked.as_deref())?;
         let Resolved {
             yaml,
             dir,
             model,
             id,
             ..
-        } = resolve_and_synthesize(req.get_ref().manifest.as_ref()).await?;
-        let root = self.handles.gateway.runtime_dir.clone();
-        let scope = crate::scope::of(&req, &root, req.get_ref().run.as_ref(), dir.as_deref())?;
+        } = resolve_run("vehicle status", &scope, req.get_ref().manifest.as_ref()).await?;
         let (gateway, nodes) = plan_vehicle(&model, dir.as_deref(), scope.instance)?;
         self.require_active("vehicle status", &model, dir.as_deref(), &nodes, &scope)
             .await?;

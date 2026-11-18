@@ -345,6 +345,48 @@ fn active_record(runtime_dir: &Path) -> PathBuf {
     runtime_dir.join("active.json")
 }
 
+/// The manifest `up` provisioned a run from, beside its `active.json`: the exact document the
+/// gateway was handed, so a vehicle's holds its synthesized experiment too.
+pub(crate) fn snapshot_path(runtime_dir: &Path) -> PathBuf {
+    runtime_dir.join("manifest.yaml")
+}
+
+/// A run as its `up` left it: the record and the manifest snapshot. `down`, status, the fleet view
+/// and a restarted daemon read the run from here rather than from its workspace, which may have
+/// been edited, moved or deleted since, or never existed for an inline manifest. Only a slot with
+/// an `active.json` has one: a snapshot without a record is not a run.
+#[derive(Debug, Clone)]
+pub(crate) struct RunManifest {
+    pub record: ActiveRecord,
+    pub yaml: String,
+}
+
+impl RunManifest {
+    pub(crate) fn read(runtime_dir: &Path) -> Option<Self> {
+        let record = read_active_record(runtime_dir)?;
+        let yaml = std::fs::read_to_string(snapshot_path(runtime_dir)).ok()?;
+        Some(Self { record, yaml })
+    }
+
+    /// The workspace the run came from, when it came from one.
+    pub(crate) fn dir(&self) -> Option<PathBuf> {
+        (self.record.dir != Path::new(".")).then(|| self.record.dir.clone())
+    }
+
+    /// The workspace identity `up` recorded, or the snapshot's hash for a record without one.
+    pub(crate) fn sha256(&self) -> String {
+        self.record
+            .sha256
+            .clone()
+            .unwrap_or_else(|| hex::encode(sha2::Sha256::digest(self.yaml.as_bytes())))
+    }
+
+    /// The vehicle's id, when the run is a bare vehicle's.
+    pub(crate) fn vehicle(&self) -> Option<String> {
+        self.record.vehicle.clone()
+    }
+}
+
 /// What `active.json` says. A record from before 0.4.1 has no `sha256`, one from before 0.5.0
 /// has no `run_id` or `started_unix_ms`, and one from before `vxws/2` has no
 /// `identity_algorithm`.
@@ -369,6 +411,8 @@ pub(crate) struct ActiveRecord {
     /// The gateway's time sync, [`time_sync_kind`]. `None` for a run without one, or a record
     /// written before time sync was recorded.
     pub time_sync: Option<String>,
+    /// The bare vehicle the run is, as its author wrote its id. `None` for an experiment's run.
+    pub vehicle: Option<String>,
 }
 
 /// What a run records as its time sync (`ARCHITECTURE.md` §6.0.3): `network.time_sync`'s kind,
@@ -506,13 +550,14 @@ pub(crate) fn read_active_record(runtime_dir: &Path) -> Option<ActiveRecord> {
         kernel,
         shaping: v["shaping"].as_str().map(str::to_string),
         time_sync: v["time_sync"].as_str().map(str::to_string),
+        vehicle: v["vehicle"].as_str().map(str::to_string),
     })
 }
 
 /// Rebuild `EdgeState` from the record after a daemon restart, so verbs that act on what is active
 /// keep working on a vehicle that outlived its daemon. A record only counts while its bridge
-/// exists, and a workspace with no directory cannot be re-read, so both leave the state empty.
-/// A workspace edited since `up` is refused: its plans would not describe what is running.
+/// exists. The run is rebuilt from the manifest `up` persisted, not from its workspace, so one
+/// edited, moved or deleted since, or an inline manifest, still restores as what is running.
 pub(crate) async fn restore_active(
     state: &SharedState,
     scope: &crate::scope::RunScope,
@@ -524,9 +569,6 @@ pub(crate) async fn restore_active(
     let Some(record) = read_active_record(&scope.dir) else {
         return Ok(());
     };
-    if record.dir == Path::new(".") {
-        return Ok(());
-    }
     let sh = shell.clone();
     let bridge = record.bridge.clone();
     let present = tokio::task::spawn_blocking(move || sh.link_exists(&bridge))
@@ -535,60 +577,45 @@ pub(crate) async fn restore_active(
     if !present {
         return Ok(());
     }
-    let refuse_as = |reason, e: String| {
-        crate::errors::precondition(
-            reason,
-            format!(
-                "`{}` is active from {}, but that workspace cannot be restored: {e}",
-                record.id,
-                record.dir.display()
-            ),
-        )
-    };
-    let refuse = |e: String| refuse_as(crate::errors::R::WorkspaceInvalid, e);
-    let mref = ManifestRef {
-        source: Some(Source::Path(record.dir.display().to_string())),
-        ..Default::default()
-    };
-    let (yaml, sha256, _) = resolve_manifest(Some(&mref))
-        .await
-        .map_err(|e| refuse(e.message().to_string()))?;
-    if let Some(recorded) = &record.sha256 {
-        // Compare under the algorithm the record was written with: a run recorded before
-        // `vxws/2` holds a `vxws/1` value, and recomputing that one is what tells an upgraded
-        // daemon whether the workspace really changed.
-        let algorithm: vxedge_core::IdentityAlgorithm = record
-            .identity_algorithm()
-            .parse()
-            .map_err(|e: vxedge_core::identity::IdentityError| refuse(e.to_string()))?;
-        let now = if algorithm == vxedge_core::IdentityAlgorithm::CURRENT {
-            sha256.clone()
-        } else {
-            let dir = record.dir.clone();
-            tokio::task::spawn_blocking(move || Workspace::identity_with(&dir, algorithm))
-                .await
-                .map_err(|e| Status::internal(format!("identity task panicked: {e}")))?
-                .map_err(|e| refuse(e.to_string()))?
-                .value
-        };
-        if *recorded != now {
-            return Err(refuse_as(
-                crate::errors::R::WorkspaceChanged,
-                "it has changed since `up`".to_string(),
+    let (model, sha256) = match RunManifest::read(&scope.dir) {
+        Some(m) => {
+            let model = vxedge_core::model::load_yaml(&m.yaml).map_err(|e| {
+                crate::errors::precondition(
+                    crate::errors::R::WorkspaceInvalid,
+                    format!("`{}`'s recorded manifest cannot be read: {e}", record.id),
+                )
+            })?;
+            let sha256 = m.sha256();
+            (model, sha256)
+        }
+        None => {
+            return Err(crate::errors::precondition(
+                crate::errors::R::WorkspaceInvalid,
+                format!(
+                    "`{}` is active, but its manifest was not recorded",
+                    record.id
+                ),
             ));
         }
-    }
-    let model =
-        vxedge_core::model::load_workspace_yaml(&yaml).map_err(|e| refuse(e.to_string()))?;
+    };
     if model.id != record.id {
-        return Err(refuse(format!("it now declares `{}`", model.id)));
+        return Err(crate::errors::precondition(
+            crate::errors::R::WorkspaceInvalid,
+            format!(
+                "`{}` is active, but its manifest now declares `{}`",
+                record.id, model.id
+            ),
+        ));
     }
-    let plan =
-        GatewayPlan::from_model(&model, scope.instance).map_err(|e| refuse(e.to_string()))?;
+    let plan = GatewayPlan::from_model(&model, scope.instance).map_err(|e| {
+        crate::errors::precondition(crate::errors::R::WorkspaceInvalid, e.to_string())
+    })?;
     let fiveg = if plan.snssai_slice_ids.is_empty() {
         None
     } else {
-        Some(FiveGPlan::from_model(&model).map_err(|e| refuse(e.to_string()))?)
+        Some(FiveGPlan::from_model(&model).map_err(|e| {
+            crate::errors::precondition(crate::errors::R::WorkspaceInvalid, e.to_string())
+        })?)
     };
     let mut st = state.lock().await;
     let run = st.run_mut(scope.instance);
@@ -667,6 +694,7 @@ impl GatewaySvc {
         verb: Verb,
         target: crate::scope::Target,
         caller: crate::scope::Caller,
+        vehicle: Option<String>,
     ) -> Result<Response<Job>, Status> {
         let (yaml, sha256, manifest_dir) = resolve_manifest(mref).await?;
         let model_id = parse_to_model(&yaml).ok().map(|m| m.id);
@@ -940,11 +968,11 @@ impl GatewaySvc {
                         // actually ran. Campaign tooling that still consumes §6.1 files
                         // (vxtelemetry) reads it from here, and it makes a run inspectable
                         // after the fact rather than only reconstructable.
-                        let active = runtime_dir.join("manifest.yaml");
-                        if let Err(e) = tokio::fs::write(&active, &yaml).await {
-                            tracing::warn!(path = %active.display(), error = %e,
-                                "could not persist the active manifest");
-                        }
+                        // `down` and a restarted daemon read the run from it, so a run is never
+                        // recorded without it: written before `active.json`.
+                        tokio::fs::write(snapshot_path(&runtime_dir), &yaml)
+                            .await
+                            .map_err(|e| format!("cannot record the run's manifest: {e}"))?;
 
                         let dir = manifest_dir.clone().unwrap_or_else(|| PathBuf::from("."));
                         // A repeated `up` of the same workspace is the same run.
@@ -969,6 +997,9 @@ impl GatewaySvc {
                             "shaping": shaping_kind(&model),
                             "time_sync": time_sync_kind(&model),
                         });
+                        if let Some(vehicle) = &vehicle {
+                            record["vehicle"] = vehicle.clone().into();
+                        }
                         if let (Some(fields), Some(kernel)) = (record.as_object_mut(), &kernel) {
                             fields.extend(provenance(package.as_ref(), kernel));
                         }
@@ -977,7 +1008,7 @@ impl GatewaySvc {
                             .map_err(|e| format!("cannot record the active workspace: {e}"))?;
                         crate::scope::remember_workspace(&root, instance, &dir);
                         if fresh && let Some(record) = read_active_record(&runtime_dir) {
-                            let (kind, target) = crate::runs::target(&record).await;
+                            let (kind, target) = crate::runs::target(&record);
                             events.emit_run(
                                 crate::events::EventKind::RunUp,
                                 kind,
@@ -1070,13 +1101,22 @@ impl GatewaySvc {
                             }
                             _ => {}
                         }
+                        // After the record, never before: a `down` cut short keeps a run that
+                        // can still be read back. Only this file goes: a campaign's
+                        // `reserved.json` beside it holds the slot between trials.
+                        match tokio::fs::remove_file(snapshot_path(&runtime_dir)).await {
+                            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                                tracing::warn!(error = %e, "could not remove the run's manifest");
+                            }
+                            _ => {}
+                        }
                         events.emit(
                             crate::events::EventKind::GatewayDown,
                             "vxgateway",
                             "bridge, uplink and endpoints removed",
                         );
                         if let Some(record) = ended {
-                            let (kind, target) = crate::runs::target(&record).await;
+                            let (kind, target) = crate::runs::target(&record);
                             events.emit_run(
                                 crate::events::EventKind::RunDown,
                                 kind,
@@ -1104,6 +1144,7 @@ impl GatewayService for GatewaySvc {
             Verb::Apply,
             crate::scope::start_of(&req, "")?,
             crate::scope::Caller::of(&req),
+            None,
         )
         .await
     }
@@ -1119,6 +1160,9 @@ impl GatewayService for GatewaySvc {
             },
             crate::scope::start_of(&req, &req.get_ref().instance)?,
             crate::scope::Caller::of(&req),
+            req.extensions()
+                .get::<crate::scope::VehicleRun>()
+                .map(|v| v.0.clone()),
         )
         .await
     }
@@ -1135,6 +1179,7 @@ impl GatewayService for GatewaySvc {
                 None => crate::scope::Target::Existing(req.get_ref().run.clone()),
             },
             crate::scope::Caller::of(&req),
+            None,
         )
         .await
     }
@@ -3523,7 +3568,7 @@ mod tests {
         assert!(read_active_record(&dir).is_none());
         std::fs::write(
             active_record(&dir),
-            r#"{"id":"vehicle-a","dir":"/ws/a","bridge":"vxbr0"}"#,
+            r#"{"id":"vehicle-a","dir":"/ws/a","bridge":"vxbr0","vehicle":"a"}"#,
         )
         .unwrap();
         assert_eq!(
@@ -3540,6 +3585,7 @@ mod tests {
                 kernel: None,
                 shaping: None,
                 time_sync: None,
+                vehicle: Some("a".into()),
             })
         );
         std::fs::write(
