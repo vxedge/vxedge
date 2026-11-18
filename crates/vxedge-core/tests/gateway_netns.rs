@@ -1367,8 +1367,11 @@ fn a_closed_gate_delays_a_slices_frames() {
     std::fs::create_dir_all(&runtime).unwrap();
     let nodes = plan_nodes_from_model(&model, &plan, std::path::Path::new("/")).unwrap();
     let _nodes_guard = NodeNetnsGuard(nodes.iter().map(|n| n.runtime_name()).collect());
-    sh.run("ip", &["link", "set", &plan.uplink_peer, "up"])
-        .unwrap();
+    // The uplink peer lives in the run's uplink-side namespace, and so do the far sides.
+    let side = Shell {
+        netns: Some(plan.uplink_ns.clone()),
+        escalate: sh.escalate,
+    };
     let mut far = std::collections::BTreeMap::new();
     for node in &nodes {
         node_up(&sh, node, &runtime, &runtime).unwrap();
@@ -1379,7 +1382,7 @@ fn a_closed_gate_delays_a_slices_frames() {
             .expect("the device's slice is planned");
         let (addr, prefix) = sibling_address(node.ip_cidr.as_deref().expect("declared ip"));
         let dev = format!("{}.{}", plan.uplink_peer, slice.vlan);
-        sh.run(
+        side.run(
             "ip",
             &[
                 "link",
@@ -1395,12 +1398,12 @@ fn a_closed_gate_delays_a_slices_frames() {
             ],
         )
         .unwrap();
-        sh.run(
+        side.run(
             "ip",
             &["addr", "add", &format!("{addr}/{prefix}"), "dev", &dev],
         )
         .unwrap();
-        sh.run("ip", &["link", "set", &dev, "up"]).unwrap();
+        side.run("ip", &["link", "set", &dev, "up"]).unwrap();
         far.insert(slice.id.clone(), (node.runtime_name(), addr));
     }
     // 60 requests 23 ms apart sample every phase of the 100 ms cycle.

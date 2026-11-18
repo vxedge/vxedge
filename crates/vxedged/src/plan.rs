@@ -458,6 +458,17 @@ pub(crate) async fn preflight(
         }),
     );
 
+    // A traffic profile whose end is a VM's tap has nowhere to run its generator (§6.0.5): refused
+    // here, before `up` starts anything, not when its traffic starts.
+    let on_tap = GatewayPlan::from_model(model, scope.instance)
+        .ok()
+        .and_then(|g| vxedge_core::traffic::TrafficPlan::from_model(model, &g).err())
+        .filter(|e| matches!(e, vxedge_core::traffic::TrafficPlanError::EndOnTap { .. }));
+    pf.check(
+        "traffic profiles",
+        on_tap.map(|e| (R::WorkspaceInvalid, model.id.clone(), e.to_string())),
+    );
+
     // What one host has once, held by another run, refuses this one (`ARCHITECTURE.md` §6.0.5).
     let others: Vec<(vxedge_core::instance::Instance, String, Experiment)> = {
         let st = gateway.state.lock().await;

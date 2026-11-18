@@ -2611,12 +2611,23 @@ fn host_addresses(netns: Option<&str>) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Why `profile` cannot put its device end's address on the host: another interface there
-/// already has an address in that end's /24, which is another run's device whose zone is down.
+/// Why `profile`, run in slot `own`, cannot put its device end's address on the host: another
+/// run's device end there (a `vp<c>-` veth peer of another slot, its zone down) already has an
+/// address in that end's /24. This run's own ends, and addresses vxedge did not place, are not
+/// another run's.
 fn host_subnet_held(
     profile: &vxedge_core::traffic::ResolvedProfile,
     addrs: &[(String, String)],
+    own: vxedge_core::instance::Instance,
 ) -> Option<String> {
+    let other_runs_end = |iface: &str| {
+        let b = iface.as_bytes();
+        b.len() > 4
+            && b.starts_with(b"vp")
+            && b[3] == b'-'
+            && vxedge_core::instance::Instance::from_char(char::from(b[2]))
+                .is_some_and(|slot| slot != own)
+    };
     use vxedge_core::traffic::ProfileEndpoint;
     let net24 = |a: &str| {
         a.split('/')
@@ -2632,9 +2643,9 @@ fn host_subnet_held(
             return None;
         };
         let mine = net24(addr)?;
-        let (iface, cidr) = addrs
-            .iter()
-            .find(|(i, c)| i != peer_iface && net24(c).as_deref() == Some(mine.as_str()))?;
+        let (iface, cidr) = addrs.iter().find(|(i, c)| {
+            i != peer_iface && other_runs_end(i) && net24(c).as_deref() == Some(mine.as_str())
+        })?;
         Some(format!(
             "traffic profile `{}`: its device end `{peer_iface}` would take {addr}/24 on the host, \
              and `{iface}` already has {cidr} there, the end of another run's device whose zone \
@@ -2789,7 +2800,7 @@ impl TrafficService for TrafficSvc {
         // routing table, which another run's may already hold (`ARCHITECTURE.md` §6.0.5).
         let addrs = host_addresses(self.shell.netns.as_deref());
         for profile in &selected {
-            if let Some(why) = host_subnet_held(profile, &addrs) {
+            if let Some(why) = host_subnet_held(profile, &addrs, scope.instance) {
                 return Err(crate::errors::precondition(
                     crate::errors::R::HeldByRun,
                     why,
@@ -3371,13 +3382,21 @@ mod tests {
             payload_bytes: 64,
         };
         let held = [("vp0-node-a".to_string(), "10.103.0.2/24".to_string())];
-        let why = host_subnet_held(&profile, &held).expect("another run's end holds the subnet");
+        let slot1 = vxedge_core::instance::Instance::parse("1").unwrap();
+        let why = host_subnet_held(&profile, &held, slot1).expect("another run's end holds it");
         assert!(why.contains("vp0-node-a"), "{why}");
-        // Its own interface, or another subnet, is no clash; far sides are never on the host.
-        let own = [("vp1-node-a".to_string(), "10.103.0.2/24".to_string())];
-        assert!(host_subnet_held(&profile, &own).is_none());
-        let other = [("vp0-node-b".to_string(), "10.104.0.2/24".to_string())];
-        assert!(host_subnet_held(&profile, &other).is_none());
+        // This run's own ends, another subnet, or an address vxedge did not place are no clash.
+        for addrs in [
+            [("vp1-node-a".to_string(), "10.103.0.2/24".to_string())],
+            [("vp1-node-b".to_string(), "10.103.0.2/24".to_string())],
+            [("vp0-node-b".to_string(), "10.104.0.2/24".to_string())],
+            [("eth0".to_string(), "10.103.0.9/24".to_string())],
+        ] {
+            assert!(
+                host_subnet_held(&profile, &addrs, slot1).is_none(),
+                "{addrs:?}"
+            );
+        }
     }
 
     use super::*;

@@ -79,11 +79,20 @@ fn teardown_uplink_side(sh: &Shell, plan: &GatewayPlan) -> Result<(), NetOpsErro
     if !netlink::netns_exists(&plan.uplink_ns) {
         return Ok(());
     }
-    for pid in pids_in_netns(&plan.uplink_ns) {
-        let _ = std::process::Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .status();
+    let signal = |sig: &str, pids: &[u32]| {
+        for pid in pids {
+            let _ = std::process::Command::new("kill")
+                .args([sig, &pid.to_string()])
+                .status();
+        }
+    };
+    let left = pids_in_netns(&plan.uplink_ns);
+    signal("-TERM", &left);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !pids_in_netns(&plan.uplink_ns).is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
+    signal("-KILL", &pids_in_netns(&plan.uplink_ns));
     super::netops::delete_named_netns(sh, &plan.uplink_ns)
 }
 
