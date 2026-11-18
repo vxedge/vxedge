@@ -25,11 +25,12 @@ use vxedge_api::v1::traffic_service_client::TrafficServiceClient;
 use vxedge_api::v1::vehicle_service_client::VehicleServiceClient;
 use vxedge_api::v1::zone_service_client::ZoneServiceClient;
 use vxedge_api::v1::{
-    ComputeListRequest, ExperimentStage, ExperimentStatusRequest, ExperimentUpRequest,
+    ComputeListRequest, ErrorReason, ExperimentStage, ExperimentStatusRequest, ExperimentUpRequest,
     GetJobRequest, JobState, ManifestRef, NodeBackend, NosCheckStatusRequest, PayloadKind,
-    ResourceKind, ResourceState, RunGetRequest, RunListRequest, RunRef, SubscribeRequest,
-    SvcDownRequest, SvcStatusRequest, SvcUpRequest, TrafficDownRequest, VehicleStatusRequest,
-    VehicleUpRequest, VxidRef, ZoneListRequest, ZoneUpRequest, manifest_ref::Source,
+    ResourceKind, ResourceState, RunDownRequest, RunGetRequest, RunListRequest, RunRef,
+    RunStatusRequest, SubscribeRequest, SvcDownRequest, SvcStatusRequest, SvcUpRequest,
+    TrafficDownRequest, VehicleStatusRequest, VehicleUpRequest, VxidRef, ZoneListRequest,
+    ZoneUpRequest, manifest_ref::Source,
 };
 
 const VEHICLE: &str = r#"
@@ -912,6 +913,166 @@ async fn run_service_is_empty_with_nothing_active() {
         .into_inner()
         .runs;
     assert!(runs.is_empty());
+}
+
+#[tokio::test]
+async fn fleet_status_reports_every_run_and_an_absent_named_one() {
+    let ws = vehicle_workspace();
+    let daemon = Daemon::start_with(|run| write_run_record(run, &vehicle_id(), &ws, "run-a"));
+    let mut runs = RunServiceClient::new(daemon.channel().await);
+    let every = runs
+        .status(RunStatusRequest::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .runs;
+    assert_eq!(every.len(), 1);
+    let run = every[0].run.clone().unwrap();
+    assert_eq!((run.id.as_str(), run.instance.as_str()), ("run-a", "0"));
+    assert_eq!(run.kind, ResourceKind::Vehicle as i32);
+
+    let named = runs
+        .status(RunStatusRequest {
+            runs: vec![
+                RunRef {
+                    run_id: "run-b".into(),
+                },
+                RunRef {
+                    run_id: "run-a".into(),
+                },
+            ],
+        })
+        .await
+        .expect("a named run that is not up is an entry, not a refusal")
+        .into_inner()
+        .runs;
+    let ids: Vec<String> = named
+        .iter()
+        .map(|r| r.run.clone().unwrap_or_default().id)
+        .collect();
+    assert_eq!(
+        ids,
+        ["run-a", "run-b"],
+        "runs that are up first, then the absent"
+    );
+    assert_eq!(named[1].error_reason, ErrorReason::RunMismatch as i32);
+    assert!(named[1].status.is_none() && !named[1].error_message.is_empty());
+}
+
+#[tokio::test]
+async fn fleet_status_with_nothing_up_is_empty_and_names_the_absent() {
+    let daemon = Daemon::start();
+    let mut runs = RunServiceClient::new(daemon.channel().await);
+    assert!(
+        runs.status(RunStatusRequest::default())
+            .await
+            .unwrap()
+            .into_inner()
+            .runs
+            .is_empty()
+    );
+    let named = runs
+        .status(RunStatusRequest {
+            runs: vec![RunRef {
+                run_id: "run-a".into(),
+            }],
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .runs;
+    assert_eq!(named.len(), 1);
+    assert_eq!(named[0].error_reason, ErrorReason::NoActiveRun as i32);
+}
+
+#[tokio::test]
+async fn fleet_down_takes_exactly_one_of_runs_or_all() {
+    let daemon = Daemon::start();
+    let channel = daemon.channel().await;
+    let mut runs = RunServiceClient::new(channel.clone());
+    let neither = runs.down(RunDownRequest::default()).await.unwrap_err();
+    assert_eq!(neither.code(), tonic::Code::InvalidArgument, "{neither:?}");
+    assert_eq!(reason(&neither), "ERROR_REASON_INVALID_REQUEST");
+    let both = runs
+        .down(RunDownRequest {
+            runs: vec![RunRef {
+                run_id: "run-a".into(),
+            }],
+            all: true,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&both), "ERROR_REASON_INVALID_REQUEST");
+    let missing = runs
+        .down(RunDownRequest {
+            runs: vec![RunRef {
+                run_id: "run-a".into(),
+            }],
+            all: false,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&missing), "ERROR_REASON_NO_ACTIVE_RUN");
+
+    let job = runs
+        .down(RunDownRequest {
+            runs: Vec::new(),
+            all: true,
+        })
+        .await
+        .expect("every run, with nothing up, is nothing to do")
+        .into_inner();
+    assert_eq!(job.kind, "run.down");
+    assert_eq!(
+        wait_for_job(channel, job.id).await,
+        JobState::Succeeded as i32
+    );
+}
+
+#[tokio::test]
+async fn fleet_down_refuses_every_run_while_a_campaign_holds_a_slot() {
+    let ws = vehicle_workspace();
+    let daemon = Daemon::start_with(|run| {
+        write_run_record(run, &vehicle_id(), &ws, "run-a");
+        let held = run.join("runs").join("3");
+        std::fs::create_dir_all(&held).unwrap();
+        std::fs::write(
+            held.join("reserved.json"),
+            r#"{"campaign":"c-held","resumable":true}"#,
+        )
+        .unwrap();
+        // A campaign still running, so the daemon keeps its hold when it starts.
+        std::fs::create_dir_all(run.join("campaigns")).unwrap();
+        std::fs::write(
+            run.join("campaigns/c-held.json"),
+            r#"{"campaign_id":"c-held","state":"running","trials":[]}"#,
+        )
+        .unwrap();
+    });
+    let mut runs = RunServiceClient::new(daemon.channel().await);
+    let refused = runs
+        .down(RunDownRequest {
+            runs: Vec::new(),
+            all: true,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&refused), "ERROR_REASON_HELD_BY_RUN");
+    assert!(
+        refused.message().contains("slot 3 (campaign `c-held`)"),
+        "{}",
+        refused.message()
+    );
+    assert_eq!(
+        runs.list(RunListRequest::default())
+            .await
+            .unwrap()
+            .into_inner()
+            .runs
+            .len(),
+        1,
+        "nothing was taken down"
+    );
 }
 
 #[tokio::test]
