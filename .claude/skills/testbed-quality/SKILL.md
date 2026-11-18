@@ -22,7 +22,7 @@ automotive vocabulary**. Every feature is judged against those four properties.
 
 ## 2. Fidelity honesty (credibility is compounding)
 
-- Call the platform an **executable virtual prototype / all-software SDV testbed** — the
+- Call the platform a **virtual vehicle with environmental parity** or an **executable virtual prototype** — the
   word "twin" is reserved for hardware-in-the-loop parity or explicit vendor-twin
   claims (Snapdragon vSoC, Mcity). Overclaiming once costs more than underclaiming always.
 - Known gaps are stated where users will see them: RTOS-as-guest inversion, shared-host

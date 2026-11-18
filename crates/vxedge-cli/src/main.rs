@@ -46,7 +46,7 @@ use vxedge_api::v1::{
 #[command(
     name = "vxedge",
     version,
-    about = "vxedge — manifest-driven SDV testbed orchestrator"
+    about = "vxedge — a virtual vehicle with environmental parity, for packaged, measured SDV experiments"
 )]
 struct Cli {
     /// vxAPI endpoint (unix:///path.sock; TCP arrives with the auth work).
