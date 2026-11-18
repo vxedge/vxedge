@@ -6,6 +6,11 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- A gateway `apply` that finds the access port's ingress qdisc already gone no longer fails: `tc` reports that
+  case as `Invalid handle`, which now reads as already absent for that one command.
+
 ## [0.32.0] - 2026-11-18
 
 Each run's uplink side gets a network namespace of its own, `vxh<s>`, so two runs can use the same far-side

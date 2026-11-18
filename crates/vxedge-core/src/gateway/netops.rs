@@ -314,6 +314,18 @@ impl Shell {
     fn tolerate_missing(res: Result<String, NetOpsError>) -> Result<(), NetOpsError> {
         match res {
             Ok(_) => Ok(()),
+            // `tc qdisc del dev <x> ingress` on a device whose ingress qdisc is already gone: the
+            // kernel finds the placeholder left in the ingress slot, whose handle is 0, and
+            // answers "Invalid handle". The OVS backend's live test met it when a second apply
+            // found the ingress qdisc removed under it. Only that command reads it as absent:
+            // elsewhere the same text is a real error.
+            Err(NetOpsError::Command { cmdline, stderr })
+                if stderr.contains("Invalid handle")
+                    && cmdline.contains("tc qdisc del ")
+                    && cmdline.ends_with(" ingress") =>
+            {
+                Ok(())
+            }
             Err(NetOpsError::Command { stderr, .. })
                 if stderr.contains("Cannot find device")
                     || stderr.contains("does not exist")
@@ -343,5 +355,61 @@ impl Shell {
             cmdline,
             detail: e.to_string(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failed(cmdline: &str, stderr: &str) -> Result<String, NetOpsError> {
+        Err(NetOpsError::Command {
+            cmdline: cmdline.into(),
+            stderr: stderr.into(),
+        })
+    }
+
+    #[test]
+    fn an_ingress_qdisc_already_gone_reads_as_absent() {
+        assert!(
+            Shell::tolerate_missing(failed(
+                "tc qdisc del dev vxoep1 ingress",
+                "Error: Invalid handle."
+            ))
+            .is_ok()
+        );
+        assert!(
+            Shell::tolerate_missing(failed(
+                "tc qdisc del dev vxoep1 ingress",
+                "Error: Cannot find specified qdisc on specified device."
+            ))
+            .is_ok()
+        );
+        assert!(
+            Shell::tolerate_missing(failed(
+                "sudo ip netns exec vxh0 tc qdisc del dev vxup0p ingress",
+                "Error: Invalid handle."
+            ))
+            .is_ok(),
+            "escalated or in a namespace, it is the same command"
+        );
+    }
+
+    #[test]
+    fn invalid_handle_elsewhere_is_still_an_error() {
+        assert!(
+            Shell::tolerate_missing(failed(
+                "tc qdisc del dev vxup0 root handle 1:",
+                "Error: Invalid handle."
+            ))
+            .is_err()
+        );
+        assert!(
+            Shell::tolerate_missing(failed(
+                "tc filter add dev vxoep1 parent ffff: protocol all prio 1",
+                "Error: Invalid handle."
+            ))
+            .is_err()
+        );
     }
 }
