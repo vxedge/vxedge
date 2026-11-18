@@ -173,24 +173,11 @@ pub(crate) enum HostWide {
     Adopted(String),
     /// A port a host-process service (no `on:`) listens on.
     HostPort(u16),
-    /// A host-side address's subnet: `(network, prefix)`.
-    Subnet(u32, u8),
 }
 
 impl HostWide {
     fn clashes(&self, other: &HostWide) -> bool {
-        match (self, other) {
-            (HostWide::Subnet(a, pa), HostWide::Subnet(b, pb)) => {
-                let p = (*pa).min(*pb);
-                let mask = if p == 0 {
-                    0
-                } else {
-                    u32::MAX << (32 - u32::from(p))
-                };
-                a & mask == b & mask
-            }
-            _ => self == other,
-        }
+        self == other
     }
 
     fn describe(&self) -> String {
@@ -200,34 +187,15 @@ impl HostWide {
             HostWide::Vxlan { vni, port } => format!("VXLAN VNI {vni} on port {port}"),
             HostWide::Adopted(i) => format!("host interface `{i}`"),
             HostWide::HostPort(p) => format!("host port {p}, which a service listens on"),
-            HostWide::Subnet(n, p) => format!(
-                "host-side addresses in {}/{p}",
-                std::net::Ipv4Addr::from(*n)
-            ),
         }
     }
-}
-
-fn subnet(cidr: &str) -> Option<HostWide> {
-    let (ip, prefix) = cidr.split_once('/').unwrap_or((cidr, "24"));
-    let ip: std::net::Ipv4Addr = ip.parse().ok()?;
-    let prefix: u8 = prefix.parse().ok().filter(|p| *p <= 32)?;
-    let mask = if prefix == 0 {
-        0
-    } else {
-        u32::MAX << (32 - u32::from(prefix))
-    };
-    Some(HostWide::Subnet(u32::from(ip) & mask, prefix))
 }
 
 /// What `model`, run in slot `instance`, holds that one host has once.
 pub(crate) fn host_wide(
     model: &Experiment,
     instance: vxedge_core::instance::Instance,
-    nodes: &[NodePlan],
-    cache_dir: &Path,
 ) -> Vec<HostWide> {
-    use vxedge_core::traffic::ProfileEndpoint as E;
     let mut held = Vec::new();
     if model
         .slices
@@ -276,29 +244,9 @@ pub(crate) fn host_wide(
             .filter(|e| e.kind == vxedge_core::gateway::plan::EndpointKind::Adopted)
             .map(|e| HostWide::Adopted(e.name.clone())),
     );
-    // Addresses on the host's side: traffic far sides and host-side peers, and measurement far
-    // sides. They sit in the host's routing table, so two runs' must not overlap.
-    if let Ok(traffic) = vxedge_core::traffic::TrafficPlan::from_model(model, &gateway) {
-        for p in &traffic.profiles {
-            for end in [&p.source, &p.target] {
-                if let E::VlanUplinkFarSide { addr, .. } | E::VlanNodePeer { addr, .. } = end {
-                    held.extend(subnet(&format!("{addr}/24")));
-                }
-            }
-        }
-    }
-    if let Ok(placements) = vxedge_core::measurements::run::plan(model, &gateway, nodes, cache_dir)
-    {
-        use vxedge_core::measurements::run::{Reflector, Sender};
-        for p in &placements {
-            if let Sender::Host(f) = &p.sender {
-                held.extend(subnet(&f.cidr));
-            }
-            if let Reflector::FarSide(f) = &p.reflector {
-                held.extend(subnet(&f.cidr));
-            }
-        }
-    }
+    // Far sides are not here: each run's live in its own uplink-side namespace, `vxh<s>`. A
+    // device end a traffic profile puts on the host (its zone down) is checked when that traffic
+    // starts, since `up` brings the zone up and the traffic then runs inside the node.
     held
 }
 
@@ -510,34 +458,32 @@ pub(crate) async fn preflight(
         }),
     );
 
+    // A traffic profile whose end is a VM's tap has nowhere to run its generator (§6.0.5): refused
+    // here, before `up` starts anything, not when its traffic starts.
+    let on_tap = GatewayPlan::from_model(model, scope.instance)
+        .ok()
+        .and_then(|g| vxedge_core::traffic::TrafficPlan::from_model(model, &g).err())
+        .filter(|e| matches!(e, vxedge_core::traffic::TrafficPlanError::EndOnTap { .. }));
+    pf.check(
+        "traffic profiles",
+        on_tap.map(|e| (R::WorkspaceInvalid, model.id.clone(), e.to_string())),
+    );
+
     // What one host has once, held by another run, refuses this one (`ARCHITECTURE.md` §6.0.5).
-    let others: Vec<(
-        vxedge_core::instance::Instance,
-        String,
-        Experiment,
-        Vec<NodePlan>,
-    )> = {
+    let others: Vec<(vxedge_core::instance::Instance, String, Experiment)> = {
         let st = gateway.state.lock().await;
         st.runs
             .iter()
             .filter(|(i, _)| **i != scope.instance)
             .filter_map(|(i, r)| {
                 let a = r.active.as_ref()?;
-                let g = r.gateway.as_ref()?;
-                let nodes = vxedge_core::zones::plan_nodes_from_model(&a.model, g, &a.dir)
-                    .unwrap_or_default();
-                Some((*i, a.model.id.clone(), a.model.clone(), nodes))
+                Some((*i, a.model.id.clone(), a.model.clone()))
             })
             .collect()
     };
     let mut theirs: Vec<(String, Vec<HostWide>)> = others
         .iter()
-        .map(|(i, id, m, n)| {
-            (
-                format!("`{id}` in slot {i}"),
-                host_wide(m, *i, n, cache_dir),
-            )
-        })
+        .map(|(i, id, m)| (format!("`{id}` in slot {i}"), host_wide(m, *i)))
         .collect();
     // A campaign between two trials has no run up, and still holds what its next trial needs.
     let root = gateway.runtime_dir.clone();
@@ -558,16 +504,12 @@ pub(crate) async fn preflight(
         let Ok(m) = vxedge_core::model::load_yaml(&text) else {
             continue;
         };
-        let nodes = GatewayPlan::from_model(&m, i)
-            .ok()
-            .and_then(|g| vxedge_core::zones::plan_nodes_from_model(&m, &g, &dir).ok())
-            .unwrap_or_default();
         theirs.push((
             format!("campaign `{campaign}` in slot {i}"),
-            host_wide(&m, i, &nodes, cache_dir),
+            host_wide(&m, i),
         ));
     }
-    let mine = host_wide(model, scope.instance, nodes, cache_dir);
+    let mine = host_wide(model, scope.instance);
     pf.check(
         "host-wide resources",
         held_by_other_run(&mine, &theirs).map(|(what, run)| {
@@ -1367,17 +1309,6 @@ parts:
 #[cfg(test)]
 mod host_wide_tests {
     use super::*;
-
-    #[test]
-    fn overlapping_host_side_subnets_clash_and_disjoint_ones_do_not() {
-        let a = subnet("10.101.0.1/24").unwrap();
-        assert!(a.clashes(&subnet("10.101.0.200/24").unwrap()));
-        assert!(
-            a.clashes(&subnet("10.101.0.0/16").unwrap()),
-            "one inside the other"
-        );
-        assert!(!a.clashes(&subnet("10.102.0.1/24").unwrap()));
-    }
 
     #[test]
     fn what_one_host_has_once_is_named_with_the_run_that_holds_it() {

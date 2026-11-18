@@ -92,16 +92,20 @@ fn own_uid() -> u32 {
     std::fs::metadata("/proc/self").unwrap().uid()
 }
 
-/// One UDP round trip to the guest's reflector.
-fn reflected(payload: &str) -> bool {
+/// One UDP round trip to the guest's reflector, from the far side in the run's uplink-side
+/// namespace `ns`.
+fn reflected(ns: &str, payload: &str) -> bool {
     let target = format!("UDP:{GUEST_IP}:{REFLECTOR_PORT}");
-    let mut child = Command::new("socat")
-        .args(["-t1", "-", &target])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("socat installed");
+    let mut child = vxedge_core::gateway::netlink::in_netns(ns, move || {
+        Command::new("socat")
+            .args(["-t1", "-", &target])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+    })
+    .expect("enters the uplink-side namespace")
+    .expect("socat installed");
     child
         .stdin
         .take()
@@ -135,7 +139,9 @@ fn an_unprivileged_vmm_carries_traffic_on_a_tap_its_user_owns() {
         escalate: true,
     };
     let model = vxedge_core::model::load_yaml(&workspace(&bundle)).expect("workspace loads");
-    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST).unwrap();
+    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST)
+        .unwrap()
+        .uplink_side_beside(&sh);
     let _guard = Guard {
         sh: sh.clone(),
         plan: plan.clone(),
@@ -147,7 +153,12 @@ fn an_unprivileged_vmm_carries_traffic_on_a_tap_its_user_owns() {
 
     // The far side, on the guest's slice and subnet.
     let far_dev = format!("{}.101", plan.uplink_peer);
-    sh.run(
+    // The uplink peer lives in the run's uplink-side namespace, and so does its far side.
+    let side = Shell {
+        netns: Some(plan.uplink_ns.clone()),
+        escalate: sh.escalate,
+    };
+    side.run(
         "ip",
         &[
             "link",
@@ -163,10 +174,10 @@ fn an_unprivileged_vmm_carries_traffic_on_a_tap_its_user_owns() {
         ],
     )
     .unwrap();
-    sh.run("ip", &["addr", "add", FAR_SIDE_CIDR, "dev", &far_dev])
+    side.run("ip", &["addr", "add", FAR_SIDE_CIDR, "dev", &far_dev])
         .unwrap();
-    sh.run("ip", &["link", "set", &far_dev, "up"]).unwrap();
-    sh.run("ip", &["link", "set", &plan.uplink_peer, "up"])
+    side.run("ip", &["link", "set", &far_dev, "up"]).unwrap();
+    side.run("ip", &["link", "set", &plan.uplink_peer, "up"])
         .unwrap();
 
     node_up(&sh, node, &runtime, &runtime).unwrap();
@@ -190,7 +201,7 @@ fn an_unprivileged_vmm_carries_traffic_on_a_tap_its_user_owns() {
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut answered = false;
     while !answered && Instant::now() < deadline {
-        answered = reflected("vxedge-unprivileged");
+        answered = reflected(&plan.uplink_ns, "vxedge-unprivileged");
     }
     let log = std::fs::read_to_string(&serial).unwrap_or_default();
     assert!(answered, "the reflector never answered; serial:\n{log}");

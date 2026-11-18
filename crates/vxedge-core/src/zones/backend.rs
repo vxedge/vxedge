@@ -265,7 +265,6 @@ use crate::containers::{
     PAUSE_IMAGE,
 };
 use crate::gateway::netlink;
-use crate::gateway::netops::children_are_privileged;
 use crate::gateway::netops::{NetOpsError, Shell};
 use crate::model::Backend;
 use crate::model::{QemuMachine, QemuOptions, VirtioTransport};
@@ -376,22 +375,8 @@ pub(super) fn netns_port_up(sh: &Shell, np: &NodePlan) -> Result<(), ZoneBackend
     // a bind mount created from inside one doesn't propagate; only the veth move targets
     // where the interface currently lives. See `gateway::netlink`'s own module doc for why
     // netns create/delete is `rtnetlink::NetworkNamespace`, not a hand-rolled unshare/mount.
-    if escalates_netns_registry(sh) {
-        if !netlink::netns_exists(&ns) {
-            sh.run_host("ip", &["netns", "add", &ns])?;
-        }
-    } else {
-        netlink::ensure_netns(&ns).map_err(|e| nl(np, e))?;
-    }
+    crate::gateway::netops::ensure_named_netns(sh, &ns)?;
     attach_port(sh, np, &ns)
-}
-
-/// Whether a named namespace has to go through `ip` and sudo. `/run/netns` is root's, and
-/// `cap_net_admin,cap_sys_admin` do not reach a directory another user owns, so a `vxedged` under
-/// `setcap` cannot register a namespace itself. Everything after that works with its own
-/// capabilities.
-fn escalates_netns_registry(sh: &Shell) -> bool {
-    sh.escalate && !children_are_privileged()
 }
 
 fn container_up(sh: &Shell, np: &NodePlan) -> Result<(), ZoneBackendError> {
@@ -440,11 +425,7 @@ pub(super) fn container_down(sh: &Shell, np: &NodePlan) -> Result<(), ZoneBacken
     // Destroys the moved veth peer (and thus the bridge-side pair);
     // `vxedge up` re-creates endpoints idempotently.
     let ns = np.runtime_name();
-    if !escalates_netns_registry(sh) {
-        netlink::delete_netns(&ns).map_err(|e| nl(np, e))?;
-    } else if netlink::netns_exists(&ns) {
-        sh.run_host("ip", &["netns", "del", &ns])?;
-    }
+    crate::gateway::netops::delete_named_netns(sh, &ns)?;
     if np.image.is_some() {
         // The group's namespace, and the port in it, go with its infra container.
         let client = block_on(ContainerClient::connect_user()).map_err(|e| ct(np, e))?;

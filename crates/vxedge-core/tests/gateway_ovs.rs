@@ -25,6 +25,7 @@ fn test_plan() -> GatewayPlan {
         bridge: "vxovstest".into(),
         uplink: "vxovsup".into(),
         uplink_peer: "vxovsupp".into(),
+        uplink_ns: "vxovsh".into(),
         root_rate_mbps: 500,
         slices: vec![SlicePlan {
             id: "adas".into(),
@@ -63,11 +64,12 @@ fn test_plan() -> GatewayPlan {
 }
 
 /// Removes everything this test could have created, even on panic — the OVS bridge, its ports,
-/// and the IFB, none of which a namespace teardown would take care of here.
+/// the IFB and the uplink side's namespace, none of which a namespace teardown would take care of here.
 struct OvsCleanup {
     bridge: &'static str,
     ports: &'static [&'static str],
     ifbs: &'static [&'static str],
+    uplink_ns: &'static str,
 }
 
 impl Drop for OvsCleanup {
@@ -85,6 +87,10 @@ impl Drop for OvsCleanup {
                 .args(["link", "del", p])
                 .output();
         }
+        // The uplink side's namespace, which holds the uplink's peer.
+        let _ = std::process::Command::new("ip")
+            .args(["netns", "del", self.uplink_ns])
+            .output();
     }
 }
 
@@ -95,6 +101,7 @@ fn ovs_data_plane_cycle() {
         bridge: "vxovstest",
         ports: &["vxovsup", "vxoep1"],
         ifbs: &["vxoifb1"],
+        uplink_ns: "vxovsh",
     };
     let sh = Shell::default();
     let plan = test_plan();

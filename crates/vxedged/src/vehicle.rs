@@ -341,6 +341,12 @@ impl VehicleService for VehicleSvc {
                     // Reverse order, best-effort — same reasoning as `ExperimentSvc::down`: a
                     // teardown that stops at the first error strands whatever came after it.
                     let mut failures: Vec<JobFailure> = Vec::new();
+                    if wants(&stages, ExperimentStage::Zones)
+                        || wants(&stages, ExperimentStage::Gateway)
+                    {
+                        crate::experiment::stop_run_processes(&svc.gateway.shell, &run.scope.dir)
+                            .await;
+                    }
                     if wants(&stages, ExperimentStage::Services)
                         && let Err(e) = svc
                             .stage_services(&model, &yaml, dir.as_deref(), false, &p, &run)

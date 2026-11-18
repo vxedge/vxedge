@@ -64,6 +64,7 @@ struct NetnsGuard(String);
 impl Drop for NetnsGuard {
     fn drop(&mut self) {
         let _ = sudo(&["ip", "netns", "del", &self.0]);
+        let _ = sudo(&["ip", "netns", "del", &format!("{}-h", self.0)]);
     }
 }
 
@@ -109,7 +110,9 @@ fn container_node_runs_an_oci_payload_in_its_own_group_namespace() {
     };
 
     let model = vxedge_core::model::load_yaml(&workspace()).expect("workspace loads");
-    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST).unwrap();
+    let plan = GatewayPlan::from_model(&model, vxedge_core::instance::Instance::FIRST)
+        .unwrap()
+        .uplink_side_beside(&sh);
     apply(&sh, &plan).unwrap();
     assert!(observe(&sh, &plan).unwrap().fully_up());
 

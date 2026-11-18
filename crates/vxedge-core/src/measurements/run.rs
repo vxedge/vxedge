@@ -65,8 +65,8 @@ pub struct End {
     pub addr: String,
 }
 
-/// A VLAN subinterface of the uplink's peer, in the host's namespace, addressed in a node's
-/// subnet: the far side of the shared uplink for that node's slice.
+/// A VLAN subinterface of the uplink's peer, in the run's uplink-side namespace, addressed in a
+/// node's subnet: the far side of the shared uplink for that node's slice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FarSide {
     pub parent: String,
@@ -75,6 +75,9 @@ pub struct FarSide {
     /// The address with its prefix, as `ip addr` takes it.
     pub cidr: String,
     pub addr: String,
+    /// The run's uplink-side namespace, `vxh<s>`, which holds `parent`, this subinterface and
+    /// whatever runs on it (`ARCHITECTURE.md` §6.0.5).
+    pub netns: String,
 }
 
 /// Where the sender runs.
@@ -107,7 +110,7 @@ pub enum Reflector {
     Node(End),
     /// The slice's UE, bound to its PDU-session address, which is learned when it starts.
     Ue(Box<crate::fiveg::SliceSession>),
-    /// A VLAN subinterface of the uplink's peer, in the host's namespace.
+    /// A VLAN subinterface of the uplink's peer, in the run's uplink-side namespace.
     FarSide(FarSide),
     /// The reflector a node's guest runs, declared by its part in the bundle's `meta.json`.
     Guest {
@@ -386,6 +389,7 @@ pub(crate) fn far_side_of(
         iface: format!("{}.{}", gateway.uplink_peer, slice.vlan),
         cidr: format!("{addr}/{prefix}"),
         addr,
+        netns: gateway.uplink_ns.clone(),
     })
 }
 
@@ -417,6 +421,9 @@ pub struct Started {
     /// The far-side interface this measurement's reflector listens on, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub far_side: Option<String>,
+    /// The namespace holding `far_side`: the run's uplink-side one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub far_side_netns: Option<String>,
 }
 
 /// The file prefix of a measurement's processes, records and logs.
@@ -602,14 +609,20 @@ pub(crate) async fn netns_of(end: &End, containers: &LazyClient) -> Result<Strin
     }
 }
 
-/// The far side's VLAN subinterface of the uplink's peer, up and addressed. Idempotent.
-pub(crate) fn ensure_far_side(
-    sh: &Shell,
-    parent: &str,
-    vlan: u16,
-    iface: &str,
-    cidr: &str,
-) -> Result<(), String> {
+/// A shell that runs inside the run's uplink-side namespace `netns`, escalating as `sh` does.
+pub(crate) fn uplink_side(sh: &Shell, netns: &str) -> Shell {
+    Shell {
+        netns: Some(netns.to_string()),
+        escalate: sh.escalate,
+    }
+}
+
+/// The far side's VLAN subinterface of the uplink's peer, up and addressed, in the run's
+/// uplink-side namespace. Idempotent.
+pub(crate) fn ensure_far_side(sh: &Shell, f: &FarSide) -> Result<(), String> {
+    let sh = &uplink_side(sh, &f.netns);
+    let (parent, vlan, iface, cidr) =
+        (f.parent.as_str(), f.vlan, f.iface.as_str(), f.cidr.as_str());
     if !sh.link_exists(iface) {
         let vlan = vlan.to_string();
         sh.run(
@@ -670,14 +683,12 @@ pub async fn start(
         Sender::DataNetwork { .. } => (String::new(), None),
         Sender::Host(f) => {
             let (sh, f) = (sh.clone(), f.clone());
-            let iface = f.iface.clone();
-            tokio::task::spawn_blocking(move || {
-                ensure_far_side(&sh, &f.parent, f.vlan, &f.iface, &f.cidr)
-            })
-            .await
-            .map_err(|e| err(e.to_string()))?
-            .map_err(err)?;
-            (String::new(), Some(iface))
+            let far = (f.iface.clone(), f.netns.clone());
+            tokio::task::spawn_blocking(move || ensure_far_side(&sh, &f))
+                .await
+                .map_err(|e| err(e.to_string()))?
+                .map_err(err)?;
+            (far.1.clone(), Some(far))
         }
     };
     let listen = |addr: &str| {
@@ -717,7 +728,7 @@ pub async fn start(
             None
         }
         Reflector::Node(_) if reflecting => None,
-        Reflector::FarSide(f) if reflecting => Some(f.iface.clone()),
+        Reflector::FarSide(f) if reflecting => Some((f.iface.clone(), f.netns.clone())),
         Reflector::Node(to) => {
             let ns = netns_of(to, containers).await.map_err(err)?;
             let (rt, id, bin, args) = (
@@ -743,13 +754,13 @@ pub async fn start(
                 listen(&f.addr),
             );
             tokio::task::spawn_blocking(move || -> Result<(), String> {
-                ensure_far_side(&sh, &f_c.parent, f_c.vlan, &f_c.iface, &f_c.cidr)?;
-                spawn(&rt, &id, "reflect", None, &bin, args, None).map(|_| ())
+                ensure_far_side(&sh, &f_c)?;
+                spawn(&rt, &id, "reflect", Some(&f_c.netns), &bin, args, None).map(|_| ())
             })
             .await
             .map_err(|e| err(e.to_string()))?
             .map_err(err)?;
-            Some(f.iface.clone())
+            Some((f.iface.clone(), f.netns.clone()))
         }
     };
     let target = target.ok_or_else(|| err("no reflector address".into()))?;
@@ -799,12 +810,14 @@ pub async fn start(
     .await
     .map_err(|e| err(e.to_string()))?
     .map_err(err)?;
+    let far = reflector_far_side.or(sender_far_side);
     let record = Started {
         id: p.id.clone(),
         entity: p.entity.clone(),
         netns: sender_ns,
         metrics_port: p.metrics_port,
-        far_side: reflector_far_side.or(sender_far_side),
+        far_side: far.as_ref().map(|(iface, _)| iface.clone()),
+        far_side_netns: far.map(|(_, ns)| ns),
     };
     std::fs::write(
         file(runtime_dir, &p.id, ".json"),
@@ -881,16 +894,19 @@ pub fn stop(sh: &Shell, runtime_dir: &Path, id: &str) -> String {
         let _ = std::fs::remove_file(exitfile(runtime_dir, id, role));
     }
     let record = file(runtime_dir, id, ".json");
-    let far_side = std::fs::read(&record)
+    let started_as = std::fs::read(&record)
         .ok()
-        .and_then(|b| serde_json::from_slice::<Started>(&b).ok())
-        .and_then(|s| s.far_side);
+        .and_then(|b| serde_json::from_slice::<Started>(&b).ok());
     let _ = std::fs::remove_file(&record);
-    if let Some(iface) = far_side {
+    if let Some((iface, netns)) = started_as.and_then(|s| Some((s.far_side?, s.far_side_netns))) {
         let shared = started(runtime_dir)
             .iter()
             .any(|s| s.far_side.as_deref() == Some(iface.as_str()))
             || traffic_uses(runtime_dir, &iface);
+        let sh = match &netns {
+            Some(ns) => uplink_side(sh, ns),
+            None => sh.clone(),
+        };
         if !shared && sh.link_exists(&iface) {
             let _ = sh.run("ip", &["link", "del", &iface]);
         }
@@ -900,8 +916,9 @@ pub fn stop(sh: &Shell, runtime_dir: &Path, id: &str) -> String {
 
 /// Every running measurement's metrics, read inside its sender's namespace and labelled with its
 /// entity, as Prometheus text. One that does not answer within half a second is left out, so a
-/// hung sender cannot hold a scrape past the ingest's timeout.
-pub fn collect_metrics(runtime_dir: &Path) -> String {
+/// hung sender cannot hold a scrape past the ingest's timeout, and `missed` is told which and why:
+/// a gap is reported, never dropped in silence.
+pub fn collect_metrics(runtime_dir: &Path, missed: &mut dyn FnMut(&str, String)) -> String {
     let mut out = String::new();
     for s in started(runtime_dir) {
         if status(runtime_dir, &s.id) != State::Running {
@@ -909,16 +926,18 @@ pub fn collect_metrics(runtime_dir: &Path) -> String {
         }
         let port = s.metrics_port;
         let text = if s.netns.is_empty() {
-            fetch(port)
+            fetch(port).ok_or_else(|| format!("no answer on 127.0.0.1:{port}"))
         } else {
             netlink::in_netns(&s.netns, move || fetch(port))
-                .ok()
-                .flatten()
+                .map_err(|e| format!("cannot enter `{}`: {e}", s.netns))
+                .and_then(|t| {
+                    t.ok_or_else(|| format!("no answer on 127.0.0.1:{port} in `{}`", s.netns))
+                })
         };
-        let Some(text) = text else {
-            continue;
-        };
-        out.push_str(&relabel(&text, &s.entity));
+        match text {
+            Ok(text) => out.push_str(&relabel(&text, &s.entity)),
+            Err(why) => missed(&s.id, why),
+        }
     }
     out
 }
@@ -1031,12 +1050,17 @@ network:
             iface,
             cidr,
             addr,
+            netns,
         }) = &p[0].reflector
         else {
             panic!("{:?}", p[0].reflector)
         };
         assert_eq!(*vlan, 101);
         assert_eq!(iface, &format!("{parent}.101"));
+        assert_eq!(
+            netns, "vxh0",
+            "the far side lives in the run's uplink-side namespace"
+        );
         assert_eq!(
             (cidr.as_str(), addr.as_str()),
             ("10.101.0.1/24", "10.101.0.1")
@@ -1263,7 +1287,7 @@ measurements:
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(status(dir.path(), "a"), State::NotStarted);
         assert!(started(dir.path()).is_empty());
-        assert_eq!(collect_metrics(dir.path()), "");
+        assert_eq!(collect_metrics(dir.path(), &mut |_, _| {}), "");
         let sh = Shell::default();
         assert_eq!(stop(&sh, dir.path(), "a"), "measurement `a` stopped");
     }

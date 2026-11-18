@@ -19,6 +19,21 @@ pub enum NetOpsError {
     Permission { cmdline: String },
     #[error("`{cmdline}` failed: {stderr}")]
     Command { cmdline: String, stderr: String },
+    /// `sudo -n` refused for want of a credential or a rule: a host requirement, not a
+    /// networking failure.
+    #[error(
+        "vxedged cannot escalate `{cmdline}`: `sudo` wants a password and a daemon has no \
+         terminal. Either run vxedged as root, or grant passwordless sudo for that command \
+         (TESTBED-SETUP.md). `setcap` on the vxedged binary does not cover it: capabilities do \
+         not propagate across exec to child processes"
+    )]
+    NoSudo { cmdline: String },
+    /// This process cannot enter a named network namespace (`setns(2)` needs `CAP_SYS_ADMIN`).
+    #[error(
+        "vxedged cannot enter network namespace `{netns}`: it needs CAP_SYS_ADMIN \
+         (`sudo setcap cap_net_admin,cap_sys_admin+ep <path-to-vxedged>`, or run it as root)"
+    )]
+    CannotEnterNetns { netns: String },
     #[error("cannot execute `{program}`: {source} (is iproute2 installed?)")]
     Spawn {
         program: String,
@@ -77,6 +92,66 @@ pub(crate) fn children_are_privileged() -> bool {
             })
             .is_some_and(|euid| euid == "0")
     })
+}
+
+/// Whether this process can enter a named network namespace: `setns(2)` needs `CAP_SYS_ADMIN`
+/// in its effective set, or uid 0. Read from `/proc/self/status`'s `CapEff` like
+/// [`children_are_privileged`], and cached for the same reason.
+pub fn can_enter_netns() -> bool {
+    const CAP_SYS_ADMIN: u32 = 21;
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status
+                    .lines()
+                    .find_map(|l| l.strip_prefix("CapEff:"))
+                    .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
+            })
+            .is_some_and(|caps| caps & (1 << CAP_SYS_ADMIN) != 0)
+    })
+}
+
+/// Whether registering a named namespace has to go through `ip` and sudo. `/run/netns` is
+/// root's, and `cap_net_admin,cap_sys_admin` do not reach a directory another user owns, so a
+/// `vxedged` under `setcap` cannot register a namespace itself. Everything after that works with
+/// its own capabilities.
+pub fn escalates_netns_registry(sh: &Shell) -> bool {
+    sh.escalate && !children_are_privileged()
+}
+
+/// Register the named namespace `name` unless it exists. Registry operations run in the host
+/// context, never nested inside another namespace: a bind mount made from inside one does not
+/// propagate.
+pub fn ensure_named_netns(sh: &Shell, name: &str) -> Result<(), NetOpsError> {
+    if super::netlink::netns_exists(name) {
+        return Ok(());
+    }
+    if escalates_netns_registry(sh) {
+        sh.run_host("ip", &["netns", "add", name]).map(|_| ())
+    } else {
+        super::netlink::ensure_netns(name).map_err(|e| NetOpsError::Command {
+            cmdline: format!("ip netns add {name}"),
+            stderr: e.to_string(),
+        })
+    }
+}
+
+/// Delete the named namespace `name` if it exists. Its interfaces go with it; a process still
+/// inside keeps the namespace itself alive, so callers stop those first.
+pub fn delete_named_netns(sh: &Shell, name: &str) -> Result<(), NetOpsError> {
+    if !super::netlink::netns_exists(name) {
+        return Ok(());
+    }
+    if escalates_netns_registry(sh) {
+        sh.run_host("ip", &["netns", "del", name]).map(|_| ())
+    } else {
+        super::netlink::delete_netns(name).map_err(|e| NetOpsError::Command {
+            cmdline: format!("ip netns del {name}"),
+            stderr: e.to_string(),
+        })
+    }
 }
 
 impl Shell {
@@ -185,15 +260,7 @@ impl Shell {
         // `sudo -n` refusing for want of credentials is not a networking failure, and reporting
         // it as one sends people debugging their manifest. Name both fixes instead.
         if escalate && (stderr.contains("password is required") || stderr.contains("askpass")) {
-            return Err(NetOpsError::Command {
-                cmdline,
-                stderr: "vxedged cannot escalate: `sudo` wants a password and a daemon has no \
-                         terminal. Either run vxedged as root, or grant passwordless sudo for \
-                         the network tools — see TESTBED-SETUP.md. Note that `setcap` on the \
-                         vxedged binary does NOT work: capabilities do not propagate across \
-                         exec to the `ip`/`bridge`/`tc` children."
-                    .to_string(),
-            });
+            return Err(NetOpsError::NoSudo { cmdline });
         }
         if stderr.contains("Operation not permitted") || stderr.contains("Permission denied") {
             Err(NetOpsError::Permission { cmdline })

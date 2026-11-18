@@ -334,8 +334,12 @@ fn render(
         Some((model, _, Some(_))) => vxedge_core::gptp::metrics(model, runtime_dir, instance),
         _ => String::new(),
     };
-    // Each running measurement's sender, read inside its own namespace (`measurements/<id>`).
-    text(&families) + &gptp + &vxedge_core::measurements::run::collect_metrics(runtime_dir)
+    // Each running measurement's sender, read inside its own namespace (`measurements/<id>`). A
+    // sender that cannot be read is a gap in its series, and the log says why.
+    let measured = vxedge_core::measurements::run::collect_metrics(runtime_dir, &mut |id, why| {
+        tracing::warn!(measurement = %id, reason = %why, "measurement metrics not read");
+    });
+    text(&families) + &gptp + &measured
 }
 
 /// What the processes in the network namespace at `ns` use together, or `None` when it runs

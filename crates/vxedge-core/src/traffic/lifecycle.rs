@@ -150,7 +150,7 @@ fn ensure_endpoint(
     profile_id: &str,
     ep: &ProfileEndpoint,
 ) -> Result<(), TrafficLifecycleError> {
-    let provision = |iface: &str, addr: &str, create_vlan: Option<(&str, u16)>| {
+    let provision_on = |sh: &Shell, iface: &str, addr: &str, create_vlan: Option<(&str, u16)>| {
         if let Some((parent, vlan)) = create_vlan
             && !sh.link_exists(iface)
         {
@@ -178,15 +178,21 @@ fn ensure_endpoint(
     match ep {
         ProfileEndpoint::VlanNodePeer {
             peer_iface, addr, ..
-        } => provision(peer_iface, addr, None)
+        } => provision_on(sh, peer_iface, addr, None)
             .map_err(|e| TrafficLifecycleError::Provision(profile_id.to_string(), e)),
         ProfileEndpoint::VlanUplinkFarSide {
             uplink_peer,
             vlan,
             addr,
+            netns,
         } => {
+            // The uplink peer lives in the run's uplink-side namespace, and so does this.
+            let side = Shell {
+                netns: Some(netns.clone()),
+                escalate: sh.escalate,
+            };
             let iface = format!("{uplink_peer}.{vlan}");
-            provision(&iface, addr, Some((uplink_peer, *vlan)))
+            provision_on(&side, &iface, addr, Some((uplink_peer, *vlan)))
                 .map_err(|e| TrafficLifecycleError::Provision(profile_id.to_string(), e))
         }
         ProfileEndpoint::SnssaiUe { .. } | ProfileEndpoint::SnssaiFarSide => Ok(()),
@@ -222,12 +228,22 @@ async fn transport_addr(
     }
 }
 
+/// The namespace a process on `ep` runs in: the run's uplink-side one for a far side, else the
+/// daemon's own (`None`).
+fn netns_of(ep: &ProfileEndpoint) -> Option<String> {
+    match ep {
+        ProfileEndpoint::VlanUplinkFarSide { netns, .. } => Some(netns.clone()),
+        _ => None,
+    }
+}
+
 fn spawn_tracked(
     runtime_dir: &Path,
     profile_id: &str,
     role: &'static str,
     bin: &str,
     args: &[String],
+    netns: Option<&str>,
 ) -> Result<u32, TrafficLifecycleError> {
     let log_path = runtime_dir.join(format!("traffic-{profile_id}-{role}.log"));
     let log = std::fs::File::create(&log_path)
@@ -235,18 +251,24 @@ fn spawn_tracked(
     let log_err = log
         .try_clone()
         .map_err(|e| TrafficLifecycleError::Pidfile(profile_id.to_string(), e))?;
-    let mut child = Command::new(bin)
+    let mut command = Command::new(bin);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log_err))
-        .spawn()
-        .map_err(|source| TrafficLifecycleError::Spawn {
-            profile: profile_id.to_string(),
-            role,
-            bin: bin.to_string(),
-            source,
-        })?;
+        .stderr(Stdio::from(log_err));
+    let spawned = match netns {
+        None => command.spawn(),
+        Some(ns) => crate::gateway::netlink::in_netns(ns, move || command.spawn())
+            .map_err(|e| std::io::Error::other(e.to_string()))
+            .and_then(|r| r),
+    };
+    let mut child = spawned.map_err(|source| TrafficLifecycleError::Spawn {
+        profile: profile_id.to_string(),
+        role,
+        bin: bin.to_string(),
+        source,
+    })?;
     let pid = child.id();
     let exit = exitfile(runtime_dir, profile_id, role);
     let _ = std::fs::remove_file(&exit);
@@ -331,6 +353,7 @@ async fn ensure_reflector(
                         "--listen".to_string(),
                         format!("{target_addr}:{port}"),
                     ],
+                    netns_of(&profile.target),
                 )
                 .await?;
             }
@@ -346,13 +369,14 @@ async fn spawn_off_runtime(
     role: &'static str,
     bin: &str,
     args: Vec<String>,
+    netns: Option<String>,
 ) -> Result<u32, TrafficLifecycleError> {
     let (dir, id, bin) = (
         runtime_dir.to_path_buf(),
         profile_id.to_string(),
         bin.to_string(),
     );
-    off_runtime(move || spawn_tracked(&dir, &id, role, &bin, &args)).await
+    off_runtime(move || spawn_tracked(&dir, &id, role, &bin, &args, netns.as_deref())).await
 }
 
 /// [`ensure_endpoint`] in `spawn_blocking`: it execs `ip` through `Shell`.
@@ -433,6 +457,7 @@ pub async fn profile_up(
                 "--duration-s".to_string(),
                 duration_s.to_string(),
             ],
+            netns_of(&profile.source),
         )
         .await?;
         Ok(format!(
@@ -466,6 +491,7 @@ pub async fn profile_up(
                 "--duration-s".to_string(),
                 duration_s.to_string(),
             ],
+            netns_of(&profile.source),
         )
         .await?;
         Ok(format!(
@@ -473,6 +499,27 @@ pub async fn profile_up(
             profile.id
         ))
     }
+}
+
+/// The profiles this run's runtime directory records a process for, whichever path started
+/// them (on the host or inside a node), so a teardown can stop them without the manifest.
+pub fn started(runtime_dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(runtime_dir) else {
+        return Vec::new();
+    };
+    let mut ids: Vec<String> = entries
+        .filter_map(|e| {
+            let name = e.ok()?.file_name().into_string().ok()?;
+            let rest = name.strip_prefix("traffic-")?.strip_suffix(".pid")?;
+            ["-reflect", "-send", "-load"]
+                .iter()
+                .find_map(|role| rest.strip_suffix(role))
+                .map(str::to_string)
+        })
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
 }
 
 /// Tear one profile's host-spawned processes down. Idempotent: no
@@ -499,6 +546,22 @@ pub fn profile_down(runtime_dir: &Path, profile_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn started_lists_each_profile_with_a_pidfile_once() {
+        let dir = tempfile::tempdir().unwrap();
+        for f in [
+            "traffic-adas-rtt-reflect.pid",
+            "traffic-adas-rtt-send.pid",
+            "traffic-infotainment-load-load.pid",
+            "traffic-old-send.exit",
+            "measure-ctl-rtt-send.pid",
+        ] {
+            std::fs::write(dir.path().join(f), "1").unwrap();
+        }
+        assert_eq!(started(dir.path()), ["adas-rtt", "infotainment-load"]);
+        assert!(started(&dir.path().join("missing")).is_empty());
+    }
 
     fn snssai_profile(id: &str, pps: Option<u64>, bandwidth_mbps: Option<u64>) -> ResolvedProfile {
         ResolvedProfile {
