@@ -6,6 +6,17 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-11-18
+
+Each run's uplink side gets a network namespace of its own, `vxh<s>`, so two runs can use the same far-side
+subnets and two copies of one measuring experiment run at once. The uplink stays on the bridge, so slice
+shaping is unchanged. Traffic to a container whose zone is down now crosses the bridge and the uplink instead
+of loopback, `down` stops a run's measurements and traffic before its nodes, and a traffic profile on a VM's
+tap is refused. A `from: host` measurement now sends from `vxh<s>` and reads about 1.7 µs lower at p50 than on
+0.31.0 (details under Changed), so allow for that offset when comparing reruns. Scripts that reach a far side
+from the host now enter it with `ip netns exec vxh<s>`, and `up` needs `CAP_SYS_ADMIN` or a sudo rule for
+`ip netns add`. vxAPI is unchanged.
+
 ### Changed
 
 - vxedge is described as a virtual vehicle with environmental parity, for packaged, measured SDV experiments;
