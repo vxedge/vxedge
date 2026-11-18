@@ -368,9 +368,12 @@ impl RunManifest {
         Some(Self { record, yaml })
     }
 
-    /// The workspace the run came from, when it came from one.
+    /// The workspace the run came from, while it is still there: a local bundle or part ref
+    /// resolves against it. A run whose workspace moved or went has none, so its stages are
+    /// handed the recorded manifest alone, which is what tearing it down needs.
     pub(crate) fn dir(&self) -> Option<PathBuf> {
-        (self.record.dir != Path::new(".")).then(|| self.record.dir.clone())
+        (self.record.dir != Path::new(".") && self.record.dir.is_dir())
+            .then(|| self.record.dir.clone())
     }
 
     /// The workspace identity `up` recorded, or the snapshot's hash for a record without one.

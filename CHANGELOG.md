@@ -15,7 +15,9 @@ All notable changes to this repo are documented here. Format follows
   manifest instead of re-reading its workspace. A workspace edited since `up` comes down as what
   is running rather than as the new file; a moved or deleted one, and an inline manifest, come
   down by run id or through `vxedge runs down`, where they answered `ERROR_REASON_WORKSPACE_INVALID`
-  before. A restarted daemon restores such runs too, so `ERROR_REASON_WORKSPACE_CHANGED` is no
+  before. Their stages are handed the recorded manifest without the workspace once it is gone.
+  `vxedge experiment down --run <id>` and `status --run <id>` no longer need to run inside a
+  workspace. A restarted daemon restores such runs too, so `ERROR_REASON_WORKSPACE_CHANGED` is no
   longer returned. With no `run` named, the `manifest` on a `down` or status picks the run and
   must still resolve, and an inline one must declare that run's workspace: a mistyped path or
   another workspace's document is refused rather than taking down the one run up. A run whose
