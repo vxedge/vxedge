@@ -960,6 +960,44 @@ async fn fleet_status_reports_every_run_and_an_absent_named_one() {
 }
 
 #[tokio::test]
+async fn fleet_status_answers_for_every_run_when_one_cannot_be_read() {
+    let ws = vehicle_workspace();
+    let daemon = Daemon::start_with(|run| {
+        write_run_record(run, &vehicle_id(), &ws, "run-a");
+        // A second run whose workspace is gone.
+        let gone = run.join("runs").join("1");
+        std::fs::create_dir_all(&gone).unwrap();
+        let record = serde_json::json!({
+            "id": "exp-gone", "dir": "/nonexistent/vxedge-workspace", "bridge": "lo",
+            "run_id": "run-gone", "started_unix_ms": 1,
+        });
+        std::fs::write(gone.join("active.json"), record.to_string()).unwrap();
+    });
+    let runs = RunServiceClient::new(daemon.channel().await)
+        .status(RunStatusRequest::default())
+        .await
+        .expect("one unreadable run does not fail the call")
+        .into_inner()
+        .runs;
+    let ids: Vec<String> = runs
+        .iter()
+        .map(|r| r.run.clone().unwrap_or_default().id)
+        .collect();
+    assert_eq!(ids, ["run-a", "run-gone"]);
+    let gone = &runs[1];
+    assert_ne!(
+        gone.error_reason,
+        ErrorReason::Unspecified as i32,
+        "{gone:?}"
+    );
+    assert!(
+        !gone.error_message.is_empty() && gone.status.is_none(),
+        "{gone:?}"
+    );
+    assert_eq!(gone.run.clone().unwrap().instance, "1");
+}
+
+#[tokio::test]
 async fn fleet_status_with_nothing_up_is_empty_and_names_the_absent() {
     let daemon = Daemon::start();
     let mut runs = RunServiceClient::new(daemon.channel().await);

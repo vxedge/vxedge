@@ -21,7 +21,7 @@ All notable changes to this repo are documented here. Format follows
 ### Changed
 
 - Only the run a lifecycle job acts on reads `STAGING` in `RunService.Get` and `List`. Until now, any lifecycle
-  job made every run read `STAGING`.
+  job made every run read `STAGING`. A job that names no single run, such as `run.down`, still does.
 
 ### Fixed
 
