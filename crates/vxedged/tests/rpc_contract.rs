@@ -494,6 +494,85 @@ async fn the_experiment_verbs_refuse_a_vehicles_run() {
     );
 }
 
+/// With one run up and no run named, the manifest a `down` carries still picks the run: a path
+/// that is not there, or another workspace's document, is refused and never takes down the run
+/// that happens to be up.
+#[tokio::test]
+async fn a_down_whose_manifest_is_not_the_runs_is_refused() {
+    let (ws, id) = experiment_workspace();
+    let daemon = Daemon::start_with(|run| write_active_record(run, &id, &ws, None));
+    let mut experiments = ExperimentServiceClient::new(daemon.channel().await);
+    let typo = experiments
+        .down(vxedge_api::v1::ExperimentDownRequest {
+            manifest: path_ref(Path::new("/nonexistent/vxedge-typo")),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&typo), "ERROR_REASON_WORKSPACE_INVALID", "{typo:?}");
+    let other = experiments
+        .down(vxedge_api::v1::ExperimentDownRequest {
+            manifest: Some(ManifestRef {
+                source: Some(Source::InlineYaml(
+                    vxedge_core::Workspace::read_text(&ws)
+                        .unwrap()
+                        .replace(&format!("id: {id}"), "id: exp-other"),
+                )),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&other), "ERROR_REASON_WRONG_WORKSPACE", "{other:?}");
+    // The run is still up.
+    let runs = RunServiceClient::new(daemon.channel().await)
+        .list(RunListRequest::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .runs;
+    assert_eq!(runs.len(), 1);
+}
+
+/// A run whose manifest was not recorded fails its own `down` before anything starts, and the
+/// fleet `down` reports that child failed.
+#[tokio::test]
+async fn a_run_without_its_recorded_manifest_fails_its_down() {
+    let ws = vehicle_workspace();
+    let daemon = Daemon::start_with(|run| {
+        write_run_record(run, &vehicle_id(), &ws, "run-n");
+        std::fs::remove_file(slot0(run).join("manifest.yaml")).unwrap();
+    });
+    let channel = daemon.channel().await;
+    let job = RunServiceClient::new(channel.clone())
+        .down(RunDownRequest {
+            all: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        wait_for_job(channel.clone(), job.id.clone()).await,
+        JobState::Failed as i32
+    );
+    let children = JobServiceClient::new(channel)
+        .list(vxedge_api::v1::JobListRequest {
+            parent_job_id: job.id,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .jobs;
+    assert_eq!(children.len(), 1, "{children:?}");
+    assert!(
+        children[0].error.contains("manifest was not recorded"),
+        "{children:?}"
+    );
+}
+
 /// A slot whose `active.json` is there without the manifest `up` records beside it is not
 /// restored: there is nothing to say what is running.
 #[tokio::test]

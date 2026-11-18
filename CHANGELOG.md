@@ -16,8 +16,10 @@ All notable changes to this repo are documented here. Format follows
   is running rather than as the new file; a moved or deleted one, and an inline manifest, come
   down by run id or through `vxedge runs down`, where they answered `ERROR_REASON_WORKSPACE_INVALID`
   before. A restarted daemon restores such runs too, so `ERROR_REASON_WORKSPACE_CHANGED` is no
-  longer returned. `manifest` on a `down` or status only finds the run when no `run` is named,
-  and is read only when no run is up there. The experiment verbs refuse a bare vehicle's run, and
+  longer returned. With no `run` named, the `manifest` on a `down` or status picks the run and
+  must still resolve, and an inline one must declare that run's workspace: a mistyped path or
+  another workspace's document is refused rather than taking down the one run up. A run whose
+  manifest was not recorded refuses its `down` with `ERROR_REASON_WORKSPACE_INVALID`. The experiment verbs refuse a bare vehicle's run, and
   the vehicle verbs an experiment's, with `ERROR_REASON_WRONG_WORKSPACE`. `down` removes the
   manifest after `active.json`, and leaves a campaign's `reserved.json` alone. A run brought up
   by an earlier daemon has no vehicle id recorded, so it reads as an experiment's until its next

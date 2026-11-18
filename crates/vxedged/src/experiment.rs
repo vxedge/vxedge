@@ -214,9 +214,11 @@ pub(crate) async fn run_manifest(
     verb: &str,
     scope: &crate::scope::RunScope,
     mref: Option<&ManifestRef>,
+    run: Option<&vxedge_api::v1::RunRef>,
     asked: Option<std::path::PathBuf>,
 ) -> Result<(String, Option<std::path::PathBuf>), Status> {
-    match crate::services::RunManifest::read(&scope.dir) {
+    let named = run.is_some_and(|r| !r.run_id.is_empty());
+    match crate::services::run_of_request(scope, mref, named).await? {
         Some(run) => match run.vehicle() {
             Some(vehicle) => Err(crate::errors::precondition(
                 crate::errors::R::WrongWorkspace,
@@ -1066,6 +1068,7 @@ impl ExperimentService for ExperimentSvc {
             "experiment down",
             &scope,
             req.get_ref().manifest.as_ref(),
+            req.get_ref().run.as_ref(),
             asked,
         )
         .await?;
@@ -1176,6 +1179,7 @@ impl ExperimentService for ExperimentSvc {
             "experiment status",
             &scope,
             req.get_ref().manifest.as_ref(),
+            req.get_ref().run.as_ref(),
             asked,
         )
         .await?;

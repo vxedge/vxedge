@@ -387,6 +387,61 @@ impl RunManifest {
     }
 }
 
+/// The run a `down` or status acts on in `scope`: `None` when the slot has nothing up, so the
+/// request's own manifest is what it reads. A run up there is read from what its `up` recorded,
+/// never from the request. When no run was named, the request's manifest is what picked the
+/// slot, so it must still resolve and, inline, declare the run's workspace: a mistyped path or
+/// another workspace's document never takes down the one run that happens to be up.
+pub(crate) async fn run_of_request(
+    scope: &crate::scope::RunScope,
+    mref: Option<&ManifestRef>,
+    run_named: bool,
+) -> Result<Option<RunManifest>, Status> {
+    let Some(record) = read_active_record(&scope.dir) else {
+        return Ok(None);
+    };
+    let Some(run) = RunManifest::read(&scope.dir) else {
+        return Err(crate::errors::precondition(
+            crate::errors::R::WorkspaceInvalid,
+            format!(
+                "run `{}` is up but its manifest was not recorded",
+                record.run_id()
+            ),
+        ));
+    };
+    if let (false, Some(mref)) = (run_named, mref) {
+        let (yaml, _, dir) = resolve_manifest(Some(mref)).await.map_err(|e| {
+            Status::with_details(
+                e.code(),
+                format!(
+                    "{}; a run whose workspace moved is named by its run id, or taken down \
+                     with `vxedge runs down`",
+                    e.message()
+                ),
+                e.details().to_vec().into(),
+            )
+        })?;
+        if dir.is_none() {
+            let id = vxedge_core::model::load_workspace_yaml(&yaml)
+                .map(|m| m.id)
+                .map_err(|e| {
+                    crate::errors::invalid(crate::errors::R::WorkspaceInvalid, e.to_string())
+                })?;
+            if id != run.record.id {
+                return Err(crate::errors::precondition(
+                    crate::errors::R::WrongWorkspace,
+                    format!(
+                        "run `{}` is `{}`'s, not `{id}`'s: name the run, or pass its workspace",
+                        run.record.run_id(),
+                        run.record.id
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(Some(run))
+}
+
 /// What `active.json` says. A record from before 0.4.1 has no `sha256`, one from before 0.5.0
 /// has no `run_id` or `started_unix_ms`, and one from before `vxws/2` has no
 /// `identity_algorithm`.

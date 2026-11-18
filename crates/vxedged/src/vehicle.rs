@@ -38,8 +38,8 @@ use tonic::{Request, Response, Status};
 use vxedge_api::v1::svc_service_server::SvcService;
 use vxedge_api::v1::vehicle_service_server::VehicleService;
 use vxedge_api::v1::{
-    ExperimentStage, ManifestRef, ResourceKind, ResourceState, ResourceStatus, SvcStatusRequest,
-    VehicleDownRequest, VehicleStatus, VehicleStatusRequest, VehicleUpRequest,
+    ExperimentStage, ManifestRef, ResourceKind, ResourceState, ResourceStatus, RunRef,
+    SvcStatusRequest, VehicleDownRequest, VehicleStatus, VehicleStatusRequest, VehicleUpRequest,
 };
 use vxedge_core::gateway::GatewayPlan;
 use vxedge_core::model::{DeviceRole, Experiment};
@@ -109,8 +109,10 @@ async fn resolve_run(
     verb: &str,
     scope: &crate::scope::RunScope,
     mref: Option<&ManifestRef>,
+    named: Option<&RunRef>,
 ) -> Result<Resolved, Status> {
-    let Some(run) = crate::services::RunManifest::read(&scope.dir) else {
+    let named = named.is_some_and(|r| !r.run_id.is_empty());
+    let Some(run) = crate::services::run_of_request(scope, mref, named).await? else {
         return resolve_and_synthesize(mref).await;
     };
     let Some(id) = run.vehicle() else {
@@ -352,7 +354,13 @@ impl VehicleService for VehicleSvc {
             sha256,
             model,
             id,
-        } = resolve_run("vehicle down", &scope, req.get_ref().manifest.as_ref()).await?;
+        } = resolve_run(
+            "vehicle down",
+            &scope,
+            req.get_ref().manifest.as_ref(),
+            req.get_ref().run.as_ref(),
+        )
+        .await?;
         let (gateway, nodes) = plan_vehicle(&model, dir.as_deref(), scope.instance)?;
         self.require_active("vehicle down", &model, dir.as_deref(), &nodes, &scope)
             .await?;
@@ -464,7 +472,13 @@ impl VehicleService for VehicleSvc {
             model,
             id,
             ..
-        } = resolve_run("vehicle status", &scope, req.get_ref().manifest.as_ref()).await?;
+        } = resolve_run(
+            "vehicle status",
+            &scope,
+            req.get_ref().manifest.as_ref(),
+            req.get_ref().run.as_ref(),
+        )
+        .await?;
         let (gateway, nodes) = plan_vehicle(&model, dir.as_deref(), scope.instance)?;
         self.require_active("vehicle status", &model, dir.as_deref(), &nodes, &scope)
             .await?;
