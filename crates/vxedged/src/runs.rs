@@ -154,8 +154,20 @@ pub(crate) fn down_targets(
         }
         found
     };
-    // With `all`, a campaign between trials holds a slot with no run in it yet, and would bring
-    // its next trial up there after this call reports the host cleared: it counts too.
+    if let Some(message) = held(&targets, all, reserved) {
+        return Err(crate::errors::precondition(R::HeldByRun, message));
+    }
+    Ok(targets)
+}
+
+/// Why a `Down` over `targets` must not start, if a running campaign holds one of its slots.
+/// With `all`, a campaign between trials holds a slot with no run in it yet, and would bring its
+/// next trial up there after the call reports the host cleared: it counts too.
+fn held(
+    targets: &[(Instance, ActiveRecord)],
+    all: bool,
+    reserved: impl Fn(Instance) -> Option<String>,
+) -> Option<String> {
     let slots: Vec<Instance> = if all {
         Instance::all().collect()
     } else {
@@ -165,17 +177,13 @@ pub(crate) fn down_targets(
         .into_iter()
         .filter_map(|i| reserved(i).map(|c| format!("slot {i} (campaign `{c}`)")))
         .collect();
-    if !held.is_empty() {
-        return Err(crate::errors::precondition(
-            R::HeldByRun,
-            format!(
-                "held by a running campaign between its trials: {}. Cancel the campaign or wait \
-                 for it to end; nothing was taken down",
-                held.join(", ")
-            ),
-        ));
-    }
-    Ok(targets)
+    (!held.is_empty()).then(|| {
+        format!(
+            "held by a running campaign between its trials: {}. Cancel the campaign or wait for \
+             it to end; nothing was taken down",
+            held.join(", ")
+        )
+    })
 }
 
 /// What one read of a run observed: the gateway, and the workspace's status when it could be
@@ -468,8 +476,15 @@ async fn down_all(
     engine: JobEngine,
     root: PathBuf,
     targets: Vec<(Instance, ActiveRecord)>,
+    all: bool,
     p: Progress,
 ) -> Result<String, JobFailure> {
+    // Checked again under the lifecycle claim: a campaign that started between the call's check
+    // and the claim holds a slot that check never saw. One that starts after the claim queues its
+    // trials behind this job.
+    if let Some(message) = held(&targets, all, |i| crate::scope::reserved_by(&root, i)) {
+        return Err(JobFailure::new(R::HeldByRun, message));
+    }
     let n = targets.len();
     if n == 0 {
         return Ok("no run is up".to_string());
@@ -600,7 +615,7 @@ impl RunService for RunSvc {
             .gateway
             .engine
             .submit_with(JobOpts::lifecycle(&req, claim), "run.down", move |p| {
-                down_all(experiments, vehicles, engine, root, targets, p)
+                down_all(experiments, vehicles, engine, root, targets, all, p)
             })
             .await?;
         Ok(Response::new(job))
@@ -719,6 +734,22 @@ mod tests {
             ids(&down_targets(runs(), &names(&["run-c"]), false, held).unwrap()),
             ["run-c"],
             "a run whose slot no campaign holds goes down"
+        );
+    }
+
+    #[test]
+    fn the_jobs_own_check_reads_a_hold_taken_after_the_call() {
+        // What `down_all` checks under the lifecycle claim: the holds on disk now, not the ones
+        // the call saw.
+        let root = tempfile::tempdir().unwrap();
+        let on_disk = |i| crate::scope::reserved_by(root.path(), i);
+        assert!(held(&runs(), true, on_disk).is_none());
+        crate::scope::reserve(root.path(), slot("4"), "c-late", true).unwrap();
+        let m = held(&runs(), true, on_disk).expect("every run: any held slot counts");
+        assert!(m.contains("slot 4 (campaign `c-late`)"), "{m}");
+        assert!(
+            held(&runs(), false, on_disk).is_none(),
+            "named runs: only their own slots count"
         );
     }
 

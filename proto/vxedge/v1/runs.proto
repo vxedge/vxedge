@@ -102,7 +102,10 @@ message RunStatusResponse {
 }
 
 message RunDownRequest {
-  // The runs to take down. Set this or `all`, not both.
+  // The runs to take down. Set this or `all`, not both. A named run that is not up refuses the
+  // call with ERROR_REASON_NO_ACTIVE_RUN or ERROR_REASON_RUN_MISMATCH, under the gRPC code
+  // NOT_FOUND as `Get` uses, where a single run's verbs answer FAILED_PRECONDITION: branch on the
+  // reason, never on the code.
   repeated RunRef runs = 1;
   // Every run on the host. With nothing up, the job succeeds and does nothing.
   bool all = 2;
