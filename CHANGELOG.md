@@ -13,7 +13,7 @@ The fleet view: `RunService.Status` reads every run on the host in one call, or 
 that is not up comes back as an entry with `error_reason` rather than failing the call, and a slot a campaign holds
 refuses the whole teardown before anything is touched. The CLI adds `vxedge runs status` and `vxedge runs down`.
 Only the run a lifecycle job acts on now reads `STAGING`, and a gateway `apply` no longer fails when the access
-port's ingress qdisc is already gone. vxAPI gains the two RPCs and their messages; nothing existing changes.
+port's ingress qdisc is already gone. vxAPI gains the two RPCs and their messages; no existing RPC or message changes.
 
 ### Added
 
