@@ -25,6 +25,9 @@ All notable changes to this repo are documented here. Format follows
     a missing sudo rule for `ip netns add` fails the same way. Both carry `ERROR_REASON_HOST_REQUIREMENT_UNMET`
     and name what is missing.
   - A measurement whose metrics cannot be read is logged with the reason instead of being left out silently.
+  - A `from: host` measurement now sends from `vxh<s>`. On a same-day comparison (exp-002's container arm,
+    4 trials per build at 1000 pps for 60 s), its p50 is 36.6 µs (IQR 0.9) against 38.3 µs (IQR 0.4) on 0.31.0,
+    so compare reruns against numbers taken with 0.31.0 or earlier with that offset in mind.
 - A traffic profile whose end is a VM's tap is refused with `ERROR_REASON_WORKSPACE_INVALID`. A tap is the
   bridge port itself, so an address on it sent into the guest, and vxedge runs no generator inside a guest.
 - A traffic profile whose container device's zone is down still puts that end's address on the host. Its traffic
