@@ -10,6 +10,6 @@ pub mod lifecycle;
 pub mod plan;
 
 pub use lifecycle::{
-    ProfileState, TrafficLifecycleError, profile_down, profile_status, profile_up,
+    ProfileState, TrafficLifecycleError, profile_down, profile_status, profile_up, started,
 };
 pub use plan::{ProfileEndpoint, ResolvedProfile, TrafficPlan, TrafficPlanError};

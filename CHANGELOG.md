@@ -34,6 +34,9 @@ All notable changes to this repo are documented here. Format follows
 
 ### Fixed
 
+- `experiment down` and `vehicle down` stop the run's measurements and traffic profiles before its nodes and
+  gateway. A sender still running inside a node held its namespace open, so the node's teardown failed; one on
+  the host kept sending after the run was gone, and a host-side reflector was never stopped.
 - `vxedge --json` prints a failed job's `error_reason`, and the human output adds a `reason:` line. Both were
   dropped, so a job that failed after it started showed only its sentence.
 

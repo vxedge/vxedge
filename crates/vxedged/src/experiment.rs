@@ -841,6 +841,24 @@ pub(crate) fn staged_target(base: String, stages: &[i32]) -> String {
     format!("{base} [{}]", names.join(", "))
 }
 
+/// Stop the run's measurements and traffic profiles before its nodes and gateway go down.
+/// They run inside the nodes, or on the host on a device's gateway-side end: a sender left
+/// running holds its node's namespace open, so the node's teardown fails, or keeps sending
+/// after the run is gone. Far sides in the uplink-side namespace die with it anyway.
+pub(crate) async fn stop_run_processes(sh: &vxedge_core::gateway::Shell, rt: &std::path::Path) {
+    let (sh, rt) = (sh.clone(), rt.to_path_buf());
+    let _ = tokio::task::spawn_blocking(move || {
+        for s in vxedge_core::measurements::run::started(&rt) {
+            vxedge_core::measurements::run::stop(&sh, &rt, &s.id);
+        }
+        for id in vxedge_core::traffic::started(&rt) {
+            vxedge_core::traffic::in_node::forget(&rt, &id);
+            vxedge_core::traffic::profile_down(&rt, &id);
+        }
+    })
+    .await;
+}
+
 pub(crate) fn wants(stages: &[i32], stage: ExperimentStage) -> bool {
     stages.is_empty() || stages.contains(&(stage as i32))
 }
@@ -1046,15 +1064,10 @@ impl ExperimentService for ExperimentSvc {
                     // strands whatever came after it. Collect failures, tear the rest down anyway,
                     // and report everything that went wrong.
                     let mut failures: Vec<JobFailure> = Vec::new();
-                    // Measurements run inside the nodes, so they stop before the nodes do.
-                    if wants(&stages, ExperimentStage::Zones) {
-                        let (sh, rt) = (svc.gateway.shell.clone(), run.scope.dir.clone());
-                        let _ = tokio::task::spawn_blocking(move || {
-                            for s in vxedge_core::measurements::run::started(&rt) {
-                                vxedge_core::measurements::run::stop(&sh, &rt, &s.id);
-                            }
-                        })
-                        .await;
+                    if wants(&stages, ExperimentStage::Zones)
+                        || wants(&stages, ExperimentStage::Gateway)
+                    {
+                        stop_run_processes(&svc.gateway.shell, &run.scope.dir).await;
                     }
                     if wants(&stages, ExperimentStage::Services)
                         && let Err(e) = svc

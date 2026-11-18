@@ -501,6 +501,27 @@ pub async fn profile_up(
     }
 }
 
+/// The profiles this run's runtime directory records a process for, whichever path started
+/// them (on the host or inside a node), so a teardown can stop them without the manifest.
+pub fn started(runtime_dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(runtime_dir) else {
+        return Vec::new();
+    };
+    let mut ids: Vec<String> = entries
+        .filter_map(|e| {
+            let name = e.ok()?.file_name().into_string().ok()?;
+            let rest = name.strip_prefix("traffic-")?.strip_suffix(".pid")?;
+            ["-reflect", "-send", "-load"]
+                .iter()
+                .find_map(|role| rest.strip_suffix(role))
+                .map(str::to_string)
+        })
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
 /// Tear one profile's host-spawned processes down. Idempotent: no
 /// pidfile/dead pid per role is a no-op. Endpoint interfaces are
 /// deliberately left in place — they're `gateway`-owned (or
@@ -525,6 +546,22 @@ pub fn profile_down(runtime_dir: &Path, profile_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn started_lists_each_profile_with_a_pidfile_once() {
+        let dir = tempfile::tempdir().unwrap();
+        for f in [
+            "traffic-adas-rtt-reflect.pid",
+            "traffic-adas-rtt-send.pid",
+            "traffic-infotainment-load-load.pid",
+            "traffic-old-send.exit",
+            "measure-ctl-rtt-send.pid",
+        ] {
+            std::fs::write(dir.path().join(f), "1").unwrap();
+        }
+        assert_eq!(started(dir.path()), ["adas-rtt", "infotainment-load"]);
+        assert!(started(&dir.path().join("missing")).is_empty());
+    }
 
     fn snssai_profile(id: &str, pps: Option<u64>, bandwidth_mbps: Option<u64>) -> ResolvedProfile {
         ResolvedProfile {
