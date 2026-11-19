@@ -10,7 +10,7 @@ All notable changes to this repo are documented here. Format follows
 
 - An attach adapter's commands get `VX_SLOT`, the slot of the run they serve, so a platform whose guest carries the
   `vx.node=` marker can carry `vx.slot=` beside it. Without it, the host scan read such a guest as no run's and
-  refused every other vehicle's `up` on the host while that one was up.
+  refused every other vehicle's `up` on the host while that one was up (#212).
 
 ## [0.34.1] - 2026-11-19
 
