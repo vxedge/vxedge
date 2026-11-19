@@ -84,7 +84,9 @@ pub fn load(np: &NodePlan) -> Result<(PathBuf, Adapter), ZoneBackendError> {
 }
 
 /// Runs one adapter command through `sh -c` in the adapter's directory, with the node's identity
-/// in the environment, and waits at most `timeout`.
+/// in the environment, and waits at most `timeout`. `VX_SLOT` is the run's slot: a platform whose
+/// guest carries the `vx.node=` marker carries `vx.slot=` beside it, or the host scan reads that
+/// guest as no run's and refuses every other run on the host (`zones::foreign`).
 fn run(
     np: &NodePlan,
     dir: &Path,
@@ -104,6 +106,7 @@ fn run(
         .arg(script)
         .current_dir(dir)
         .env("VX_NODE", &np.node_id)
+        .env("VX_SLOT", np.instance.to_string())
         .env("VX_IP", np.ip_cidr.as_deref().unwrap_or(""))
         .env("VX_INTERFACE", &np.endpoint)
         .env("VX_RUNTIME_DIR", runtime_dir)
@@ -253,7 +256,7 @@ mod tests {
     fn adapter(dir: &Path) {
         std::fs::write(
             dir.join("attach.yaml"),
-            "interface: tap-ivi\nstart: touch up && echo \"$VX_NODE $VX_IP\" > started\n\
+            "interface: tap-ivi\nstart: touch up && echo \"$VX_NODE $VX_SLOT $VX_IP\" > started\n\
              status: test -f up\nstop: rm up\nstart_timeout_s: 5\n",
         )
         .unwrap();
@@ -264,13 +267,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let rt = tempfile::tempdir().unwrap();
         adapter(dir.path());
-        let np = node(dir.path());
+        let mut np = node(dir.path());
+        // A run outside the first slot: the adapter learns which, to mark its guest with it.
+        np.instance = crate::instance::Instance::parse("1").unwrap();
         let b = AttachBackend;
         assert_eq!(b.status(&sh(), &np, rt.path()), NodeState::Down);
         b.up(&sh(), &np, rt.path()).unwrap();
         assert_eq!(b.status(&sh(), &np, rt.path()), NodeState::Up);
         let started = std::fs::read_to_string(dir.path().join("started")).unwrap();
-        assert_eq!(started.trim(), format!("{} 192.168.98.3/24", np.node_id));
+        assert_eq!(
+            started.trim(),
+            format!("{} {} 192.168.98.3/24", np.node_id, np.instance)
+        );
         // A second up finds the platform up and does not start it again.
         std::fs::remove_file(dir.path().join("started")).unwrap();
         b.up(&sh(), &np, rt.path()).unwrap();
