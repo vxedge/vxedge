@@ -6,6 +6,17 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.34.1] - 2026-11-19
+
+Fixes. An ingress impairment on the OVS data plane stays installed instead of being removed by ovs-vswitchd during
+`up`. A service placed on a device reads as running, and comes down, after its workspace moved. wasmtime moves to
+50.0.2 for the advisories published 2026-11-19. No RPC or message changes.
+
+### Security
+
+- wasmtime and wasmtime-wasi move to 50.0.2 for RUSTSEC-2026-0566 to RUSTSEC-2026-0573 (#209). Only wasmtime and
+  cranelift crates change, by patch releases.
+
 ### Fixed
 
 - **An ingress impairment on the OVS data plane stays installed (#199).** ovs-vswitchd deletes
