@@ -15,6 +15,9 @@ All notable changes to this repo are documented here. Format follows
   the impairment installed. The redirect now hangs off a `clsact` qdisc, which OVS leaves
   alone, on both data planes. Status now also requires the access port's redirect, not only
   the IFB's netem, so a lost redirect reads as an impairment not installed.
+- A service placed on a device (`on:`) whose workspace moved since `up` read as not running in status, and its
+  `down` left the container to the device's own teardown. Status and `down` resolved the service's local artifact
+  store to find its container, and that store moved with the workspace. They now find the container by name alone.
 
 ## [0.34.0] - 2026-11-19
 

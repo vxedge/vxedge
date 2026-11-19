@@ -843,6 +843,22 @@ pub fn kuksa_spec(def: &Kuksa) -> Result<crate::containers::ContainerSpec, Servi
 /// Where `config.artifacts` is mounted inside a placed service's container.
 const PLACED_ARTIFACTS: &str = "/srv/vxedge/artifacts";
 
+/// The container a service placed with `on:` runs as, as far as finding it goes: its name and
+/// image, never its artifact store. Status and `down` use it, so a run whose workspace moved
+/// since `up`, taking a local store with it, still finds the container that is running.
+pub fn placed_member(
+    def: &ServiceDef,
+) -> Result<crate::containers::ContainerSpec, ServiceBackendError> {
+    if def.service_type != ServiceType::Ota {
+        return Err(ServiceBackendError::Unsupported(def.id.clone()));
+    }
+    Ok(crate::containers::ContainerSpec {
+        name: def.id.clone(),
+        image: def.image.url.clone(),
+        ..Default::default()
+    })
+}
+
 /// The container a service placed with `on:` runs as. Takes the service's image with the
 /// arguments its host-process form would get, so its entrypoint is the service binary. The
 /// artifact store is on the host, so it is resolved here and mounted read-only: a local store from
@@ -1237,6 +1253,19 @@ mod tests {
         );
         assert_eq!(spec.binds[0].host, dir.path().join("./store"));
         assert!(spec.binds[0].read_only);
+    }
+
+    #[test]
+    fn a_placed_service_is_found_without_its_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut def = ota_def("artifacts: ./store\nlisten: 0.0.0.0:9900\n");
+        def.on = Some("hpc1".into());
+        assert!(placed_spec(&def, dir.path(), dir.path()).is_err());
+        let member = placed_member(&def).unwrap();
+        assert!(member.binds.is_empty());
+        std::fs::create_dir(dir.path().join("store")).unwrap();
+        let spec = placed_spec(&def, dir.path(), dir.path()).unwrap();
+        assert_eq!((&member.name, &member.image), (&spec.name, &spec.image));
     }
 
     #[test]
