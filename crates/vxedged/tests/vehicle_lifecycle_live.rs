@@ -3,8 +3,9 @@
 //! this test provisions, so it can check what only a real vehicle shows:
 //!
 //! - a second `vehicle up` changes nothing: the same containers, links, VLANs, queues and rules;
-//! - `status`, `up` and `down` of another vehicle are refused while this one is up, and change
-//!   nothing, before and after a daemon restart;
+//! - another vehicle is a run of its own: its `status` and `down` find no run while this one is
+//!   up, before and after a daemon restart, and its `up` and `down` in another slot leave this
+//!   one's containers, links, VLANs, queues and rules as they were;
 //! - a restarted daemon still reports the vehicle up, signal plane included, and brings it down;
 //! - `down` twice succeeds, and leaves nothing behind;
 //! - `down` takes down what `up` brought up, from the manifest the run recorded: after the
@@ -507,26 +508,19 @@ fn rollup(status: &VehicleStatus) -> ResourceState {
     ResourceState::try_from(status.status.as_ref().expect("a rollup").state).unwrap()
 }
 
-/// `status`, `up` and `down` of a vehicle that is not the active one are each refused as the wrong
-/// workspace, and none of them changes the host.
-async fn wrong_vehicle_is_refused(channel: &Channel, other: &Path, before: &str, when: &str) {
+/// `status` and `down` of a vehicle that is not up answer that no run is: the host runs several,
+/// so the other vehicle's workspace names none of them. Neither changes the host.
+async fn another_vehicle_finds_no_run(channel: &Channel, other: &Path, before: &str, when: &str) {
     let refused = status(channel, other).await.err();
     let refused = refused.unwrap_or_else(|| panic!("{when}: status of another vehicle answered"));
     assert_eq!(refused.code(), tonic::Code::FailedPrecondition, "{when}");
-    assert_eq!(reason(&refused), "ERROR_REASON_WRONG_WORKSPACE", "{when}");
+    assert_eq!(reason(&refused), "ERROR_REASON_NO_ACTIVE_RUN", "{when}");
 
-    match up(channel, other).await {
-        Ok(job) => panic!("{when}: up of another vehicle ran a job: {job:?}"),
-        Err(refused) => {
-            assert_eq!(refused.code(), tonic::Code::FailedPrecondition, "{when}");
-            assert_eq!(reason(&refused), "ERROR_REASON_WRONG_WORKSPACE", "{when}");
-        }
-    }
     match down(channel, other).await {
         Ok(job) => panic!("{when}: down of another vehicle ran a job: {job:?}"),
         Err(refused) => {
             assert_eq!(refused.code(), tonic::Code::FailedPrecondition, "{when}");
-            assert_eq!(reason(&refused), "ERROR_REASON_WRONG_WORKSPACE", "{when}");
+            assert_eq!(reason(&refused), "ERROR_REASON_NO_ACTIVE_RUN", "{when}");
         }
     }
     assert_eq!(
@@ -539,7 +533,7 @@ async fn wrong_vehicle_is_refused(channel: &Channel, other: &Path, before: &str,
 #[tokio::test]
 #[ignore = "provisions the host gateway; needs file capabilities on vxedged, a cached sudo \
             credential and the user Podman socket (see module docs)"]
-async fn a_second_up_a_wrong_vehicle_and_a_daemon_restart_change_nothing() {
+async fn a_second_up_another_vehicle_and_a_daemon_restart_leave_the_run_alone() {
     assert_host_clean("before the test");
     let scratch = Scratch::new("restart");
     let yaml = vehicle("veh-life", "0.0.0.0:55555");
@@ -549,6 +543,10 @@ async fn a_second_up_a_wrong_vehicle_and_a_daemon_restart_change_nothing() {
     let _down = DownOnPanic {
         socket: daemon.socket(),
         workspace: ws.clone(),
+    };
+    let _down_other = DownOnPanic {
+        socket: daemon.socket(),
+        workspace: other.clone(),
     };
     let channel = daemon.channel().await;
 
@@ -574,11 +572,38 @@ async fn a_second_up_a_wrong_vehicle_and_a_daemon_restart_change_nothing() {
     assert_eq!(podman_id(&broker).as_deref(), Some(first.as_str()));
     assert_eq!(snapshot(), before, "the second up changed the host");
 
-    wrong_vehicle_is_refused(&channel, &other, &before, "daemon running").await;
+    another_vehicle_finds_no_run(&channel, &other, &before, "daemon running").await;
+
+    // The other vehicle comes up in a slot of its own, and its `down` removes only what it added.
+    let job = up(&channel, &other)
+        .await
+        .expect("up of another vehicle accepted");
+    assert_succeeded(&job, "up of another vehicle");
+    assert_eq!(
+        rollup(&status(&channel, &other).await.unwrap()),
+        ResourceState::Up,
+        "the other vehicle"
+    );
+    assert_eq!(
+        podman_id(&broker).as_deref(),
+        Some(first.as_str()),
+        "the other vehicle's up touched this one's databroker"
+    );
+    assert_succeeded(
+        &down(&channel, &other)
+            .await
+            .expect("down of another vehicle accepted"),
+        "down of another vehicle",
+    );
+    assert_eq!(
+        snapshot(),
+        before,
+        "another vehicle's up and down changed this one"
+    );
 
     daemon.restart();
     let channel = daemon.channel().await;
-    wrong_vehicle_is_refused(&channel, &other, &before, "after a restart").await;
+    another_vehicle_finds_no_run(&channel, &other, &before, "after a restart").await;
     let st = status(&channel, &ws).await.expect("status after a restart");
     assert_eq!(rollup(&st), ResourceState::Up, "after a restart: {st:?}");
     assert_eq!(
