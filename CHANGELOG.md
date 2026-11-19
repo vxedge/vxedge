@@ -8,6 +8,13 @@ All notable changes to this repo are documented here. Format follows
 
 ### Fixed
 
+- **An ingress impairment on the OVS data plane stays installed (#199).** ovs-vswitchd deletes
+  the `ingress` qdisc of a port it manages after a link event on that port, so the redirect
+  that carries a link's device→bridge impairment was removed during `up` or as soon as the
+  zone's end came up. Inbound traffic then crossed the link unimpaired while status reported
+  the impairment installed. The redirect now hangs off a `clsact` qdisc, which OVS leaves
+  alone, on both data planes. Status now also requires the access port's redirect, not only
+  the IFB's netem, so a lost redirect reads as an impairment not installed.
 - A service placed on a device (`on:`) whose workspace moved since `up` read as not running in status, and its
   `down` left the container to the device's own teardown. Status and `down` resolved the service's local artifact
   store to find its container, and that store moved with the workspace. They now find the container by name alone.
