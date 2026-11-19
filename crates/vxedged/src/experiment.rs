@@ -207,6 +207,36 @@ async fn resolve_once(mref: Option<&ManifestRef>) -> Result<String, Status> {
     crate::services::resolve_manifest_yaml(mref).await
 }
 
+/// The manifest a `down` or status of an experiment acts on, and its workspace: the run's own
+/// snapshot when the slot has a run, otherwise the request's manifest, for a slot with nothing up.
+/// A run that is a bare vehicle's is refused: `VehicleService` acts on it.
+pub(crate) async fn run_manifest(
+    verb: &str,
+    scope: &crate::scope::RunScope,
+    mref: Option<&ManifestRef>,
+    run: Option<&vxedge_api::v1::RunRef>,
+    asked: Option<std::path::PathBuf>,
+) -> Result<(String, Option<std::path::PathBuf>), Status> {
+    let named = run.is_some_and(|r| !r.run_id.is_empty());
+    match crate::services::run_of_request(scope, mref, named).await? {
+        Some(run) => match run.vehicle() {
+            Some(vehicle) => Err(crate::errors::precondition(
+                crate::errors::R::WrongWorkspace,
+                format!(
+                    "run `{}` is vehicle `{vehicle}`'s, not an experiment's: `{verb}` does not \
+                     act on it; use the vehicle verbs",
+                    run.record.run_id()
+                ),
+            )),
+            None => {
+                let dir = run.dir();
+                Ok((run.yaml, dir))
+            }
+        },
+        None => Ok((resolve_once(mref).await?, asked)),
+    }
+}
+
 impl Handles {
     /// Bring the gateway up (`Some(unlocked)`) or down (`None`).
     pub(crate) async fn stage_gateway(
@@ -226,19 +256,22 @@ impl Handles {
             },
         );
         let job = if let Some(unlocked) = up {
-            self.gateway
-                .up(crate::scope::with_slot(
-                    stage(
-                        GatewayUpRequest {
-                            instance: run.scope.instance.to_string(),
-                            manifest: inline(yaml, dir),
-                            unlocked,
-                        },
-                        p.job_id(),
-                    ),
-                    run.scope.instance,
-                ))
-                .await
+            let mut req = crate::scope::with_slot(
+                stage(
+                    GatewayUpRequest {
+                        instance: run.scope.instance.to_string(),
+                        manifest: inline(yaml, dir),
+                        unlocked,
+                    },
+                    p.job_id(),
+                ),
+                run.scope.instance,
+            );
+            if let Some(vehicle) = &run.vehicle {
+                req.extensions_mut()
+                    .insert(crate::scope::VehicleRun(vehicle.clone()));
+            }
+            self.gateway.up(req).await
         } else {
             self.gateway
                 .down(crate::scope::with_slot(
@@ -1021,20 +1054,27 @@ impl ExperimentService for ExperimentSvc {
 
     async fn down(&self, req: Request<ExperimentDownRequest>) -> Result<Response<Job>, Status> {
         check_stages(&req.get_ref().stages)?;
-        // Same resolution `up` does (minus preflight, which only guards provisioning) — carried
-        // into every stage below for the same reason: a local bundle/part ref, or the audit
-        // sha256, should resolve against the real workspace, not the daemon's own cwd.
-        let dir = match req.get_ref().manifest.as_ref() {
+        let root = self.handles.gateway.runtime_dir.clone();
+        let asked = match req.get_ref().manifest.as_ref() {
             Some(mref) => crate::services::resolve_manifest_dir(mref).await,
             None => None,
         };
-        let yaml = resolve_once(req.get_ref().manifest.as_ref()).await?;
+        let scope = crate::scope::of(&req, &root, req.get_ref().run.as_ref(), asked.as_deref())?;
+        crate::scope::guard(&req, &root, &scope)?;
+        // The run's own manifest when it is up: what `up` provisioned, whatever its workspace
+        // holds now. The workspace, carried into every stage, still resolves a local bundle or
+        // part ref when it is there.
+        let (yaml, dir) = run_manifest(
+            "experiment down",
+            &scope,
+            req.get_ref().manifest.as_ref(),
+            req.get_ref().run.as_ref(),
+            asked,
+        )
+        .await?;
         let model = vxedge_core::model::load_yaml(&yaml).map_err(|e| {
             crate::errors::invalid(crate::errors::R::WorkspaceInvalid, e.to_string())
         })?;
-        let root = self.handles.gateway.runtime_dir.clone();
-        let scope = crate::scope::of(&req, &root, req.get_ref().run.as_ref(), dir.as_deref())?;
-        crate::scope::guard(&req, &root, &scope)?;
         let active = self.handles.gateway.active_on_host(&scope).await;
         check_active_target(
             "experiment down",
@@ -1128,17 +1168,24 @@ impl ExperimentService for ExperimentSvc {
         &self,
         req: Request<ExperimentStatusRequest>,
     ) -> Result<Response<ExperimentStatus>, Status> {
-        let dir = match req.get_ref().manifest.as_ref() {
+        // The components below describe the run the caller named, or its workspace's run.
+        let root = self.handles.gateway.runtime_dir.clone();
+        let asked = match req.get_ref().manifest.as_ref() {
             Some(mref) => crate::services::resolve_manifest_dir(mref).await,
             None => None,
         };
-        let yaml = resolve_once(req.get_ref().manifest.as_ref()).await?;
+        let scope = crate::scope::of(&req, &root, req.get_ref().run.as_ref(), asked.as_deref())?;
+        let (yaml, dir) = run_manifest(
+            "experiment status",
+            &scope,
+            req.get_ref().manifest.as_ref(),
+            req.get_ref().run.as_ref(),
+            asked,
+        )
+        .await?;
         let model = vxedge_core::model::load_yaml(&yaml).map_err(|e| {
             crate::errors::invalid(crate::errors::R::WorkspaceInvalid, e.to_string())
         })?;
-        // The components below describe the run the caller named, or its workspace's run.
-        let root = self.handles.gateway.runtime_dir.clone();
-        let scope = crate::scope::of(&req, &root, req.get_ref().run.as_ref(), dir.as_deref())?;
         let run = crate::scope::RunCtx::new(scope);
         let active = self.handles.gateway.active_on_host(&run.scope).await;
         check_active_target(

@@ -2256,8 +2256,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // never learns that §6.1 exists — which is the point of §6.0 being the only
             // authored schema.
             ExperimentCmd::Up { .. } | ExperimentCmd::Down { .. } | ExperimentCmd::Status => {
-                let found = vxedge_core::discover(&here()?)?;
-                let workspace = found.root.to_string_lossy().to_string();
+                // `down` and `status` with `--run` act on that run as its `up` recorded it, so
+                // they need no workspace here: the run's may have moved or gone.
+                let workspace = match vxedge_core::discover(&here()?) {
+                    Ok(found) => Some(found.root.to_string_lossy().to_string()),
+                    Err(_) if cli.run.is_some() && !matches!(cmd, ExperimentCmd::Up { .. }) => None,
+                    Err(e) => return Err(e.into()),
+                };
                 let channel = connect(&cli.endpoint).await?;
                 let mut exp = ExperimentServiceClient::new(channel.clone());
                 match cmd {
@@ -2265,7 +2270,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         let st = exp
                             .status(ExperimentStatusRequest {
                                 run: run_ref(&cli.run),
-                                manifest: manifest_ref(&Some(workspace)),
+                                manifest: manifest_ref(&workspace),
                             })
                             .await?
                             .into_inner();
@@ -2301,7 +2306,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         let job = exp
                             .up(ExperimentUpRequest {
                                 instance: instance.clone().unwrap_or_default(),
-                                manifest: manifest_ref(&Some(workspace)),
+                                manifest: manifest_ref(&workspace),
                                 stages: stages.iter().map(|s| s.as_proto()).collect(),
                                 unlocked: *unlocked,
                             })
@@ -2319,7 +2324,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         let job = exp
                             .down(ExperimentDownRequest {
                                 run: run_ref(&cli.run),
-                                manifest: manifest_ref(&Some(workspace)),
+                                manifest: manifest_ref(&workspace),
                                 stages,
                             })
                             .await?

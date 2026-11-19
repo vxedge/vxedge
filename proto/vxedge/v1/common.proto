@@ -80,7 +80,8 @@ enum ErrorReason {
   ERROR_REASON_NO_ACTIVE_RUN = 3;
   // `RunRef` does not name the active run.
   ERROR_REASON_RUN_MISMATCH = 4;
-  // The active workspace was edited since `up`, so its plans would not describe what is running.
+  // No longer returned: a restarted daemon restores a run from the manifest its `up` recorded,
+  // so a workspace edited since does not stop it. Kept so the number is never reused.
   ERROR_REASON_WORKSPACE_CHANGED = 5;
   // The workspace does not load: a parse, cross-reference or invariant failure.
   ERROR_REASON_WORKSPACE_INVALID = 6;

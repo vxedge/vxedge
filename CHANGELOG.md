@@ -6,6 +6,27 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **A run comes down as its `up` brought it up (X0.8).** `up` already wrote the manifest it
+  provisioned to the run's directory, `runs/<s>/manifest.yaml`; it now fails rather than run
+  without it, and records a bare vehicle's id in `active.json`. Experiment and vehicle `down` and
+  status, `RunService.Status` and `.Down`, and a restarted daemon now read the run from that
+  manifest instead of re-reading its workspace. A workspace edited since `up` comes down as what
+  is running rather than as the new file; a moved or deleted one, and an inline manifest, come
+  down by run id or through `vxedge runs down`, where they answered `ERROR_REASON_WORKSPACE_INVALID`
+  before. Their stages are handed the recorded manifest without the workspace once it is gone.
+  `vxedge experiment down --run <id>` and `status --run <id>` no longer need to run inside a
+  workspace. A restarted daemon restores such runs too, so `ERROR_REASON_WORKSPACE_CHANGED` is no
+  longer returned. With no `run` named, the `manifest` on a `down` or status picks the run and
+  must still resolve, and an inline one must declare that run's workspace: a mistyped path or
+  another workspace's document is refused rather than taking down the one run up. A run whose
+  manifest was not recorded refuses its `down` with `ERROR_REASON_WORKSPACE_INVALID`. The experiment verbs refuse a bare vehicle's run, and
+  the vehicle verbs an experiment's, with `ERROR_REASON_WRONG_WORKSPACE`. `down` removes the
+  manifest after `active.json`, and leaves a campaign's `reserved.json` alone. A run brought up
+  by an earlier daemon has no vehicle id recorded, so it reads as an experiment's until its next
+  `up`; `vxedge runs down` takes it down.
+
 ## [0.33.0] - 2026-11-18
 
 The fleet view: `RunService.Status` reads every run on the host in one call, or the named ones, and

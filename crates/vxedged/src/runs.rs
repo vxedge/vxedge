@@ -17,12 +17,11 @@ use tonic::{Request, Response, Status};
 
 use vxedge_api::v1::experiment_service_server::ExperimentService;
 use vxedge_api::v1::gateway_service_server::GatewayService;
-use vxedge_api::v1::manifest_ref::Source;
 use vxedge_api::v1::run_service_server::RunService;
 use vxedge_api::v1::vehicle_service_server::VehicleService;
 use vxedge_api::v1::{
     ExperimentDownRequest, ExperimentStatusRequest, GatewayStatus, GatewayStatusRequest, Job,
-    Kernel, ManifestRef, NodeStatus, PackageRef, ResourceKind, ResourceState, ResourceStatus, Run,
+    Kernel, NodeStatus, PackageRef, ResourceKind, ResourceState, ResourceStatus, Run,
     RunDownRequest, RunGetRequest, RunListRequest, RunListResponse, RunRef, RunStatus,
     RunStatusRequest, RunStatusResponse, VehicleDownRequest, VehicleStatusRequest,
 };
@@ -31,7 +30,7 @@ use vxedge_core::instance::Instance;
 use crate::errors::R;
 use crate::experiment::{ExperimentSvc, await_job};
 use crate::jobs::{JobEngine, JobFailure, JobOpts, Progress, stage};
-use crate::services::{ActiveRecord, GatewaySvc, read_workspace};
+use crate::services::{ActiveRecord, GatewaySvc};
 use crate::vehicle::VehicleSvc;
 
 /// The run's state from what is observed. `STAGING` while a lifecycle job acts on it; the
@@ -54,22 +53,12 @@ pub(crate) fn acts_on(running: bool, claimed: Option<&Path>, dir: &Path) -> bool
     running && claimed.is_none_or(|c| c == dir)
 }
 
-/// Whether the workspace is a bare vehicle, and the id its author wrote. A vehicle's record
-/// holds the id of its synthesized experiment.
-pub(crate) async fn target(record: &ActiveRecord) -> (ResourceKind, String) {
-    let experiment = (ResourceKind::Experiment, record.id.clone());
-    if record.dir == Path::new(".") {
-        return experiment;
-    }
-    let Ok(yaml) = read_workspace(&record.dir.display().to_string()).await else {
-        return experiment;
-    };
-    match vxedge_core::Workspace::from_yaml(&yaml) {
-        Ok(ws) if ws.experiments.is_empty() => match ws.vehicles.first() {
-            Some(vehicle) => (ResourceKind::Vehicle, vehicle.id.clone()),
-            None => experiment,
-        },
-        _ => experiment,
+/// Whether the run is a bare vehicle's, and the id its author wrote. A vehicle's record holds
+/// the id of its synthesized experiment, and the vehicle's own beside it.
+pub(crate) fn target(record: &ActiveRecord) -> (ResourceKind, String) {
+    match &record.vehicle {
+        Some(vehicle) => (ResourceKind::Vehicle, vehicle.clone()),
+        None => (ResourceKind::Experiment, record.id.clone()),
     }
 }
 
@@ -214,40 +203,31 @@ impl RunSvc {
         let run_ref = RunRef {
             run_id: record.run_id().to_string(),
         };
-        let workspace = if record.dir == Path::new(".") {
-            Err(crate::errors::precondition(
-                R::WorkspaceInvalid,
-                "the run was brought up from an inline manifest, so its workspace cannot be read",
-            ))
-        } else {
-            let manifest = Some(ManifestRef {
-                source: Some(Source::Path(record.dir.display().to_string())),
-                ..Default::default()
-            });
-            match kind {
-                ResourceKind::Vehicle => self
-                    .vehicles
-                    .status(Request::new(VehicleStatusRequest {
-                        run: Some(run_ref.clone()),
-                        manifest,
-                    }))
-                    .await
-                    .map(|r| {
-                        let r = r.into_inner();
-                        (r.gateway, r.status, r.components, r.nodes)
-                    }),
-                _ => self
-                    .experiments
-                    .status(Request::new(ExperimentStatusRequest {
-                        run: Some(run_ref.clone()),
-                        manifest,
-                    }))
-                    .await
-                    .map(|r| {
-                        let r = r.into_inner();
-                        (r.gateway, r.status, r.components, r.nodes)
-                    }),
-            }
+        // No manifest: the status reads the run's own, which `up` recorded, so a workspace
+        // edited, moved or deleted since, or an inline one, still reports what is running.
+        let workspace = match kind {
+            ResourceKind::Vehicle => self
+                .vehicles
+                .status(Request::new(VehicleStatusRequest {
+                    run: Some(run_ref.clone()),
+                    manifest: None,
+                }))
+                .await
+                .map(|r| {
+                    let r = r.into_inner();
+                    (r.gateway, r.status, r.components, r.nodes)
+                }),
+            _ => self
+                .experiments
+                .status(Request::new(ExperimentStatusRequest {
+                    run: Some(run_ref.clone()),
+                    manifest: None,
+                }))
+                .await
+                .map(|r| {
+                    let r = r.into_inner();
+                    (r.gateway, r.status, r.components, r.nodes)
+                }),
         };
         let (gateway, workspace) = match workspace {
             Ok((gateway, status, components, nodes)) => (
@@ -305,7 +285,7 @@ impl RunSvc {
         record: ActiveRecord,
         always: bool,
     ) -> Result<(Run, Option<Observed>), Status> {
-        let (kind, target_id) = target(&record).await;
+        let (kind, target_id) = target(&record);
         let busy = self.staging(instance).await;
         let observed = if busy && !always {
             None
@@ -394,7 +374,7 @@ async fn down_one(
     instance: Instance,
     record: &ActiveRecord,
 ) -> Job {
-    let (kind, _) = target(record).await;
+    let (kind, _) = target(record);
     let run = Some(RunRef {
         run_id: record.run_id().to_string(),
     });
@@ -402,54 +382,39 @@ async fn down_one(
         ResourceKind::Vehicle => "vehicle.down",
         _ => "experiment.down",
     };
-    let started = if record.dir == Path::new(".") {
-        Err(crate::errors::precondition(
-            R::WorkspaceInvalid,
-            format!(
-                "run `{}` was brought up from an inline manifest; take it down with \
-                 `ExperimentService.Down` and that manifest",
-                record.run_id()
+    // No manifest: the run's own `down` reads what `up` recorded for it, so a workspace edited,
+    // moved or deleted since, or an inline one, still comes down.
+    let started = match kind {
+        ResourceKind::Vehicle => VehicleService::down(
+            &**vehicles,
+            crate::scope::with_slot(
+                stage(
+                    VehicleDownRequest {
+                        run,
+                        ..Default::default()
+                    },
+                    parent,
+                ),
+                instance,
             ),
-        ))
-    } else {
-        let manifest = Some(ManifestRef {
-            source: Some(Source::Path(record.dir.display().to_string())),
-            ..Default::default()
-        });
-        match kind {
-            ResourceKind::Vehicle => VehicleService::down(
-                &**vehicles,
-                crate::scope::with_slot(
-                    stage(
-                        VehicleDownRequest {
-                            manifest,
-                            run,
-                            ..Default::default()
-                        },
-                        parent,
-                    ),
-                    instance,
+        )
+        .await
+        .map(Response::into_inner),
+        _ => ExperimentService::down(
+            &**experiments,
+            crate::scope::with_slot(
+                stage(
+                    ExperimentDownRequest {
+                        run,
+                        ..Default::default()
+                    },
+                    parent,
                 ),
-            )
-            .await
-            .map(Response::into_inner),
-            _ => ExperimentService::down(
-                &**experiments,
-                crate::scope::with_slot(
-                    stage(
-                        ExperimentDownRequest {
-                            manifest,
-                            run,
-                            ..Default::default()
-                        },
-                        parent,
-                    ),
-                    instance,
-                ),
-            )
-            .await
-            .map(Response::into_inner),
-        }
+                instance,
+            ),
+        )
+        .await
+        .map(Response::into_inner),
     };
     match started {
         Ok(job) => job,
@@ -644,6 +609,7 @@ mod tests {
             kernel: None,
             shaping: None,
             time_sync: None,
+            vehicle: None,
         }
     }
 

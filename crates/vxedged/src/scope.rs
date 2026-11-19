@@ -336,13 +336,26 @@ pub(crate) fn choose_in(
 pub(crate) struct RunCtx {
     pub scope: RunScope,
     pub run: Option<RunRef>,
+    /// The bare vehicle a `vehicle up` brings up, so its gateway stage records the run as that
+    /// vehicle's. `None` for an experiment.
+    pub vehicle: Option<String>,
 }
 
 impl RunCtx {
     pub(crate) fn new(scope: RunScope) -> Self {
-        let mut ctx = Self { scope, run: None };
+        let mut ctx = Self {
+            scope,
+            run: None,
+            vehicle: None,
+        };
         ctx.refresh();
         ctx
+    }
+
+    /// A run that is the bare vehicle `id`'s.
+    pub(crate) fn of_vehicle(mut self, id: &str) -> Self {
+        self.vehicle = Some(id.to_string());
+        self
     }
 
     /// Read the run id from the run's record: after its gateway comes up, or for a run already up.
@@ -364,6 +377,12 @@ pub(crate) fn with_slot<T>(mut req: tonic::Request<T>, instance: Instance) -> to
     req.extensions_mut().insert(Slot(instance));
     req
 }
+
+/// The bare vehicle a gateway `up` brings up a run for, on the stage request `vehicle up` sends,
+/// so the run's record says it is that vehicle's: its manifest is the synthesized experiment, which
+/// alone does not say so.
+#[derive(Debug, Clone)]
+pub(crate) struct VehicleRun(pub String);
 
 /// The run a request acts on: the slot an internal request names, else [`resolve`]'s rule.
 pub(crate) fn of<T>(
@@ -490,6 +509,7 @@ mod tests {
             kernel: None,
             shaping: None,
             time_sync: None,
+            vehicle: None,
         }
     }
 
