@@ -6,6 +6,14 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.34.0] - 2026-11-19
+
+A run comes down as it was brought up. `up` records the manifest it provisioned, and `down`, status, the fleet
+view and a restarted daemon read the run from that record rather than from its workspace. A workspace edited,
+moved or deleted since `up` no longer leaves its run stuck, and `ERROR_REASON_WORKSPACE_CHANGED` is no longer
+returned. A `down` whose manifest is not the run's is refused instead of taking down the one run up. No RPC or
+message changes.
+
 ### Changed
 
 - **A run comes down as its `up` brought it up (X0.8).** `up` already wrote the manifest it
