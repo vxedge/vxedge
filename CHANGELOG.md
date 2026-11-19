@@ -6,6 +6,11 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.34.2] - 2026-11-19
+
+Fix. An attach adapter learns the slot of the run it serves, so a vehicle with an attach node no longer blocks a
+second vehicle from coming up beside it. No RPC or message changes.
+
 ### Fixed
 
 - An attach adapter's commands get `VX_SLOT`, the slot of the run they serve, so a platform whose guest carries the
