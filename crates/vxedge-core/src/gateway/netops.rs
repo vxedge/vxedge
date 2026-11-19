@@ -337,11 +337,10 @@ impl Shell {
                     || stderr.contains("No such device")
                     || stderr.contains("No such file")
                     // `tc qdisc del dev <x> parent ffff:fff1` on a device with no ingress-slot
-                    // qdisc yet
-                    // (gateway::provision::apply_impairment's own first-apply case) — a third
-                    // spelling of "already absent," alongside links' and addresses' own, that
-                    // only a live kernel surfaces: no fixture reproduces exact iproute2 stderr
-                    // text.
+                    // qdisc yet (gateway::provision::apply_impairment's own first-apply case) —
+                    // a third spelling of "already absent," alongside links' and addresses' own,
+                    // that only a live kernel surfaces: no fixture reproduces exact iproute2
+                    // stderr text.
                     || stderr.contains("Cannot find specified qdisc") =>
             {
                 Ok(())
