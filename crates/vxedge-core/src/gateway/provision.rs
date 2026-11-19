@@ -640,11 +640,24 @@ fn netem_args(params: &crate::model::Impairment) -> Vec<String> {
 /// `up`, and there is no version-portable way to replace an unhandled `u32` filter in place.
 /// Reading the existing filter back instead is what this file already avoids for `tc` —
 /// `observe`'s own comment records `tc -j class show` emitting non-JSON on shipped iproute2
-/// versions. So the ingress qdisc is deleted and rebuilt, which takes its filters with it and
-/// lands on exactly one redirect every time. That is convergent rather than untouched: a re-apply
-/// leaves a sub-millisecond window where inbound traffic crosses unimpaired. `up` is a
-/// provisioning operation and traffic is started separately (`vxedge traffic up`), so no
-/// measurement is running when it happens.
+/// versions. So the port's ingress-slot qdisc is deleted and rebuilt, which takes its filters
+/// with it and lands on exactly one redirect every time. That is convergent rather than
+/// untouched: a re-apply leaves a sub-millisecond window where inbound traffic crosses
+/// unimpaired. `up` is a provisioning operation and traffic is started separately (`vxedge
+/// traffic up`), so no measurement is running when it happens.
+///
+/// # Why `clsact`, not `ingress`
+///
+/// The redirect hangs off a `clsact` qdisc. An `ingress` qdisc would do the same job, but
+/// ovs-vswitchd deletes the `ingress` qdisc of every port it manages whenever a link event on
+/// that port (a carrier change when the zone's end comes up, an MTU change) is followed by a
+/// bridge reconfigure: its ingress-policing code removes the qdisc to reset policing, even with
+/// none configured (`netdev_linux_set_policing`, `lib/netdev-linux.c`). On the OVS data plane an
+/// ingress impairment would vanish as soon as its zone started, after `up` had reported success
+/// (vxedge#199). OVS deletes by kind, and the kernel refuses a delete whose kind does not match
+/// the qdisc in the slot, so a `clsact` qdisc is left alone. The kernel bridge uses the same
+/// path, so both data planes install the same thing. The delete is by slot (`parent ffff:fff1`),
+/// not by kind, so it also clears an `ingress` qdisc left by an earlier version.
 fn apply_impairment(
     sh: &Shell,
     access_port: &str,
@@ -667,8 +680,18 @@ fn apply_impairment(
     ifb_egress.extend_from_slice(&netem);
     sh.run("tc", &ifb_egress)?;
 
-    sh.run_tolerate_missing("tc", &["qdisc", "del", "dev", access_port, "ingress"])?;
-    sh.run("tc", &["qdisc", "add", "dev", access_port, "ingress"])?;
+    sh.run_tolerate_missing(
+        "tc",
+        &[
+            "qdisc",
+            "del",
+            "dev",
+            access_port,
+            "parent",
+            super::netops::INGRESS_SLOT,
+        ],
+    )?;
+    sh.run("tc", &["qdisc", "add", "dev", access_port, "clsact"])?;
     sh.run(
         "tc",
         &[
@@ -676,8 +699,7 @@ fn apply_impairment(
             "add",
             "dev",
             access_port,
-            "parent",
-            "ffff:",
+            "ingress",
             "protocol",
             "all",
             "prio",
@@ -696,6 +718,42 @@ fn apply_impairment(
         ],
     )?;
     Ok(())
+}
+
+/// One link's impairment as installed, on either data plane.
+///
+/// Text, not `-j`: this file's own note on `tc -j class show` emitting non-JSON on shipped
+/// iproute2 versions applies to qdiscs and filters too, and `htb_root_present` reads qdiscs this
+/// way. What is checked is that netem is *there*, not that its parameters match — a full
+/// parameter diff belongs with the converging reconciler. Ingress needs both halves: netem on
+/// the IFB and the access port's redirect onto it. Without the redirect, inbound traffic crosses
+/// unimpaired whatever the IFB carries, which is how vxedge#199 went unseen.
+fn observe_impairment(
+    sh: &Shell,
+    ep: &super::plan::EndpointPlan,
+    imp: &super::plan::EndpointImpairment,
+) -> Result<ImpairmentObservation, NetOpsError> {
+    let ns = sh.netns.as_deref();
+    let netem_on = |dev: &str| -> Result<bool, NetOpsError> {
+        Ok(netlink::link_exists(ns, dev)
+            && sh
+                .run("tc", &["qdisc", "show", "dev", dev])?
+                .lines()
+                .any(|l| l.starts_with("qdisc netem ")))
+    };
+    let egress_present = netem_on(&ep.name)?;
+    let redirect = format!("Egress Redirect to device {})", imp.ifb);
+    let ingress_present = netem_on(&imp.ifb)?
+        && netlink::link_exists(ns, &ep.name)
+        && sh
+            .run("tc", &["filter", "show", "dev", &ep.name, "ingress"])?
+            .contains(&redirect);
+    Ok(ImpairmentObservation {
+        link: imp.link.clone(),
+        access_port: ep.name.clone(),
+        egress_present,
+        ingress_present,
+    })
 }
 
 /// The nftables `netdev` table name for one access port's anti-spoof filter. One table per
@@ -1536,23 +1594,9 @@ fn ovs_observe(sh: &Shell, plan: &GatewayPlan) -> Result<GatewayObservation, Net
 
     let mut impairments = Vec::new();
     for ep in &plan.endpoints {
-        let Some(imp) = &ep.impairment else { continue };
-        let egress_present = netlink::link_exists(ns, &ep.name)
-            && sh
-                .run("tc", &["qdisc", "show", "dev", &ep.name])?
-                .lines()
-                .any(|l| l.starts_with("qdisc netem "));
-        let ingress_present = netlink::link_exists(ns, &imp.ifb)
-            && sh
-                .run("tc", &["qdisc", "show", "dev", &imp.ifb])?
-                .lines()
-                .any(|l| l.starts_with("qdisc netem "));
-        impairments.push(ImpairmentObservation {
-            link: imp.link.clone(),
-            access_port: ep.name.clone(),
-            egress_present,
-            ingress_present,
-        });
+        if let Some(imp) = &ep.impairment {
+            impairments.push(observe_impairment(sh, ep, imp)?);
+        }
     }
 
     let mut ingress_filters = Vec::new();
@@ -1913,7 +1957,8 @@ pub struct ImpairmentObservation {
     pub access_port: String,
     /// netem is the root qdisc on the access port — the bridge→device direction.
     pub egress_present: bool,
-    /// The IFB exists and carries its own netem — the device→bridge direction.
+    /// The IFB exists and carries its own netem, and the access port redirects its ingress onto
+    /// it — the device→bridge direction.
     pub ingress_present: bool,
 }
 
@@ -2038,27 +2083,9 @@ pub fn observe(sh: &Shell, plan: &GatewayPlan) -> Result<GatewayObservation, Net
 
     let mut impairments = Vec::new();
     for ep in &plan.endpoints {
-        let Some(imp) = &ep.impairment else { continue };
-        // Text, not `-j`: this file's own note on `tc -j class show` emitting non-JSON on
-        // shipped iproute2 versions applies to qdiscs too, and `htb_root_present` above already
-        // reads qdiscs this way. What is checked is that netem is *there*, not that its
-        // parameters match — a full parameter diff belongs with the converging reconciler.
-        let egress_present = netlink::link_exists(ns, &ep.name)
-            && sh
-                .run("tc", &["qdisc", "show", "dev", &ep.name])?
-                .lines()
-                .any(|l| l.starts_with("qdisc netem "));
-        let ingress_present = netlink::link_exists(ns, &imp.ifb)
-            && sh
-                .run("tc", &["qdisc", "show", "dev", &imp.ifb])?
-                .lines()
-                .any(|l| l.starts_with("qdisc netem "));
-        impairments.push(ImpairmentObservation {
-            link: imp.link.clone(),
-            access_port: ep.name.clone(),
-            egress_present,
-            ingress_present,
-        });
+        if let Some(imp) = &ep.impairment {
+            impairments.push(observe_impairment(sh, ep, imp)?);
+        }
     }
 
     let mut ingress_filters = Vec::new();

@@ -6,6 +6,16 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **An ingress impairment on the OVS data plane stays installed (#199).** ovs-vswitchd deletes
+  the `ingress` qdisc of a port it manages after a link event on that port, so the redirect
+  that carries a link's device→bridge impairment was removed during `up` or as soon as the
+  zone's end came up. Inbound traffic then crossed the link unimpaired while status reported
+  the impairment installed. The redirect now hangs off a `clsact` qdisc, which OVS leaves
+  alone, on both data planes. Status now also requires the access port's redirect, not only
+  the IFB's netem, so a lost redirect reads as an impairment not installed.
+
 ## [0.34.0] - 2026-11-19
 
 A run comes down as it was brought up. `up` records the manifest it provisioned, and `down`, status, the fleet
