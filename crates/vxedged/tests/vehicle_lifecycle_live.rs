@@ -504,6 +504,15 @@ fn signal_plane(status: &VehicleStatus) -> ResourceState {
     ResourceState::try_from(plane.state).unwrap()
 }
 
+fn service(status: &VehicleStatus, vxid: &str) -> ResourceState {
+    let svc = status
+        .components
+        .iter()
+        .find(|c| c.kind == ResourceKind::Service as i32 && c.vxid == vxid)
+        .unwrap_or_else(|| panic!("no {vxid} component in {status:?}"));
+    ResourceState::try_from(svc.state).unwrap()
+}
+
 fn rollup(status: &VehicleStatus) -> ResourceState {
     ResourceState::try_from(status.status.as_ref().expect("a rollup").state).unwrap()
 }
@@ -743,6 +752,14 @@ async fn down_reads_the_run_not_its_workspace() {
     std::fs::rename(&ws, &moved).unwrap();
     daemon.restart();
     let channel = daemon.channel().await;
+    // Its OTA service, placed on a device, is still found: its local store moved with the workspace.
+    let st = VehicleServiceClient::new(channel.clone())
+        .status(VehicleStatusRequest::default())
+        .await
+        .expect("status of a moved workspace's run")
+        .into_inner();
+    assert_eq!(service(&st, "svc-ota"), ResourceState::Up, "{st:?}");
+    assert_eq!(rollup(&st), ResourceState::Up, "{st:?}");
     let job = RunServiceClient::new(channel.clone())
         .down(RunDownRequest {
             all: true,

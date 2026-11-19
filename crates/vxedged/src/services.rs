@@ -2340,7 +2340,9 @@ impl SvcSvc {
         })
     }
 
-    /// The node and container of a service placed with `on:`, or `None` for a host process.
+    /// The node and container of a service placed with `on:`, or `None` for a host process. Only
+    /// finds the container (status, `down`): its artifact store is not resolved, so a workspace
+    /// moved since `up` still finds what runs.
     async fn placed(
         &self,
         service_type: &str,
@@ -2359,12 +2361,7 @@ impl SvcSvc {
             .service_def(service_type, Some(experiment), scope)
             .await
             .ok()?;
-        let spec = vxedge_core::services::placed_spec(
-            &declared.def,
-            &declared.workspace_dir,
-            &self.cache_dir,
-        )
-        .ok()?;
+        let spec = vxedge_core::services::placed_member(&declared.def).ok()?;
         Some((declared.node?, spec))
     }
 }

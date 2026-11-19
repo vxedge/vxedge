@@ -6,6 +6,12 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- A service placed on a device (`on:`) whose workspace moved since `up` read as not running in status, and its
+  `down` left the container to the device's own teardown. Status and `down` resolved the service's local artifact
+  store to find its container, and that store moved with the workspace. They now find the container by name alone.
+
 ## [0.34.0] - 2026-11-19
 
 A run comes down as it was brought up. `up` records the manifest it provisioned, and `down`, status, the fleet
