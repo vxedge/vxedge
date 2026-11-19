@@ -43,6 +43,11 @@ pub enum NetOpsError {
     Parse { cmdline: String, detail: String },
 }
 
+/// A device's ingress qdisc slot (`TC_H_INGRESS`), which holds either an `ingress` or a `clsact`
+/// qdisc. `tc qdisc del ... parent` this slot removes whichever is there, where a delete by kind
+/// fails on the other.
+pub(crate) const INGRESS_SLOT: &str = "ffff:fff1";
+
 /// Executes iproute2 commands, optionally inside a named network namespace
 /// (`ip netns exec <ns> ...`) — that is what makes the integration tests and
 /// future multi-gateway setups isolated.
@@ -314,15 +319,15 @@ impl Shell {
     fn tolerate_missing(res: Result<String, NetOpsError>) -> Result<(), NetOpsError> {
         match res {
             Ok(_) => Ok(()),
-            // `tc qdisc del dev <x> ingress` on a device whose ingress qdisc is already gone: the
-            // kernel finds the placeholder left in the ingress slot, whose handle is 0, and
-            // answers "Invalid handle". The OVS backend's live test met it when a second apply
-            // found the ingress qdisc removed under it. Only that command reads it as absent:
-            // elsewhere the same text is a real error.
+            // `tc qdisc del dev <x> parent ffff:fff1` on a device whose ingress-slot qdisc is
+            // already gone: the kernel finds the placeholder left in the slot, whose handle is 0,
+            // and answers "Cannot delete qdisc with handle of zero" ("Invalid handle" on older
+            // kernels). Only that command reads it as absent: elsewhere the same text is a real
+            // error.
             Err(NetOpsError::Command { cmdline, stderr })
-                if stderr.contains("Invalid handle")
+                if (stderr.contains("handle of zero") || stderr.contains("Invalid handle"))
                     && cmdline.contains("tc qdisc del ")
-                    && cmdline.ends_with(" ingress") =>
+                    && cmdline.ends_with(&format!(" parent {INGRESS_SLOT}")) =>
             {
                 Ok(())
             }
@@ -331,7 +336,8 @@ impl Shell {
                     || stderr.contains("does not exist")
                     || stderr.contains("No such device")
                     || stderr.contains("No such file")
-                    // `tc qdisc del dev <x> ingress` on a device with no ingress qdisc yet
+                    // `tc qdisc del dev <x> parent ffff:fff1` on a device with no ingress-slot
+                    // qdisc yet
                     // (gateway::provision::apply_impairment's own first-apply case) — a third
                     // spelling of "already absent," alongside links' and addresses' own, that
                     // only a live kernel surfaces: no fixture reproduces exact iproute2 stderr
@@ -370,25 +376,22 @@ mod tests {
     }
 
     #[test]
-    fn an_ingress_qdisc_already_gone_reads_as_absent() {
+    fn an_ingress_slot_already_empty_reads_as_absent() {
+        for stderr in [
+            "Error: Cannot delete qdisc with handle of zero.",
+            "Error: Invalid handle.",
+            "Error: Cannot find specified qdisc on specified device.",
+        ] {
+            assert!(
+                Shell::tolerate_missing(failed("tc qdisc del dev vxoep1 parent ffff:fff1", stderr))
+                    .is_ok(),
+                "{stderr}"
+            );
+        }
         assert!(
             Shell::tolerate_missing(failed(
-                "tc qdisc del dev vxoep1 ingress",
-                "Error: Invalid handle."
-            ))
-            .is_ok()
-        );
-        assert!(
-            Shell::tolerate_missing(failed(
-                "tc qdisc del dev vxoep1 ingress",
-                "Error: Cannot find specified qdisc on specified device."
-            ))
-            .is_ok()
-        );
-        assert!(
-            Shell::tolerate_missing(failed(
-                "sudo ip netns exec vxh0 tc qdisc del dev vxup0p ingress",
-                "Error: Invalid handle."
+                "sudo ip netns exec vxh0 tc qdisc del dev vxup0p parent ffff:fff1",
+                "Error: Cannot delete qdisc with handle of zero."
             ))
             .is_ok(),
             "escalated or in a namespace, it is the same command"
@@ -406,7 +409,14 @@ mod tests {
         );
         assert!(
             Shell::tolerate_missing(failed(
-                "tc filter add dev vxoep1 parent ffff: protocol all prio 1",
+                "tc qdisc del dev vxup0 root",
+                "Error: Cannot delete qdisc with handle of zero."
+            ))
+            .is_err()
+        );
+        assert!(
+            Shell::tolerate_missing(failed(
+                "tc filter add dev vxoep1 ingress protocol all prio 1",
                 "Error: Invalid handle."
             ))
             .is_err()

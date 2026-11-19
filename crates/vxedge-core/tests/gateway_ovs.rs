@@ -118,6 +118,35 @@ fn ovs_data_plane_cycle() {
     let obs = Ovs.observe(&sh, &plan).expect("observe after re-apply");
     assert!(obs.fully_up(), "not fully up after re-apply: {obs:?}");
 
+    // vxedge#199: ovs-vswitchd deletes the `ingress` qdisc of a port it manages after a link
+    // event on that port, which a zone's end coming up is. The redirect must survive it, and
+    // not only for the instant after `apply`: a carrier change and an MTU change, each given
+    // vswitchd time to reconfigure, leave the impairment whole.
+    let peer = &plan.endpoints[0].peer;
+    let settle = || std::thread::sleep(std::time::Duration::from_secs(2));
+    sh.run("ip", &["link", "set", peer, "up"]).expect("peer up");
+    settle();
+    let obs = Ovs
+        .observe(&sh, &plan)
+        .expect("observe after a carrier change");
+    assert!(
+        obs.impairments[0].healthy(),
+        "impairment lost after the port's carrier came up: {obs:?}"
+    );
+    sh.run(
+        "ip",
+        &["link", "set", &plan.endpoints[0].name, "mtu", "1400"],
+    )
+    .expect("mtu change");
+    settle();
+    let obs = Ovs
+        .observe(&sh, &plan)
+        .expect("observe after an MTU change");
+    assert!(
+        obs.impairments[0].healthy(),
+        "impairment lost after the port's MTU changed: {obs:?}"
+    );
+
     // The trunk VLAN really lives on the OVS port, not merely tracked in the plan.
     let trunks = std::process::Command::new("ovs-vsctl")
         .args(["get", "port", &plan.uplink, "trunks"])

@@ -290,14 +290,11 @@ fn impairments_install_both_directions_and_survive_reapply() {
     assert!(ifb.contains("netem"), "no netem on {}: {ifb}", imp.ifb);
 
     let redirects = |sh: &Shell| -> usize {
-        sh.run(
-            "tc",
-            &["filter", "show", "dev", &ep.name, "parent", "ffff:"],
-        )
-        .expect("read the ingress filters")
-        .lines()
-        .filter(|l| l.contains("Egress Redirect to device"))
-        .count()
+        sh.run("tc", &["filter", "show", "dev", &ep.name, "ingress"])
+            .expect("read the ingress filters")
+            .lines()
+            .filter(|l| l.contains("Egress Redirect to device"))
+            .count()
     };
     assert_eq!(redirects(&sh), 1, "expected exactly one ingress redirect");
 
