@@ -327,23 +327,49 @@ impl crate::status::Observable for NodeState {
 }
 
 pub(super) fn kernel_cmdline(np: &NodePlan) -> String {
-    kernel_cmdline_for(np, GuestArch::X86_64)
+    kernel_cmdline_for(np, GuestArch::X86_64, false)
+}
+
+/// A bundle's root disk: a raw image of the guest's whole system, booted as `/dev/vda` by
+/// `qemu-microvm` only. Its guest runs its distribution's own init, which reads no `vx.ip=`, so it
+/// gets its address from the kernel's own `ip=` instead.
+pub(super) const ROOT_DISK: &str = "rootfs.img";
+
+/// The kernel's own address setting (`ip=<addr>:<server>:<gw>:<netmask>:<host>:<dev>:off`) for a guest
+/// whose init reads no `vx.ip=`. No gateway: the guest's slice is its one subnet.
+fn kernel_ip_param(np: &NodePlan) -> Option<String> {
+    let (addr, prefix) = np.ip_cidr.as_deref()?.split_once('/')?;
+    let prefix: u32 = prefix.parse().ok().filter(|p| *p <= 32)?;
+    let mask = std::net::Ipv4Addr::from(u32::MAX.checked_shl(32 - prefix).unwrap_or(0));
+    Some(format!("ip={addr}:::{mask}:{}:eth0:off", np.node_id))
 }
 
 /// The guest's console is the machine's first serial port: the 8250 `ttyS0` on x86_64, the
 /// PL011 `ttyAMA0` on an aarch64 `virt` machine.
-fn kernel_cmdline_for(np: &NodePlan, arch: GuestArch) -> String {
+///
+/// A guest that boots from a root disk ([`ROOT_DISK`]) mounts `/dev/vda`, keeps the kernel's
+/// interface names, and takes its address from the kernel's `ip=`. The `vx.` markers stay, since
+/// the host scan finds a guest by them.
+fn kernel_cmdline_for(np: &NodePlan, arch: GuestArch, root_disk: bool) -> String {
     let ip = np.ip_cidr.as_deref().unwrap_or("");
     let console = match arch {
         GuestArch::X86_64 => "ttyS0",
         GuestArch::Aarch64 | GuestArch::Armv7m => "ttyAMA0",
     };
-    format!(
+    let mut line = format!(
         "console={console} reboot=t panic=-1 quiet vx.ip={ip} vx.node={} {}{}",
         np.node_id,
         super::foreign::SLOT_MARKER,
         np.instance
-    )
+    );
+    if root_disk {
+        line.push_str(" root=/dev/vda rw rootwait net.ifnames=0");
+        if let Some(param) = kernel_ip_param(np) {
+            line.push(' ');
+            line.push_str(&param);
+        }
+    }
+    line
 }
 
 pub(super) fn bundle_paths(np: &NodePlan) -> Result<(String, String), ZoneBackendError> {
@@ -351,6 +377,15 @@ pub(super) fn bundle_paths(np: &NodePlan) -> Result<(String, String), ZoneBacken
         .bundle
         .as_deref()
         .expect("plan invariant: vm backends carry a bundle");
+    if dir.join(ROOT_DISK).exists() {
+        return Err(ZoneBackendError::Runtime {
+            node: np.node_id.clone(),
+            detail: format!(
+                "the bundle boots from a root disk (`{ROOT_DISK}`), which only `backend: \
+                 qemu-microvm` boots"
+            ),
+        });
+    }
     let kernel = dir.join("vmlinuz");
     let initrd = dir.join("initrd.img");
     for p in [&kernel, &initrd] {
@@ -647,7 +682,7 @@ fn microvm_up(sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneB
     if microvm_status(np, runtime_dir) == NodeState::Up {
         return Ok(()); // idempotent
     }
-    let (kernel, initrd) = bundle_paths(np)?;
+    let (kernel, initrd) = microvm_bundle_paths(np)?;
     let boot = bundle_boot(np)?;
     check_qemu_options(np, boot, vhost_net_usable)?;
     let arch = boot.arch;
@@ -680,6 +715,29 @@ fn microvm_up(sh: &Shell, np: &NodePlan, runtime_dir: &Path) -> Result<(), ZoneB
     };
     qemu_sh.run(argv[0], &argv[1..])?;
     Ok(())
+}
+
+/// A `qemu-microvm` bundle: `vmlinuz`, with `initrd.img`, a root disk ([`ROOT_DISK`]) or both.
+fn microvm_bundle_paths(np: &NodePlan) -> Result<(String, String), ZoneBackendError> {
+    let dir = np
+        .bundle
+        .as_deref()
+        .expect("plan invariant: vm backends carry a bundle");
+    let (kernel, initrd) = (dir.join("vmlinuz"), dir.join("initrd.img"));
+    let needed = if dir.join(ROOT_DISK).exists() {
+        vec![&kernel]
+    } else {
+        vec![&kernel, &initrd]
+    };
+    for p in needed {
+        if !p.exists() {
+            return Err(ZoneBackendError::BundleFile {
+                node: np.node_id.clone(),
+                path: p.display().to_string(),
+            });
+        }
+    }
+    Ok((kernel.display().to_string(), initrd.display().to_string()))
 }
 
 /// Whether this process can open `/dev/vhost-net` for reading and writing, as QEMU's
@@ -760,7 +818,12 @@ fn microvm_argv(
         "virtio-net-device"
     };
     let nic = format!("{nic_model},netdev=n0,mac={}", np.guest_mac());
-    let append = kernel_cmdline_for(np, arch);
+    let root_disk = np
+        .bundle
+        .as_deref()
+        .map(|dir| dir.join(ROOT_DISK))
+        .filter(|p| p.exists());
+    let append = kernel_cmdline_for(np, arch, root_disk.is_some());
     let kvm = accel == Acceleration::Kvm;
     let (machine, cpu, default_mb) = match arch {
         // A PCIe bus on `microvm` needs ACPI: without it the NIC behind the root port stays in
@@ -848,6 +911,24 @@ fn microvm_argv(
     // system. QEMU's arm loader refuses an empty file, so it is not passed at all.
     if std::fs::metadata(initrd).is_ok_and(|m| m.len() > 0) {
         args.extend(["-initrd".to_string(), initrd.to_string()]);
+    }
+    // The root disk is a snapshot: the guest writes to a temporary overlay QEMU drops when it
+    // exits, so the bundle's image stays as its checksum says and every boot starts from it.
+    if let Some(disk) = &root_disk {
+        let blk = if pci {
+            "virtio-blk-pci"
+        } else {
+            "virtio-blk-device"
+        };
+        args.extend([
+            "-drive".to_string(),
+            format!(
+                "id=root,file={},if=none,format=raw,snapshot=on",
+                disk.display()
+            ),
+            "-device".to_string(),
+            format!("{blk},drive=root"),
+        ]);
     }
     if kvm {
         args.push("-enable-kvm".into());
@@ -1543,7 +1624,7 @@ mod tests {
             "-kernel",
             "k",
             "-append",
-            &kernel_cmdline_for(&np, GuestArch::X86_64),
+            &kernel_cmdline_for(&np, GuestArch::X86_64, false),
             "-netdev",
             "tap,id=n0,ifname=vz-arm,script=no,downscript=no",
             "-device",
@@ -2180,5 +2261,114 @@ mod tests {
             .unwrap()
         });
         assert_eq!(got, 8, "timers are driven by the caller's runtime");
+    }
+
+    /// A bundle with a root disk boots it as `/dev/vda`, a snapshot of the bundle's image, and
+    /// gives the guest its address through the kernel's own `ip=`: its init reads no `vx.ip=`.
+    #[test]
+    fn a_root_disk_bundle_boots_its_disk_as_a_snapshot_with_the_kernels_address() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("vmlinuz"), b"k").unwrap();
+        std::fs::write(dir.path().join(ROOT_DISK), b"disk").unwrap();
+        let mut np = microvm_node(Some(dir.path().to_path_buf()));
+        np.ip_cidr = Some("10.130.0.21/24".into());
+        let (kernel, initrd) = microvm_bundle_paths(&np).expect("no initrd needed");
+        let argv = microvm_argv(
+            &np,
+            Path::new("/run/vx"),
+            &kernel,
+            &initrd,
+            boot(GuestArch::Aarch64),
+            Acceleration::Tcg,
+        );
+        let disk = dir.path().join(ROOT_DISK);
+        assert_eq!(
+            arg_after(&argv, "-drive"),
+            format!(
+                "id=root,file={},if=none,format=raw,snapshot=on",
+                disk.display()
+            )
+        );
+        assert!(
+            argv.iter().any(|a| a == "virtio-blk-device,drive=root"),
+            "{argv:?}"
+        );
+        assert!(!argv.iter().any(|a| a == "-initrd"));
+        let append = arg_after(&argv, "-append");
+        assert!(
+            append.contains(" root=/dev/vda rw rootwait net.ifnames=0 "),
+            "{append}"
+        );
+        assert!(
+            append.ends_with(&format!(
+                " ip=10.130.0.21:::255.255.255.0:{}:eth0:off",
+                np.node_id
+            )),
+            "{append}"
+        );
+        assert!(
+            append.contains(&format!("vx.node={}", np.node_id)),
+            "{append}"
+        );
+    }
+
+    /// Without a root disk, nothing changes: the initramfs boots and reads `vx.ip=`.
+    #[test]
+    fn a_bundle_without_a_root_disk_keeps_its_initramfs_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("vmlinuz"), b"k").unwrap();
+        let np = microvm_node(Some(dir.path().to_path_buf()));
+        assert!(matches!(
+            microvm_bundle_paths(&np),
+            Err(ZoneBackendError::BundleFile { .. })
+        ));
+        std::fs::write(dir.path().join("initrd.img"), b"i").unwrap();
+        let (kernel, initrd) = microvm_bundle_paths(&np).unwrap();
+        let argv = microvm_argv(
+            &np,
+            Path::new("/run/vx"),
+            &kernel,
+            &initrd,
+            boot(GuestArch::Aarch64),
+            Acceleration::Tcg,
+        );
+        assert!(!argv.iter().any(|a| a == "-drive"));
+        assert!(!arg_after(&argv, "-append").contains("root="));
+    }
+
+    /// libvirt and cloud-hypervisor boot a kernel and an initramfs only, so they refuse a root
+    /// disk rather than boot without it.
+    #[test]
+    fn only_qemu_microvm_boots_a_root_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        for f in ["vmlinuz", "initrd.img", ROOT_DISK] {
+            std::fs::write(dir.path().join(f), b"x").unwrap();
+        }
+        let np = microvm_node(Some(dir.path().to_path_buf()));
+        let e = bundle_paths(&np).unwrap_err();
+        assert!(e.to_string().contains("qemu-microvm"), "{e}");
+    }
+
+    #[test]
+    fn the_kernels_address_carries_the_netmask_of_the_prefix() {
+        let mut np = microvm_node(None);
+        for (cidr, want) in [
+            ("10.1.2.3/24", Some("ip=10.1.2.3:::255.255.255.0:")),
+            ("10.1.2.3/16", Some("ip=10.1.2.3:::255.255.0.0:")),
+            ("10.1.2.3/32", Some("ip=10.1.2.3:::255.255.255.255:")),
+            ("10.1.2.3/0", Some("ip=10.1.2.3:::0.0.0.0:")),
+            ("10.1.2.3/33", None),
+            ("10.1.2.3", None),
+        ] {
+            np.ip_cidr = Some(cidr.into());
+            let got = kernel_ip_param(&np);
+            match want {
+                Some(prefix) => assert!(
+                    got.as_deref().is_some_and(|g| g.starts_with(prefix)),
+                    "{cidr}: {got:?}"
+                ),
+                None => assert_eq!(got, None, "{cidr}"),
+            }
+        }
     }
 }

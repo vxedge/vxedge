@@ -87,7 +87,8 @@ pub struct NodePlan {
     pub ip_cidr: Option<String>,
     /// Further addresses on the same port, after `ip_cidr` (a container node carries them all).
     pub extra_cidrs: Vec<String>,
-    /// For vm/rtimage kinds: guest bundle dir (vmlinuz + initrd.img; `firmware.elf` for qemu-mcu),
+    /// For vm/rtimage kinds: guest bundle dir (vmlinuz + initrd.img or `rootfs.img`; `firmware.elf`
+    /// for qemu-mcu),
     /// resolved against the manifest's directory when relative.
     ///
     /// Mutually exclusive with `remote_bundle`: planning records *intent* only, never fetches —
@@ -394,8 +395,8 @@ pub fn plan_nodes_from_model(
     Ok(plans)
 }
 
-/// Local bundle directories the plan will boot that are not on disk (or lack `vmlinuz` /
-/// `initrd.img`), resolved the same way [`plan_nodes_from_model`] resolves them. Lets a caller
+/// Local bundle directories the plan will boot that are not on disk (or lack `vmlinuz`, or both
+/// `initrd.img` and a root disk), resolved the same way [`plan_nodes_from_model`] resolves them. Lets a caller
 /// refuse *before* provisioning anything: a bundle built from a local recipe embeds the host
 /// kernel, so it is per-host and a fresh clone never has one.
 /// The one module a `wasm-capsule` device runs.
@@ -469,12 +470,16 @@ pub fn missing_local_bundles(exp: &crate::model::Experiment, workspace_dir: &Pat
                 } else {
                     workspace_dir.join(p)
                 };
-                // A guest bundle is a kernel and an initramfs, an MCU bundle its firmware, and an
-                // attach part its adapter.
+                // A guest bundle is a kernel and an initramfs or a root disk, an MCU bundle its
+                // firmware, and an attach part its adapter.
                 let complete = match (part.kind, device.backend) {
                     (crate::model::PartKind::Attach, _) => dir.join("attach.yaml").exists(),
                     (_, Some(Backend::QemuMcu)) => dir.join(super::qemu_mcu::FIRMWARE).exists(),
-                    _ => dir.join("vmlinuz").exists() && dir.join("initrd.img").exists(),
+                    _ => {
+                        dir.join("vmlinuz").exists()
+                            && (dir.join("initrd.img").exists()
+                                || dir.join(super::backend::ROOT_DISK).exists())
+                    }
                 };
                 if !complete && !missing.contains(&dir) {
                     missing.push(dir);

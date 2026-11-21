@@ -8,10 +8,14 @@
 //! aarch64 one). `VXEDGE_TEST_BUNDLE` names a bundle directory (`vmlinuz`, `initrd.img`,
 //! `meta.json`), for example a pulled `zone/*/stack/probe-bundle`. `VXEDGE_TEST_QEMU`, optional,
 //! gives the device a `qemu:` block as `<machine>,<transport>[,vhost]` (`q35,pci,vhost`); a PCI
-//! transport needs a bundle that declares `org.vxedge.virtio-pci`. Run with:
+//! transport needs a bundle that declares `org.vxedge.virtio-pci`. `VXEDGE_TEST_PROOF=icmp`, optional,
+//! proves the guest by an ICMP echo at the pinned address instead, for a bundle that runs no
+//! reflector (a distribution booted from its root disk, `rootfs.img`). The kernel answers an echo
+//! before the guest's init has run, so `VXEDGE_TEST_SERIAL_READY`, optional, names a line the
+//! guest's console prints once it is up (`login:`), and the test waits for it too. Run with:
 //!   cargo test -p vxedge-core --test zones_qemu_microvm --no-run
 //!   sudo env "PATH=$PATH" VXEDGE_TEST_BUNDLE=/path/to/bundle [VXEDGE_TEST_QEMU=q35,pci] \
-//!     <test-binary> --ignored --nocapture
+//!     [VXEDGE_TEST_PROOF=icmp] <test-binary> --ignored --nocapture
 
 #![cfg(target_os = "linux")]
 
@@ -160,18 +164,53 @@ fn reflected(ns: &str, payload: &str) -> bool {
     String::from_utf8_lossy(&out.stdout).contains(payload)
 }
 
+/// One ICMP echo to the guest, from inside the gateway namespace.
+fn echoed(ns: &str) -> bool {
+    Command::new("ip")
+        .args(["netns", "exec", ns, "ping", "-c1", "-W1", GUEST_IP])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Whether the guest answers, by the proof `VXEDGE_TEST_PROOF` names.
+fn answered(ns: &str, payload: &str) -> bool {
+    match std::env::var("VXEDGE_TEST_PROOF").as_deref() {
+        Ok("icmp") => echoed(ns),
+        Ok("") | Err(_) => reflected(ns, payload),
+        Ok(other) => panic!("VXEDGE_TEST_PROOF is `icmp` or unset: {other}"),
+    }
+}
+
 fn wait_for_reflector(ns: &str, serial: &Path, within: Duration) {
     let deadline = Instant::now() + within;
     while Instant::now() < deadline {
-        if reflected(ns, "vxedge-microvm") {
+        if answered(ns, "vxedge-microvm") {
             return;
         }
     }
     let log = std::fs::read_to_string(serial).unwrap_or_default();
     let tail: Vec<&str> = log.lines().rev().take(15).collect();
     panic!(
-        "the guest's reflector never answered on :{REFLECTOR_PORT}; serial tail, newest first:\n{tail:#?}"
+        "the guest never answered at {GUEST_IP} (reflector :{REFLECTOR_PORT}, or ICMP with \
+         VXEDGE_TEST_PROOF=icmp); serial tail, newest first:\n{tail:#?}"
     );
+}
+
+/// Waits for the console line `VXEDGE_TEST_SERIAL_READY` names, if it names one.
+fn wait_for_console(serial: &Path, within: Duration) {
+    let Ok(ready) = std::env::var("VXEDGE_TEST_SERIAL_READY") else {
+        return;
+    };
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        if std::fs::read_to_string(serial).is_ok_and(|log| log.contains(&ready)) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    panic!("the guest's console never printed `{ready}`");
 }
 
 #[test]
@@ -273,6 +312,7 @@ fn a_probe_guest_boots_on_the_gateway_tap_and_its_reflector_answers_at_the_pinne
         Acceleration::Tcg => Duration::from_secs(120),
     };
     wait_for_reflector(&plan.uplink_ns, &serial, within);
+    wait_for_console(&serial, within);
 
     // --- idempotent up --------------------------------------------------------
     let first = guest(&runtime).expect("the guest is running");
@@ -291,7 +331,7 @@ fn a_probe_guest_boots_on_the_gateway_tap_and_its_reflector_answers_at_the_pinne
         "`down` left QEMU running"
     );
     assert!(
-        !reflected(&ns, "vxedge-down"),
+        !answered(&plan.uplink_ns, "vxedge-down"),
         "a guest that is down still answered"
     );
     node_down(&sh, node, &runtime).unwrap();
