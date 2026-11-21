@@ -6,6 +6,12 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.35.0] - 2026-11-21
+
+A VM bundle can carry its guest's whole system as a root disk: `backend: qemu-microvm` boots it from a snapshot
+and addresses the guest with the kernel's `ip=`, so a full distribution runs as a zone guest. `vxcapsule` pins
+Wasmtime 50.0.3 for RUSTSEC-2026-0587. No RPC or message changes.
+
 ### Added
 
 - A VM bundle may carry its guest's whole system as a root disk, `rootfs.img`, beside `vmlinuz` (ARCHITECTURE.md §9).
@@ -13,13 +19,13 @@ All notable changes to this repo are documented here. Format follows
   guest's address with the kernel's own `ip=` on `eth0`, since a distribution's init reads no `vx.ip=`. A bundle
   with a root disk needs no `initrd.img`. libvirt and cloud-hypervisor refuse such a bundle. The `zones_qemu_microvm`
   integration test can prove a guest by ICMP echo (`VXEDGE_TEST_PROOF=icmp`) and wait for a console line
-  (`VXEDGE_TEST_SERIAL_READY`), and expects `virt` for an aarch64 bundle.
+  (`VXEDGE_TEST_SERIAL_READY`), and expects `virt` for an aarch64 bundle (#221).
 
 ### Security
 
 - `vxcapsule` pins Wasmtime 50.0.3 (from 50.0.2), the release that fixes RUSTSEC-2026-0587, a WASI filesystem
   sandbox escape through a drive-prefixed path component. The flaw is in Wasmtime's Windows path handling; vxedge
-  runs on Linux, and the bump clears the advisory check.
+  runs on Linux, and the bump clears the advisory check (#222).
 
 ## [0.34.2] - 2026-11-19
 
