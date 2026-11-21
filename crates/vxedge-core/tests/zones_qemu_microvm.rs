@@ -299,7 +299,12 @@ fn a_probe_guest_boots_on_the_gateway_tap_and_its_reflector_answers_at_the_pinne
         let i = argv.iter().position(|a| a == flag).expect(flag);
         argv[i + 1].clone()
     };
-    assert_eq!(after("-M"), arm.machine);
+    // An aarch64 guest runs on `virt`, which takes no `qemu:` block.
+    let machine = match arch {
+        GuestArch::Aarch64 => "virt",
+        _ => arm.machine,
+    };
+    assert_eq!(after("-M"), machine);
     assert!(after("-device").starts_with(arm.nic), "{argv:?}");
     assert_eq!(
         after("-netdev").ends_with(",vhost=on"),
