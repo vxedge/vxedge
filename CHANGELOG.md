@@ -6,6 +6,15 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- A VM bundle may carry its guest's whole system as a root disk, `rootfs.img`, beside `vmlinuz` (ARCHITECTURE.md §9).
+  `backend: qemu-microvm` boots it as `/dev/vda` from a snapshot, so the image is never written, and sets the
+  guest's address with the kernel's own `ip=` on `eth0`, since a distribution's init reads no `vx.ip=`. A bundle
+  with a root disk needs no `initrd.img`. libvirt and cloud-hypervisor refuse such a bundle. The `zones_qemu_microvm`
+  integration test can prove a guest by ICMP echo (`VXEDGE_TEST_PROOF=icmp`) and wait for a console line
+  (`VXEDGE_TEST_SERIAL_READY`), and expects `virt` for an aarch64 bundle.
+
 ### Security
 
 - `vxcapsule` pins Wasmtime 50.0.3 (from 50.0.2), the release that fixes RUSTSEC-2026-0587, a WASI filesystem
