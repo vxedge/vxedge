@@ -6,6 +6,12 @@ All notable changes to this repo are documented here. Format follows
 
 ## [Unreleased]
 
+### Security
+
+- `vxcapsule` pins Wasmtime 50.0.3 (from 50.0.2), the release that fixes RUSTSEC-2026-0587, a WASI filesystem
+  sandbox escape through a drive-prefixed path component. The flaw is in Wasmtime's Windows path handling; vxedge
+  runs on Linux, and the bump clears the advisory check.
+
 ## [0.34.2] - 2026-11-19
 
 Fix. An attach adapter learns the slot of the run it serves, so a vehicle with an attach node no longer blocks a
